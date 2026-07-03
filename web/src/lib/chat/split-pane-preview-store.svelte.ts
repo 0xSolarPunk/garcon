@@ -36,6 +36,7 @@ function emptyEntry(chatId: string): SplitPanePreviewEntry {
 export class SplitPanePreviewStore {
 	#entries = new SvelteMap<string, SplitPanePreviewEntry>();
 	#loadEpochs = new Map<string, number>();
+	#inFlightLoads = new Map<string, Promise<void>>();
 	#transcriptCache: ChatTranscriptCache;
 
 	constructor(transcriptCache = new ChatTranscriptCache({ limit: PREVIEW_LIMIT })) {
@@ -72,14 +73,33 @@ export class SplitPanePreviewStore {
 		if (!chatId) return;
 		const current = this.entry(chatId);
 		if (current.messages.length > 0 && !current.isStale) return;
+		if (current.isLoading) {
+			await this.#inFlightLoads.get(chatId);
+			return;
+		}
 		await this.loadSnapshot(chatId);
 	}
 
 	async loadSnapshot(chatId: string): Promise<void> {
 		if (!chatId) return;
+		const inFlight = this.#inFlightLoads.get(chatId);
+		if (inFlight) return inFlight;
+
 		const epoch = (this.#loadEpochs.get(chatId) ?? 0) + 1;
 		this.#loadEpochs.set(chatId, epoch);
 		this.#entries.set(chatId, { ...this.entry(chatId), isLoading: true, error: null });
+		let resolveLoad!: () => void;
+		let rejectLoad!: (error: unknown) => void;
+		const load = new Promise<void>((resolve, reject) => {
+			resolveLoad = resolve;
+			rejectLoad = reject;
+		});
+		this.#inFlightLoads.set(chatId, load);
+		void this.#loadSnapshot(chatId, epoch).then(resolveLoad, rejectLoad);
+		return load;
+	}
+
+	async #loadSnapshot(chatId: string, epoch: number): Promise<void> {
 		try {
 			const page = await getChatMessages({ chatId, limit: PREVIEW_LIMIT });
 			if (this.#loadEpochs.get(chatId) !== epoch) return;
@@ -92,6 +112,10 @@ export class SplitPanePreviewStore {
 				isLoading: false,
 				error: error instanceof Error ? error.message : 'Failed to load chat preview',
 			});
+		} finally {
+			if (this.#loadEpochs.get(chatId) === epoch) {
+				this.#inFlightLoads.delete(chatId);
+			}
 		}
 	}
 
@@ -111,7 +135,12 @@ export class SplitPanePreviewStore {
 		messages: ChatViewMessage[],
 		serverLastSeq?: number,
 	): boolean {
-		const result = this.#transcriptCache.applyMessages(chatId, generationId, messages, serverLastSeq);
+		const result = this.#transcriptCache.applyMessages(
+			chatId,
+			generationId,
+			messages,
+			serverLastSeq,
+		);
 		if (result.status !== 'applied') {
 			this.markStale(chatId);
 			return false;
@@ -122,8 +151,10 @@ export class SplitPanePreviewStore {
 
 	markStale(chatId: string): void {
 		if (!chatId) return;
+		this.#loadEpochs.set(chatId, (this.#loadEpochs.get(chatId) ?? 0) + 1);
+		this.#inFlightLoads.delete(chatId);
 		this.#transcriptCache.markStale(chatId);
-		this.#entries.set(chatId, { ...this.entry(chatId), isStale: true });
+		this.#entries.set(chatId, { ...this.entry(chatId), isLoading: false, isStale: true });
 	}
 
 	remove(chatId: string): void {
@@ -131,5 +162,6 @@ export class SplitPanePreviewStore {
 		this.#entries.delete(chatId);
 		this.#transcriptCache.remove(chatId);
 		this.#loadEpochs.delete(chatId);
+		this.#inFlightLoads.delete(chatId);
 	}
 }

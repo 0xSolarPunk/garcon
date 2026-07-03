@@ -288,11 +288,7 @@ describe('event router integration', () => {
 			'generation-b',
 			expect.arrayContaining([expect.objectContaining({ seq: 1 })]),
 		);
-		expect(stores.chatState.warmBackgroundTranscript).toHaveBeenCalledWith(
-			'chat-b',
-			'generation-b',
-			expect.arrayContaining([expect.objectContaining({ seq: 1 })]),
-		);
+		expect(stores.chatState.warmBackgroundTranscript).not.toHaveBeenCalled();
 		expect(stores.chatState.applyChatMessages).not.toHaveBeenCalled();
 	});
 
@@ -326,6 +322,11 @@ describe('event router integration', () => {
 
 		expect(stores.chatState.markVisibleChatPreviewStale).toHaveBeenCalledWith('chat-b');
 		expect(stores.chatState.loadVisibleChatPreview).toHaveBeenCalledWith('chat-b');
+		expect(stores.chatState.warmBackgroundTranscript).toHaveBeenCalledWith(
+			'chat-b',
+			'generation-b',
+			expect.arrayContaining([expect.objectContaining({ seq: 3 })]),
+		);
 	});
 
 	it('marks pending user messages failed on correlated execution failure', () => {

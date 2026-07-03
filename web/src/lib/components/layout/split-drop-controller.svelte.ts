@@ -88,6 +88,43 @@ export class SplitDropController {
 
 		$effect(() => {
 			const splitLayout = this.#options.splitLayout;
+			if (!splitLayout.isEnabled) {
+				splitLayout.endDrag?.();
+				this.activeSplitDropTarget = null;
+				this.workspaceDragOver = false;
+			}
+		});
+
+		$effect(() => {
+			if (typeof window === 'undefined') return;
+			const splitLayout = this.#options.splitLayout;
+			const clearDrag = () => {
+				if (!splitLayout.draggedChatId) return;
+				splitLayout.endDrag?.();
+				this.activeSplitDropTarget = null;
+				this.workspaceDragOver = false;
+			};
+			const handleKeyDown = (event: KeyboardEvent) => {
+				if (event.key === 'Escape') clearDrag();
+			};
+			const handleVisibilityChange = () => {
+				if (document.visibilityState !== 'visible') clearDrag();
+			};
+
+			window.addEventListener('dragend', clearDrag, true);
+			window.addEventListener('drop', clearDrag);
+			window.addEventListener('keydown', handleKeyDown, true);
+			document.addEventListener('visibilitychange', handleVisibilityChange);
+			return () => {
+				window.removeEventListener('dragend', clearDrag, true);
+				window.removeEventListener('drop', clearDrag);
+				window.removeEventListener('keydown', handleKeyDown, true);
+				document.removeEventListener('visibilitychange', handleVisibilityChange);
+			};
+		});
+
+		$effect(() => {
+			const splitLayout = this.#options.splitLayout;
 			const focusedId = splitLayout.focusedPaneId;
 			const isEnabled = splitLayout.isEnabled;
 			// Depends on tree identity so pane mount/unmount updates the measured target.

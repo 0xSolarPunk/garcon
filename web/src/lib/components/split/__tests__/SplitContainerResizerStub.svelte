@@ -3,9 +3,10 @@
 
 	interface Props {
 		direction: SplitDirection;
+		ratio: number;
 	}
 
-	let { direction }: Props = $props();
+	let { direction, ratio }: Props = $props();
 </script>
 
-<div data-testid="split-resizer-stub" data-direction={direction}></div>
+<div data-testid="split-resizer-stub" data-direction={direction} data-ratio={ratio}></div>

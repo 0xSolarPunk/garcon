@@ -142,9 +142,9 @@ describe('WorkspaceView header visibility', () => {
 			isMobile: false,
 		});
 
-		expect(container.querySelector<HTMLElement>('[data-floating-workspace-toolbar]')?.className).toBe(
-			initialClass,
-		);
+		expect(
+			container.querySelector<HTMLElement>('[data-floating-workspace-toolbar]')?.className,
+		).toBe(initialClass);
 	});
 
 	it('lowers the desktop floating toolbar only while split chat panes are visible', async () => {
@@ -198,9 +198,9 @@ describe('WorkspaceView header visibility', () => {
 			splitLayout,
 		});
 
-		expect(container.querySelector<HTMLElement>('[data-floating-workspace-toolbar]')?.className).toContain(
-			'top-2',
-		);
+		expect(
+			container.querySelector<HTMLElement>('[data-floating-workspace-toolbar]')?.className,
+		).toContain('top-2');
 		expect(
 			container.querySelector<HTMLElement>('[data-floating-workspace-toolbar]')?.className,
 		).not.toContain('top-8');
@@ -442,9 +442,7 @@ describe('WorkspaceView header visibility', () => {
 
 		await openCurrentChatMenu();
 
-		const labels = (await screen.findAllByRole('menuitem')).map((item) =>
-			item.textContent?.trim(),
-		);
+		const labels = (await screen.findAllByRole('menuitem')).map((item) => item.textContent?.trim());
 		expect(labels).toEqual([
 			'Split view',
 			'Fullscreen',
@@ -468,9 +466,7 @@ describe('WorkspaceView header visibility', () => {
 
 		expect(screen.queryByRole('menuitem', { name: 'Split view' })).toBeNull();
 		expect(screen.queryByRole('menuitem', { name: 'Fullscreen' })).toBeNull();
-		const labels = (await screen.findAllByRole('menuitem')).map((item) =>
-			item.textContent?.trim(),
-		);
+		const labels = (await screen.findAllByRole('menuitem')).map((item) => item.textContent?.trim());
 		expect(labels).toEqual([
 			'Share',
 			'Details',
@@ -511,14 +507,14 @@ describe('WorkspaceView header visibility', () => {
 		await openCurrentChatMenu();
 
 		expect(
-			screen.getByRole('menuitem', { name: 'Reload from native history' }).hasAttribute('data-disabled'),
+			screen
+				.getByRole('menuitem', { name: 'Reload from native history' })
+				.hasAttribute('data-disabled'),
 		).toBe(true);
 		expect(
 			screen.getByRole('menuitem', { name: 'Change project path' }).hasAttribute('data-disabled'),
 		).toBe(true);
-		expect(screen.getByRole('menuitem', { name: 'Fork' }).hasAttribute('data-disabled')).toBe(
-			true,
-		);
+		expect(screen.getByRole('menuitem', { name: 'Fork' }).hasAttribute('data-disabled')).toBe(true);
 	});
 
 	it('keeps current chat fork enabled while processing when running fork is supported', async () => {
@@ -565,7 +561,9 @@ describe('WorkspaceView header visibility', () => {
 		await openCurrentChatMenu();
 		await fireEvent.click(await screen.findByRole('menuitem', { name: 'Details' }));
 		await openCurrentChatMenu();
-		await fireEvent.click(await screen.findByRole('menuitem', { name: 'Reload from native history' }));
+		await fireEvent.click(
+			await screen.findByRole('menuitem', { name: 'Reload from native history' }),
+		);
 		await openCurrentChatMenu();
 		await fireEvent.click(await screen.findByRole('menuitem', { name: 'Share' }));
 		await openCurrentChatMenu();
@@ -779,6 +777,65 @@ describe('WorkspaceView header visibility', () => {
 		expect(addChatToZone).toHaveBeenCalledWith('pane-right', 'chat-3', 'right');
 		expect(endDrag).toHaveBeenCalledOnce();
 		expect(setSelectedChatId).toHaveBeenCalledWith('chat-1');
+	});
+
+	it('clears stale split drag state from global drag completion', async () => {
+		const endDrag = vi.fn();
+		const root = {
+			type: 'split',
+			direction: 'horizontal',
+			ratio: 0.5,
+			children: [
+				{ type: 'pane', id: 'pane-left', chatId: 'chat-1' },
+				{ type: 'pane', id: 'pane-right', chatId: 'chat-2' },
+			],
+		};
+		const splitLayout = {
+			isEnabled: true,
+			root,
+			focusedPaneId: 'pane-left',
+			draggedChatId: 'chat-3',
+			draggedPaneId: null,
+			panes: [
+				{ type: 'pane', id: 'pane-left', chatId: 'chat-1' },
+				{ type: 'pane', id: 'pane-right', chatId: 'chat-2' },
+			],
+			focusedChatId: 'chat-1',
+			addChatToZone: vi.fn(),
+			endDrag,
+			focusPane: vi.fn(),
+			replacePaneChat: vi.fn(),
+			swapPanes: vi.fn(),
+			closePane: vi.fn(),
+			setRatioByPath: vi.fn(),
+			disable: vi.fn(),
+			enableWithChat: vi.fn(),
+			setGrid: vi.fn(),
+			splitPane: vi.fn(),
+		};
+
+		const { container } = render(WorkspaceViewTestHost, {
+			activeTab: 'chat',
+			isMobile: false,
+			splitLayout,
+			chatSessions: {
+				selectedChat: {
+					id: 'chat-1',
+					title: 'Header Test Chat',
+					projectPath: '/tmp/header-test',
+				},
+				byId: {},
+				orderedChats: [],
+				setSelectedChatId: vi.fn(),
+			},
+		});
+
+		expect(container.querySelector('[data-split-drag-layer]')).toBeTruthy();
+
+		window.dispatchEvent(new Event('dragend', { bubbles: true, cancelable: true }));
+		await tick();
+
+		expect(endDrag).toHaveBeenCalledOnce();
 	});
 
 	it('focuses an existing split pane instead of duplicating a sidebar chat', async () => {

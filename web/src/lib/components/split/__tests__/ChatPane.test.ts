@@ -1,7 +1,7 @@
-	import { describe, expect, it, vi } from 'vitest';
-	import { fireEvent, render, screen } from '@testing-library/svelte';
-	import ChatPaneTestHost from './ChatPaneTestHost.svelte';
-	import { AssistantMessage, BashToolUseMessage, UserMessage } from '$shared/chat-types';
+import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/svelte';
+import ChatPaneTestHost from './ChatPaneTestHost.svelte';
+import { AssistantMessage, BashToolUseMessage, UserMessage } from '$shared/chat-types';
 
 vi.mock('$lib/api/chats.js', () => ({
 	getChatMessages: vi.fn(() =>
@@ -10,32 +10,26 @@ vi.mock('$lib/api/chats.js', () => ({
 			messages: [
 				{
 					seq: 1,
-					message: new UserMessage(
-						'2026-05-01T00:00:00.000Z',
-						'Unfocused user question',
-					),
+					message: new UserMessage('2026-05-01T00:00:00.000Z', 'Unfocused user question'),
 				},
-					{
-						seq: 2,
-						message: new AssistantMessage(
-							'2026-05-01T00:00:01.000Z',
-							'Unfocused assistant answer',
-						),
-					},
-					{
-						seq: 3,
-						message: new BashToolUseMessage('2026-05-01T00:00:02.000Z', 'tool-1', 'pwd'),
-					},
-					{
-						seq: 4,
-						message: new BashToolUseMessage('2026-05-01T00:00:03.000Z', 'tool-2', 'rg split'),
-					},
-				],
-				pendingUserInputs: [],
-				lastSeq: 4,
-				pageOldestSeq: 1,
-				hasMore: false,
-				limit: 50,
+				{
+					seq: 2,
+					message: new AssistantMessage('2026-05-01T00:00:01.000Z', 'Unfocused assistant answer'),
+				},
+				{
+					seq: 3,
+					message: new BashToolUseMessage('2026-05-01T00:00:02.000Z', 'tool-1', 'pwd'),
+				},
+				{
+					seq: 4,
+					message: new BashToolUseMessage('2026-05-01T00:00:03.000Z', 'tool-2', 'rg split'),
+				},
+			],
+			pendingUserInputs: [],
+			lastSeq: 4,
+			pageOldestSeq: 1,
+			hasMore: false,
+			limit: 50,
 		}),
 	),
 }));
@@ -85,5 +79,14 @@ describe('ChatPane', () => {
 		await fireEvent.click(screen.getByRole('button', { name: 'Maximize pane' }));
 
 		expect(onMaximize).toHaveBeenCalledOnce();
+	});
+
+	it('does not focus the pane when header actions receive keyboard events', async () => {
+		const onFocus = vi.fn();
+		render(ChatPaneTestHost, { isFocused: false, onFocus });
+
+		await fireEvent.keyDown(screen.getByRole('button', { name: 'Close pane' }), { key: 'Enter' });
+
+		expect(onFocus).not.toHaveBeenCalled();
 	});
 });

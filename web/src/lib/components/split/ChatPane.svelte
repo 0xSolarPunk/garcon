@@ -55,8 +55,9 @@
 	let previewScrollContainer: HTMLDivElement | null = $state(null);
 
 	const previewEntry = $derived(previewStore.entry(chatId));
+	const previewMessages = $derived(previewEntry.messages.slice(-20));
 	const previewRows = $derived.by((): ChatDisplayRow[] =>
-		previewEntry.messages.map((entry) => ({
+		previewMessages.map((entry) => ({
 			kind: 'message',
 			id: `${previewEntry.generationId}:${entry.seq}`,
 			message: entry.message,
@@ -92,6 +93,10 @@
 
 	// Pane header is draggable for rearranging splits.
 	function handlePaneHeaderDragStart(e: DragEvent) {
+		if (isHeaderActionTarget(e.target)) {
+			e.preventDefault();
+			return;
+		}
 		if (!e.dataTransfer) return;
 		e.dataTransfer.effectAllowed = 'move';
 		e.dataTransfer.setData('text/plain', chatId);
@@ -149,13 +154,28 @@
 
 	function isInteractiveTarget(target: EventTarget | null, container: EventTarget | null): boolean {
 		if (!(target instanceof Element) || !(container instanceof Element)) return false;
-		const interactive = target.closest('button,a,input,textarea,select,[role="button"]');
+		const interactive = target.closest(
+			'button,a,input,textarea,select,[role="button"],[data-pane-header-action]',
+		);
 		return Boolean(interactive && interactive !== container);
+	}
+
+	function isHeaderActionTarget(target: EventTarget | null): boolean {
+		return target instanceof Element && target.closest('[data-pane-header-action]') !== null;
 	}
 
 	function handlePreviewClick(event: MouseEvent): void {
 		if (isInteractiveTarget(event.target, event.currentTarget)) return;
 		onFocus();
+	}
+
+	function handlePaneHeaderPointerDown(e: PointerEvent): void {
+		if (isHeaderActionTarget(e.target)) e.stopPropagation();
+	}
+
+	function handlePaneHeaderKeyDown(e: KeyboardEvent): void {
+		if (isHeaderActionTarget(e.target)) return;
+		if (e.key === 'Enter') onFocus();
 	}
 </script>
 
@@ -183,10 +203,9 @@
 					: 'bg-muted/20 border-border/30 hover:bg-muted/40',
 		)}
 		draggable={true}
+		onpointerdown={handlePaneHeaderPointerDown}
 		onclick={onFocus}
-		onkeydown={(e) => {
-			if (e.key === 'Enter') onFocus();
-		}}
+		onkeydown={handlePaneHeaderKeyDown}
 		ondragstart={handlePaneHeaderDragStart}
 		ondragend={handlePaneHeaderDragEnd}
 		ondragover={handleHeaderDragOver}
@@ -238,7 +257,9 @@
 			class:opacity-100={isFocused}
 		>
 			<button
+				data-pane-header-action
 				class="p-0.5 rounded hover:bg-accent hover:text-foreground text-muted-foreground/50 transition-colors flex-shrink-0"
+				onpointerdown={(e) => e.stopPropagation()}
 				onclick={(e) => {
 					e.stopPropagation();
 					onMaximize();
@@ -248,7 +269,9 @@
 				<Maximize2 class="w-2.5 h-2.5" />
 			</button>
 			<button
+				data-pane-header-action
 				class="p-0.5 rounded hover:bg-destructive/10 hover:text-destructive text-muted-foreground/50 hover:text-destructive transition-colors flex-shrink-0"
+				onpointerdown={(e) => e.stopPropagation()}
 				onclick={(e) => {
 					e.stopPropagation();
 					onClose();
