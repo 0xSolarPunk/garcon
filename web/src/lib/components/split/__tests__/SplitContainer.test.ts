@@ -52,6 +52,9 @@ describe('SplitContainer', () => {
 		expect(split?.getAttribute('style')).toContain('0.5fr');
 		expect(split?.getAttribute('style')).toContain('auto');
 		expect(split?.getAttribute('style')).not.toContain('calc(');
+		expect(
+			container.querySelector('[data-testid="split-resizer-stub"]')?.getAttribute('data-ratio'),
+		).toBe('0.5');
 		for (const wrapper of paneWrappers) {
 			expect(wrapper.getAttribute('style') ?? '').toBe('');
 		}

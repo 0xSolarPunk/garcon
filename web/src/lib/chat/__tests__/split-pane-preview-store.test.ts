@@ -73,8 +73,9 @@ describe('SplitPanePreviewStore', () => {
 		await store.loadSnapshot('chat-1');
 
 		expect(getChatMessages).toHaveBeenCalledWith({ chatId: 'chat-1', limit: 50 });
-		expect(store.entry('chat-1').messages.map((item) => (item.message as AssistantMessage).content))
-			.toEqual(['loaded']);
+		expect(
+			store.entry('chat-1').messages.map((item) => (item.message as AssistantMessage).content),
+		).toEqual(['loaded']);
 
 		transcriptCache.flush();
 		const restored = storage.restore('chat-1');
@@ -90,8 +91,9 @@ describe('SplitPanePreviewStore', () => {
 
 		expect(applied).toBe(true);
 		expect(store.entry('chat-1').lastSeq).toBe(2);
-		expect(store.entry('chat-1').messages.map((item) => (item.message as AssistantMessage).content))
-			.toEqual(['first', 'second']);
+		expect(
+			store.entry('chat-1').messages.map((item) => (item.message as AssistantMessage).content),
+		).toEqual(['first', 'second']);
 	});
 
 	it('marks stale when incoming messages belong to another generation', () => {
@@ -126,23 +128,63 @@ describe('SplitPanePreviewStore', () => {
 		expect(store.entry('chat-1').lastSeq).toBe(1);
 	});
 
-	it('ignores stale snapshot load results', async () => {
-		let resolveFirst!: (value: ReturnType<typeof page>) => void;
-		vi.mocked(getChatMessages)
-			.mockReturnValueOnce(new Promise((resolve) => {
-				resolveFirst = resolve;
-			}))
-			.mockResolvedValueOnce(page([entry(1, 'new')], 'generation-new'));
+	it('coalesces concurrent snapshot loads for the same chat', async () => {
+		let resolveLoad!: (value: ReturnType<typeof page>) => void;
+		vi.mocked(getChatMessages).mockReturnValueOnce(
+			new Promise((resolve) => {
+				resolveLoad = resolve;
+			}),
+		);
 		const store = new SplitPanePreviewStore();
 
 		const first = store.loadSnapshot('chat-1');
 		const second = store.loadSnapshot('chat-1');
-		await second;
-		resolveFirst(page([entry(1, 'old')], 'generation-old'));
-		await first;
+		expect(getChatMessages).toHaveBeenCalledTimes(1);
 
-		expect(store.entry('chat-1').generationId).toBe('generation-new');
-		expect(store.entry('chat-1').messages.map((item) => (item.message as AssistantMessage).content))
-			.toEqual(['new']);
+		resolveLoad(page([entry(1, 'loaded')], 'generation-loaded'));
+		await first;
+		await second;
+
+		expect(store.entry('chat-1').generationId).toBe('generation-loaded');
+		expect(
+			store.entry('chat-1').messages.map((item) => (item.message as AssistantMessage).content),
+		).toEqual(['loaded']);
+	});
+
+	it('forces a fresh snapshot after stale marking invalidates an in-flight load', async () => {
+		let resolveOldLoad!: (value: ReturnType<typeof page>) => void;
+		let resolveFreshLoad!: (value: ReturnType<typeof page>) => void;
+		vi.mocked(getChatMessages)
+			.mockReturnValueOnce(
+				new Promise((resolve) => {
+					resolveOldLoad = resolve;
+				}),
+			)
+			.mockReturnValueOnce(
+				new Promise((resolve) => {
+					resolveFreshLoad = resolve;
+				}),
+			);
+		const store = new SplitPanePreviewStore();
+
+		const oldLoad = store.loadSnapshot('chat-1');
+		store.markStale('chat-1');
+		const freshLoad = store.loadSnapshot('chat-1');
+
+		expect(getChatMessages).toHaveBeenCalledTimes(2);
+
+		resolveOldLoad(page([entry(1, 'old')], 'generation-old'));
+		await oldLoad;
+		expect(store.entry('chat-1').generationId).toBeNull();
+		expect(store.entry('chat-1').isStale).toBe(true);
+
+		resolveFreshLoad(page([entry(1, 'fresh')], 'generation-fresh'));
+		await freshLoad;
+
+		expect(store.entry('chat-1').generationId).toBe('generation-fresh');
+		expect(store.entry('chat-1').isStale).toBe(false);
+		expect(
+			store.entry('chat-1').messages.map((item) => (item.message as AssistantMessage).content),
+		).toEqual(['fresh']);
 	});
 });

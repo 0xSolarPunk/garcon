@@ -493,22 +493,26 @@ export function createEventRouter(
 					const agentMsg = event.message;
 					if (agentMsg.chatId && agentMsg.messages.length > 0) {
 						if (agentMsg.chatId !== activeViewChatId) {
+							let warmedVisiblePreview = false;
 							if (stores.chatState.isVisiblePreviewChat?.(agentMsg.chatId)) {
 								const applied = stores.chatState.warmVisibleChatPreview?.(
 									agentMsg.chatId,
 									agentMsg.generationId,
 									agentMsg.messages,
 								);
+								warmedVisiblePreview = applied === true;
 								if (applied === false) {
 									stores.chatState.markVisibleChatPreviewStale?.(agentMsg.chatId);
 									void stores.chatState.loadVisibleChatPreview?.(agentMsg.chatId);
 								}
 							}
-							stores.chatState.warmBackgroundTranscript?.(
-								agentMsg.chatId,
-								agentMsg.generationId,
-								agentMsg.messages,
-							);
+							if (!warmedVisiblePreview) {
+								stores.chatState.warmBackgroundTranscript?.(
+									agentMsg.chatId,
+									agentMsg.generationId,
+									agentMsg.messages,
+								);
+							}
 						}
 						const preview = selectPreviewFromBatch(agentMsg.messages.map((entry) => entry.message));
 						if (preview) {
