@@ -1,4 +1,5 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import type { PartialKeys, VirtualizerOptions } from '@tanstack/svelte-virtual';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
 	GitVirtualFileHeaderRow,
@@ -7,7 +8,17 @@ import type {
 	GitVirtualReviewRow,
 	GitVirtualUnifiedRow,
 } from '$lib/git/review/git-virtual-review-document.svelte.js';
+import { arrayGitVirtualReviewRowSource } from '$lib/git/review/git-virtual-review-row-source.js';
+import { measureVirtualRow } from '../git-virtual-row-measurement.js';
 
+type TestInitialVirtualizerOptions = PartialKeys<
+	VirtualizerOptions<HTMLElement, HTMLDivElement>,
+	'observeElementRect' | 'observeElementOffset' | 'scrollToFn'
+>;
+type TestRefreshedVirtualizerOptions = Partial<VirtualizerOptions<HTMLElement, HTMLDivElement>>;
+
+let initialVirtualizerOptions: TestInitialVirtualizerOptions | null;
+let refreshedVirtualizerOptions: TestRefreshedVirtualizerOptions | null;
 let measureCalls: number;
 let scrollToIndexCalls: number[];
 
@@ -23,14 +34,21 @@ vi.mock('@tanstack/svelte-virtual', async () => {
 	const virtualizer = {
 		getVirtualItems: () => virtualItems,
 		getTotalSize: () => 126,
-		setOptions: () => undefined,
+		setOptions: (options: TestRefreshedVirtualizerOptions) => {
+			refreshedVirtualizerOptions = options;
+		},
 		measureElement: () => undefined,
 		scrollToIndex: (index: number) => scrollToIndexCalls.push(index),
 		measure: () => {
 			measureCalls += 1;
 		},
 	};
-	return { createVirtualizer: () => readable(virtualizer) };
+	return {
+		createVirtualizer: (options: TestInitialVirtualizerOptions) => {
+			initialVirtualizerOptions = options;
+			return readable(virtualizer);
+		},
+	};
 });
 
 import GitVirtualDiffSurface from '../GitVirtualDiffSurface.svelte';
@@ -106,7 +124,7 @@ function makeUnifiedRow(index: number, documentId = 'doc-a'): GitVirtualUnifiedR
 			rowContextTarget: null,
 		},
 		actionTarget: null,
-		selectableLineKeys: [],
+		selectableLineKeys: () => [],
 	};
 }
 
@@ -136,17 +154,18 @@ function fileIndexes(rows: GitVirtualReviewRow[]): Map<string, number> {
 
 describe('Git virtual diff refresh', () => {
 	beforeEach(() => {
+		initialVirtualizerOptions = null;
+		refreshedVirtualizerOptions = null;
 		measureCalls = 0;
 		scrollToIndexCalls = [];
 	});
 
-	it('keeps the virtualizer snapshot keys while the refreshed rows reconcile', async () => {
+	it('keeps shared measurement options while refreshed rows reconcile', async () => {
 		const initialRows = [makeHeaderRow(0), makeHeaderRow(1), makeHeaderRow(2)];
 		const replacementRows = [makeHeaderRow(2)];
 		const props = {
 			documentId: 'doc-a',
-			rows: initialRows,
-			fileRowIndex: new Map(initialRows.map((row, index) => [row.filePath, index])),
+			source: arrayGitVirtualReviewRowSource(initialRows),
 			activeTab: 'unstaged' as const,
 			fontSize: 12,
 			selectedLineKeys: new Set<string>(),
@@ -181,23 +200,33 @@ describe('Git virtual diff refresh', () => {
 		const { container, rerender } = render(GitVirtualDiffSurface, { props });
 		const viewport = container.querySelector<HTMLElement>('[data-git-virtual-diff-root]')!;
 		viewport.scrollTop = 300;
+		expect(initialVirtualizerOptions?.measureElement).toBe(measureVirtualRow);
+		await waitFor(() => {
+			expect(refreshedVirtualizerOptions?.measureElement).toBe(measureVirtualRow);
+		});
+		await waitFor(() => expect(measureCalls).toBe(1));
 
 		await rerender({
 			...props,
-			rows: replacementRows,
-			fileRowIndex: new Map([['file-2.ts', 0]]),
+			source: arrayGitVirtualReviewRowSource(replacementRows),
 		});
 
 		expect(screen.getByText('file-2.ts')).toBeTruthy();
 		expect(viewport.scrollTop).toBe(300);
+		expect(measureCalls).toBe(1);
+		const rowWindow = container.querySelector<HTMLElement>('[data-git-virtual-row-window]');
+		expect(rowWindow).toBeTruthy();
+		if (!rowWindow) return;
+		const mountedRows = Array.from(rowWindow.children);
+		expect(mountedRows).toHaveLength(1);
+		expect(mountedRows[0]?.parentElement).toBe(rowWindow);
 	});
 
 	it('repositions a requested file when preceding rows move its index', async () => {
 		const initialRows = makeUnloadedRows();
 		const props = {
 			documentId: 'doc-a',
-			rows: initialRows,
-			fileRowIndex: fileIndexes(initialRows),
+			source: arrayGitVirtualReviewRowSource(initialRows, fileIndexes(initialRows)),
 			activeTab: 'unstaged' as const,
 			fontSize: 12,
 			selectedLineKeys: new Set<string>(),
@@ -244,8 +273,7 @@ describe('Git virtual diff refresh', () => {
 		];
 		await rerender({
 			...props,
-			rows: movedRows,
-			fileRowIndex: fileIndexes(movedRows),
+			source: arrayGitVirtualReviewRowSource(movedRows, fileIndexes(movedRows)),
 		});
 
 		await waitFor(() => expect(scrollToIndexCalls).toEqual([4, 5]));
@@ -255,8 +283,7 @@ describe('Git virtual diff refresh', () => {
 		const initialRows = makeUnloadedRows();
 		const props = {
 			documentId: 'doc-a',
-			rows: initialRows,
-			fileRowIndex: fileIndexes(initialRows),
+			source: arrayGitVirtualReviewRowSource(initialRows, fileIndexes(initialRows)),
 			activeTab: 'unstaged' as const,
 			fontSize: 12,
 			selectedLineKeys: new Set<string>(),
@@ -288,25 +315,53 @@ describe('Git virtual diff refresh', () => {
 			commentCopyText: null,
 			onOpenChat: vi.fn(),
 		};
-		const { rerender } = render(GitVirtualDiffSurface, { props });
+		const { container, rerender } = render(GitVirtualDiffSurface, { props });
 
 		await waitFor(() => expect(scrollToIndexCalls).toEqual([4]));
 
 		const expandedRows = [...initialRows.slice(0, -1), makeUnifiedRow(2)];
 		await rerender({
 			...props,
-			rows: expandedRows,
+			source: arrayGitVirtualReviewRowSource(expandedRows, fileIndexes(expandedRows)),
 		});
 
 		await waitFor(() => expect(scrollToIndexCalls).toEqual([4, 4]));
+
+		const shiftedRows = [
+			...expandedRows.slice(0, 2),
+			makeUnifiedRow(0, 'preceding-file-expanded'),
+			...expandedRows.slice(2),
+		];
+		await rerender({
+			...props,
+			source: arrayGitVirtualReviewRowSource(shiftedRows, fileIndexes(shiftedRows)),
+		});
+
+		await waitFor(() => expect(scrollToIndexCalls).toEqual([4, 4, 5]));
+
+		const viewport = container.querySelector<HTMLElement>('[data-git-virtual-diff-root]');
+		expect(viewport).toBeTruthy();
+		if (!viewport) return;
+		await fireEvent.wheel(viewport);
+
+		const shiftedAgainRows = [
+			...shiftedRows.slice(0, 3),
+			makeUnifiedRow(0, 'preceding-file-expanded-again'),
+			...shiftedRows.slice(3),
+		];
+		await rerender({
+			...props,
+			source: arrayGitVirtualReviewRowSource(shiftedAgainRows, fileIndexes(shiftedAgainRows)),
+		});
+
+		expect(scrollToIndexCalls).toEqual([4, 4, 5]);
 	});
 
 	it('does not replay a serviced scroll when a pending file becomes stale', async () => {
 		const initialRows = makeUnloadedRows();
 		const props = {
 			documentId: 'doc-a',
-			rows: initialRows,
-			fileRowIndex: fileIndexes(initialRows),
+			source: arrayGitVirtualReviewRowSource(initialRows, fileIndexes(initialRows)),
 			activeTab: 'unstaged' as const,
 			fontSize: 12,
 			selectedLineKeys: new Set<string>(),
@@ -343,7 +398,7 @@ describe('Git virtual diff refresh', () => {
 		await waitFor(() => expect(scrollToIndexCalls).toEqual([4]));
 		await rerender({
 			...props,
-			rows: [...initialRows.slice(0, -1), makeLimitRow(2)],
+			source: arrayGitVirtualReviewRowSource([...initialRows.slice(0, -1), makeLimitRow(2)]),
 		});
 
 		expect(scrollToIndexCalls).toEqual([4]);
@@ -354,8 +409,7 @@ describe('Git virtual diff refresh', () => {
 		const onVisibleRowsChange = vi.fn();
 		const props = {
 			documentId: 'doc-a',
-			rows: initialRows,
-			fileRowIndex: new Map(initialRows.map((row, index) => [row.filePath, index])),
+			source: arrayGitVirtualReviewRowSource(initialRows),
 			activeTab: 'unstaged' as const,
 			fontSize: 12,
 			selectedLineKeys: new Set<string>(),
@@ -401,7 +455,7 @@ describe('Git virtual diff refresh', () => {
 		await rerender({
 			...props,
 			documentId: 'doc-b',
-			rows: replacementRows,
+			source: arrayGitVirtualReviewRowSource(replacementRows),
 		});
 
 		expect(viewport.scrollTop).toBe(0);

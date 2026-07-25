@@ -157,7 +157,7 @@
 
 {#if row.kind === 'unified-row'}
 	<div
-		class="font-mono"
+		class="flow-root font-mono"
 		style:font-size={`${fontSize}px`}
 		style:line-height={`${rowLineHeight}px`}
 		data-git-diff-content-row
@@ -188,7 +188,7 @@
 			{@const defaultTarget = row.view.rowContextTarget}
 			<div
 				data-git-diff-review-row
-				class="diff-review-row group/diff-cell relative grid select-none {workbenchControls
+				class="group/diff-cell relative grid select-none {workbenchControls
 					? 'grid-cols-[2rem_3rem_3rem_minmax(0,1fr)]'
 					: 'grid-cols-[3rem_3rem_minmax(0,1fr)]'} {row.view.bgClass}"
 			>
@@ -224,7 +224,7 @@
 								row.file.path,
 								row.view.beforeContextTarget,
 								row.view.selectionKey,
-								row.selectableLineKeys,
+								row.selectableLineKeys(),
 							)}
 						ondblclick={() => openEditor(row.file.path, row.view.row.beforeLine)}
 						title={m.git_comment_add_old_line_to_chat({
@@ -254,7 +254,7 @@
 								row.file.path,
 								row.view.afterContextTarget,
 								row.view.selectionKey,
-								row.selectableLineKeys,
+								row.selectableLineKeys(),
 							)}
 						ondblclick={() => openEditor(row.file.path, row.view.row.afterLine)}
 						title={m.git_comment_add_new_line_to_chat({ line: row.view.afterContextTarget.line })}
@@ -283,7 +283,7 @@
 								row.file.path,
 								defaultTarget,
 								row.view.selectionKey,
-								row.selectableLineKeys,
+								row.selectableLineKeys(),
 							)}
 					>
 						<span class="{row.view.textClass} select-text"
@@ -330,7 +330,7 @@
 	</div>
 {:else}
 	<div
-		class="font-mono"
+		class="flow-root font-mono"
 		style:font-size={`${fontSize}px`}
 		style:line-height={`${rowLineHeight}px`}
 		data-git-diff-content-row
@@ -358,10 +358,7 @@
 				{/if}
 			</div>
 		{:else}
-			<div
-				data-git-diff-review-row
-				class="diff-review-row grid grid-cols-[minmax(0,1fr)_1px_minmax(0,1fr)]"
-			>
+			<div data-git-diff-review-row class="grid grid-cols-[minmax(0,1fr)_1px_minmax(0,1fr)]">
 				{#each splitCellViews(row.view) as cellView, index}
 					<div
 						class="group/diff-cell grid min-w-0 grid-cols-[3rem_minmax(0,1fr)] {cellView?.bgClass ??
@@ -377,7 +374,7 @@
 										row.file.path,
 										cellView.contextTarget,
 										cellView.selectionKey,
-										row.selectableLineKeys,
+										row.selectableLineKeys(),
 									)}
 								ondblclick={() =>
 									openEditor(row.file.path, cellView.side === 'after' ? cellView.cell.line : null)}
@@ -413,7 +410,7 @@
 												row.file.path,
 												cellView.contextTarget,
 												cellView.selectionKey,
-												row.selectableLineKeys,
+												row.selectableLineKeys(),
 											)}
 									>
 										<span class="{cellView.textClass} select-text"
@@ -485,14 +482,3 @@
 			</div>{/if}
 	</div>
 {/if}
-
-<style>
-	.diff-review-row {
-		transition: box-shadow 120ms ease;
-	}
-
-	.diff-review-row:hover,
-	.diff-review-row:focus-within {
-		box-shadow: inset 0 0 0 1px hsl(var(--interactive-accent) / 0.65);
-	}
-</style>

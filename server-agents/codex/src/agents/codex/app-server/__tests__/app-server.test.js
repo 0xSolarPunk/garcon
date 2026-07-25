@@ -5051,6 +5051,121 @@ describe('CodexAppServerRuntime', () => {
     expect(resolvedPath).toBe(nativePath);
   });
 
+  it('shares cached discovery misses until an explicit transcript load requests a refresh', async () => {
+    const nativePath = path.join(tmpDir, 'later-resolved-thread.jsonl');
+    await fs.writeFile(nativePath, '{}\n');
+    let discoverable = false;
+    const fake = new FakeClient({
+      listThreads: async () => ({
+        data: discoverable ? [makeThread({ id: 'thread-1', path: nativePath })] : [],
+        nextCursor: null,
+        backwardsCursor: null,
+      }),
+    });
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+    const session = {
+      provider: 'codex',
+      agentSessionId: 'thread-1',
+      nativePath: null,
+      projectPath: '/repo',
+    };
+
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    discoverable = true;
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    expect(fake.listThreads).toHaveBeenCalledTimes(1);
+
+    provider.requestNativePathDiscoveryRefresh('thread-1');
+    await expect(provider.resolveNativePath(session)).resolves.toBe(nativePath);
+
+    expect(fake.listThreads).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses one discovery snapshot for sequential missing-session resolutions', async () => {
+    const fake = new FakeClient();
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+
+    for (let index = 0; index < 100; index += 1) {
+      await expect(provider.resolveNativePath({
+        provider: 'codex',
+        agentSessionId: `missing-thread-${index}`,
+        nativePath: null,
+        projectPath: '/repo',
+      })).resolves.toBeNull();
+    }
+
+    expect(fake.listThreads).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds repeated native path discovery refresh requests', async () => {
+    let now = 0;
+    const fake = new FakeClient();
+    const provider = new CodexAppServerRuntime({
+      createClient: () => fake,
+      nativePathDiscoveryRefresh: {
+        sessionIntervalMs: 30_000,
+        globalIntervalMs: 1_000,
+        now: () => now,
+      },
+    });
+    const session = {
+      provider: 'codex',
+      agentSessionId: 'missing-thread',
+      nativePath: null,
+      projectPath: '/repo',
+    };
+
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    provider.requestNativePathDiscoveryRefresh('missing-thread');
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    provider.requestNativePathDiscoveryRefresh('missing-thread');
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    expect(fake.listThreads).toHaveBeenCalledTimes(2);
+
+    now = 30_000;
+    provider.requestNativePathDiscoveryRefresh('missing-thread');
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    expect(fake.listThreads).toHaveBeenCalledTimes(3);
+
+    now = 0;
+    provider.requestNativePathDiscoveryRefresh('missing-thread');
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    expect(fake.listThreads).toHaveBeenCalledTimes(4);
+  });
+
+  it('lets another session request a refresh after the global minimum interval', async () => {
+    let now = 0;
+    const fake = new FakeClient();
+    const provider = new CodexAppServerRuntime({
+      createClient: () => fake,
+      nativePathDiscoveryRefresh: {
+        sessionIntervalMs: 30_000,
+        globalIntervalMs: 1_000,
+        now: () => now,
+      },
+    });
+    const session = {
+      provider: 'codex',
+      agentSessionId: 'missing-thread',
+      nativePath: null,
+      projectPath: '/repo',
+    };
+
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    provider.requestNativePathDiscoveryRefresh('background-thread');
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+
+    now = 100;
+    provider.requestNativePathDiscoveryRefresh('user-thread');
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    expect(fake.listThreads).toHaveBeenCalledTimes(2);
+
+    now = 1_000;
+    provider.requestNativePathDiscoveryRefresh('user-thread');
+    await expect(provider.resolveNativePath(session)).resolves.toBeNull();
+    expect(fake.listThreads).toHaveBeenCalledTimes(3);
+  });
+
   it('surfaces thread/list failures during native path reconciliation', async () => {
     const fake = new FakeClient({
       listThreads: async () => {

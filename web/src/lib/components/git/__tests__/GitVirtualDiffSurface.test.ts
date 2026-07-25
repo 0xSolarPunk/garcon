@@ -1,8 +1,9 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import type { ComponentProps } from 'svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { GitVirtualReviewRow } from '$lib/git/review/git-virtual-review-document.svelte.js';
 import type { GitVirtualFileHeaderRow } from '$lib/git/review/git-virtual-review-document.svelte.js';
+import { arrayGitVirtualReviewRowSource } from '$lib/git/review/git-virtual-review-row-source.js';
 import GitVirtualDiffSurface from '../GitVirtualDiffSurface.svelte';
 
 type GitVirtualDiffSurfaceProps = ComponentProps<typeof GitVirtualDiffSurface>;
@@ -42,8 +43,7 @@ function renderSurface(
 ) {
 	const props = {
 		documentId: 'doc',
-		rows,
-		fileRowIndex: new Map(rows.map((row, index) => [row.filePath, index])),
+		source: arrayGitVirtualReviewRowSource(rows),
 		activeTab: 'unstaged' as const,
 		fontSize: 12,
 		selectedLineKeys: new Set<string>(),
@@ -85,7 +85,32 @@ function renderSurface(
 }
 
 describe('GitVirtualDiffSurface', () => {
-	it('uses one virtual diff root and mounts a bounded row window for large documents', async () => {
+	beforeEach(() => {
+		vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(1024);
+		vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(720);
+		vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+			this: HTMLElement,
+		) {
+			const height = this.hasAttribute('data-git-virtual-diff-root') ? 720 : 42;
+			return {
+				width: 1024,
+				height,
+				top: 0,
+				right: 1024,
+				bottom: height,
+				left: 0,
+				x: 0,
+				y: 0,
+				toJSON: () => ({}),
+			};
+		});
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('renders one bounded contiguous row window for large documents', async () => {
 		const rows = Array.from({ length: 10_000 }, (_, index) => makeHeaderRow(index));
 		const { container } = renderSurface(rows);
 
@@ -96,7 +121,36 @@ describe('GitVirtualDiffSurface', () => {
 		await waitFor(() => {
 			expect(container.querySelectorAll('[data-git-virtual-row]').length).toBeGreaterThan(0);
 		});
-		expect(container.querySelectorAll('[data-git-virtual-row]').length).toBeLessThan(300);
+
+		const rowWindows = container.querySelectorAll<HTMLElement>('[data-git-virtual-row-window]');
+		expect(rowWindows).toHaveLength(1);
+		const rowWindow = rowWindows.item(0);
+		expect(rowWindow).toBeTruthy();
+		if (!rowWindow) return;
+
+		const mountedRows = Array.from(rowWindow.children).filter((element): element is HTMLElement =>
+			element.hasAttribute('data-git-virtual-row'),
+		);
+		expect(mountedRows).toHaveLength(rowWindow.children.length);
+		expect(mountedRows.length).toBeLessThan(300);
+
+		const indexes = mountedRows.map((element) => Number(element.dataset.index));
+		const firstIndex = indexes[0];
+		expect(firstIndex).toBeDefined();
+		if (firstIndex === undefined) return;
+		expect(indexes).toEqual(
+			Array.from({ length: indexes.length }, (_, offset) => firstIndex + offset),
+		);
+
+		for (const element of mountedRows) {
+			expect(element.className).toBe('');
+			expect(element.style.transform).toBe('');
+			expect(element.style.top).toBe('');
+			expect(element.parentElement).toBe(rowWindow);
+		}
+		expect(rowWindow.className).toBe('absolute inset-x-0');
+		expect(rowWindow.className).not.toMatch(/(?:^|\s)-?(?:translate|transform)(?:-|\s|$)/);
+		expect(rowWindow.style.transform).toBe('');
 	});
 
 	it('reconciles a refreshed document against the virtualizer item snapshot', async () => {
@@ -110,8 +164,7 @@ describe('GitVirtualDiffSurface', () => {
 
 		await rerender({
 			...props,
-			rows: replacementRows,
-			fileRowIndex: new Map([['file-2.ts', 0]]),
+			source: arrayGitVirtualReviewRowSource(replacementRows),
 		});
 
 		await waitFor(() => {

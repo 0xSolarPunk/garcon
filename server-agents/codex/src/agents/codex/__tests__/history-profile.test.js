@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { inspectCodexHistoryProfile } from '../history-profile.ts';
+import { inspectCodexHistoryProfile, inspectCodexSessionIdentity } from '../history-profile.ts';
 
 async function withProfile(payload, run, timestamp = '2026-07-20T00:00:00.000Z') {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-history-profile-'));
@@ -16,6 +16,21 @@ async function withProfile(payload, run, timestamp = '2026-07-20T00:00:00.000Z')
 }
 
 describe('inspectCodexHistoryProfile', () => {
+  it('validates session identity independently of history mode support', async () => {
+    await withProfile({ id: 'thread-1', history_mode: 'future' }, async (nativePath) => {
+      await expect(
+        inspectCodexSessionIdentity({
+          nativePath,
+          expectedThreadId: 'thread-1',
+          signal: new AbortController().signal,
+        }),
+      ).resolves.toEqual({
+        threadId: 'thread-1',
+        createdAt: '2026-07-20T00:00:00.000Z',
+      });
+    });
+  });
+
   it('treats a missing history mode as legacy', async () => {
     await withProfile({ id: 'thread-1' }, async (nativePath) => {
       await expect(inspectCodexHistoryProfile({
@@ -80,6 +95,32 @@ describe('inspectCodexHistoryProfile', () => {
     }, 'July 20, 2026');
   });
 
+  it('does not include native paths in read failures', async () => {
+    const nativePath = '/home/private/.codex/sessions/rollout-secret.jsonl';
+
+    let failure;
+    try {
+      await inspectCodexHistoryProfile({
+        nativePath,
+        signal: new AbortController().signal,
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: 'TRANSCRIPT_UNAVAILABLE',
+      message: 'Codex session metadata is unavailable',
+      details: {
+        operation: 'inspect-history',
+        provider: 'codex',
+        reason: 'read-failed',
+        causeCode: 'ENOENT',
+      },
+    });
+    expect(failure.message).not.toContain(nativePath);
+  });
+
   it('rejects an oversized first record without loading the rollout', async () => {
     await withProfile({
       id: 'thread-1',
@@ -109,7 +150,14 @@ describe('inspectCodexHistoryProfile', () => {
         nativePath,
         expectedThreadId: 'thread-2',
         signal: new AbortController().signal,
-      })).rejects.toMatchObject({ code: 'TRANSCRIPT_UNAVAILABLE' });
+      })).rejects.toMatchObject({
+        code: 'TRANSCRIPT_UNAVAILABLE',
+        details: {
+          operation: 'inspect-history',
+          provider: 'codex',
+          reason: 'thread-mismatch',
+        },
+      });
     });
   });
 
