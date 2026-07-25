@@ -9,8 +9,7 @@
 	interface SidebarChatSummaryProps {
 		session: ChatSessionRecord;
 		isSelected: boolean;
-		isPinned: boolean;
-		isArchived: boolean;
+		suppressUnread?: boolean;
 		currentTime?: Date;
 		showTimestamp?: boolean;
 		showProjectPath?: boolean;
@@ -22,6 +21,7 @@
 	let {
 		session,
 		isSelected,
+		suppressUnread,
 		currentTime = new Date(),
 		showTimestamp = false,
 		showProjectPath = true,
@@ -30,7 +30,8 @@
 		onManageTags,
 	}: SidebarChatSummaryProps = $props();
 
-	let isUnread = $derived(session.isUnread && !isSelected);
+	let isUnread = $derived(session.isUnread && !(suppressUnread ?? isSelected));
+	let isProcessing = $derived(session.isProcessing);
 	let chatName = $derived(session.title || m.sidebar_chats_new_chat());
 	let lastMessage = $derived(session.lastMessage || '');
 	let projectPath = $derived(showProjectPath ? session.projectPath || '' : '');
@@ -47,17 +48,28 @@
 	<div class="min-w-0 flex-1">
 		<div
 			class={cn(
-				'flex min-w-0 items-center gap-1.5 truncate text-[14px] font-medium leading-[1.3]',
+				'flex min-w-0 items-center gap-1.5 text-[14px] leading-[1.3]',
 				isSelected ? 'text-sidebar-chat-item-selected-foreground' : 'text-foreground',
 			)}
 		>
+			<span class={cn('min-w-0 truncate', isUnread ? 'font-semibold' : 'font-medium')}>
+				{chatName}
+			</span>
 			{#if isUnread}
+				<span class="sr-only" data-slot="sidebar-chat-unread-status">
+					{m.sidebar_chat_unread()}
+				</span>
+			{/if}
+			{#if isProcessing}
+				<span class="sr-only">{m.chat_pane_processing()}</span>
+			{/if}
+			{#if isProcessing}
 				<span
-					class="h-1.5 w-1.5 shrink-0 rounded-full bg-indicator-unread"
-					aria-label={m.sidebar_chat_unread()}
+					class="sidebar-processing-indicator size-2 shrink-0 rounded-full bg-status-processing"
+					aria-hidden="true"
+					data-slot="sidebar-chat-processing-indicator"
 				></span>
 			{/if}
-			<span class="truncate">{chatName}</span>
 		</div>
 
 		{#if projectPath || formattedTimestamp}
