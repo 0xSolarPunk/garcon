@@ -678,7 +678,7 @@ describe('WorkspaceRoot', () => {
 		).toBe('false');
 	});
 
-	it('centers desktop taskbars when they contain multiple tabs', () => {
+	it('centers tabs independently from end-aligned desktop toolbar controls', () => {
 		installContext(withAdditionalSurfaces());
 		const { container } = render(WorkspaceRoot, {
 			isMobile: false,
@@ -686,11 +686,48 @@ describe('WorkspaceRoot', () => {
 		});
 		const mainToolbar = container.querySelector<HTMLElement>('[data-floating-workspace-toolbar]');
 		const sidebarToolbar = container.querySelector<HTMLElement>('[data-floating-sidebar-toolbar]');
+		const mainCenter = mainToolbar?.querySelector('[data-workspace-taskbar-center]');
+		const mainEnd = mainToolbar?.querySelector('[data-workspace-taskbar-end]');
+		const sidebarCenter = sidebarToolbar?.querySelector('[data-workspace-taskbar-center]');
+		const sidebarEnd = sidebarToolbar?.querySelector('[data-workspace-taskbar-end]');
 
-		expect(mainToolbar?.classList.contains('justify-center')).toBe(true);
+		expect(mainToolbar?.classList.contains('justify-center')).toBe(false);
 		expect(mainToolbar?.classList.contains('justify-end')).toBe(false);
-		expect(sidebarToolbar?.classList.contains('justify-center')).toBe(true);
+		expect(sidebarToolbar?.classList.contains('justify-center')).toBe(false);
 		expect(sidebarToolbar?.classList.contains('justify-start')).toBe(false);
+		expect(mainCenter?.querySelector('[role="tablist"]')).toBeTruthy();
+		expect(mainEnd?.querySelector(`[aria-label="${m.workspace_taskbar_actions()}"]`)).toBeTruthy();
+		expect(sidebarCenter?.querySelector('[role="tablist"]')).toBeTruthy();
+		expect(sidebarEnd?.querySelector(`[aria-label="${m.workspace_close_sidebar()}"]`)).toBeTruthy();
+	});
+
+	it('shows Agents only while the Chat feed is the active main tab', async () => {
+		const snapshot = minimalGitSnapshot();
+		installContext({
+			...snapshot,
+			main: {
+				...snapshot.main,
+				activeId: CHAT_SURFACE_ID,
+				mru: [CHAT_SURFACE_ID, 'singleton:git'],
+			},
+			mobileActiveSurfaceId: CHAT_SURFACE_ID,
+		});
+		const { container } = render(WorkspaceRoot, {
+			isMobile: false,
+			chatActions,
+		});
+		const start = container.querySelector('[data-workspace-taskbar-start]');
+		const end = container.querySelector('[data-workspace-taskbar-end]');
+		const agents = await screen.findByRole('button', { name: /Agents/ });
+
+		expect(start?.contains(agents)).toBe(true);
+		expect(end?.contains(agents)).toBe(false);
+
+		await fireEvent.click(screen.getByRole('tab', { name: m.workspace_surface_git() }));
+		await waitFor(() => expect(screen.queryByRole('button', { name: /Agents/ })).toBeNull());
+
+		await fireEvent.click(screen.getByRole('tab', { name: m.workspace_surface_chat() }));
+		expect(await screen.findByRole('button', { name: /Agents/ })).toBeTruthy();
 	});
 
 	it('binds focus, move, and close for every portable kind without replacing Chat', async () => {

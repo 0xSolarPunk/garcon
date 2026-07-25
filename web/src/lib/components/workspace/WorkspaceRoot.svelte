@@ -5,8 +5,13 @@
 	import Maximize2 from '@lucide/svelte/icons/maximize-2';
 	import Minimize2 from '@lucide/svelte/icons/minimize-2';
 	import ChatSurface from '$lib/components/chat/ChatSurface.svelte';
+	import SubagentManagementControl from '$lib/components/chat/SubagentManagementControl.svelte';
 	import CurrentChatMenuItems from '$lib/components/layout/CurrentChatMenuItems.svelte';
 	import NewBranchModal from '$lib/components/git/NewBranchModal.svelte';
+	import {
+		FLOATING_ICON_TRIGGER_CLASS,
+		FLOATING_TOOLBAR_RAIL_CLASS,
+	} from '$lib/components/shared/floating-toolbar-styles.js';
 	import PortableSurfaceFrame from './PortableSurfaceFrame.svelte';
 	import WorkspaceSidebarHost from './WorkspaceSidebarHost.svelte';
 	import WorkspaceTaskBar from './WorkspaceTaskBar.svelte';
@@ -28,10 +33,14 @@
 		UserMessageNavigatorCommand,
 		UserMessageNavigatorRegistration,
 	} from '$lib/chat/transcript/user-message-navigator-controller.svelte.js';
+	import { SubagentToolbarState } from '$lib/chat/transcript/subagent-toolbar-state.svelte.js';
 	import { toggleChatSplitMode } from '$lib/chat/split/chat-split-actions.js';
 	import { CHAT_SURFACE_ID, type HostId } from '$lib/workspace/surface-types';
 	import type { ChatSessionRecord } from '$lib/types/chat-session';
-	import type { ChatDraftAppend, ChatDraftAppendResult } from '$lib/chat/composer/chat-draft-append.js';
+	import type {
+		ChatDraftAppend,
+		ChatDraftAppendResult,
+	} from '$lib/chat/composer/chat-draft-append.js';
 	import { surfaceFrame } from '$lib/workspace/surface-frame-action';
 	import {
 		renderedPortablePresentations,
@@ -98,6 +107,7 @@
 	const gitBranchActions = getGitBranchActions();
 	const fileSessions = getFileSessions();
 	const surfaceFrames = getSurfaceFrames();
+	const subagentToolbar = new SubagentToolbarState();
 	let openSidebarButton: HTMLButtonElement | null = $state(null);
 	let chatSubmit: ((message: string) => Promise<boolean>) | null = null;
 	let openUserMessageNavigator = $state<UserMessageNavigatorCommand | null>(null);
@@ -335,7 +345,7 @@
 				{#if !isMobile}
 					<div
 						data-floating-workspace-toolbar
-						class={`pointer-events-none absolute inset-x-2 top-2 z-40 flex min-w-0 ${snapshot.main.order.length === 1 ? 'justify-end' : 'justify-center'}`}
+						class="pointer-events-none absolute inset-x-2 top-2 z-40 min-w-0"
 					>
 						<WorkspaceTaskBar
 							host="main"
@@ -345,16 +355,25 @@
 							onSelect={(surfaceId) => void workspace.focusSurface(surfaceId)}
 							onFocus={(surfaceId) => workspace.noteHostChromeFocus('main', surfaceId)}
 						>
+							{#snippet startActions()}
+								{#if activeMain === CHAT_SURFACE_ID}
+									{@const toolbarModel = subagentToolbar.model}
+									{#if toolbarModel}
+										<SubagentManagementControl
+											model={toolbarModel}
+											onJumpToTool={(anchorId) => subagentToolbar.jumpToTool(anchorId)}
+										/>
+									{/if}
+								{/if}
+							{/snippet}
 							{#snippet menuItems()}{@render mainMenuItems()}{/snippet}
 							{#snippet endActions()}
 								{#if !snapshot.sidebarOpen && !snapshot.manualFullscreen && workspace.canOpenSidebar}
-									<div
-										class="relative flex shrink-0 rounded-lg border border-chat-tabs-rail-border bg-chat-tabs-rail p-0.5 text-foreground shadow-sm"
-									>
+									<div class={FLOATING_TOOLBAR_RAIL_CLASS}>
 										<button
 											bind:this={openSidebarButton}
 											type="button"
-											class="relative inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+											class={FLOATING_ICON_TRIGGER_CLASS}
 											onclick={() => void workspace.openSidebar()}
 											aria-label={m.workspace_open_sidebar()}
 											title={m.workspace_open_sidebar()}
@@ -401,6 +420,7 @@
 					>
 						<ChatSurface
 							{isMobile}
+							{subagentToolbar}
 							reserveTopFloatingToolbar={!isMobile}
 							isVisible={workspace.isChatPresented}
 							isInteractive={workspace.isChatInteractive}
