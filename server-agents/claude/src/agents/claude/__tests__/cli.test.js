@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 import { buildClaudeCLIArgs, buildClaudePermissionApprovalResponse, convertCLIMessageToChatMessages } from '../claude-cli.js';
+import { claudeResultFailureMessage } from '../cli-protocol.js';
 import { convertClaudePermissionTool } from '../permission-tool-converter.js';
 import { AskUserQuestionToolUseMessage, BashToolUseMessage, ExitPlanModeToolUseMessage } from '@garcon/common/chat-types';
 
@@ -15,7 +16,7 @@ describe('buildClaudeCLIArgs', () => {
     expect(buildClaudeCLIArgs({ thinkingMode: 'none', prompt: 'hi' })).not.toContain('--effort');
   });
 
-  it('does not forward Claude thinking mode unless the CLI supports the legacy flag', () => {
+  it('does not forward the removed Claude thinking flag', () => {
     for (const claudeThinkingMode of ['auto', 'on', 'off']) {
       const args = buildClaudeCLIArgs({ claudeThinkingMode, prompt: 'hi' });
 
@@ -24,16 +25,6 @@ describe('buildClaudeCLIArgs', () => {
       expect(args).not.toContain('enabled');
       expect(args).not.toContain('disabled');
     }
-  });
-
-  it('maps Claude thinking modes to legacy --thinking values on old CLIs', () => {
-    const legacy = (claudeThinkingMode) =>
-      buildClaudeCLIArgs({ claudeThinkingMode, prompt: 'hi', supportsLegacyThinkingFlag: true });
-
-    expect(legacy('auto')).toContain('--thinking');
-    expect(legacy('auto')).toContain('adaptive');
-    expect(legacy('on')).toContain('enabled');
-    expect(legacy('off')).toContain('disabled');
   });
 
   it('includes stream-json session flags and effort for sessions', () => {
@@ -49,39 +40,27 @@ describe('buildClaudeCLIArgs', () => {
       '--print',
       '--output-format', 'stream-json',
       '--input-format', 'stream-json',
+      '--replay-user-messages',
       '--verbose',
       '--model', 'sonnet',
       '--permission-mode', 'acceptEdits',
       '--permission-prompt-tool', 'stdio',
       '--effort', 'medium',
-      '--session-id', 'session-1',
+      '--session-id=session-1',
       '-p', '',
     ]);
   });
 
-  it('appends legacy --thinking to stream-json sessions on old CLIs', () => {
-    expect(buildClaudeCLIArgs({
-      model: 'sonnet',
-      permissionMode: 'acceptEdits',
-      thinkingMode: 'think-hard',
-      claudeThinkingMode: 'off',
-      sessionId: 'session-1',
+  it('passes session identifiers with inline values', () => {
+    const args = buildClaudeCLIArgs({
+      resumeSessionId: 'session-1',
       prompt: '',
       streamJson: true,
-      supportsLegacyThinkingFlag: true,
-    })).toEqual([
-      '--print',
-      '--output-format', 'stream-json',
-      '--input-format', 'stream-json',
-      '--verbose',
-      '--model', 'sonnet',
-      '--permission-mode', 'acceptEdits',
-      '--permission-prompt-tool', 'stdio',
-      '--effort', 'medium',
-      '--thinking', 'disabled',
-      '--session-id', 'session-1',
-      '-p', '',
-    ]);
+    });
+
+    expect(args).toContain('--resume=session-1');
+    expect(args).not.toContain('--resume');
+    expect(args).not.toContain('session-1');
   });
 
   it('starts manual bypass as normal Claude mode with stdio permission prompts', () => {
@@ -158,6 +137,49 @@ describe('convertCLIMessageToChatMessages', () => {
     expect(result[0].type).toBe('tool-result');
     expect(result[0].toolId).toBe('tool-1');
     expect(result[0].isError).toBe(false);
+  });
+
+  it('converts real CLI user-frame tool results without replaying user text', () => {
+    const msg = {
+      type: 'user',
+      uuid: 'user-1',
+      isReplay: true,
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'do not render this prompt again' },
+          {
+            type: 'tool_result',
+            tool_use_id: 'tool-1',
+            content: 'command output',
+            is_error: false,
+          },
+        ],
+      },
+      tool_use_result: {
+        stdout: 'command output',
+        stderr: '',
+        interrupted: false,
+      },
+    };
+
+    const result = convertCLIMessageToChatMessages(msg);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      type: 'tool-result',
+      toolId: 'tool-1',
+      isError: false,
+      content: {
+        raw: 'command output',
+        toolUseResult: {
+          stdout: 'command output',
+          stderr: '',
+          interrupted: false,
+        },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('do not render this prompt again');
   });
 
   it('converts all content types from a single assistant message', () => {
@@ -303,6 +325,20 @@ describe('convertCLIMessageToChatMessages', () => {
     const msg = { type: 'assistant', content: [] };
     const result = convertCLIMessageToChatMessages(msg);
     expect(result).toHaveLength(0);
+  });
+});
+
+describe('claudeResultFailureMessage', () => {
+  it('does not expose Claude internal execution diagnostics', () => {
+    expect(claudeResultFailureMessage({
+      type: 'result',
+      subtype: 'error_during_execution',
+      terminal_reason: 'aborted_streaming',
+      is_error: true,
+      errors: [
+        '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null',
+      ],
+    })).toBe('Claude CLI turn failed: error_during_execution');
   });
 });
 

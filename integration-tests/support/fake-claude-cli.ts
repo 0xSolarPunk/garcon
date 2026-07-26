@@ -22,7 +22,7 @@ if (args.includes('--version')) {
 async function runStreamSession(): Promise<void> {
   const sessionId = argumentValue('--session-id') ?? argumentValue('--resume');
   if (!sessionId) {
-    writeOutput({ type: 'system', subtype: 'init', slash_commands: [] });
+    await runInitializeProbe();
     return;
   }
 
@@ -46,6 +46,7 @@ async function runStreamSession(): Promise<void> {
     session_id: sessionId,
     model: argumentValue('--model') ?? 'claude-haiku-4-5-20251001',
     slash_commands: [],
+    capabilities: ['interrupt_receipt_v1', 'interrupt_cancel_queued_v1', 'msg_lifecycle_v1'],
   });
 
   const decoder = new TextDecoder();
@@ -63,7 +64,35 @@ async function runStreamSession(): Promise<void> {
   if (buffered.trim()) handleInput(buffered, nativePath, sessionId);
 }
 
+async function runInitializeProbe(): Promise<void> {
+  const decoder = new TextDecoder();
+  let buffered = '';
+  for await (const chunk of Bun.stdin.stream()) {
+    buffered += decoder.decode(chunk, { stream: true });
+    const newline = buffered.indexOf('\n');
+    if (newline < 0) continue;
+    const input = JSON.parse(buffered.slice(0, newline)) as {
+      type?: string;
+      request_id?: string;
+      request?: { subtype?: string };
+    };
+    if (input.type === 'control_request' && input.request?.subtype === 'initialize') {
+      writeOutput({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: input.request_id,
+          response: { commands: [] },
+        },
+      });
+    }
+    return;
+  }
+}
+
 function argumentValue(name: string): string | null {
+  const inline = args.find((value) => value.startsWith(`${name}=`));
+  if (inline) return inline.slice(name.length + 1);
   const index = args.indexOf(name);
   return index >= 0 && typeof args[index + 1] === 'string'
     ? args[index + 1]!
@@ -85,9 +114,27 @@ function handleInput(line: string, nativePath: string, sessionId: string): void 
   if (!line.trim()) return;
   const input = JSON.parse(line) as {
     type?: string;
+    request_id?: string;
+    request?: { subtype?: string };
+    uuid?: string;
     message?: { role?: string; content?: unknown };
   };
+  if (
+    input.type === 'control_request'
+    && (input.request?.subtype === 'initialize' || input.request?.subtype === 'set_model')
+  ) {
+    writeOutput({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: input.request_id,
+        response: { commands: [], capabilities: ['interrupt_cancel_queued_v1'] },
+      },
+    });
+    return;
+  }
   if (input.type !== 'user' || input.message?.role !== 'user') return;
+  if (!input.uuid) throw new Error('Claude stream input requires a command UUID');
 
   const prompt = messageText(input.message.content);
   const response = `echo:${prompt}`;
@@ -97,7 +144,7 @@ function handleInput(line: string, nativePath: string, sessionId: string): void 
     JSON.stringify({
       sessionId,
       type: 'user',
-      uuid: randomUUID(),
+      uuid: input.uuid,
       timestamp: userTimestamp,
       cwd: process.cwd(),
       message: { role: 'user', content: prompt },
@@ -117,6 +164,25 @@ function handleInput(line: string, nativePath: string, sessionId: string): void 
   ].join('\n'));
 
   writeOutput({
+    type: 'command_lifecycle',
+    command_uuid: input.uuid,
+    state: 'queued',
+    session_id: sessionId,
+  });
+  writeOutput({
+    type: 'command_lifecycle',
+    command_uuid: input.uuid,
+    state: 'started',
+    session_id: sessionId,
+  });
+  writeOutput({
+    type: 'user',
+    uuid: input.uuid,
+    isReplay: true,
+    message: input.message,
+    session_id: sessionId,
+  });
+  writeOutput({
     type: 'assistant',
     session_id: sessionId,
     message: {
@@ -132,6 +198,12 @@ function handleInput(line: string, nativePath: string, sessionId: string): void 
     duration_ms: 1,
     num_turns: 1,
     result: response,
+  });
+  writeOutput({
+    type: 'command_lifecycle',
+    command_uuid: input.uuid,
+    state: 'completed',
+    session_id: sessionId,
   });
 }
 

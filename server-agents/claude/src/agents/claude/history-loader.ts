@@ -7,7 +7,6 @@ import {
   readJsonlLineEntries,
   readJsonlTailLines,
 } from '@garcon/server-agent-common/shared/history-loader-utils';
-import { normalizeToolResultContent } from '@garcon/server-agent-common/shared/normalize-util';
 import {
   UserMessage,
   AssistantMessage,
@@ -18,6 +17,7 @@ import {
   type ChatMessage,
 } from '@garcon/common/chat-types';
 import { convertClaudeToolUse } from './tool-use-converter.js';
+import { claudeToolResultContent } from './tool-result-converter.js';
 import { extractCompactionSummary, parseCompactMetadata } from './compaction.js';
 import { stripResolvedFileMentionContext } from '@garcon/server-agent-common/shared/file-mention-context';
 import { attachNativeMessageSource, getNativeMessageSource } from '@garcon/server-agent-common/shared/native-message-source';
@@ -161,18 +161,6 @@ function getMessageText(content: unknown): string {
   return '';
 }
 
-function toolResultContentForEntry(
-  entry: Record<string, unknown>,
-  content: unknown,
-): Record<string, unknown> {
-  const normalized = normalizeToolResultContent(content);
-  const toolUseResult = entry.toolUseResult;
-  if (toolUseResult && typeof toolUseResult === 'object' && !Array.isArray(toolUseResult)) {
-    return { ...normalized, toolUseResult: toolUseResult as Record<string, unknown> };
-  }
-  return normalized;
-}
-
 function isSystemUserMessage(text: string): boolean {
   return (
     text.startsWith('<command-name>') ||
@@ -180,6 +168,7 @@ function isSystemUserMessage(text: string): boolean {
     text.startsWith('<command-args>') ||
     text.startsWith('<local-command-stdout>') ||
     text.startsWith('<system-reminder>') ||
+    text.startsWith('<task-notification>') ||
     text.startsWith('Caveat:') ||
     text.startsWith('This session is being continued from a previous') ||
     text.startsWith('Invalid API key') ||
@@ -187,6 +176,23 @@ function isSystemUserMessage(text: string): boolean {
     text.includes('CRITICAL: You MUST respond with ONLY a JSON') ||
     text === 'Warmup'
   );
+}
+
+function isProviderOwnedUserMessage(
+  entry: Record<string, unknown>,
+  text: string,
+): boolean {
+  return asRecord(entry.origin).kind === 'task-notification' || isSystemUserMessage(text);
+}
+
+function queuedCommandPrompt(entry: Record<string, unknown>): string | null {
+  if (entry.type !== 'attachment') return null;
+  const attachment = asRecord(entry.attachment);
+  if (attachment.type !== 'queued_command' || attachment.commandMode !== 'prompt') return null;
+  const prompt = asString(attachment.prompt)?.trim();
+  return prompt && !isProviderOwnedUserMessage(entry, prompt)
+    ? stripResolvedFileMentionContext(prompt)
+    : null;
 }
 
 function isSystemAssistantMessage(text: string): boolean {
@@ -266,6 +272,15 @@ export function convertClaudeEntries(entries: Record<string, unknown>[]): ChatMe
       continue;
     }
 
+    const queuedPrompt = queuedCommandPrompt(entry);
+    if (queuedPrompt) {
+      const attachmentTimestamp = asString(asRecord(entry.attachment).timestamp);
+      pushMessage(entry, new UserMessage(attachmentTimestamp || ts, queuedPrompt));
+      continue;
+    }
+
+    if (entry.type === 'attachment') continue;
+
     if (entry.type === 'system') continue;
 
     if (entry.isCompactSummary) {
@@ -305,13 +320,18 @@ export function convertClaudeEntries(entries: Record<string, unknown>[]): ChatMe
         for (const rawPart of content) {
           const part = asRecord(rawPart);
           if (part.type === 'tool_result') {
-            pushMessage(entry, new ToolResultMessage(ts, asString(part.tool_use_id) || '', toolResultContentForEntry(entry, part.content), Boolean(part.is_error)));
+            pushMessage(entry, new ToolResultMessage(
+              ts,
+              asString(part.tool_use_id) || '',
+              claudeToolResultContent(part.content, entry.toolUseResult ?? entry.tool_use_result),
+              Boolean(part.is_error),
+            ));
           }
         }
       }
 
       const text = getMessageText(content);
-      if (text && !isSystemUserMessage(text)) {
+      if (text && !isProviderOwnedUserMessage(entry, text)) {
         pushMessage(entry, new UserMessage(ts, stripResolvedFileMentionContext(text)));
       }
       continue;
@@ -608,7 +628,7 @@ export async function getClaudeSessionMessagesFromNativePath(
 }
 
 // Reads the head of a JSONL file to find the first user message.
-async function readFirstUserMessage(filePath: string, logger: AgentLogger): Promise<{
+async function readFirstUserMessage(filePath: string): Promise<{
   firstMessage: string | null;
   firstTimestamp: string | number | null;
 }> {
@@ -631,19 +651,15 @@ async function readFirstUserMessage(filePath: string, logger: AgentLogger): Prom
         firstTimestamp = entry.timestamp;
       }
       const message = asRecord(entry.message);
-      if (message.role !== 'user') {
-        continue;
-      }
-      const text = getMessageText(message.content);
-      if (text && !isSystemUserMessage(text)) {
-        firstMessage = text;
-      }
-      if (firstMessage) {
-        if (firstTimestamp) {
-          break;
+      if (message.role === 'user') {
+        const text = getMessageText(message.content);
+        if (!firstMessage && text && !isProviderOwnedUserMessage(entry, text)) {
+          firstMessage = text;
         }
-        logger.error('Claude first user message has no timestamp', { filePath });
+      } else if (!firstMessage) {
+        firstMessage = queuedCommandPrompt(entry);
       }
+      if (firstMessage && firstTimestamp) break;
     }
   } catch { } finally {
     await fh?.close();
@@ -701,7 +717,7 @@ export async function getClaudePreviewFromNativePath(
       const role = message.role;
       if (role === 'user') {
         const text = getMessageText(message.content);
-        if (!text || isSystemUserMessage(text)) {
+        if (!text || isProviderOwnedUserMessage(entry, text)) {
           continue;
         }
         lastMessage = '> ' + text;
@@ -711,6 +727,9 @@ export async function getClaudePreviewFromNativePath(
           continue;
         }
         lastMessage = text;
+      } else {
+        const prompt = queuedCommandPrompt(entry);
+        if (prompt) lastMessage = '> ' + prompt;
       }
     }
     if (lastActivity && lastMessage) {
@@ -720,7 +739,7 @@ export async function getClaudePreviewFromNativePath(
 
   // TODO: It's possible that the full file was already read if it's small enough (see `fullyRead`),
   // in which case we could have handled it in the loop above.
-  const { firstMessage, firstTimestamp } = await readFirstUserMessage(nativePath, logger);
+  const { firstMessage, firstTimestamp } = await readFirstUserMessage(nativePath);
   if (!firstMessage || !firstTimestamp) {
     logger.warn('Claude preview has no first user message', { nativePath });
   }

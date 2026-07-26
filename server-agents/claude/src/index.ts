@@ -93,7 +93,7 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
     const config = createClaudeConfig(host.environment);
     const logger = createScopedAgentLogger(host.logger, 'claude');
     const nativeSessions = createPathNativeSessionCodec('claude');
-    const versionProbe = new ClaudeCliVersionProbe(logger);
+    const versionProbe = new ClaudeCliVersionProbe();
     const runtime = new ClaudeCliRuntime({
       binary: config.binary,
       logger,
@@ -105,7 +105,11 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
       logger,
       environment: () => claudeLoginEnvironment(config),
     });
-    const commandDiscovery = new ClaudeSlashCommandDiscovery(config.binary, logger);
+    const commandDiscovery = new ClaudeSlashCommandDiscovery(
+      config.binary,
+      () => buildClaudeHostEnvironment(config),
+      logger,
+    );
 
     this.settings = createVersionedSettings({
       ownerId: 'claude',
@@ -231,7 +235,7 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
     this.lifecycle = createIntegrationLifecycle({
       start: () => runtime.startPurgeTimer(),
       stop: async () => {
-        runtime.shutdown();
+        await runtime.shutdown();
         login.stop();
         commandDiscovery.clear();
       },

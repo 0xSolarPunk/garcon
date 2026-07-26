@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 
-let versionProbe = () => Promise.resolve(false);
+let versionProbe = () => Promise.resolve([2, 1, 220]);
 
 import { ClaudeCliRuntime } from '../claude-cli.js';
 
@@ -14,7 +14,7 @@ function createRuntime() {
       error: mock(() => undefined),
     },
     versionProbe: {
-      supportsLegacyThinkingFlag: () => versionProbe(),
+      assertCompatible: () => versionProbe(),
     },
   });
 }
@@ -35,16 +35,45 @@ function createControllableProc() {
   const exited = new Promise((resolve) => { resolveExit = resolve; });
   const encoder = new TextEncoder();
   const writes = [];
+  let exitedOnce = false;
+  const exit = (code) => {
+    if (exitedOnce) return;
+    exitedOnce = true;
+    resolveExit(code);
+  };
 
   const proc = {
     stdout,
     stderr,
-    stdin: { write(value) { writes.push(value); }, flush() {} },
+    stdin: {
+      write(value) {
+        writes.push(value);
+        const message = JSON.parse(value);
+        if (
+          message.type !== 'control_request'
+          || !['initialize', 'set_model'].includes(message.request?.subtype)
+        ) return;
+        queueMicrotask(() => stdoutController.enqueue(encoder.encode(JSON.stringify({
+          type: 'control_response',
+          response: {
+            subtype: 'success',
+            request_id: message.request_id,
+            response: message.request.subtype === 'initialize' ? { commands: [] } : {},
+          },
+        }) + '\n')));
+      },
+      flush() {},
+      end() {
+        proc.ended = true;
+        exit(0);
+      },
+    },
     exited,
     killed: false,
+    ended: false,
     kill() {
       this.killed = true;
-      resolveExit(143);
+      exit(143);
     },
   };
 
@@ -52,8 +81,25 @@ function createControllableProc() {
     proc,
     writes,
     push(message) { stdoutController.enqueue(encoder.encode(JSON.stringify(message) + '\n')); },
+    latestInput() {
+      const input = writes
+        .map((line) => JSON.parse(line))
+        .filter((message) => message.type === 'user')
+        .at(-1);
+      if (!input?.uuid) throw new Error('Claude input UUID was not written');
+      return input;
+    },
+    pushLatestInputLifecycle(state) {
+      const input = this.latestInput();
+      stdoutController.enqueue(encoder.encode(JSON.stringify({
+        type: 'command_lifecycle',
+        command_uuid: input.uuid,
+        state,
+      }) + '\n'));
+    },
+    startLatestInput() { this.pushLatestInputLifecycle('started'); },
     // Simulate the process dying on its own (not via our kill()), e.g. an OOM.
-    crash(code) { resolveExit(code); },
+    crash(code) { exit(code); },
   };
 }
 
@@ -89,7 +135,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
 
     spawnMock = mock();
     Bun.spawn = spawnMock;
-    versionProbe = () => Promise.resolve(false);
+    versionProbe = () => Promise.resolve([2, 1, 220]);
 
     scheduled = [];
     cleared = [];
@@ -131,6 +177,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
 
     const retry = runtime.runClaudeTurn(startOptions({ command: 'retry' }));
     await flush();
+    ctrl.startLatestInput();
     ctrl.push(INIT);
     ctrl.push(RESULT);
     await retry;
@@ -141,8 +188,10 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
   it('kills and rolls back a process whose prompt write fails synchronously', async () => {
     const runtime = createRuntime();
     const ctrl = createControllableProc();
-    ctrl.proc.stdin.write = () => {
-      throw new Error('stdin failed');
+    const write = ctrl.proc.stdin.write.bind(ctrl.proc.stdin);
+    ctrl.proc.stdin.write = (line) => {
+      if (JSON.parse(line).type === 'user') throw new Error('stdin failed');
+      write(line);
     };
     spawnMock.mockReturnValueOnce(ctrl.proc);
     const markStarted = mock();
@@ -154,7 +203,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
       },
     }))).rejects.toThrow('stdin failed');
 
-    expect(ctrl.proc.killed).toBe(true);
+    expect(ctrl.proc.ended).toBe(true);
     expect(markStarted).not.toHaveBeenCalled();
     expect(runtime.isClaudeInternalSessionRunning('session-1')).toBe(false);
     runtime.shutdown();
@@ -164,10 +213,13 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     const runtime = createRuntime();
     const ctrl = createControllableProc();
     spawnMock.mockReturnValue(ctrl.proc);
+    const failures = [];
+    runtime.onFailed((chatId, message) => failures.push({ chatId, message }));
 
     const turn = runtime.startClaudeCliSession(startOptions());
     ctrl.push(INIT);
     await flush();
+    ctrl.startLatestInput();
 
     await runtime.abortClaudeInternalSession('session-1');
     const [abortTimerId] = abortTimerIds();
@@ -175,11 +227,120 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
 
     // Interrupt acknowledged: the CLI ends the turn with a result while the
     // persistent process stays alive for follow-up turns.
-    ctrl.push(RESULT);
+    ctrl.push({
+      type: 'result',
+      subtype: 'error_during_execution',
+      terminal_reason: 'aborted_streaming',
+      is_error: true,
+    });
     await turn;
 
     expect(cleared).toContain(abortTimerId);
     expect(ctrl.proc.killed).toBe(false);
+    expect(failures).toEqual([]);
+  });
+
+  it('cancels a queued submitted input when an internal turn is interrupted', async () => {
+    const runtime = createRuntime();
+    const ctrl = createControllableProc();
+    spawnMock.mockReturnValue(ctrl.proc);
+    const failures = [];
+    const finishes = [];
+    runtime.onFailed((chatId, message) => failures.push({ chatId, message }));
+    runtime.onFinished((chatId, exitCode) => finishes.push({ chatId, exitCode }));
+
+    const turn = runtime.startClaudeCliSession(startOptions());
+    ctrl.push(INIT);
+    await flush();
+    const input = ctrl.latestInput();
+
+    await runtime.abortClaudeInternalSession('session-1');
+    const interrupt = ctrl.writes
+      .map((line) => JSON.parse(line))
+      .find((message) => message.request?.subtype === 'interrupt');
+    const [abortTimerId] = abortTimerIds();
+    expect(interrupt.request).toEqual({ subtype: 'interrupt', cancel_queued: true });
+
+    // The active internal turn ends first, then Claude confirms that the
+    // submitted Garcon input was removed without ever starting.
+    ctrl.push({ type: 'result', subtype: 'success', is_error: false, result: '' });
+    ctrl.push({
+      type: 'command_lifecycle',
+      command_uuid: input.uuid,
+      state: 'cancelled',
+    });
+    await turn;
+
+    expect(cleared).toContain(abortTimerId);
+    expect(ctrl.proc.killed).toBe(false);
+    expect(failures).toEqual([]);
+    expect(finishes).toEqual([{ chatId: 'chat-1', exitCode: 0 }]);
+  });
+
+  it('settles a pre-start abort from the interrupt cancellation receipt', async () => {
+    const runtime = createRuntime();
+    const ctrl = createControllableProc();
+    spawnMock.mockReturnValue(ctrl.proc);
+    const failures = [];
+    const finishes = [];
+    runtime.onFailed((chatId, message) => failures.push({ chatId, message }));
+    runtime.onFinished((chatId, exitCode) => finishes.push({ chatId, exitCode }));
+
+    const turn = runtime.startClaudeCliSession(startOptions());
+    ctrl.push(INIT);
+    await flush();
+    const input = ctrl.latestInput();
+
+    await runtime.abortClaudeInternalSession('session-1');
+    const interrupt = ctrl.writes
+      .map((line) => JSON.parse(line))
+      .find((message) => message.request?.subtype === 'interrupt');
+    ctrl.push({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: interrupt.request_id,
+        response: {
+          cancelled: [input.uuid],
+          still_queued: [],
+        },
+      },
+    });
+    await turn;
+
+    expect(failures).toEqual([]);
+    expect(finishes).toEqual([{ chatId: 'chat-1', exitCode: 0 }]);
+    expect(ctrl.proc.killed).toBe(false);
+  });
+
+  it('retires the process immediately when the interrupt control fails', async () => {
+    const runtime = createRuntime();
+    const ctrl = createControllableProc();
+    spawnMock.mockReturnValue(ctrl.proc);
+    const failures = [];
+    runtime.onFailed((_chatId, message) => failures.push(message));
+
+    const turn = runtime.startClaudeCliSession(startOptions());
+    ctrl.push(INIT);
+    await flush();
+    ctrl.startLatestInput();
+    await runtime.abortClaudeInternalSession('session-1');
+    const interrupt = ctrl.writes
+      .map((line) => JSON.parse(line))
+      .find((message) => message.request?.subtype === 'interrupt');
+
+    ctrl.push({
+      type: 'control_response',
+      response: {
+        subtype: 'error',
+        request_id: interrupt.request_id,
+        error: 'interrupt unavailable',
+      },
+    });
+    await turn;
+
+    expect(ctrl.proc.killed).toBe(true);
+    expect(failures).toEqual(['Claude CLI interrupt request failed.']);
   });
 
   it('does not kill a process reused by a new turn sent right after an abort', async () => {
@@ -198,6 +359,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     }));
     ctrl.push(INIT);
     await flush();
+    ctrl.startLatestInput();
 
     ctrl.push({ type: 'assistant', content: [{ type: 'text', text: 'first output' }] });
     await runtime.abortClaudeInternalSession('session-1');
@@ -221,6 +383,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(cleared).toContain(abortTimerId);
 
+    ctrl.startLatestInput();
     ctrl.push({ type: 'assistant', content: [{ type: 'text', text: 'second output' }] });
     ctrl.push(RESULT);
     await second;
@@ -264,7 +427,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     const second = runtime.startClaudeCliSession(startOptions({ command: 'replacement' }));
     await flush();
 
-    expect(firstCtrl.proc.killed).toBe(true);
+    expect(firstCtrl.proc.ended).toBe(true);
     expect(cleared).toContain(abortTimerId);
     await first;
     expect(spawnMock).toHaveBeenCalledTimes(1);
@@ -276,10 +439,11 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     expect(finishes).toEqual([]);
     expect(failures).toEqual([]);
 
-    resolveProbe(false);
+    resolveProbe([2, 1, 220]);
     await flush();
     expect(spawnMock).toHaveBeenCalledTimes(2);
 
+    secondCtrl.startLatestInput();
     secondCtrl.push(INIT);
     firstCtrl.push({ type: 'assistant', content: [{ type: 'text', text: 'late replaced output' }] });
     firstCtrl.push(RESULT);
@@ -299,49 +463,31 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     }]);
   });
 
-  it('queues a resume behind a start whose version probe is still pending', async () => {
+  it('rejects a resume while the initial turn is still active', async () => {
     const runtime = createRuntime();
     const ctrl = createControllableProc();
     spawnMock.mockReturnValue(ctrl.proc);
 
-    let resolveStartProbe;
-    const startProbe = new Promise((resolve) => { resolveStartProbe = resolve; });
-    let probeCalls = 0;
-    versionProbe = () => (++probeCalls === 1 ? startProbe : Promise.resolve(false));
-
-    let startResolved = false;
-    let resumeResolved = false;
-    const start = runtime.startClaudeCliSession(startOptions({ command: 'initial' }))
-      .then(() => { startResolved = true; });
-    const resume = runtime.runClaudeTurn(startOptions({ command: 'resume' }))
-      .then(() => { resumeResolved = true; });
+    const start = runtime.startClaudeCliSession(startOptions({ command: 'initial' }));
+    await flush();
+    const resume = runtime.runClaudeTurn(startOptions({ command: 'resume' }));
+    const resumeRejected = expect(resume).rejects.toThrow('already has an active turn');
     await flush();
 
-    expect(spawnMock).toHaveBeenCalledTimes(0);
-    expect(startResolved).toBe(false);
-    expect(resumeResolved).toBe(false);
-
-    resolveStartProbe(false);
-    await flush();
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(ctrl.writes.map((line) => JSON.parse(line).message?.content).filter(Boolean)).toEqual(['initial']);
+    await resumeRejected;
 
+    ctrl.startLatestInput();
     ctrl.push(INIT);
     ctrl.push(RESULT);
     await start;
-    await flush();
 
-    expect(startResolved).toBe(true);
-    expect(resumeResolved).toBe(false);
     expect(spawnMock).toHaveBeenCalledTimes(1);
-    expect(ctrl.writes.map((line) => JSON.parse(line).message?.content).filter(Boolean)).toEqual(['initial', 'resume']);
-
-    ctrl.push(RESULT);
-    await resume;
-    expect(resumeResolved).toBe(true);
+    expect(ctrl.writes.map((line) => JSON.parse(line).message?.content).filter(Boolean)).toEqual(['initial']);
   });
 
-  it('serializes concurrent resumes on the persistent process', async () => {
+  it('rejects concurrent resumes instead of queueing inside the provider', async () => {
     const runtime = createRuntime();
     const ctrl = createControllableProc();
     spawnMock.mockReturnValue(ctrl.proc);
@@ -349,42 +495,71 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     const start = runtime.startClaudeCliSession(startOptions({ command: 'initial' }));
     ctrl.push(INIT);
     await flush();
+    ctrl.startLatestInput();
     ctrl.push(RESULT);
     await start;
 
     let firstResolved = false;
-    let secondResolved = false;
     const first = runtime.runClaudeTurn(startOptions({ command: 'first resume' }))
       .then(() => { firstResolved = true; });
-    const second = runtime.runClaudeTurn(startOptions({ command: 'second resume' }))
-      .then(() => { secondResolved = true; });
+    const second = runtime.runClaudeTurn(startOptions({ command: 'second resume' }));
+    const secondRejected = expect(second).rejects.toThrow('already has an active turn');
     await flush();
 
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(ctrl.writes.map((line) => JSON.parse(line).message?.content).filter(Boolean))
       .toEqual(['initial', 'first resume']);
     expect(firstResolved).toBe(false);
-    expect(secondResolved).toBe(false);
+    await secondRejected;
 
+    ctrl.startLatestInput();
     ctrl.push(RESULT);
     await first;
-    await flush();
 
     expect(firstResolved).toBe(true);
-    expect(secondResolved).toBe(false);
     expect(ctrl.writes.map((line) => JSON.parse(line).message?.content).filter(Boolean))
-      .toEqual(['initial', 'first resume', 'second resume']);
-
-    ctrl.push(RESULT);
-    await second;
-    expect(secondResolved).toBe(true);
+      .toEqual(['initial', 'first resume']);
     expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retire the winning turn when concurrent model updates interleave', async () => {
+    const runtime = createRuntime();
+    const ctrl = createControllableProc();
+    spawnMock.mockReturnValue(ctrl.proc);
+
+    const start = runtime.startClaudeCliSession(startOptions({ command: 'initial' }));
+    ctrl.push(INIT);
+    await flush();
+    ctrl.startLatestInput();
+    ctrl.push(RESULT);
+    await start;
+
+    let firstResolved = false;
+    const first = runtime.runClaudeTurn(startOptions({ command: 'winner', model: 'opus' }))
+      .then(() => { firstResolved = true; });
+    const second = runtime.runClaudeTurn(startOptions({ command: 'duplicate', model: 'opus' }));
+    await expect(second).rejects.toThrow('already has an active turn');
+    await flush();
+
+    expect(firstResolved).toBe(false);
+    expect(ctrl.proc.ended).toBe(false);
+    expect(ctrl.writes.map((line) => JSON.parse(line).message?.content).filter(Boolean))
+      .toEqual(['initial', 'winner']);
+
+    ctrl.startLatestInput();
+    ctrl.push(RESULT);
+    await first;
+    expect(firstResolved).toBe(true);
   });
 
   it('still force-kills when the interrupt is never acknowledged', async () => {
     const runtime = createRuntime();
     const ctrl = createControllableProc();
     spawnMock.mockReturnValue(ctrl.proc);
+    const failures = [];
+    const finishes = [];
+    runtime.onFailed((chatId, message) => failures.push({ chatId, message }));
+    runtime.onFinished((chatId, exitCode) => finishes.push({ chatId, exitCode }));
 
     const turn = runtime.startClaudeCliSession(startOptions());
     ctrl.push(INIT);
@@ -399,9 +574,14 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
 
     expect(ctrl.proc.killed).toBe(true);
     await turn;
+    expect(failures).toEqual([{
+      chatId: 'chat-1',
+      message: 'Claude CLI did not confirm the interrupt.',
+    }]);
+    expect(finishes).toEqual([]);
   });
 
-  it('surfaces the abort force-kill as a clean finish, not a 143 failure', async () => {
+  it('fails closed when an active abort never reaches a correlated result', async () => {
     const runtime = createRuntime();
     const ctrl = createControllableProc();
     spawnMock.mockReturnValue(ctrl.proc);
@@ -414,6 +594,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     const turn = runtime.startClaudeCliSession(startOptions());
     ctrl.push(INIT);
     await flush();
+    ctrl.startLatestInput();
 
     // User interrupts; the CLI never acknowledges, so the fallback force-kills.
     await runtime.abortClaudeInternalSession('session-1');
@@ -421,9 +602,51 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     fallback.fn();
     await turn;
 
-    // The intentional interrupt must not look like a crash.
-    expect(failures).toEqual([]);
-    expect(finishes.some((f) => f.chatId === 'chat-1' && f.exitCode === 0)).toBe(true);
+    expect(failures).toEqual([{
+      chatId: 'chat-1',
+      message: 'Claude CLI did not confirm the interrupt.',
+    }]);
+    expect(finishes).toEqual([]);
+  });
+
+  it('extends the result deadline after an active interrupt receipt', async () => {
+    const runtime = createRuntime();
+    const ctrl = createControllableProc();
+    spawnMock.mockReturnValue(ctrl.proc);
+    const failures = [];
+    runtime.onFailed((chatId, message) => failures.push({ chatId, message }));
+
+    const turn = runtime.startClaudeCliSession(startOptions());
+    ctrl.push(INIT);
+    await flush();
+    ctrl.startLatestInput();
+
+    await runtime.abortClaudeInternalSession('session-1');
+    const [receiptTimerId] = abortTimerIds();
+    const interrupt = ctrl.writes
+      .map((line) => JSON.parse(line))
+      .find((message) => message.request?.subtype === 'interrupt');
+    ctrl.push({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: interrupt.request_id,
+        response: { cancelled: [], still_queued: [] },
+      },
+    });
+    await flush();
+
+    expect(cleared).toContain(receiptTimerId);
+    const completionFallback = scheduled.find((entry) => entry.ms === 15_000);
+    expect(completionFallback).toBeDefined();
+    expect(ctrl.proc.killed).toBe(false);
+
+    completionFallback.fn();
+    await turn;
+    expect(failures).toEqual([{
+      chatId: 'chat-1',
+      message: 'Claude CLI did not confirm the interrupt.',
+    }]);
   });
 
   it('still reports a genuine crash during the abort window as a failure', async () => {
