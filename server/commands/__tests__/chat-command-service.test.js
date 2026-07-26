@@ -532,6 +532,9 @@ function makeService(overrides = {}) {
     queue,
     ledger,
     settings,
+    recentTitleIcons: {
+      getRecentIcons: () => [],
+    },
     metadata,
     agents,
     pendingInputs,

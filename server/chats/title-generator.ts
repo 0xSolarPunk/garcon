@@ -14,12 +14,14 @@ import {
   createGenerationRequestSignal,
   GENERATION_PROVIDER_TIMEOUT_MS,
 } from '../settings/generation-limits.js';
+import type { RecentTitleIconSource } from './recent-title-icons.js';
 
 const logger = createLogger('chats:title-generator');
+const TITLE_GENERATION_SOURCE_MAX_CHARS = 32_000;
 
 interface TitleGenerationAgents {
   getAgentAuthStatusMap(): Promise<Record<string, unknown>>;
-    getAgentReadinessMap(authByAgent?: Record<string, unknown>): Promise<Record<string, unknown>>;
+  getAgentReadinessMap(authByAgent?: Record<string, unknown>): Promise<Record<string, unknown>>;
   getAgentCatalogEntries?(): Promise<AgentCatalogEntry[]>;
   getAgentCatalog?(): Promise<{ agents?: AgentCatalogEntry[] }>;
   runSingleQuery(prompt: string, options: {
@@ -31,9 +33,9 @@ interface TitleGenerationAgents {
     thinkingMode: ThinkingMode;
     apiProviderId?: string | null;
     modelEndpointId?: string | null;
-      modelProtocol?: ApiProtocol | null;
-      timeoutMs?: number;
-      signal?: AbortSignal;
+    modelProtocol?: ApiProtocol | null;
+    timeoutMs?: number;
+    signal?: AbortSignal;
   }): Promise<string>;
 }
 
@@ -48,8 +50,9 @@ interface MaybeGenerateChatTitleInput {
   projectPath: string;
   firstPrompt: string;
   agents: TitleGenerationAgents;
-    settings: TitleGenerationSettings;
-    signal?: AbortSignal;
+  settings: TitleGenerationSettings;
+  recentTitleIcons: RecentTitleIconSource;
+  signal?: AbortSignal;
 }
 
 interface GenerateChatTitleFromMessageInput {
@@ -58,8 +61,9 @@ interface GenerateChatTitleFromMessageInput {
   message: string;
   messageSeq?: number;
   agents: TitleGenerationAgents;
-    settings: TitleGenerationSettings;
-    signal?: AbortSignal;
+  settings: TitleGenerationSettings;
+  recentTitleIcons: RecentTitleIconSource;
+  signal?: AbortSignal;
 }
 
 interface RunTitleGenerationInput {
@@ -68,10 +72,11 @@ interface RunTitleGenerationInput {
   sourceText: string;
   agents: TitleGenerationAgents;
   settings: TitleGenerationSettings;
+  recentTitleIcons: RecentTitleIconSource;
   requireEnabled: boolean;
   skipExistingTitle: boolean;
-    swallowErrors: boolean;
-    signal?: AbortSignal;
+  swallowErrors: boolean;
+  signal?: AbortSignal;
 }
 
 export interface GenerateChatTitleResult {
@@ -93,28 +98,42 @@ export class TitleGenerationError extends DomainError {
 
 // Modified from Open WebUI
 const TITLE_GENERATION_PROMPT = `### Task:
-Generate a concise, 2-5 word title with an emoji summarizing the chat history.
+Generate a concise, 2-5 word title with a leading emoji icon summarizing the chat history.
 ### Guidelines:
 - The title should clearly represent the main theme or subject of the conversation.
 - Use emojis that enhance understanding of the topic, but avoid quotation marks or special formatting.
+- Prefer a specific subject-related emoji over a generic emoji.
 - Write the title in the chat's primary language; default to English if multilingual.
 - Prioritize accuracy over excessive creativity; keep it clear and simple.
 - Your entire response must consist solely of the title, without any introductory or concluding text.
 - The output must be a single line without any markdown code fences or other encapsulating text.
 - Ensure no conversational text, affirmations, or explanations precede or follow the title, as this will cause direct parsing failure.
-### Output:
-your concise title here
 ### Examples:
-Stock Market Trends
-Perfect Chocolate Chip Recipe
-Evolution of Music Streaming
-Remote Work Productivity Tips
-Artificial Intelligence in Healthcare
-Video Game Development Insights
+📈 Stock Market Trends
+🍪 Perfect Chocolate Chip Recipe
+🎵 Evolution of Music Streaming
+🏠 Remote Work Productivity Tips
+🩺 Artificial Intelligence in Healthcare
+🎮 Video Game Development Insights
+### Recently Used Emojis to Avoid When Another Accurate Emoji Is Available:
+{RECENT_TITLE_ICONS}
 ### Chat History:
 <chat_history>
 {USER_PROMPT}
 </chat_history>`;
+
+function buildTitleGenerationPrompt(
+  sourceText: string,
+  recentTitleIcons: RecentTitleIconSource,
+): string {
+  const recentIcons = recentTitleIcons.getRecentIcons();
+  return TITLE_GENERATION_PROMPT
+    .replace(
+      '{RECENT_TITLE_ICONS}',
+      () => recentIcons.length > 0 ? recentIcons.join(' ') : 'None',
+    )
+    .replace('{USER_PROMPT}', () => sourceText);
+}
 
 function normalizeTitle(text: unknown): string {
   if (!text || typeof text !== 'string') return '';
@@ -150,23 +169,24 @@ async function runTitleGeneration({
   sourceText,
   agents,
   settings,
+  recentTitleIcons,
   requireEnabled,
   skipExistingTitle,
-    swallowErrors,
-    signal,
-  }: RunTitleGenerationInput): Promise<GenerateChatTitleResult | null> {
-    const normalizedSource = sourceText?.trim() ?? '';
-    if (!normalizedSource) return null;
-    const generationSignal = createGenerationRequestSignal(signal);
+  swallowErrors,
+  signal,
+}: RunTitleGenerationInput): Promise<GenerateChatTitleResult | null> {
+  const normalizedSource = (sourceText?.trim() ?? '').slice(0, TITLE_GENERATION_SOURCE_MAX_CHARS);
+  if (!normalizedSource) return null;
+  const generationSignal = createGenerationRequestSignal(signal);
 
   try {
     const ui = await settings.getUiSettings();
-      const persisted = ui?.chatTitle;
-      const generationContext = await resolveGenerationContextForSelection(
-        agents,
-        persisted,
-        generationSignal,
-      );
+    const persisted = ui?.chatTitle;
+    const generationContext = await resolveGenerationContextForSelection(
+      agents,
+      persisted,
+      generationSignal,
+    );
     const cfg = resolveEffectiveGenerationConfig({
       persisted: requireEnabled ? persisted : generationSettingsWithoutEnabled(persisted),
       ...generationContext,
@@ -179,7 +199,7 @@ async function runTitleGeneration({
     if (!cfg.agentId || !cfg.model) throw titleGenerationUnavailable();
     if (skipExistingTitle && settings.getChatName(chatId)) return null;
 
-    const prompt = TITLE_GENERATION_PROMPT.replace('{USER_PROMPT}', normalizedSource);
+    const prompt = buildTitleGenerationPrompt(normalizedSource, recentTitleIcons);
     const titleRaw = await agents.runSingleQuery(prompt, {
       agentId: cfg.agentId,
       model: cfg.model,
@@ -189,9 +209,9 @@ async function runTitleGeneration({
       thinkingMode: cfg.thinkingMode,
       apiProviderId: cfg.apiProviderId,
       modelEndpointId: cfg.modelEndpointId,
-        modelProtocol: cfg.modelProtocol,
-        timeoutMs: GENERATION_PROVIDER_TIMEOUT_MS,
-        signal: generationSignal,
+      modelProtocol: cfg.modelProtocol,
+      timeoutMs: GENERATION_PROVIDER_TIMEOUT_MS,
+      signal: generationSignal,
     });
 
     const title = normalizeTitle(titleRaw);
@@ -233,10 +253,11 @@ export async function maybeGenerateChatTitle(input: MaybeGenerateChatTitleInput)
     sourceText: input.firstPrompt,
     agents: input.agents,
     settings: input.settings,
+    recentTitleIcons: input.recentTitleIcons,
     requireEnabled: true,
     skipExistingTitle: true,
-      swallowErrors: true,
-      signal: input.signal,
+    swallowErrors: true,
+    signal: input.signal,
   });
 }
 
@@ -245,19 +266,21 @@ export async function generateChatTitleFromMessage({
   projectPath,
   message,
   agents,
-    settings,
-    signal,
-  }: GenerateChatTitleFromMessageInput): Promise<GenerateChatTitleResult> {
+  settings,
+  recentTitleIcons,
+  signal,
+}: GenerateChatTitleFromMessageInput): Promise<GenerateChatTitleResult> {
   const result = await runTitleGeneration({
     chatId,
     projectPath,
     sourceText: message,
     agents,
     settings,
+    recentTitleIcons,
     requireEnabled: false,
     skipExistingTitle: false,
-      swallowErrors: false,
-      signal,
+    swallowErrors: false,
+    signal,
   });
 
   if (!result) {
