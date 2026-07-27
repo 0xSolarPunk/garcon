@@ -700,6 +700,7 @@ describe('WorkspaceCoordinator', () => {
 			appShell: appShell as never,
 			navigation: {} as never,
 			files: files as never,
+			localSettings: { globalShortcuts: {} } as never,
 		});
 		const handler = vi.fn(() => true);
 		dispatcher.registerSurface('singleton:files', handler);

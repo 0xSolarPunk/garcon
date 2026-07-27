@@ -8,6 +8,7 @@
 		TransientLayerRegistry,
 		type TransientLayerKind,
 	} from '$lib/workspace/transient-layers.svelte';
+	import type { GlobalShortcutOverrides } from '$lib/workspace/global-shortcuts.js';
 
 	interface KeyboardShortcutsHostProps {
 		appShell: {
@@ -31,6 +32,7 @@
 		onToggleMainSidebarFocus?: () => void;
 		onTransientEscape?: () => void;
 		onSurfaceEscape?: () => void;
+		globalShortcuts?: GlobalShortcutOverrides;
 	}
 
 	let {
@@ -46,6 +48,7 @@
 		onToggleMainSidebarFocus = () => undefined,
 		onTransientEscape = () => undefined,
 		onSurfaceEscape = () => undefined,
+		globalShortcuts = {},
 	}: KeyboardShortcutsHostProps = $props();
 	let transientElement = $state<HTMLElement | null>(null);
 
@@ -131,6 +134,11 @@
 		appShell: appShellPort,
 		navigation: navigationPort,
 		files: { save: () => onFileSave() } as never,
+		localSettings: {
+			get globalShortcuts() {
+				return globalShortcuts;
+			},
+		} as never,
 	});
 	shortcuts.registerSurface('singleton:chat', (event) => {
 		if (event.key !== 'Escape') return false;
