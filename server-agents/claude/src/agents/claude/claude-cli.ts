@@ -47,8 +47,10 @@ import {
   claudeResultFailureMessage,
   convertCLIMessageToChatMessages,
   type ClaudeCLIMessage,
+  type ClaudeProviderSessionState,
   type ClaudeTurnTerminalState,
 } from './cli-protocol.js';
+import { handleClaudeProviderLifecycleMessage } from './cli-session-state.js';
 
 const NOOP_LOGGER: AgentLogger = {
   debug() {},
@@ -66,6 +68,9 @@ interface ClaudeRunningSession {
   initialization: Promise<void> | null;
   completeInitialization: (() => void) | null;
   lastActivityAt: number;
+  providerState: ClaudeProviderSessionState;
+  backgroundTaskCount: number;
+  unownedProviderActivity: boolean;
   activeTurn: ClaudeActiveTurn | null;
   process: ReturnType<typeof Bun.spawn> | null;
   transport: ClaudeProcessTransport<ClaudeCLIMessage> | null;
@@ -145,13 +150,14 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
       resolve = complete;
     });
     const activeTurn: ClaudeActiveTurn = {
-      protocol: new ClaudeTurnState(crypto.randomUUID()),
+      protocol: new ClaudeTurnState(crypto.randomUUID(), session.backgroundTaskCount),
       eventMetadata,
       startedAt: Date.now(),
       completion,
       resolve,
       abortTimer: null,
     };
+    session.unownedProviderActivity = false;
     session.activeTurn = activeTurn;
     session.lastActivityAt = activeTurn.startedAt;
     return activeTurn;
@@ -268,6 +274,13 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
   }
 
   #handleSystemMessage(session: ClaudeRunningSession, msg: ClaudeCLIMessage): void {
+    if (handleClaudeProviderLifecycleMessage(msg, session, {
+      logger: this.#dependencies.logger,
+      finish: () => this.#finishTurn(session),
+      fail: message => this.#failSession(session, message),
+      retire: () => this.#retireSessionProcessInBackground(session),
+    })) return;
+
     const activeTurn = session.activeTurn;
     if (msg.subtype === 'init') {
       this.#dependencies.logger.info('Claude CLI session initialized', {
@@ -407,18 +420,8 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
       return;
     }
 
-    if (
-      msg.is_error
-      && protocol.abortRequested
-      && msg.terminal_reason === 'aborted_streaming'
-    ) {
-      this.#dependencies.logger.info('Claude CLI turn stopped after an interrupt', resultDetails);
-      this.#finishTurn(session);
-      return;
-    }
-
     const resultText = typeof msg.result === 'string' ? msg.result.trim() : '';
-    if (!msg.is_error && !protocol.assistantContentSeen && resultText) {
+    if (!msg.is_error && !protocol.assistantContentSinceLastResult && resultText) {
       protocol.addOutputMessages(1, true);
       this.emitMessages(
         session.chatId,
@@ -426,21 +429,15 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
         activeTurn.eventMetadata,
       );
     }
-    const completedWithoutResponse = protocol.completedWithoutResponse(msg);
-    if (msg.is_error || completedWithoutResponse) {
-      this.#dependencies.logger.warn('Claude CLI turn completed with an error', resultDetails);
+    protocol.recordAcceptedResult(msg);
+    const resultLog = correlation === 'input'
+      ? 'Claude CLI input result received; awaiting provider idle'
+      : 'Claude CLI continuation result received; awaiting provider idle';
+    if (msg.is_error && !protocol.cleanAbortResultSeen) {
+      this.#dependencies.logger.warn(resultLog, resultDetails);
     } else {
-      this.#dependencies.logger.info('Claude CLI turn completed', resultDetails);
+      this.#dependencies.logger.info(resultLog, resultDetails);
     }
-    if (msg.is_error) {
-      this.#failSession(session, claudeResultFailureMessage(msg));
-      return;
-    }
-    if (completedWithoutResponse) {
-      this.#failSession(session, protocol.emptyCompletionFailureMessage());
-      return;
-    }
-    this.#finishTurn(session);
   }
 
   #handleInputTerminalBeforeStart(
@@ -639,6 +636,7 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
   #failSession(session: ClaudeRunningSession, message: string): void {
     const activeTurn = session.activeTurn;
     if (!activeTurn) return;
+    message = activeTurn.protocol.recordedResultFailureMessage ?? message;
     this.#clearAbortTimer(session);
     session.activeTurn = null;
     this.#controlBroker.rejectSession(session.id, 'Claude turn settled', 'interrupt');
@@ -921,10 +919,20 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      env: (() => { const { CLAUDECODE, ...env } = process.env; return { ...env, ...options.envOverrides }; })(),
+      env: (() => {
+        const { CLAUDECODE, ...env } = process.env;
+        return {
+          ...env,
+          ...options.envOverrides,
+          CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+        };
+      })(),
     });
 
     session.options = options;
+    session.providerState = 'unknown';
+    session.backgroundTaskCount = 0;
+    session.unownedProviderActivity = false;
     session.process = proc;
     session.currentThinkingMode = options.thinkingMode || 'none';
     session.currentClaudeThinkingMode = normalizeClaudeThinkingModeForState(options.claudeThinkingMode);
@@ -1033,6 +1041,9 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
       initialization,
       completeInitialization,
       lastActivityAt: Date.now(),
+      providerState: 'unknown',
+      backgroundTaskCount: 0,
+      unownedProviderActivity: false,
       activeTurn: null,
       process: null,
       transport: null,
@@ -1149,6 +1160,9 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
         initialization: null,
         completeInitialization: null,
         lastActivityAt: Date.now(),
+        providerState: 'unknown',
+        backgroundTaskCount: 0,
+        unownedProviderActivity: false,
         activeTurn: null,
         process: null,
         transport: null,

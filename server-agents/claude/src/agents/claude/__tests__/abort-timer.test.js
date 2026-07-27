@@ -118,7 +118,13 @@ function startOptions(overrides = {}) {
 }
 
 const INIT = { type: 'system', subtype: 'init', session_id: 'session-1', model: 'sonnet' };
-const RESULT = { type: 'result', is_error: false };
+const RESULT = { type: 'result', is_error: false, result: 'done' };
+const IDLE = { type: 'system', subtype: 'session_state_changed', state: 'idle' };
+
+function settleTurn(ctrl, result = RESULT) {
+  ctrl.push(result);
+  ctrl.push(IDLE);
+}
 
 describe('ClaudeCliRuntime abort force-kill fallback', () => {
   let originalSpawn;
@@ -179,7 +185,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     await flush();
     ctrl.startLatestInput();
     ctrl.push(INIT);
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await retry;
     expect(processing).toEqual([true, false]);
     runtime.shutdown();
@@ -227,7 +233,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
 
     // Interrupt acknowledged: the CLI ends the turn with a result while the
     // persistent process stays alive for follow-up turns.
-    ctrl.push({
+    settleTurn(ctrl, {
       type: 'result',
       subtype: 'error_during_execution',
       terminal_reason: 'aborted_streaming',
@@ -238,6 +244,99 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     expect(cleared).toContain(abortTimerId);
     expect(ctrl.proc.killed).toBe(false);
     expect(failures).toEqual([]);
+  });
+
+  it('retains the force-kill fallback until provider idle follows an abort result', async () => {
+    const runtime = createRuntime();
+    const ctrl = createControllableProc();
+    spawnMock.mockReturnValue(ctrl.proc);
+    const failures = [];
+    runtime.onFailed((chatId, message) => failures.push({ chatId, message }));
+
+    const turn = runtime.startClaudeCliSession(startOptions());
+    ctrl.push(INIT);
+    await flush();
+    ctrl.startLatestInput();
+
+    await runtime.abortClaudeInternalSession('session-1');
+    const fallback = scheduled.find((entry) => entry.ms === 5000);
+    expect(fallback).toBeDefined();
+    ctrl.push({
+      type: 'result',
+      subtype: 'error_during_execution',
+      terminal_reason: 'aborted_streaming',
+      is_error: true,
+    });
+    await flush();
+
+    expect(cleared).not.toContain(fallback.id);
+    fallback.fn();
+    await turn;
+    expect(ctrl.proc.killed).toBe(true);
+    expect(failures).toEqual([{
+      chatId: 'chat-1',
+      message: 'Claude CLI did not confirm the interrupt.',
+    }]);
+  });
+
+  it('settles cleanly when an interrupt ends a fenced background wait', async () => {
+    const runtime = createRuntime();
+    const ctrl = createControllableProc();
+    const nextCtrl = createControllableProc();
+    spawnMock.mockReturnValueOnce(ctrl.proc).mockReturnValueOnce(nextCtrl.proc);
+    const failures = [];
+    const finishes = [];
+    runtime.onFailed((chatId, message) => failures.push({ chatId, message }));
+    runtime.onFinished((chatId, exitCode) => finishes.push({ chatId, exitCode }));
+
+    const turn = runtime.startClaudeCliSession(startOptions());
+    ctrl.push(INIT);
+    await flush();
+    ctrl.startLatestInput();
+    ctrl.push({
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_id: 'background-build', task_type: 'local_bash' }],
+    });
+    ctrl.push({ type: 'assistant', content: [{ type: 'text', text: 'started' }] });
+    ctrl.push(RESULT);
+    ctrl.push(IDLE);
+    await flush();
+    expect(runtime.isClaudeInternalSessionRunning('session-1')).toBe(true);
+
+    await runtime.abortClaudeInternalSession('session-1');
+    const interrupt = ctrl.writes
+      .map((line) => JSON.parse(line))
+      .find((message) => message.request?.subtype === 'interrupt');
+    ctrl.push({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: interrupt.request_id,
+        response: { cancelled: [], still_queued: [] },
+      },
+    });
+    await flush();
+    const completionFallback = scheduled.find((entry) => entry.ms === 15_000);
+    expect(completionFallback).toBeDefined();
+
+    ctrl.push(IDLE);
+    await turn;
+    await flush();
+    expect(cleared).toContain(completionFallback.id);
+    expect(ctrl.proc.killed).toBe(false);
+    expect(ctrl.proc.ended).toBe(true);
+    expect(failures).toEqual([]);
+    expect(finishes).toEqual([{ chatId: 'chat-1', exitCode: 0 }]);
+
+    const nextTurn = runtime.runClaudeTurn(startOptions({ command: 'after stop' }));
+    await flush();
+    nextCtrl.push(INIT);
+    nextCtrl.startLatestInput();
+    nextCtrl.push({ type: 'assistant', content: [{ type: 'text', text: 'continued' }] });
+    settleTurn(nextCtrl);
+    await nextTurn;
+    expect(spawnMock).toHaveBeenCalledTimes(2);
   });
 
   it('cancels a queued submitted input when an internal turn is interrupted', async () => {
@@ -364,7 +463,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     ctrl.push({ type: 'assistant', content: [{ type: 'text', text: 'first output' }] });
     await runtime.abortClaudeInternalSession('session-1');
     const [abortTimerId] = abortTimerIds();
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await first;
 
     ctrl.push({ type: 'assistant', content: [{ type: 'text', text: 'trailing output' }] });
@@ -385,7 +484,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
 
     ctrl.startLatestInput();
     ctrl.push({ type: 'assistant', content: [{ type: 'text', text: 'second output' }] });
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await second;
 
     expect(ctrl.proc.killed).toBe(false);
@@ -453,7 +552,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     expect(runtime.isClaudeInternalSessionRunning('session-1')).toBe(true);
 
     secondCtrl.push({ type: 'assistant', content: [{ type: 'text', text: 'replacement output' }] });
-    secondCtrl.push(RESULT);
+    settleTurn(secondCtrl);
     await second;
     expect(finishes).toEqual([{ chatId: 'chat-1', exitCode: 0 }]);
     expect(failures).toEqual([]);
@@ -480,7 +579,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
 
     ctrl.startLatestInput();
     ctrl.push(INIT);
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await start;
 
     expect(spawnMock).toHaveBeenCalledTimes(1);
@@ -496,7 +595,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     ctrl.push(INIT);
     await flush();
     ctrl.startLatestInput();
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await start;
 
     let firstResolved = false;
@@ -513,7 +612,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     await secondRejected;
 
     ctrl.startLatestInput();
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await first;
 
     expect(firstResolved).toBe(true);
@@ -531,7 +630,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
     ctrl.push(INIT);
     await flush();
     ctrl.startLatestInput();
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await start;
 
     let firstResolved = false;
@@ -547,7 +646,7 @@ describe('ClaudeCliRuntime abort force-kill fallback', () => {
       .toEqual(['initial', 'winner']);
 
     ctrl.startLatestInput();
-    ctrl.push(RESULT);
+    settleTurn(ctrl);
     await first;
     expect(firstResolved).toBe(true);
   });

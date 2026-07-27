@@ -126,6 +126,16 @@ async function enqueueResult(fake) {
   fake.stdout.enqueue(new TextEncoder().encode(JSON.stringify({
     type: 'result',
     is_error: false,
+    result: 'done',
+  }) + '\n'));
+  enqueueProviderState(fake, 'idle');
+}
+
+function enqueueProviderState(fake, state) {
+  fake.stdout.enqueue(encoder.encode(JSON.stringify({
+    type: 'system',
+    subtype: 'session_state_changed',
+    state,
   }) + '\n'));
 }
 
@@ -194,9 +204,12 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         stop_reason: 'end_turn',
         permission_denials: [],
       }) + '\n'));
+      enqueueProviderState(fake, 'idle');
 
       await expect(start).resolves.toBe('expected-session');
-      expect(logger.info).toHaveBeenCalledWith('Claude CLI turn completed', {
+      expect(logger.info).toHaveBeenCalledWith(
+        'Claude CLI input result received; awaiting provider idle',
+        {
         chatId: 'chat-1',
         turnId: null,
         sessionId: 'expected',
@@ -213,7 +226,8 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         outputMessages: 0,
         hasResult: true,
         permissionDenials: 0,
-      });
+        },
+      );
       expect(JSON.stringify(logger.info.mock.calls)).not.toContain('private result content');
       runtime.shutdown();
     } finally {
@@ -248,6 +262,32 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
       await enqueueResult(fake);
 
       await expect(start).resolves.toBe('expected-session');
+      await runtime.shutdown();
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
+  });
+
+  it('forces Claude session-state events after inherited endpoint overrides', async () => {
+    const originalSpawn = Bun.spawn;
+    const fake = createFakeClaudeProcess();
+    Bun.spawn = mock(() => fake.proc);
+
+    try {
+      const runtime = createRuntime();
+      const start = runtime.startClaudeCliSession(startOptions({
+        envOverrides: {
+          ANTHROPIC_BASE_URL: 'https://example.test',
+          CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '0',
+        },
+      }));
+      await enqueueResult(fake);
+      await start;
+
+      expect(Bun.spawn.mock.calls[0][1].env).toMatchObject({
+        ANTHROPIC_BASE_URL: 'https://example.test',
+        CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+      });
       await runtime.shutdown();
     } finally {
       Bun.spawn = originalSpawn;
@@ -395,6 +435,7 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         result: 'Provider request failed',
         num_turns: 0,
       }) + '\n'));
+      enqueueProviderState(fake, 'idle');
 
       await expect(start).resolves.toBe('expected-session');
       expect(failures).toEqual([{
@@ -403,7 +444,7 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
       }]);
       expect(finishes).toEqual([]);
       expect(logger.warn).toHaveBeenCalledWith(
-        'Claude CLI turn completed with an error',
+        'Claude CLI input result received; awaiting provider idle',
         expect.objectContaining({
           outcome: 'error_during_execution',
           isError: true,
@@ -418,6 +459,33 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
     }
   });
 
+  it('preserves a structured result failure when stdout ends before idle', async () => {
+    const originalSpawn = Bun.spawn;
+    const fake = createFakeClaudeProcess();
+    Bun.spawn = mock(() => fake.proc);
+
+    try {
+      const runtime = createRuntime();
+      const failures = [];
+      runtime.onFailed((_chatId, message) => failures.push(message));
+      const start = runtime.startClaudeCliSession(startOptions());
+      await enqueueInputStarted(fake);
+      fake.stdout.enqueue(encoder.encode(JSON.stringify({
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        result: 'Provider request failed',
+      }) + '\n'));
+      fake.closeStdout();
+
+      await expect(start).resolves.toBe('expected-session');
+      expect(failures).toEqual(['Provider request failed']);
+      await runtime.shutdown();
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
+  });
+
   it('handles a terminal result without a trailing newline', async () => {
     const originalSpawn = Bun.spawn;
     const fake = createFakeClaudeProcess();
@@ -427,11 +495,19 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
       const runtime = createRuntime();
       const start = runtime.startClaudeCliSession(startOptions());
       await enqueueInputStarted(fake);
-      fake.stdout.enqueue(new TextEncoder().encode(JSON.stringify({
-        type: 'result',
-        subtype: 'success',
-        is_error: false,
-      })));
+      fake.stdout.enqueue(new TextEncoder().encode([
+        JSON.stringify({
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          result: 'done',
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'session_state_changed',
+          state: 'idle',
+        }),
+      ].join('\n')));
       fake.exit(0);
 
       await expect(start).resolves.toBe('expected-session');
@@ -475,6 +551,11 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
           result: '',
           stop_reason: null,
         }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'session_state_changed',
+          state: 'idle',
+        }),
       ].join('\n') + '\n'));
       await Promise.resolve();
 
@@ -513,6 +594,11 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
           result: 'actual user response',
           stop_reason: 'end_turn',
         }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'session_state_changed',
+          state: 'idle',
+        }),
       ].join('\n') + '\n'));
 
       await expect(start).resolves.toBe('expected-session');
@@ -532,6 +618,158 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         }),
       );
       runtime.shutdown();
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
+  });
+
+  it('keeps routing continuation output until Claude reports provider idle', async () => {
+    const originalSpawn = Bun.spawn;
+    const fake = createFakeClaudeProcess();
+    Bun.spawn = mock(() => fake.proc);
+
+    try {
+      const runtime = createRuntime();
+      const messages = [];
+      const finishes = [];
+      const processing = [];
+      runtime.onMessages((_chatId, emitted) => messages.push(...emitted));
+      runtime.onFinished((chatId, exitCode) => finishes.push({ chatId, exitCode }));
+      runtime.onProcessing((chatId, isProcessing) => processing.push({ chatId, isProcessing }));
+
+      const start = runtime.startClaudeCliSession(startOptions());
+      const input = await enqueueInputStarted(fake);
+      for (let attempt = 0; attempt < 10 && processing.length === 0; attempt += 1) {
+        await Promise.resolve();
+      }
+      enqueueProviderState(fake, 'running');
+      fake.stdout.enqueue(encoder.encode([
+        JSON.stringify({
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [{ task_id: 'background-build', task_type: 'local_bash' }],
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [],
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'background-build',
+          status: 'completed',
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          content: [{ type: 'text', text: 'Background build started.' }],
+        }),
+        JSON.stringify({
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          user_message_uuid: input.uuid,
+          result: 'Background build started.',
+        }),
+      ].join('\n') + '\n'));
+      await Promise.resolve();
+
+      expect(finishes).toEqual([]);
+      expect(runtime.isClaudeInternalSessionRunning('expected-session')).toBe(true);
+      expect(processing).not.toContainEqual({ chatId: 'chat-1', isProcessing: false });
+
+      fake.stdout.enqueue(encoder.encode([
+        JSON.stringify({
+          type: 'assistant',
+          content: [{ type: 'text', text: 'Background build finished.' }],
+        }),
+        JSON.stringify({
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          result: 'Background build finished.',
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'session_state_changed',
+          state: 'idle',
+        }),
+      ].join('\n') + '\n'));
+
+      await expect(start).resolves.toBe('expected-session');
+      expect(messages).toMatchObject([
+        { type: 'assistant-message', content: 'Background build started.' },
+        { type: 'assistant-message', content: 'Background build finished.' },
+      ]);
+      expect(finishes).toEqual([{ chatId: 'chat-1', exitCode: 0 }]);
+      expect(processing).toEqual([
+        { chatId: 'chat-1', isProcessing: true },
+        { chatId: 'chat-1', isProcessing: false },
+      ]);
+      await runtime.shutdown();
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
+  });
+
+  it('logs and retires provider activity without an active Garcon turn', async () => {
+    const originalSpawn = Bun.spawn;
+    const fake = createFakeClaudeProcess();
+    const logger = createLogger();
+    Bun.spawn = mock(() => fake.proc);
+
+    try {
+      const runtime = createRuntime(logger);
+      const start = runtime.startClaudeCliSession(startOptions());
+      await enqueueResult(fake);
+      await start;
+
+      enqueueProviderState(fake, 'running');
+      enqueueProviderState(fake, 'requires_action');
+      await Promise.resolve();
+      expect(fake.proc.stdin.end).not.toHaveBeenCalled();
+      enqueueProviderState(fake, 'idle');
+      for (
+        let attempt = 0;
+        attempt < 20 && fake.proc.stdin.end.mock.calls.length === 0;
+        attempt += 1
+      ) {
+        await Promise.resolve();
+      }
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Claude CLI emitted provider activity without an active Garcon turn',
+        expect.objectContaining({
+          chatId: 'chat-1',
+          next: 'running',
+        }),
+      );
+      expect(fake.proc.stdin.end).toHaveBeenCalledTimes(1);
+      await runtime.shutdown();
+    } finally {
+      Bun.spawn = originalSpawn;
+    }
+  });
+
+  it('fails closed when Claude becomes idle after input start without a result', async () => {
+    const originalSpawn = Bun.spawn;
+    const fake = createFakeClaudeProcess();
+    Bun.spawn = mock(() => fake.proc);
+
+    try {
+      const runtime = createRuntime();
+      const failures = [];
+      runtime.onFailed((_chatId, message) => failures.push(message));
+      const start = runtime.startClaudeCliSession(startOptions());
+      await enqueueInputStarted(fake);
+
+      enqueueProviderState(fake, 'idle');
+
+      await expect(start).resolves.toBe('expected-session');
+      expect(failures).toEqual([
+        'Claude CLI became idle before the submitted message produced a terminal result.',
+      ]);
+      expect(fake.proc.stdin.end).toHaveBeenCalledTimes(1);
     } finally {
       Bun.spawn = originalSpawn;
     }
@@ -571,6 +809,11 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
           subtype: 'success',
           is_error: false,
           result: 'done',
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'session_state_changed',
+          state: 'idle',
         }),
       ].join('\n') + '\n'));
 
@@ -616,6 +859,7 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         user_message_uuid: input.uuid,
         result: 'correlated response',
       }) + '\n'));
+      enqueueProviderState(fake, 'idle');
 
       await expect(start).resolves.toBe('expected-session');
       expect(finishes).toEqual([{ chatId: 'chat-1', exitCode: 0 }]);
@@ -673,6 +917,11 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
           subtype: 'success',
           is_error: false,
           result: 'retry succeeded',
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'session_state_changed',
+          state: 'idle',
         }),
       ].join('\n') + '\n'));
       await retry;
@@ -736,6 +985,7 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         result: '',
         stop_reason: null,
       }) + '\n'));
+      enqueueProviderState(fake, 'idle');
 
       await expect(start).resolves.toBe('expected-session');
       expect(failures).toEqual([{
@@ -772,6 +1022,7 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         ],
         num_turns: 0,
       }) + '\n'));
+      enqueueProviderState(fake, 'idle');
 
       await expect(start).resolves.toBe('expected-session');
       expect(failures).toEqual([{
@@ -813,6 +1064,11 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
           is_error: false,
           num_turns: 0,
           result: '',
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'session_state_changed',
+          state: 'idle',
         }),
       ].join('\n') + '\n'));
 
@@ -883,6 +1139,7 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
         is_error: false,
         result: 'done',
       }) + '\n'));
+      enqueueProviderState(fake, 'idle');
       await start;
       runtime.shutdown();
     } finally {
@@ -893,11 +1150,14 @@ describe('ClaudeCliRuntime stdout protocol handling', () => {
   for (const [name, settle] of [
     [
       'successful result',
-      (fake) => fake.stdout.enqueue(encoder.encode(JSON.stringify({
-        type: 'result',
-        is_error: false,
-        result: 'done',
-      }) + '\n')),
+      (fake) => {
+        fake.stdout.enqueue(encoder.encode(JSON.stringify({
+          type: 'result',
+          is_error: false,
+          result: 'done',
+        }) + '\n'));
+        enqueueProviderState(fake, 'idle');
+      },
     ],
     [
       'stdout failure',
