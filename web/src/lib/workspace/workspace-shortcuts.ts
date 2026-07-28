@@ -18,7 +18,7 @@ interface WorkspaceShortcutDeps {
 	appShell: AppShellStore;
 	navigation: NavigationStore;
 	files: FileSessionRegistry;
-	localSettings: LocalSettingsStore;
+	localSettings: Pick<LocalSettingsStore, 'globalShortcuts'>;
 }
 
 export class WorkspaceShortcutDispatcher {

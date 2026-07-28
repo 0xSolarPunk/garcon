@@ -9,6 +9,7 @@
 		type TransientLayerKind,
 	} from '$lib/workspace/transient-layers.svelte';
 	import type { GlobalShortcutOverrides } from '$lib/workspace/global-shortcuts.js';
+	import type { LocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
 
 	interface KeyboardShortcutsHostProps {
 		appShell: {
@@ -138,7 +139,7 @@
 			get globalShortcuts() {
 				return globalShortcuts;
 			},
-		} as never,
+		} satisfies Pick<LocalSettingsStore, 'globalShortcuts'>,
 	});
 	shortcuts.registerSurface('singleton:chat', (event) => {
 		if (event.key !== 'Escape') return false;

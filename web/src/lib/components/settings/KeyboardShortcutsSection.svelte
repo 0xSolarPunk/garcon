@@ -1,7 +1,8 @@
 <script lang="ts">
-	import { getLocalSettings } from '$lib/context';
+	import { getLocalSettings, getOptionalTransientLayers } from '$lib/context';
 	import { Button } from '$lib/components/ui/button';
 	import * as m from '$lib/paraglide/messages.js';
+	import { allocateTransientLayerId } from '$lib/workspace/transient-layer-id.js';
 	import { GLOBAL_SHORTCUTS, SLASH_COMMANDS } from './keyboard-shortcut-entries.js';
 	import {
 		assignGlobalShortcut,
@@ -16,10 +17,30 @@
 	} from '$lib/workspace/global-shortcuts.js';
 
 	const ls = getLocalSettings();
+	const transientLayers = getOptionalTransientLayers();
+	const recordingLayerId = allocateTransientLayerId('shortcut-recording');
 	const sendMessageKeys = $derived(ls.sendByShiftEnter ? ['Shift', 'Enter'] : ['Enter']);
 	const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 	let recordingId = $state<GlobalShortcutId | null>(null);
 	let feedback = $state<string | null>(null);
+	let sectionElement = $state<HTMLElement | null>(null);
+
+	// Recording claims a transient layer so Escape cancels the capture. Without it
+	// the workspace dispatcher sees Escape first and closes the settings dialog.
+	$effect(() => {
+		if (!transientLayers || !recordingId || !sectionElement) return;
+		return transientLayers.register({
+			id: recordingLayerId,
+			kind: 'popover',
+			modality: 'nonmodal',
+			element: () => sectionElement,
+			onEscape: () => {
+				recordingId = null;
+				return true;
+			},
+			restoreFocus: () => undefined,
+		});
+	});
 
 	function shortcutLabel(id: GlobalShortcutId): string {
 		return GLOBAL_SHORTCUTS.find((entry) => entry.id === id)?.label() ?? id;
@@ -28,6 +49,11 @@
 	function startRecording(id: GlobalShortcutId): void {
 		recordingId = id;
 		feedback = null;
+	}
+
+	// Losing focus abandons the capture so the control cannot stay armed while unfocused.
+	function stopRecording(id: GlobalShortcutId): void {
+		if (recordingId === id) recordingId = null;
 	}
 
 	function reportAssignment(
@@ -46,10 +72,6 @@
 		if (recordingId !== id) return;
 		event.preventDefault();
 		event.stopPropagation();
-		if (event.key === 'Escape') {
-			recordingId = null;
-			return;
-		}
 
 		const binding = globalShortcutBindingFromEvent(event);
 		if (!binding) return;
@@ -101,7 +123,7 @@
 	</div>
 {/snippet}
 
-<div class="space-y-6">
+<div class="space-y-6" bind:this={sectionElement}>
 	<section class="space-y-2">
 		<h3 class="text-sm font-semibold text-foreground">
 			{m.settings_shortcuts_group_global()}
@@ -143,6 +165,7 @@
 							class="min-w-28 font-mono"
 							onclick={() => startRecording(entry.id)}
 							onkeydown={(event) => handleBindingKeydown(event, entry.id)}
+							onblur={() => stopRecording(entry.id)}
 							aria-label={m.settings_shortcut_change_aria({ command: entry.label() })}
 						>
 							{#if recordingId === entry.id}
