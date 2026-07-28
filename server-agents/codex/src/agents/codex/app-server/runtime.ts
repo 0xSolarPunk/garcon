@@ -1,4 +1,4 @@
-import { AssistantMessage, ErrorMessage, PermissionCancelledMessage, PermissionResolvedMessage, type ChatMessage, type CompactionTrigger } from '@garcon/common/chat-types';
+import { AssistantMessage, ErrorMessage, PermissionCancelledMessage, PermissionResolvedMessage, type ChatMessage } from '@garcon/common/chat-types';
 import { AgentEventEmitterRuntime } from '@garcon/server-agent-common/shared/event-emitter-runtime';
 import type { RuntimeEventMetadata } from '@garcon/server-agent-common/shared/event-emitter-runtime';
 import type { AgentActiveInputHandoff, AgentLogger } from '@garcon/server-agent-interface';
@@ -17,7 +17,7 @@ import {
 import type { PermissionMode } from '@garcon/common/chat-modes';
 import { buildApprovalMessage, buildApprovalResponse, createPendingApproval, isApprovalRequest, type CodexPendingApproval } from './approvals.js';
 import { CodexAppServerClient, CodexAppServerRpcError, type CodexAppServerClientOptions, type CodexAppServerMetric } from './client.js';
-import { convertCodexAppServerLiveItem, convertCodexRawCodeModeItem } from './converter.js';
+import { convertCodexRawCodeModeItem } from './converter.js';
 import { accessibleThreadPath, waitForMaterializedThread } from './durability.js';
 import { NativePathDiscoveryRefreshLimiter, type NativePathDiscoveryRefreshLimiterOptions } from './native-path-discovery-refresh.js';
 import { IdleSessionPurger } from '@garcon/server-agent-common/shared/idle-session-purger';
@@ -52,9 +52,10 @@ import {
 import { CodexSkillDiscovery, type CodexSkillRef } from '../slash-command-discovery.js';
 import type { CodexGoalCommand } from '../goal-command.js';
 import { cleanupMaterializedGoalDraft, materializeGoalDraft } from './goal-files.js';
+import { CodexTurnItemLedger } from './turn-item-ledger.js';
 
-type RunningStatus = 'running' | 'completing' | 'completed' | 'failed' | 'aborted';
-type FinishSessionOptions = { failedMessage?: string; aborted?: boolean };
+type RunningStatus = 'running' | 'interrupting' | 'completing' | 'completed' | 'failed' | 'aborted';
+type FinishSessionOptions = { failedMessage?: string; aborted?: boolean; emitFinishedOnAbort?: boolean };
 type GoalCommandOptions = {
   keepSession: boolean;
   goalSynchronized?: boolean;
@@ -92,9 +93,6 @@ interface RunningCodexSession {
   status: RunningStatus;
   permissionMode: PermissionMode;
   startedAt: string;
-  // Set when this session was started by an explicit /compact, so the resulting
-  // contextCompaction item is labeled 'manual' rather than 'auto'.
-  manualCompactionPending?: boolean;
   cleanupAttachments?: () => Promise<void>;
   turnStartWaiters: Set<TurnStartWaiter>;
   goal: CodexThreadGoal | null;
@@ -105,6 +103,7 @@ interface RunningCodexSession {
   activeDeliveryReservations: number;
   pendingFinish: FinishSessionOptions | null;
   liveCodeModeResultToolIds: Map<string, string>;
+  turnItems: CodexTurnItemLedger;
   capacityRetryCount: number;
   turnAttemptGeneration: number;
   pendingCapacityFailure: { turnId: string; message: string } | null;
@@ -141,7 +140,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
   #history: CodexHistoryService;
   #idlePurger = new IdleSessionPurger<RunningCodexSession>({
     sessions: () => this.#sessions.entries(),
-    isRunning: (session) => session.status === 'running' || session.status === 'completing',
+    isRunning: (session) => isActiveSessionStatus(session.status),
     lastActivityAt: () => 0,
     purge: (threadId, session) => {
       this.#sessions.delete(threadId);
@@ -638,6 +637,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
         eventMetadata: codexEventMetadata(request),
       });
       activeSession = session;
+      await session.turnItems.seedHistory(session.nativePath);
       session.onAbortable = request.onAbortable;
       session.activeDeliveryReservations += 1;
       try {
@@ -727,8 +727,9 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
         permissionMode: request.permissionMode,
         eventMetadata: codexEventMetadata(request),
       });
-      session.manualCompactionPending = true;
       activeSession = session;
+      await session.turnItems.seedHistory(session.nativePath);
+      session.turnItems.markManualCompaction();
       session.onAbortable = request.onAbortable;
       this.#releaseBufferedClientEvents(client);
       markCodexExecutionStarted(request);
@@ -761,9 +762,13 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       this.#finishSession(session, { aborted: true });
       return true;
     }
+    if (session.status === 'interrupting') return true;
+    // Set before awaiting because the RPC response and turn/completed can arrive in one stdout read.
+    session.status = 'interrupting';
     try {
       await session.client.interruptTurn(session.threadId, turnId);
     } catch (error) {
+      if (this.#sessions.get(agentSessionId) === session && session.status === 'interrupting') session.status = 'running';
       this.#logger.warn('Codex turn interruption failed', {
         turnId,
         error: error instanceof Error ? error.message : String(error),
@@ -771,20 +776,17 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       return false;
     }
     if (this.#sessions.get(agentSessionId) !== session) return true;
-    session.status = 'aborted';
-    this.#cancelTurnStartWaiters(session, 'Codex session aborted');
-    this.#finishSession(session, { aborted: true });
     return true;
   }
 
   isRunning(agentSessionId: string): boolean {
     const status = this.#sessions.get(agentSessionId)?.status;
-    return status === 'running' || status === 'completing';
+    return status !== undefined && isActiveSessionStatus(status);
   }
 
   getRunningSessions(): Array<{ id: string; status: string; startedAt: string }> {
     return Array.from(this.#sessions.values())
-      .filter((session) => session.status === 'running' || session.status === 'completing')
+      .filter((session) => isActiveSessionStatus(session.status))
       .map((session) => ({ id: session.threadId, status: session.status, startedAt: session.startedAt }));
   }
 
@@ -1032,6 +1034,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       activeDeliveryReservations: 0,
       pendingFinish: null,
       liveCodeModeResultToolIds: new Map(),
+      turnItems: new CodexTurnItemLedger(this.#logger, (messages) => this.emitMessages(args.chatId, messages)),
       capacityRetryCount: 0,
       turnAttemptGeneration: 0,
       pendingCapacityFailure: null,
@@ -1132,7 +1135,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
     const session = this.#sessionForClientThread(client, params.threadId);
     if (!session) return;
     session.activeTurnId = params.turn.id;
-    session.status = 'running';
+    if (session.status !== 'interrupting') session.status = 'running';
     this.#notifyAbortable(session);
     for (const waiter of session.turnStartWaiters) waiter.resolve(params.turn.id);
   }
@@ -1255,15 +1258,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
   #handleItemCompleted(client: CodexAppServerClient, params: ItemCompletedNotification): void {
     const session = this.#sessionForClientTurn(client, params.threadId, params.turnId);
     if (!session) return;
-    // A contextCompaction item is 'manual' only when this session was started by
-    // /compact; otherwise the app-server auto-compacted to free context.
-    let compactionTrigger: CompactionTrigger | undefined;
-    if (params.item.type === 'contextCompaction') {
-      compactionTrigger = session.manualCompactionPending ? 'manual' : 'auto';
-      session.manualCompactionPending = false;
-    }
-    const messages = convertCodexAppServerLiveItem(params.item, undefined, compactionTrigger);
-    if (messages.length) this.emitMessages(session.chatId, messages);
+    session.turnItems.emit(params.item);
   }
 
   #handleRawResponseItemCompleted(client: CodexAppServerClient, params: RawResponseItemCompletedNotification): void {
@@ -1274,6 +1269,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       new Date().toISOString(),
       session.liveCodeModeResultToolIds,
     );
+    session.turnItems.recordMessages(messages);
     if (messages.length) this.emitMessages(session.chatId, messages);
   }
 
@@ -1315,7 +1311,9 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       this.#finishSession(session, { failedMessage });
       return;
     }
-    const aborted = params.turn.status === 'interrupted' || session.status === 'aborted';
+    const aborted = params.turn.status === 'interrupted' || session.status === 'interrupting';
+    for (const item of params.turn.items) session.turnItems.emit(item);
+    if (aborted) await session.turnItems.reconcileInterrupted(session.nativePath);
     session.capacityRetryCount = 0;
     session.pendingCapacityFailure = null;
     session.status = 'completing';
@@ -1328,7 +1326,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
         return;
       }
     }
-    this.#finishSession(session, { aborted });
+    this.#finishSession(session, { aborted, emitFinishedOnAbort: aborted });
   }
 
   #handleErrorNotification(client: CodexAppServerClient, params: ErrorNotification): void {
@@ -1452,7 +1450,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
 
   #handleClientExit(client: CodexAppServerClient, code: number): void {
     const session = this.#sessionForClient(client);
-    if (!session || (session.status !== 'running' && session.status !== 'completing')) return;
+    if (!session || !isActiveSessionStatus(session.status)) return;
     this.#finishSession(session, { failedMessage: `Codex app-server exited with code ${code}` });
   }
 
@@ -1473,7 +1471,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
 
     if (opts.failedMessage) {
       this.emitFailed(session.chatId, opts.failedMessage, session.eventMetadata);
-    } else if (!opts.aborted) {
+    } else if (!opts.aborted || opts.emitFinishedOnAbort) {
       this.emitFinished(session.chatId, 0, session.eventMetadata);
     }
 
@@ -1729,6 +1727,7 @@ function mergeFinishOptions(
   return {
     failedMessage: next.failedMessage ?? current?.failedMessage,
     aborted: Boolean(next.aborted || current?.aborted),
+    emitFinishedOnAbort: Boolean(next.emitFinishedOnAbort || current?.emitFinishedOnAbort),
   };
 }
 
@@ -1740,6 +1739,7 @@ function isTerminalSessionStatus(status: RunningStatus): boolean {
   return status === 'completed' || status === 'failed' || status === 'aborted';
 }
 
+function isActiveSessionStatus(status: RunningStatus): boolean { return status === 'running' || status === 'interrupting' || status === 'completing'; }
 function hasActiveGoalContinuation(session: RunningCodexSession): boolean {
   return session.managesGoalLifecycle
     && Boolean(session.activeTurnId || session.goal?.status === 'active');
