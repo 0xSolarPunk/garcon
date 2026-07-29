@@ -15,6 +15,7 @@ const USER_SCROLL_INTENT_WINDOW_MS = 2_000;
 
 export type ConversationScrollState = Pick<
 	ActiveTranscriptState,
+	| 'compactToRecentMessages'
 	| 'displayMessageCount'
 	| 'completeInitialMessagesReveal'
 	| 'generationId'
@@ -79,10 +80,12 @@ export class ConversationScrollController {
 		if (!chatId) return;
 		if (!this.deps.chatState.isViewingInitialMessages && !this.isScrollingToTop) {
 			this.scrollToBottom();
+			this.deps.chatState.compactToRecentMessages();
 			return;
 		}
 		if (!(await this.#navigateToWindow(chatId, 'latest'))) return;
 		this.scrollToBottom();
+		this.deps.chatState.compactToRecentMessages();
 	}
 
 	async restoreLatestWindow(chatId: string): Promise<boolean> {
