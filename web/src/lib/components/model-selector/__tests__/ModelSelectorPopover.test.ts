@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ModelSelectorPopoverHost from './ModelSelectorPopoverHost.svelte';
 import type { ModelSelectorRecentOption } from '../model-selector-types';
+import { DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID } from '$shared/agents';
 
 let originalMatchMedia: typeof window.matchMedia | undefined;
 
@@ -19,9 +20,7 @@ function installMatchMedia(matchesCompact: boolean): void {
 		writable: true,
 		value: vi.fn((query: string) => ({
 			matches:
-				query === '(max-width: 639px)' || query === '(max-width: 899px)'
-					? matchesCompact
-					: false,
+				query === '(max-width: 639px)' || query === '(max-width: 899px)' ? matchesCompact : false,
 			media: query,
 			onchange: null,
 			addEventListener: vi.fn(),
@@ -117,6 +116,22 @@ function endpointRecent(): ModelSelectorRecentOption {
 		modelLabel: 'Endpoint Model',
 		displayLabel: 'Claude · Acme · Endpoint Model',
 	});
+}
+
+function directRecent(): ModelSelectorRecentOption {
+	return {
+		id: 'direct-openai-responses-compatible:responses-model',
+		agentId: 'direct-openai-responses-compatible',
+		modelValue: 'responses-model',
+		model: 'responses-model',
+		apiProviderId: null,
+		modelEndpointId: null,
+		modelProtocol: null,
+		agentLabel: 'Direct (Responses)',
+		sourceLabel: 'Direct (Responses)',
+		modelLabel: 'Responses Model',
+		displayLabel: 'Direct (Responses) · Responses Model',
+	};
 }
 
 function buttonForText(container: HTMLElement, text: string): HTMLElement {
@@ -233,6 +248,42 @@ describe('ModelSelectorPopover', () => {
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledWith({
 				agentId: 'claude',
+				modelValue: 'removed-from-catalog',
+				model: 'removed-from-catalog',
+				apiProviderId: 'custom-provider',
+				modelEndpointId: 'custom-endpoint',
+				modelProtocol: 'anthropic-messages',
+				thinkingMode: 'high',
+			});
+		});
+	});
+
+	it('allows effort changes for a saved agent outside the catalog', async () => {
+		const onChange = vi.fn();
+
+		render(ModelSelectorPopoverHost, {
+			value: {
+				agentId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
+				model: 'removed-from-catalog',
+				apiProviderId: 'custom-provider',
+				modelEndpointId: 'custom-endpoint',
+				modelProtocol: 'anthropic-messages',
+				thinkingMode: 'none',
+			},
+			mode: { agent: 'select', source: 'select', surface: 'settings', effort: 'select' },
+			onChange,
+		});
+
+		await fireEvent.click(
+			screen.getByRole('button', {
+				name: /Direct \(Anthropic\) .* removed-from-catalog .* Default/,
+			}),
+		);
+		await fireEvent.click(screen.getByRole('button', { name: /High Thorough reasoning/ }));
+
+		await waitFor(() => {
+			expect(onChange).toHaveBeenCalledWith({
+				agentId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
 				modelValue: 'removed-from-catalog',
 				model: 'removed-from-catalog',
 				apiProviderId: 'custom-provider',
@@ -539,7 +590,7 @@ describe('ModelSelectorPopover', () => {
 
 		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
 		const recentsButton = await screen.findByRole('button', { name: 'Recents' });
-		const agentHeader = screen.getByText('Agent');
+		const agentHeader = screen.getByText('Agents');
 
 		expect(
 			recentsButton.compareDocumentPosition(agentHeader) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -567,6 +618,70 @@ describe('ModelSelectorPopover', () => {
 		await waitFor(() => {
 			expect(screen.queryByText('Recent models')).toBeNull();
 		});
+	});
+
+	it('renders desktop Direct and Agents groups after recents in the required order', async () => {
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { agent: 'select', source: 'select', surface: 'composer' },
+			includeDirectAgents: true,
+			recents: [codexRecent()],
+			onChange: vi.fn(),
+		});
+
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+
+		const recentsButton = await screen.findByRole('button', { name: 'Recents' });
+		const groupHeaders = Array.from(
+			document.querySelectorAll<HTMLElement>('[data-slot="model-selector-agent-group"]'),
+		);
+		expect(groupHeaders.map((header) => header.textContent?.trim())).toEqual(['Direct', 'Agents']);
+		expect(
+			recentsButton.compareDocumentPosition(groupHeaders[0]) & Node.DOCUMENT_POSITION_FOLLOWING,
+		).toBeTruthy();
+		expect(screen.getByRole('button', { name: 'Chat Completions' })).toBeTruthy();
+		expect(screen.getByRole('button', { name: 'Responses' })).toBeTruthy();
+		expect(screen.getByRole('button', { name: 'Anthropic' })).toBeTruthy();
+	});
+
+	it('keeps direct trigger labels qualified while grouped options stay short', async () => {
+		render(ModelSelectorPopoverHost, {
+			value: {
+				agentId: 'direct-openai-responses-compatible',
+				model: 'responses-model',
+			},
+			mode: { agent: 'select', source: 'select', surface: 'settings' },
+			includeDirectAgents: true,
+			onChange: vi.fn(),
+		});
+
+		const trigger = screen.getByRole('button', {
+			name: /Direct \(Responses\).*Responses Model/,
+		});
+		await fireEvent.click(trigger);
+
+		expect(await screen.findByRole('button', { name: 'Responses' })).toBeTruthy();
+		expect(screen.queryByRole('button', { name: 'Direct (Responses)' })).toBeNull();
+	});
+
+	it('filters ineligible direct groups and recents', async () => {
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { agent: 'select', source: 'select', surface: 'composer' },
+			includeDirectAgents: true,
+			selectableAgentIds: ['claude', 'codex'],
+			recents: [directRecent(), codexRecent()],
+			onChange: vi.fn(),
+		});
+
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+
+		expect(
+			document.querySelector('[data-slot="model-selector-agent-group"][data-group="direct"]'),
+		).toBeNull();
+		await fireEvent.click(await screen.findByRole('button', { name: 'Recents' }));
+		expect(screen.queryByRole('button', { name: directRecent().displayLabel })).toBeNull();
+		expect(screen.getByRole('button', { name: codexRecent().displayLabel })).toBeTruthy();
 	});
 
 	it('opens desktop selection at recents when requested with multiple recents', async () => {
@@ -706,6 +821,47 @@ describe('ModelSelectorPopover', () => {
 		const agentButton = screen.getByRole('button', { name: 'Codex' });
 		expect(agentButton.getAttribute('class')).toContain('px-2');
 		expect(agentButton.querySelector('.lucide-check')).toBeNull();
+	});
+
+	it('renders grouped agents in the compact top-level menu', async () => {
+		installMatchMedia(true);
+
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { agent: 'select', source: 'select', surface: 'composer' },
+			includeDirectAgents: true,
+			recents: [codexRecent()],
+			onChange: vi.fn(),
+		});
+
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+
+		const groupHeaders = Array.from(
+			document.querySelectorAll<HTMLElement>('[data-slot="model-selector-agent-group"]'),
+		);
+		expect(groupHeaders.map((header) => header.textContent?.trim())).toEqual(['Direct', 'Agents']);
+		expect(screen.getByRole('button', { name: 'Chat Completions' })).toBeTruthy();
+	});
+
+	it('renders grouped agents in the compact agent pane', async () => {
+		installMatchMedia(true);
+
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { agent: 'select', source: 'select', surface: 'composer' },
+			includeDirectAgents: true,
+			onChange: vi.fn(),
+		});
+
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+
+		expect(screen.getByText('Agent')).toBeTruthy();
+		const groupHeaders = Array.from(
+			document.querySelectorAll<HTMLElement>('[data-slot="model-selector-agent-group"]'),
+		);
+		expect(groupHeaders.map((header) => header.textContent?.trim())).toEqual(['Direct', 'Agents']);
 	});
 
 	it('skips the compact provider pane when the selected agent has one provider', async () => {
