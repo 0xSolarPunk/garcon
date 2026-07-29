@@ -384,7 +384,7 @@ function makeService(overrides = {}) {
     reserveTranscriptSnapshot: mock((chatId) => {
       const source = sessions.get(chatId);
       if (
-        queue.hasChatExecutionOwner(chatId)
+        queue.ownsExecution(chatId)
         || agents.isAgentSessionRunning(source?.agentId, source?.agentSessionId)
       ) {
         throw new DomainError('SESSION_BUSY', 'Another chat turn already owns execution', 409, true);
@@ -407,8 +407,7 @@ function makeService(overrides = {}) {
     deleteChatQueueFile: mock(() => Promise.resolve(undefined)),
     waitForDispatches: mock(() => Promise.all([...executionTasks]).then(() => undefined)),
     triggerDrain: mock(() => Promise.resolve(undefined)),
-    isChatExecutionReserved: mock(() => false),
-    hasChatExecutionOwner: mock(() => false),
+    ownsExecution: mock(() => false),
     readChatExecutionControl: mock(() => Promise.resolve(storedQueue())),
     createChatQueueEntry: mock(() =>
       Promise.resolve({
@@ -476,7 +475,7 @@ function makeService(overrides = {}) {
     resolvePermission: mock(() => undefined),
     supportsFork: mock(() => true),
     supportsForkAtMessage: mock(() => true),
-    supportsForkAtMessageWhileRunning: mock(() => false),
+    supportsForkWhileRunning: mock(() => false),
     supportsUpdateProjectPath: mock(() => true),
     requiresNativePathForProjectPathUpdate: mock((agentId) => agentId === 'pi'),
     isAgentSessionRunning: mock(() => false),
@@ -537,9 +536,17 @@ function makeService(overrides = {}) {
       }),
     ),
   };
+  const chatViews = overrides.chatViews ?? {
+    getNativeHistoryLastSeq: mock(() => null),
+  };
+  const idleReconciler = overrides.idleReconciler ?? {
+    ensureReconciled: mock(async () => undefined),
+  };
   const service = new ChatCommandService({
     chats,
     queue,
+    chatViews,
+    idleReconciler,
     ledger,
     settings,
     recentTitleIcons: {
@@ -561,6 +568,8 @@ function makeService(overrides = {}) {
     service,
     chats,
     queue,
+    chatViews,
+    idleReconciler,
     settings,
     agents,
     pendingInputs,
@@ -1659,7 +1668,7 @@ describe('ChatCommandService', () => {
     const { service, queue, forkChatFileCopy } = makeService({
       session: { agentSessionId: null, nativeSession: null },
     });
-    queue.hasChatExecutionOwner.mockReturnValue(true);
+    queue.ownsExecution.mockReturnValue(true);
 
     await expect(service.forkChat({
       sourceChatId: SOURCE_CHAT_ID,
@@ -1806,10 +1815,10 @@ describe('ChatCommandService', () => {
     expect(forkChatFileCopy).not.toHaveBeenCalled();
   });
 
-  it('rejects a whole-head fork while the source is running', async () => {
+  it('rejects a whole-head fork while the source is running without running-fork support', async () => {
     const { service, agents, forkChatFileCopy } = makeService();
     agents.isAgentSessionRunning.mockReturnValue(true);
-    agents.supportsForkAtMessageWhileRunning.mockReturnValue(true);
+    agents.supportsForkWhileRunning.mockReturnValue(false);
 
     await expect(service.forkChat({
       sourceChatId: SOURCE_CHAT_ID,
@@ -1817,6 +1826,109 @@ describe('ChatCommandService', () => {
     })).rejects.toMatchObject({ code: 'SESSION_BUSY', status: 409, retryable: true });
 
     expect(forkChatFileCopy).not.toHaveBeenCalled();
+  });
+
+  it('copies the transcript for a whole-head fork while the source is running', async () => {
+    const { service, agents, queue, forkChatFileCopy } = makeService();
+    queue.ownsExecution.mockReturnValue(true);
+    agents.isAgentSessionRunning.mockReturnValue(true);
+    agents.supportsForkWhileRunning.mockReturnValue(true);
+
+    await service.forkChat({ sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID });
+
+    expect(forkChatFileCopy).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceChatId: SOURCE_CHAT_ID, targetChatId: TARGET_CHAT_ID }),
+    );
+  });
+
+  it('rejects a whole-head fork while the source session is materializing', async () => {
+    const { service, queue, forkChatFileCopy } = makeService({
+      session: { agentSessionId: null, nativeSession: null },
+    });
+    queue.ownsExecution.mockReturnValue(true);
+
+    await expect(service.forkChat({
+      sourceChatId: SOURCE_CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+    })).rejects.toMatchObject({ code: 'SESSION_BUSY', status: 409, retryable: true });
+
+    expect(forkChatFileCopy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a fork point that only exists on the event stream', async () => {
+    const { service, agents, chatViews, queue, forkChatFileCopy } = makeService();
+    queue.ownsExecution.mockReturnValue(true);
+    agents.isAgentSessionRunning.mockReturnValue(true);
+    agents.supportsForkWhileRunning.mockReturnValue(true);
+    chatViews.getNativeHistoryLastSeq.mockReturnValue(2);
+
+    await expect(service.forkChat({
+      sourceChatId: SOURCE_CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      upToSeq: 3,
+    })).rejects.toMatchObject({
+      code: 'MESSAGE_NOT_IN_NATIVE_HISTORY',
+      status: 409,
+      retryable: true,
+    });
+
+    expect(forkChatFileCopy).not.toHaveBeenCalled();
+  });
+
+  it('reconciles an idle source before resolving its fork point', async () => {
+    const { service, chatViews, idleReconciler, forkChatFileCopy } = makeService();
+    chatViews.getNativeHistoryLastSeq.mockReturnValue(0);
+    // Reconciling is what makes an idle view address native positions, so the guard runs against
+    // the rebuilt boundary rather than the stale one.
+    idleReconciler.ensureReconciled.mockImplementation(async () => {
+      chatViews.getNativeHistoryLastSeq.mockReturnValue(2);
+    });
+
+    await service.forkChat({
+      sourceChatId: SOURCE_CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      upToSeq: 2,
+    });
+
+    expect(idleReconciler.ensureReconciled).toHaveBeenCalledWith(SOURCE_CHAT_ID);
+    expect(forkChatFileCopy).toHaveBeenCalledWith(
+      expect.objectContaining({ upToSequence: 2 }),
+    );
+  });
+
+  it('refuses an idle fork point that native history still does not cover', async () => {
+    const { service, chatViews, forkChatFileCopy } = makeService();
+    chatViews.getNativeHistoryLastSeq.mockReturnValue(1);
+
+    await expect(service.forkChat({
+      sourceChatId: SOURCE_CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      upToSeq: 2,
+    })).rejects.toMatchObject({
+      code: 'MESSAGE_NOT_IN_NATIVE_HISTORY',
+      status: 409,
+      retryable: true,
+    });
+
+    expect(forkChatFileCopy).not.toHaveBeenCalled();
+  });
+
+  it('allows a fork point that native history already covers', async () => {
+    const { service, agents, chatViews, queue, forkChatFileCopy } = makeService();
+    queue.ownsExecution.mockReturnValue(true);
+    agents.isAgentSessionRunning.mockReturnValue(true);
+    agents.supportsForkWhileRunning.mockReturnValue(true);
+    chatViews.getNativeHistoryLastSeq.mockReturnValue(2);
+
+    await service.forkChat({
+      sourceChatId: SOURCE_CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      upToSeq: 2,
+    });
+
+    expect(forkChatFileCopy).toHaveBeenCalledWith(
+      expect.objectContaining({ upToSequence: 2 }),
+    );
   });
 
   it('passes the canonical message cutoff to the owning integration', async () => {
@@ -1840,7 +1952,7 @@ describe('ChatCommandService', () => {
   it('allows message-point forks while the source is processing when the agent supports running forks', async () => {
     const { service, agents, forkChatFileCopy } = makeService();
     agents.isAgentSessionRunning.mockReturnValue(true);
-    agents.supportsForkAtMessageWhileRunning.mockReturnValue(true);
+    agents.supportsForkWhileRunning.mockReturnValue(true);
 
     await service.forkChat({
       sourceChatId: SOURCE_CHAT_ID,
@@ -2302,8 +2414,8 @@ describe('ChatCommandService', () => {
   });
 
   it('strictly queues scheduled input when the existing chat is busy', async () => {
-    const { service, agents, queue } = makeService();
-    agents.isAgentSessionRunning.mockReturnValue(true);
+    const { service, queue } = makeService();
+    queue.ownsExecution.mockReturnValue(true);
 
     const outcome = await service.submitScheduledExistingChat({
       chatId: SOURCE_CHAT_ID,
@@ -2329,8 +2441,10 @@ describe('ChatCommandService', () => {
   });
 
   it('queues scheduled input while a direct turn is still preparing', async () => {
+    // Pins the settlement window: a turn that owns execution without a running provider
+    // session still queues scheduled input rather than starting a direct turn.
     const { service, queue } = makeService({
-      queue: { isChatExecutionReserved: mock(() => true) },
+      queue: { ownsExecution: mock(() => true) },
     });
 
     const outcome = await service.submitScheduledExistingChat({
@@ -2373,8 +2487,8 @@ describe('ChatCommandService', () => {
   });
 
   it('skips scheduled input without queue side effects when configured', async () => {
-    const { service, agents, queue } = makeService();
-    agents.isAgentSessionRunning.mockReturnValue(true);
+    const { service, queue } = makeService();
+    queue.ownsExecution.mockReturnValue(true);
 
     const outcome = await service.submitScheduledExistingChat({
       chatId: SOURCE_CHAT_ID,
@@ -3006,7 +3120,7 @@ describe('ChatCommandService', () => {
     try {
       await waitForCheckpoint(entryRemoved.promise, drain, 'queue drain');
       expect((await queueService.readChatExecutionControl(SOURCE_CHAT_ID)).entries).toEqual([]);
-      expect(queueService.isChatExecutionReserved(SOURCE_CHAT_ID)).toBe(true);
+      expect(queueService.ownsExecution(SOURCE_CHAT_ID)).toBe(true);
 
       await expect(service.updateProjectPath({
         chatId: SOURCE_CHAT_ID,
@@ -3074,8 +3188,7 @@ describe('ChatCommandService', () => {
         clientRequestId: 'req-compact-path-guard',
       });
       await compactStarted.promise;
-      expect(queueService.isChatExecutionReserved(SOURCE_CHAT_ID)).toBe(true);
-      expect(queueService.hasChatExecutionOwner(SOURCE_CHAT_ID)).toBe(true);
+      expect(queueService.ownsExecution(SOURCE_CHAT_ID)).toBe(true);
 
       holdNextQueueRead = true;
       pathUpdate = service.updateProjectPath({
@@ -3086,8 +3199,9 @@ describe('ChatCommandService', () => {
 
       releaseCompact.resolve();
       await service.waitForBackgroundTasks();
-      expect(queueService.isChatExecutionReserved(SOURCE_CHAT_ID)).toBe(false);
-      expect(queueService.hasChatExecutionOwner(SOURCE_CHAT_ID)).toBe(true);
+      // The direct reservation is gone but its attempt is retained, so the chat still owns
+      // execution across the handoff; that is one question now, not two.
+      expect(queueService.ownsExecution(SOURCE_CHAT_ID)).toBe(true);
 
       releaseQueueRead.resolve();
       await expect(pathUpdate).rejects.toMatchObject({
@@ -3098,7 +3212,7 @@ describe('ChatCommandService', () => {
 
       runtimeRunning = false;
       queueService.onAgentTurnTerminal(SOURCE_CHAT_ID, compactTurn);
-      expect(queueService.hasChatExecutionOwner(SOURCE_CHAT_ID)).toBe(false);
+      expect(queueService.ownsExecution(SOURCE_CHAT_ID)).toBe(false);
       await expect(service.updateProjectPath({
         chatId: SOURCE_CHAT_ID,
         projectPath: nextPath,

@@ -54,7 +54,7 @@ const queue = {
   deleteChatQueueFile: mock(() => Promise.resolve(undefined)),
   reserveTranscriptSnapshot: mock((chatId) => ({ chatId, reservationId: 'snapshot-reservation' })),
   releaseTranscriptSnapshot: mock(() => Promise.resolve(undefined)),
-  hasChatExecutionOwner: mock(() => false),
+  ownsExecution: mock(() => false),
 };
 const pathCache = createRoutePathCache();
 const metadata = {
@@ -69,7 +69,7 @@ const agents = {
   startSession: mock(() => undefined),
   supportsFork: mock(() => true),
   supportsForkAtMessage: mock(() => true),
-  supportsForkAtMessageWhileRunning: mock(() => false),
+  supportsForkWhileRunning: mock(() => false),
   isAgentSessionRunning: mock(() => false),
   forkAgentSession: mock(() => Promise.resolve({})),
   discardForkedAgentSession: mock(() => Promise.resolve(undefined)),

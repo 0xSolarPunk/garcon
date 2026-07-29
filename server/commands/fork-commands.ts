@@ -43,8 +43,8 @@ export class ForkCommands {
       chatId: this.support.requireChatId(input.chatId),
     };
     return this.support.withChatMutationLocks([normalized.sourceChatId, normalized.chatId], async () => {
-      const context = this.validateFork(normalized);
-      if (context.upToSeq !== undefined) {
+      const context = await this.validateFork(normalized);
+      if (context.upToSeq !== undefined || this.forksSourceDuringExecution(context)) {
         await this.forkChatFromContext(context);
         return { success: true, chat: await this.support.projectCommandChat(context.targetChatId) };
       }
@@ -107,7 +107,7 @@ export class ForkCommands {
     const preparedFork = priorRecord?.forkPreparation;
     const forkAlreadyCreated = preparedFork !== undefined
       && this.deps.chats.getChat(input.chatId) !== null;
-    const forkContext = this.validateFork(input, { allowExistingTarget: forkAlreadyCreated });
+    const forkContext = await this.validateFork(input, { allowExistingTarget: forkAlreadyCreated });
     if (preparedFork?.sourceNextForkOrdinal !== undefined) {
       forkContext.sourceNextForkOrdinal = preparedFork.sourceNextForkOrdinal;
     }
@@ -170,13 +170,15 @@ export class ForkCommands {
       return { ...result, chat: await this.support.projectCommandChat(input.chatId) };
     };
 
-    return forkAlreadyCreated ? submit() : this.withSettledSourceSnapshot(forkContext, submit);
+    return forkAlreadyCreated || this.forksSourceDuringExecution(forkContext)
+      ? submit()
+      : this.withSettledSourceSnapshot(forkContext, submit);
   }
 
-  private validateFork(
+  private async validateFork(
     input: ForkChatCommandRequest,
     options: { allowExistingTarget?: boolean } = {},
-  ): ForkContext {
+  ): Promise<ForkContext> {
     const sourceChatId = this.support.requireChatId(input.sourceChatId, 'sourceChatId');
     const targetChatId = this.support.requireChatId(input.chatId);
     const upToSeq = input.upToSeq;
@@ -210,16 +212,26 @@ export class ForkCommands {
         422,
       );
     }
+    // A starting chat has no provider session to copy yet, so any fork would silently drop the
+    // turn that is materializing it.
+    if (this.deps.queue.ownsExecution(sourceChatId) && !sourceSession.agentSessionId) {
+      throw new CommandValidationError('SESSION_BUSY', 'Cannot fork a chat while it is materializing', 409, true);
+    }
     if (upToSeq !== undefined) {
-      if (this.deps.queue.hasChatExecutionOwner(sourceChatId) && !sourceSession.agentSessionId) {
-        throw new CommandValidationError('SESSION_BUSY', 'Cannot fork a chat while it is materializing', 409, true);
-      }
+      // Asks about the provider session specifically, not execution ownership: a provider that
+      // cannot tolerate a live copy only objects while its own turn runs, and widening this to
+      // ownsExecution would refuse forks during windows the provider never observes.
       if (
         this.deps.agents.isAgentSessionRunning(sourceSession.agentId, sourceSession.agentSessionId)
-        && !this.deps.agents.supportsForkAtMessageWhileRunning(sourceSession.agentId)
+        && !this.deps.agents.supportsForkWhileRunning(sourceSession.agentId)
       ) {
         throw new CommandValidationError('SESSION_BUSY', 'Cannot fork a chat while it is processing', 409, true);
       }
+      // An idle view can still number its messages from the event stream, so rebuild it from
+      // native history first rather than trusting a stale boundary. Reconciling is a no-op once
+      // the view is native-backed, and it declines while a turn owns the chat.
+      await this.deps.idleReconciler.ensureReconciled(sourceChatId);
+      this.assertSeqIsNativeBacked(sourceChatId, upToSeq);
     }
     if (!options.allowExistingTarget && this.deps.chats.getChat(targetChatId)) {
       throw new CommandValidationError('IDEMPOTENCY_CONFLICT', `Session already exists: ${targetChatId}`, 409);
@@ -232,6 +244,35 @@ export class ForkCommands {
       sourceNextForkOrdinal: normalizeNextForkOrdinal(sourceSession.nextForkOrdinal) ?? 1,
       ...(upToSeq ? { upToSeq } : {}),
     };
+  }
+
+  // Providers stream a turn's items before persisting them, so a running chat's view holds live
+  // messages that the native transcript cannot resolve yet. Translating those seqs into native
+  // positions silently forks at the wrong message, so they are refused until the turn settles.
+  // Only executing sources are checked: an idle transcript has stopped moving underneath the view.
+  // The bound is the current generation's, and the request carries no generation, so a seq the
+  // client captured before a generation replacement is still trusted; binding forks to a
+  // generation would close that remaining window.
+  private assertSeqIsNativeBacked(sourceChatId: string, upToSeq: number): void {
+    const nativeLastSeq = this.deps.chatViews.getNativeHistoryLastSeq(sourceChatId);
+    if (nativeLastSeq === null || upToSeq <= nativeLastSeq) return;
+    throw new CommandValidationError(
+      'MESSAGE_NOT_IN_NATIVE_HISTORY',
+      "This message hasn't been written to the provider's transcript yet. Wait for the turn to finish, then reload from native history and pick the message again.",
+      409,
+      true,
+    );
+  }
+
+  // An executing source cannot reserve a transcript snapshot, so providers that tolerate a live
+  // fork copy the transcript as it stands instead of waiting for the turn to settle. Execution
+  // ownership rather than provider state is the signal, because the two disagree while a turn is
+  // being dispatched and again while it settles. Ownership is narrower than the reservation's
+  // refusal, which also covers a running session with no owner; attempt retirement only happens
+  // once the session has stopped running, so that combination is unreachable here.
+  private forksSourceDuringExecution(context: ForkContext): boolean {
+    return this.deps.queue.ownsExecution(context.sourceChatId)
+      && this.deps.agents.supportsForkWhileRunning(context.sourceSession.agentId);
   }
 
   private async withSettledSourceSnapshot<T>(
