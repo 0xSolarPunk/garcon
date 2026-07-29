@@ -21,13 +21,14 @@ import { assertSameApiProviderBoundary } from '../api-providers/endpoint-resolve
 import { getMaxSessions } from '../config.js';
 import { resolveFileMentionsInCommand } from '../chats/file-mentions.js';
 import { createLogger } from '../lib/log.js';
-import { DomainError, TRANSCRIPT_UNAVAILABLE_MESSAGE } from '../lib/domain-error.js';
+import { DomainError, transcriptUnavailableMessage } from '../lib/domain-error.js';
 import type { AgentDirectory } from './directory.js';
 import type { AgentEventBus } from './event-bus.js';
 import type {
   AgentChatEntry,
   AgentExecutionAdmission,
   AgentExecutionCommandType,
+  ForkedAgentSessionOutcome,
   PrepareProjectPathUpdateRequest,
   RunAgentTurnOptions,
   StartedAgentSession,
@@ -371,7 +372,7 @@ export class AgentRuntimeRouter {
     sourceChatId: string;
     targetChatId: string;
     messageSequence?: number;
-  }): Promise<StartedAgentSession | null> {
+  }): Promise<ForkedAgentSessionOutcome | null> {
     if (
       args.messageSequence !== undefined
       && (!Number.isSafeInteger(args.messageSequence) || args.messageSequence <= 0)
@@ -432,9 +433,13 @@ export class AgentRuntimeRouter {
           },
         } : null,
       });
+      if (result.kind === 'unmaterialized') return result;
       return {
-        agentSessionId: result.agentSessionId,
-        nativeSession: result.nativeSession,
+        kind: 'materialized',
+        session: {
+          agentSessionId: result.session.agentSessionId,
+          nativeSession: result.session.nativeSession,
+        },
       };
     } catch (error) {
       if (error instanceof AgentIntegrationError && error.code === 'OPERATION_UNSUPPORTED') {
@@ -446,7 +451,7 @@ export class AgentRuntimeRouter {
       if (error instanceof AgentIntegrationError && error.code === 'TRANSCRIPT_UNAVAILABLE') {
         throw new DomainError(
           'TRANSCRIPT_UNAVAILABLE',
-          TRANSCRIPT_UNAVAILABLE_MESSAGE,
+          transcriptUnavailableMessage(error.retryable),
           422,
           error.retryable,
         );
