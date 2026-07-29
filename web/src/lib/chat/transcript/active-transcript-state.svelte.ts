@@ -21,6 +21,8 @@ type InitialRevealPhase = 'pending' | 'revealing' | 'complete';
 
 export type ChatLoadStatus = 'idle' | 'loading' | 'loaded' | 'empty' | 'error';
 export type OlderMessagesLoadResult = 'loaded' | 'exhausted' | 'invalidated' | 'failed';
+export type TranscriptWindowLoadResult = 'loaded' | 'invalidated' | 'failed';
+export type TranscriptWindowTarget = 'initial' | 'latest';
 
 export interface ChatLoadMessagesOptions {
 	minimumLimit?: number;
@@ -98,11 +100,15 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 	isUserScrolledUp = $state(false);
 	loadStatus = $state<ChatLoadStatus>('idle');
 	loadError = $state<string | null>(null);
+	isViewingInitialMessages = $state(false);
 	#snapshotBuffer: Array<{ generationId: string; messages: ChatViewMessage[] }> | null = null;
 	#loadEpoch = 0;
+	#pendingUserInputsRevision = 0;
+	#pendingUserInputsRevisionAtLoadStart = 0;
 	#loadMorePromise: Promise<OlderMessagesLoadResult> | null = null;
 	#loadingMoreChatId: string | null = null;
 	#loadMoreOperationEpoch = 0;
+	#windowNavigationEpoch = 0;
 	#initialRevealPhase = $state<InitialRevealPhase>('complete');
 
 	constructor(transcriptCache = new ChatTranscriptCache({ limit: INITIAL_VISIBLE_MESSAGES })) {
@@ -127,6 +133,10 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		return ids;
 	});
 
+	#displayLocalNotices = $derived(
+		this.isViewingInitialMessages ? ([] as LocalNoticeRow[]) : this.localNotices,
+	);
+
 	#displayRows = $derived.by(() => {
 		const durableRows = this.#renderEntries.map((entry) => ({
 			kind: 'message' as const,
@@ -138,8 +148,8 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 			this.visiblePendingInputs.length === 0
 				? durableRows
 				: mergeRowsWithPendingInputs(durableRows, this.visiblePendingInputs);
-		if (this.localNotices.length === 0) return merged;
-		return [...merged, ...this.localNotices];
+		if (this.#displayLocalNotices.length === 0) return merged;
+		return [...merged, ...this.#displayLocalNotices];
 	});
 
 	#displayMessages = $derived.by(() =>
@@ -147,12 +157,15 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 	);
 
 	#displayMessageCount = $derived.by(
-		() => this.#renderEntries.length + this.visiblePendingInputs.length + this.localNotices.length,
+		() =>
+			this.#renderEntries.length +
+			this.visiblePendingInputs.length +
+			this.#displayLocalNotices.length,
 	);
 
 	#visibleRows = $derived.by(() => {
-		const noticeCount = Math.min(this.localNotices.length, this.visibleMessageCount);
-		const visibleNotices = this.localNotices.slice(-noticeCount);
+		const noticeCount = Math.min(this.#displayLocalNotices.length, this.visibleMessageCount);
+		const visibleNotices = this.#displayLocalNotices.slice(-noticeCount);
 		const messageLimit = this.visibleMessageCount - noticeCount;
 		if (messageLimit === 0) return visibleNotices;
 
@@ -205,6 +218,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 	}
 
 	get visiblePendingInputs(): PendingUserInput[] {
+		if (this.isViewingInitialMessages) return [];
 		return this.pendingUserInputs.filter(
 			(input) => !this.#echoedClientRequestIds.has(input.clientRequestId),
 		);
@@ -245,6 +259,17 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 			);
 			return 'gap-detected';
 		}
+		if (this.isViewingInitialMessages) {
+			this.generationId = generationId;
+			this.lastSeq = result.lastSeq;
+			if (result.changed) {
+				this.localNotices = [];
+			}
+			if (this.entries.length > 0 && this.loadStatus !== 'error') {
+				this.loadStatus = 'loaded';
+			}
+			return 'applied';
+		}
 		const applied = applyChatViewMessages(this.entries, messages, this.lastSeq);
 		if (applied.status === 'applied') {
 			this.generationId = generationId;
@@ -270,7 +295,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 	}
 
 	beginSnapshotLoad(): number {
-		const epoch = ++this.#loadEpoch;
+		const epoch = this.#beginLoadEpoch();
 		this.#snapshotBuffer = [];
 		this.isLoadingMessages = true;
 		this.loadStatus = 'loading';
@@ -309,11 +334,10 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		this.oldestSeq = options.pageOldestSeq;
 		this.hasMoreMessages = options.hasMore;
 		this.totalMessages = messages.length;
-		this.pendingUserInputs = options.pendingUserInputs
-			? sortPendingInputs(options.pendingUserInputs)
-			: [];
+		this.#replacePendingUserInputs(options.pendingUserInputs ?? []);
 		this.visibleMessageCount = INITIAL_VISIBLE_MESSAGES;
 		this.#initialRevealPhase = 'complete';
+		this.isViewingInitialMessages = false;
 		this.localNotices = [];
 		this.loadStatus = messages.length === 0 ? 'empty' : 'loaded';
 		this.loadError = null;
@@ -354,11 +378,14 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		this.oldestSeq = page.pageOldestSeq;
 		this.hasMoreMessages = page.hasMore;
 		this.totalMessages = page.messages.length;
-		this.pendingUserInputs = pendingInputsFromPage(page);
+		if (this.#pendingUserInputsRevision === this.#pendingUserInputsRevisionAtLoadStart) {
+			this.#replacePendingUserInputs(pendingInputsFromPage(page));
+		}
 		this.localNotices = [];
 		this.loadStatus = page.messages.length === 0 ? 'empty' : 'loaded';
 		this.loadError = null;
 		this.isLoadingMessages = false;
+		this.isViewingInitialMessages = false;
 		for (const batch of buffered) {
 			const result = this.applyMessages(chatId, batch.generationId, batch.messages);
 			if (result !== 'applied') return result;
@@ -504,7 +531,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 	}
 
 	setPendingUserInputs(inputs: PendingUserInput[]): void {
-		this.pendingUserInputs = sortPendingInputs(inputs);
+		this.#replacePendingUserInputs(inputs);
 	}
 
 	upsertPendingUserInput(input: PendingUserInput): void {
@@ -513,31 +540,45 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		const index = next.findIndex((entry) => entry.clientRequestId === input.clientRequestId);
 		if (index >= 0) next[index] = input;
 		else next.push(input);
-		this.pendingUserInputs = sortPendingInputs(next);
+		this.#replacePendingUserInputs(next);
 	}
 
 	clearPendingUserInput(clientRequestId: string): void {
-		this.pendingUserInputs = this.pendingUserInputs.filter(
+		const next = this.pendingUserInputs.filter(
 			(input) => input.clientRequestId !== clientRequestId,
 		);
+		if (next.length === this.pendingUserInputs.length) return;
+		this.#replacePendingUserInputs(next);
 	}
 
 	updatePendingUserInputDeliveryStatus(
 		clientRequestId: string,
 		deliveryStatus: UserMessageDeliveryStatus,
 	): void {
-		this.pendingUserInputs = this.pendingUserInputs.map((input) =>
-			input.clientRequestId === clientRequestId ? { ...input, deliveryStatus } : input,
+		const current = this.pendingUserInputs.find(
+			(input) => input.clientRequestId === clientRequestId,
 		);
+		if (!current || current.deliveryStatus === deliveryStatus) return;
+		this.#replacePendingUserInputs(
+			this.pendingUserInputs.map((input) =>
+				input.clientRequestId === clientRequestId ? { ...input, deliveryStatus } : input,
+			),
+		);
+	}
+
+	#replacePendingUserInputs(inputs: PendingUserInput[]): void {
+		this.#pendingUserInputsRevision += 1;
+		this.pendingUserInputs = sortPendingInputs(inputs);
 	}
 
 	clearMessages(): void {
 		this.#invalidateLoadMoreOperation();
+		this.#loadEpoch += 1;
 		this.entries = [];
 		this.generationId = '';
 		this.lastSeq = 0;
 		this.oldestSeq = 0;
-		this.pendingUserInputs = [];
+		this.#replacePendingUserInputs([]);
 		this.localNotices = [];
 		this.hasMoreMessages = false;
 		this.totalMessages = 0;
@@ -545,6 +586,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		this.loadError = null;
 		this.#snapshotBuffer = null;
 		this.#initialRevealPhase = 'complete';
+		this.isViewingInitialMessages = false;
 	}
 
 	loadEarlierMessages(): void {
@@ -578,21 +620,100 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		this.#initialRevealPhase = 'complete';
 	}
 
-	async loadAllMessages(chatId: string): Promise<void> {
-		const generationId = this.generationId;
-		const operationEpoch = this.#loadMoreOperationEpoch;
-		const isCurrentTranscript = () =>
-			this.#isCurrentLoadMoreOperation(chatId, generationId, operationEpoch);
-		if (!isCurrentTranscript()) return;
+	async navigateToWindow(
+		chatId: string,
+		target: TranscriptWindowTarget,
+	): Promise<TranscriptWindowLoadResult> {
+		if (!chatId || this.activeChatId !== chatId) return 'invalidated';
+		if (this.#snapshotBuffer) return 'invalidated';
+		const alreadyAtTarget =
+			target === 'latest'
+				? !this.isViewingInitialMessages
+				: this.isViewingInitialMessages ||
+					(this.oldestSeq === 1 &&
+						this.entries.length <= MESSAGES_PER_PAGE &&
+						this.entries.at(-1)?.seq === this.lastSeq);
 
-		while (isCurrentTranscript() && this.hasMoreMessages) {
-			const result = await this.loadMoreMessages(chatId);
-			if (!isCurrentTranscript()) return;
-			if (result !== 'loaded') break;
+		const windowNavigationEpoch = ++this.#windowNavigationEpoch;
+		const loadEpoch = this.#beginLoadEpoch();
+		this.#invalidateLoadMoreOperation();
+		this.isLoadingMessages = false;
+		if (alreadyAtTarget) return 'loaded';
+
+		const generationId = this.generationId;
+		const latestLastSeq = this.lastSeq;
+
+		try {
+			const page = await getChatMessages(
+				target === 'initial'
+					? {
+							chatId,
+							limit: MESSAGES_PER_PAGE,
+							beforeSeq: Math.min(latestLastSeq + 1, MESSAGES_PER_PAGE + 1),
+						}
+					: { chatId, limit: MESSAGES_PER_PAGE },
+			);
+			if (
+				windowNavigationEpoch !== this.#windowNavigationEpoch ||
+				loadEpoch !== this.#loadEpoch ||
+				this.activeChatId !== chatId ||
+				this.generationId !== generationId
+			) {
+				return 'invalidated';
+			}
+			if (page.generationId !== generationId) {
+				this.transcriptCache.markStale(chatId);
+				return 'invalidated';
+			}
+
+			if (target === 'latest') {
+				const cached = this.transcriptCache.get(chatId);
+				const latestPage =
+					cached &&
+					!cached.stale &&
+					cached.generationId === page.generationId &&
+					cached.lastSeq > page.lastSeq
+						? {
+								...page,
+								messages: cached.messages,
+								lastSeq: cached.lastSeq,
+								pageOldestSeq: cached.oldestSeq,
+							}
+						: page;
+				return this.setFromPage(chatId, latestPage, loadEpoch) === 'applied'
+					? 'loaded'
+					: 'invalidated';
+			}
+
+			this.entries = page.messages;
+			this.oldestSeq = page.pageOldestSeq;
+			this.hasMoreMessages = false;
+			this.totalMessages = page.messages.length;
+			this.visibleMessageCount = page.messages.length;
+			this.#initialRevealPhase = 'complete';
+			const initialWindowServerLastSeq = Math.max(this.lastSeq, page.lastSeq);
+			this.isViewingInitialMessages = (page.messages.at(-1)?.seq ?? 0) < initialWindowServerLastSeq;
+			if (this.isViewingInitialMessages) this.isUserScrolledUp = true;
+			this.loadStatus = page.messages.length === 0 ? 'empty' : 'loaded';
+			this.loadError = null;
+			return 'loaded';
+		} catch (error) {
+			if (
+				windowNavigationEpoch !== this.#windowNavigationEpoch ||
+				loadEpoch !== this.#loadEpoch ||
+				this.activeChatId !== chatId ||
+				this.generationId !== generationId
+			) {
+				return 'invalidated';
+			}
+			console.error(`Error loading ${target} messages:`, error);
+			return 'failed';
 		}
-		if (!isCurrentTranscript()) return;
-		this.visibleMessageCount = Math.max(this.visibleMessageCount, this.displayMessageCount);
-		this.#initialRevealPhase = 'complete';
+	}
+
+	#beginLoadEpoch(): number {
+		this.#pendingUserInputsRevisionAtLoadStart = this.#pendingUserInputsRevision;
+		return ++this.#loadEpoch;
 	}
 
 	resetForNewChat(): void {
