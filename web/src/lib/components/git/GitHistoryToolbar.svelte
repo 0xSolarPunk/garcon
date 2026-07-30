@@ -32,8 +32,8 @@
 			label: m.git_header_refresh(),
 			icon: RefreshCw,
 			onclick: onRefresh,
-			disabled: controller.history.listLoading || controller.history.commitLoading,
-			busy: controller.history.listLoading || controller.history.commitLoading,
+			disabled: controller.history.activeScreenLoading,
+			busy: controller.history.activeScreenLoading,
 			priority: 0,
 		},
 	]);

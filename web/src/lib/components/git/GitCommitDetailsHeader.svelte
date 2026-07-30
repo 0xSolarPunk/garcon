@@ -2,7 +2,6 @@
 	import ArrowLeft from '@lucide/svelte/icons/arrow-left';
 	import Copy from '@lucide/svelte/icons/copy';
 	import GitBranch from '@lucide/svelte/icons/git-branch';
-	import GitCompareArrows from '@lucide/svelte/icons/git-compare-arrows';
 	import Undo2 from '@lucide/svelte/icons/undo-2';
 	import type { GitCommitSnapshotReady } from '$lib/api/git.js';
 	import type { DiffMode } from '$lib/git/workbench/git-workbench-types.js';
@@ -15,7 +14,6 @@
 		onBack: () => void;
 		onSelectParent: (parentHash: string | null) => void;
 		onRevertCommit: () => void;
-		onCompare: () => void;
 		diffMode: DiffMode;
 		contextLines: number;
 		diffFontSize: string;
@@ -32,7 +30,6 @@
 		onBack,
 		onSelectParent,
 		onRevertCommit,
-		onCompare,
 		diffMode,
 		contextLines,
 		diffFontSize,
@@ -79,7 +76,7 @@
 </script>
 
 <div class="border-b border-border bg-background px-3 py-2">
-	<div class="flex min-w-0 items-start gap-2">
+	<div class="flex min-w-0 items-start gap-2" data-git-commit-details-primary>
 		<button
 			type="button"
 			class="mt-0.5 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-interactive-accent"
@@ -129,6 +126,9 @@
 				</details>
 			{/if}
 		</div>
+		{#if showFileTreeToggle}
+			<GitFileTreeToggleButton visible={fileTreeVisible} onToggle={onToggleFileTree} />
+		{/if}
 	</div>
 
 	<div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
@@ -152,9 +152,6 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-2">
-			{#if showFileTreeToggle}
-				<GitFileTreeToggleButton visible={fileTreeVisible} onToggle={onToggleFileTree} />
-			{/if}
 			<GitDiffSettingsMenu
 				{diffMode}
 				{contextLines}
@@ -163,14 +160,6 @@
 				{onSetContextLines}
 				{onSetDiffFontSize}
 			/>
-			<button
-				type="button"
-				class="inline-flex items-center gap-1.5 rounded border border-border px-2.5 py-1 text-xs font-medium text-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-interactive-accent"
-				onclick={onCompare}
-			>
-				<GitCompareArrows class="h-3.5 w-3.5" />
-				{m.git_compare_action()}
-			</button>
 			<button
 				type="button"
 				class="inline-flex items-center gap-1.5 rounded border border-status-warning-border px-2.5 py-1 text-xs font-medium text-status-warning hover:bg-status-warning/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-interactive-accent"
