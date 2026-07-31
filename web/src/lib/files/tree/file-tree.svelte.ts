@@ -12,14 +12,17 @@ import { isAbortError } from '$lib/utils/is-abort-error.js';
 import type { WorkspaceProjectState } from '$lib/workspace/workspace-context.svelte.js';
 import type { FileTreeBreadcrumb, FileTreeEntry, FileTreeResponse } from '$shared/file-contracts';
 
-export type SortKey = 'name' | 'size' | 'modified' | 'permissions';
 export type SortDirection = 'asc' | 'desc';
 
 export const FILE_TREE_COLUMN_KEYS = ['name', 'size', 'modified', 'permissions'] as const;
 export type FileTreeColumnKey = (typeof FILE_TREE_COLUMN_KEYS)[number];
 export type OptionalFileTreeColumnKey = Exclude<FileTreeColumnKey, 'name'>;
+export type SortKey = FileTreeColumnKey;
 export type FileTreeColumnWidths = Record<FileTreeColumnKey, number>;
 export type FileTreeColumnVisibility = Record<OptionalFileTreeColumnKey, boolean>;
+
+export const FILE_TREE_VIEW_PREFERENCES = ['responsive', 'always-details'] as const;
+export type FileTreeViewPreference = (typeof FILE_TREE_VIEW_PREFERENCES)[number];
 
 export const DEFAULT_FILE_TREE_COLUMN_WIDTHS: Readonly<FileTreeColumnWidths> = {
 	name: 42,
@@ -49,11 +52,7 @@ export interface FileTreeNavigationError {
 }
 
 export type FileTreeDirectoryTargetReason =
-	| 'initial'
-	| 'directory-row'
-	| 'parent-row'
-	| 'breadcrumb'
-	| 'chat-project';
+	'initial' | 'directory-row' | 'parent-row' | 'breadcrumb' | 'chat-project';
 
 export interface FileTreeDirectoryTarget {
 	path: string;
@@ -128,6 +127,14 @@ function parseColumnVisibility(raw: string | null): FileTreeColumnVisibility | n
 	}
 }
 
+function isFileTreeViewPreference(value: string | null): value is FileTreeViewPreference {
+	return value !== null && FILE_TREE_VIEW_PREFERENCES.includes(value as FileTreeViewPreference);
+}
+
+function isSortKey(value: string): value is SortKey {
+	return FILE_TREE_COLUMN_KEYS.includes(value as FileTreeColumnKey);
+}
+
 function fileTreeNavigationError(error: unknown): FileTreeNavigationError {
 	if (error instanceof ApiError) {
 		return {
@@ -186,6 +193,7 @@ export class FileTreeStore {
 	foldersFirst = $state(true);
 	showHiddenFiles = $state(true);
 	showBreadcrumbs = $state(true);
+	viewPreference = $state<FileTreeViewPreference>('responsive');
 	visibleColumns = $state.raw<FileTreeColumnVisibility>(
 		copyColumnVisibility(DEFAULT_FILE_TREE_COLUMN_VISIBILITY),
 	);
@@ -532,23 +540,34 @@ export class FileTreeStore {
 		this.filterInput = '';
 	}
 
-	setSortKey(key: SortKey): void {
-		this.sortKey = key;
-		this.#persist(LOCAL_STORAGE_KEYS.fileTreeSortKey, key);
+	setViewPreference(preference: FileTreeViewPreference): void {
+		if (preference === this.viewPreference) return;
+		this.viewPreference = preference;
+		this.#persist(LOCAL_STORAGE_KEYS.fileTreeViewPreference, preference);
 	}
 
-	setSortDirection(direction: SortDirection): void {
+	setAlwaysUseDetailedRows(always: boolean): void {
+		this.setViewPreference(always ? 'always-details' : 'responsive');
+	}
+
+	selectSortKey(value: string): void {
+		if (!isSortKey(value) || !this.isColumnVisible(value) || value === this.sortKey) return;
+		this.setSort(value, 'asc');
+	}
+
+	setSort(key: SortKey, direction: SortDirection): void {
+		this.sortKey = key;
 		this.sortDirection = direction;
+		this.#persist(LOCAL_STORAGE_KEYS.fileTreeSortKey, key);
 		this.#persist(LOCAL_STORAGE_KEYS.fileTreeSortDirection, direction);
 	}
 
+	setSortDirection(direction: SortDirection): void {
+		this.setSort(this.sortKey, direction);
+	}
+
 	toggleSort(key: SortKey): void {
-		if (this.sortKey === key) {
-			this.setSortDirection(this.sortDirection === 'asc' ? 'desc' : 'asc');
-			return;
-		}
-		this.setSortKey(key);
-		this.setSortDirection('asc');
+		this.setSort(key, this.sortKey === key && this.sortDirection === 'asc' ? 'desc' : 'asc');
 	}
 
 	setFoldersFirst(value: boolean): void {
@@ -570,8 +589,7 @@ export class FileTreeStore {
 		this.visibleColumns = { ...this.visibleColumns, [column]: visible };
 		this.#persist(LOCAL_STORAGE_KEYS.fileTreeColumnVisibility, JSON.stringify(this.visibleColumns));
 		if (!visible && this.sortKey === column) {
-			this.setSortKey('name');
-			this.setSortDirection('asc');
+			this.setSort('name', 'asc');
 		}
 	}
 
@@ -750,9 +768,7 @@ export class FileTreeStore {
 
 	#loadPreferences(): void {
 		const sortKey = getLocalStorageItem(LOCAL_STORAGE_KEYS.fileTreeSortKey);
-		if (sortKey && FILE_TREE_COLUMN_KEYS.includes(sortKey as FileTreeColumnKey)) {
-			this.sortKey = sortKey as SortKey;
-		}
+		if (sortKey && isSortKey(sortKey)) this.sortKey = sortKey;
 		const sortDirection = getLocalStorageItem(LOCAL_STORAGE_KEYS.fileTreeSortDirection);
 		if (sortDirection === 'asc' || sortDirection === 'desc') {
 			this.sortDirection = sortDirection;
@@ -769,6 +785,8 @@ export class FileTreeStore {
 		if (showBreadcrumbs === 'true' || showBreadcrumbs === 'false') {
 			this.showBreadcrumbs = showBreadcrumbs === 'true';
 		}
+		const viewPreference = getLocalStorageItem(LOCAL_STORAGE_KEYS.fileTreeViewPreference);
+		if (isFileTreeViewPreference(viewPreference)) this.viewPreference = viewPreference;
 		const visibility = parseColumnVisibility(
 			getLocalStorageItem(LOCAL_STORAGE_KEYS.fileTreeColumnVisibility),
 		);

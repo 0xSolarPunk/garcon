@@ -33,7 +33,7 @@ function readyStore(): FileTreeStore {
 
 async function renderMeasuredToolbar(initialWidth = 270) {
 	const store = readyStore();
-	const { container } = render(FileTreeToolbar, { store });
+	const { container } = render(FileTreeToolbar, { store, viewMode: 'columns' });
 	await tick();
 	const measuredRoot = container.querySelector<HTMLElement>('[data-responsive-surface-actions]');
 	if (!measuredRoot) throw new Error('Expected responsive action root');
@@ -46,9 +46,10 @@ async function renderMeasuredToolbar(initialWidth = 270) {
 			'chat-project': 100,
 			'refresh-files': 32,
 		};
-		element.getBoundingClientRect = () => ({
-			width: widths[element.dataset.surfaceActionMeasure ?? ''] ?? 0,
-		}) as DOMRect;
+		element.getBoundingClientRect = () =>
+			({
+				width: widths[element.dataset.surfaceActionMeasure ?? ''] ?? 0,
+			}) as DOMRect;
 	}
 	const menuMeasure = container.querySelector<HTMLElement>(
 		'[data-surface-action-overflow-measure]',
@@ -126,5 +127,19 @@ describe('FileTreeToolbar', () => {
 		await tick();
 
 		expect(document.activeElement).toBe(screen.getByPlaceholderText('Filter by name...'));
+	});
+
+	it('keeps overflow actions before persistent view controls', async () => {
+		const { setWidth } = await renderMeasuredToolbar();
+		await setWidth(240);
+		await fireEvent.click(screen.getByRole('button', { name: 'File browser actions' }));
+		const refresh = screen.getByRole('menuitem', { name: 'Refresh files' });
+		const details = screen.getByRole('menuitemcheckbox', {
+			name: 'Always use detailed rows',
+		});
+
+		expect(
+			refresh.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING,
+		).toBeTruthy();
 	});
 });
