@@ -1,17 +1,19 @@
 import crypto from 'crypto';
 import type { ApiProtocol } from '../../common/api-providers.js';
 import type { AgentSettingsEnvelope } from '../../common/agent-integration.js';
-import type {
-  AgentInterruptAndSendCommandRequest,
-  AgentRunCommandRequest,
-  AgentStopCommandRequest,
-  CompactCommandRequest,
-  CommandAcceptedResponse,
-  CommandErrorCode,
-  ForkRunCommandRequest,
-  PermissionDecisionCommandRequest,
-  ProjectPathPatchRequest,
-  StartChatCommandRequest,
+import {
+  COMMAND_CORRELATION_ID_MAX_BYTES,
+  isCommandCorrelationIdWithinLimit,
+  type AgentInterruptAndSendCommandRequest,
+  type AgentRunCommandRequest,
+  type AgentStopCommandRequest,
+  type CompactCommandRequest,
+  type CommandAcceptedResponse,
+  type CommandErrorCode,
+  type ForkRunCommandRequest,
+  type PermissionDecisionCommandRequest,
+  type ProjectPathPatchRequest,
+  type StartChatCommandRequest,
 } from '../../common/chat-command-contracts.js';
 import { InvalidChatIdError, parseChatId, type ChatId } from '../../common/chat-id.js';
 import type { PermissionMode, ThinkingMode } from '../../common/chat-modes.js';
@@ -72,6 +74,7 @@ export type PendingInputsDep = Pick<
   | 'clearChat'
   | 'hasInFlightForChat'
   | 'markFailed'
+  | 'markUnconfirmed'
   | 'reconcileNativeHistory'
   | 'reconcileRetainedHistory'
 >;
@@ -125,6 +128,9 @@ export interface ChatViewSeqDep {
   getCursor(chatId: string): { generationId: string; lastSeq: number } | null;
 }
 
+export interface FileMentionResolverDep {
+  resolve(command: string, projectPath: string): Promise<string>;
+}
 
 export interface ChatCommandServiceDeps {
   chats: IChatRegistry;
@@ -137,6 +143,7 @@ export interface ChatCommandServiceDeps {
   metadata: MetadataDep;
   agents: AgentRegistryDep;
   pendingInputs: PendingInputsDep;
+  fileMentions: FileMentionResolverDep;
   forkChatFileCopy: ForkChatFileCopyDep;
   carryOver?: CarryOverDep;
   chatIds: Pick<ChatIdAllocator, 'allocate'>;
@@ -307,10 +314,17 @@ export class CommandSupport {
   }
 
   requireClientRequestId(value: string | undefined, field = 'clientRequestId'): string {
-    if (!value?.trim()) {
+    const normalized = value?.trim();
+    if (!normalized) {
       throw new CommandValidationError('VALIDATION_FAILED', `${field} is required`);
     }
-    return value.trim();
+    if (!isCommandCorrelationIdWithinLimit(normalized)) {
+      throw new CommandValidationError(
+        'VALIDATION_FAILED',
+        `${field} must be at most ${COMMAND_CORRELATION_ID_MAX_BYTES} bytes`,
+      );
+    }
+    return normalized;
   }
 
   requireChatId(value: unknown, field = 'chatId'): ChatId {

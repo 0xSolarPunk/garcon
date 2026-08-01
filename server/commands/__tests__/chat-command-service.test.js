@@ -6,13 +6,14 @@ import { randomUUID } from 'crypto';
 import { AgentIntegrationError } from '@garcon/server-agent-interface';
 
 import { ChatCommandService } from '../chat-command-service.ts';
-import { CommandLedger, commandLedgerKey } from '../command-ledger.ts';
+import { CommandLedger, LEDGER_RECORD_LIMIT, commandLedgerKey } from '../command-ledger.ts';
 import { UserMessage } from '../../../common/chat-types.js';
 import { ChatIdAllocator } from '../../chats/chat-id-allocator.js';
 import {
-  ACTIVE_INPUT_NOT_DELIVERED_MESSAGE,
-  ACTIVE_INPUT_OUTCOME_UNKNOWN_MESSAGE,
-  ActiveInputDeliveryError,
+  GOAL_CONTROL_NOT_DELIVERED_MESSAGE,
+  GOAL_CONTROL_OUTCOME_UNKNOWN_MESSAGE,
+  GoalControlDeliveryError,
+  SteerDeliveryError,
   DomainError,
 } from '../../lib/domain-error.js';
 import {
@@ -21,7 +22,9 @@ import {
 } from '../../chat-execution/chat-execution-coordinator.js';
 import { ChatViewStore } from '../../chats/chat-view-store.js';
 import { PendingUserInputService } from '../../chats/pending-user-input-service.js';
+import { KeyedPromiseLock } from '../../lib/keyed-lock.js';
 import {
+  COMMAND_CORRELATION_ID_MAX_BYTES,
   parseForkChatCommandRequest,
   parseStartChatCommandRequest,
 } from '../../../common/chat-command-contracts.ts';
@@ -310,10 +313,10 @@ function makeService(overrides = {}) {
         throw error;
       }
     }),
-    deliverAcceptedActiveInput: mock(async (input) => {
+    deliverAcceptedGoalControl: mock(async (input) => {
       let deliveryAccepted = false;
       try {
-        const delivered = await queue.deliverActiveInput(
+        const delivered = await queue.deliverGoalControlInput(
           input.command.chatId,
           input.content,
           {
@@ -341,24 +344,24 @@ function makeService(overrides = {}) {
         if (delivered) {
           deliveryAccepted = true;
           activeFallbacks.delete(input.command.key);
-          await input.settlement.settleActiveInput(input.command);
+          await input.settlement.settleGoalControl(input.command);
           return { delivery: 'active', control: await queue.readChatExecutionControl(input.command.chatId) };
         }
         const result = await queue.enqueueAccepted(input);
         return { delivery: 'queued', entryId: result.entryId, control: result.control };
       } catch (error) {
-        deliveryAccepted ||= error instanceof ActiveInputDeliveryError && error.deliveryAccepted;
+        deliveryAccepted ||= error instanceof GoalControlDeliveryError && error.deliveryAccepted;
         if (!deliveryAccepted) activeFallbacks.delete(input.command.key);
-        await input.settlement.settleActiveInputFailure(input.command, error, deliveryAccepted);
+        await input.settlement.settleGoalControlFailure(input.command, error, deliveryAccepted);
         throw error;
       }
     }),
-    recoverAcceptedActiveInput: mock(async (input) => {
+    recoverAcceptedGoalControl: mock(async (input) => {
       const fallback = activeFallbacks.get(input.command.key);
       if (!fallback) {
         throw new DomainError(
           'INTERNAL_ERROR',
-          'The previous active-input delivery did not reach a recorded outcome',
+          'The previous goal-control delivery did not reach a recorded outcome',
           409,
           false,
         );
@@ -379,6 +382,12 @@ function makeService(overrides = {}) {
         entryId: input.command.entryId,
         control,
       };
+    }),
+    captureSteerTarget: mock(() => null),
+    deliverAcceptedSteer: mock(async (input) => {
+      await input.settlement.markScheduled(input.command, input.target.identity.turnId);
+      await input.settlement.settleSteerSuccess(input.command, input.target.identity.turnId);
+      return { turnId: input.target.identity.turnId };
     }),
     registerPendingUserInput: mock(() => Promise.resolve(undefined)),
     reserveTranscriptSnapshot: mock((chatId) => {
@@ -443,7 +452,7 @@ function makeService(overrides = {}) {
         rebased: false,
       }),
     ),
-    deliverActiveInput: mock(() => Promise.resolve(false)),
+    deliverGoalControlInput: mock(() => Promise.resolve(false)),
     clearChatQueue: mock(() => Promise.resolve(storedQueue([], { version: 1 }))),
     pauseChatQueue: mock(() => Promise.resolve(storedQueue([], { version: 1 }))),
     resumeChatQueue: mock(() => Promise.resolve(storedQueue([], { version: 1 }))),
@@ -496,6 +505,7 @@ function makeService(overrides = {}) {
     reconcileRetainedHistory: mock(() => Promise.resolve(undefined)),
     reconcileNativeHistory: mock(() => Promise.resolve(undefined)),
     markFailed: mock(() => false),
+    markUnconfirmed: mock(() => false),
     hasInFlightForChat: mock(() => false),
     ...overrides.pendingInputs,
   };
@@ -543,6 +553,9 @@ function makeService(overrides = {}) {
   const idleReconciler = overrides.idleReconciler ?? {
     ensureReconciled: mock(async () => undefined),
   };
+  const fileMentions = overrides.fileMentions ?? {
+    resolve: mock(async (command) => command),
+  };
   const service = new ChatCommandService({
     chats,
     queue,
@@ -556,6 +569,7 @@ function makeService(overrides = {}) {
     metadata,
     agents,
     pendingInputs,
+    fileMentions,
     chatIds: overrides.chatIds ?? new ChatIdAllocator(chats),
     chatListProjector,
     pathCache,
@@ -574,6 +588,7 @@ function makeService(overrides = {}) {
     settings,
     agents,
     pendingInputs,
+    fileMentions,
     forkChatFileCopy,
     ledger,
     sessions,
@@ -588,6 +603,7 @@ function makeRealQueue(pendingInputsService, turnRunnerOverrides = {}) {
     workspaceDir,
     {
       runAgentTurn: mock(async () => undefined),
+      captureSteerTarget: mock(() => null),
       abortSession: mock(async () => false),
       isChatRunning: mock(() => false),
       waitUntilTurnAbortable: mock(async () => false),
@@ -2366,18 +2382,18 @@ describe('ChatCommandService', () => {
     )).toMatchObject({ status: 'rejected', errorCode: 'QUEUE_ENTRY_REORDER_CONFLICT' });
   });
 
-  it('completes handled active input without exposing a synthetic queue entry', async () => {
+  it('completes handled goal control without exposing a synthetic queue entry', async () => {
     const { service, queue, ledger } = makeService({
       queue: {
         readChatExecutionControl: mock(() => Promise.resolve(storedQueue([], { version: 4 }))),
-        deliverActiveInput: mock(async (_chatId, _content, _options, afterPendingRegistered) => {
+        deliverGoalControlInput: mock(async (_chatId, _content, _options, afterPendingRegistered) => {
           await afterPendingRegistered();
           return true;
         }),
       },
     });
 
-    const result = await service.submitActiveInput({
+    const result = await service.submitGoalControl({
       chatId: SOURCE_CHAT_ID,
       content: '/goal pause',
       clientRequestId: 'request-active',
@@ -2388,14 +2404,607 @@ describe('ChatCommandService', () => {
     expect(result.control.queue.entries).toEqual([]);
     expect(result.entryId).toBeUndefined();
     expect(queue.triggerDrain).not.toHaveBeenCalled();
-    expect(queue.deliverActiveInput).toHaveBeenCalledWith(
+    expect(queue.deliverGoalControlInput).toHaveBeenCalledWith(
       SOURCE_CHAT_ID,
       '/goal pause',
       expect.objectContaining({ clientRequestId: 'request-active' }),
       expect.any(Function),
     );
-    expect(await readLedgerRecord(ledger, 'active-input', 'request-active')).toMatchObject({
+    expect(await readLedgerRecord(ledger, 'goal-control', 'request-active')).toMatchObject({
       status: 'finished',
+    });
+  });
+
+  it('delivers strict steering once under the captured active turn identity', async () => {
+    const target = {
+      attempt: {},
+      identity: { clientRequestId: 'request-active', turnId: 'turn-active' },
+    };
+    const { service, queue, ledger } = makeService({
+      queue: { captureSteerTarget: mock(() => target) },
+    });
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'focus on the failing test',
+      clientRequestId: 'request-steer',
+      clientMessageId: 'message-steer',
+    };
+
+    await expect(service.submitSteer(input)).resolves.toMatchObject({
+      commandType: 'steer',
+      status: 'accepted',
+      turnId: 'turn-active',
+    });
+    await expect(service.submitSteer(input)).resolves.toMatchObject({
+      commandType: 'steer',
+      status: 'duplicate',
+      turnId: 'turn-active',
+    });
+
+    expect(queue.captureSteerTarget).toHaveBeenCalledTimes(2);
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledTimes(1);
+    expect(queue.readChatExecutionControl).not.toHaveBeenCalled();
+    expect(queue.createChatQueueEntry).not.toHaveBeenCalled();
+    expect(await readLedgerRecord(ledger, 'steer', input.clientRequestId)).toMatchObject({
+      status: 'finished',
+      turnId: 'turn-active',
+      entryId: undefined,
+    });
+  });
+
+  it('rejects oversized steering identities before target capture or ledger admission', async () => {
+    const { service, queue, ledger } = makeService();
+    const clientRequestId = 'x'.repeat(COMMAND_CORRELATION_ID_MAX_BYTES + 1);
+
+    await expect(service.submitSteer({
+      chatId: SOURCE_CHAT_ID,
+      content: 'focus here',
+      clientRequestId,
+      clientMessageId: 'message-steer',
+    })).rejects.toMatchObject({
+      code: 'VALIDATION_FAILED',
+      status: 400,
+      message: `clientRequestId must be at most ${COMMAND_CORRELATION_ID_MAX_BYTES} bytes`,
+    });
+
+    expect(queue.captureSteerTarget).not.toHaveBeenCalled();
+    expect(await readLedgerRecord(ledger, 'steer', clientRequestId)).toBeNull();
+  });
+
+  it('captures the strict steering target before waiting for the chat mutation lock', async () => {
+    const lock = new KeyedPromiseLock();
+    const entered = deferred();
+    const release = deferred();
+    const initialTarget = { attempt: {}, identity: { turnId: 'turn-initial' } };
+    const replacementTarget = { attempt: {}, identity: { turnId: 'turn-replacement' } };
+    let currentTarget = initialTarget;
+    const held = lock.runExclusive(`chat:${SOURCE_CHAT_ID}`, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const { service, queue } = makeService({
+      chatMutationLock: lock,
+      queue: { captureSteerTarget: mock(() => currentTarget) },
+    });
+
+    const steering = service.submitSteer({
+      chatId: SOURCE_CHAT_ID,
+      content: 'keep the observed turn',
+      clientRequestId: 'request-steer-captured',
+      clientMessageId: 'message-steer-captured',
+    });
+    expect(queue.captureSteerTarget).toHaveBeenCalledOnce();
+    currentTarget = replacementTarget;
+    release.resolve();
+
+    await expect(steering).resolves.toMatchObject({ turnId: 'turn-initial' });
+    await held;
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledWith(expect.objectContaining({
+      target: initialTarget,
+    }));
+  });
+
+  it('resolves steering file context without holding the chat mutation lock', async () => {
+    const resolutionStarted = deferred();
+    const releaseResolution = deferred();
+    const lock = new KeyedPromiseLock();
+    const target = { attempt: {}, identity: { turnId: 'turn-active' } };
+    const fileMentions = {
+      resolve: mock(async () => {
+        resolutionStarted.resolve();
+        await releaseResolution.promise;
+        return 'focus here\n\nresolved context';
+      }),
+    };
+    const { service, queue } = makeService({
+      chatMutationLock: lock,
+      fileMentions,
+      queue: { captureSteerTarget: mock(() => target) },
+    });
+
+    const steering = service.submitSteer({
+      chatId: SOURCE_CHAT_ID,
+      content: 'focus @notes.txt',
+      clientRequestId: 'request-steer-context',
+      clientMessageId: 'message-steer-context',
+    });
+    await resolutionStarted.promise;
+
+    await expect(service.submitStop({
+      chatId: SOURCE_CHAT_ID,
+      clientRequestId: 'request-stop-during-context',
+    })).resolves.toMatchObject({ status: 'accepted' });
+    expect(queue.deliverAcceptedSteer).not.toHaveBeenCalled();
+
+    releaseResolution.resolve();
+    await expect(steering).resolves.toMatchObject({ turnId: 'turn-active' });
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'focus @notes.txt',
+      providerContent: 'focus here\n\nresolved context',
+    }));
+  });
+
+  it('keeps the first same-identity steering admission while file preparation is delayed', async () => {
+    const resolutionStarted = deferred();
+    const releaseResolution = deferred();
+    const firstTarget = { attempt: {}, identity: { turnId: 'turn-first' } };
+    const secondTarget = { attempt: {}, identity: { turnId: 'turn-second' } };
+    let captureCount = 0;
+    let resolutionCount = 0;
+    const { service, queue, fileMentions } = makeService({
+      fileMentions: {
+        resolve: mock(async () => {
+          resolutionCount += 1;
+          if (resolutionCount === 1) {
+            resolutionStarted.resolve();
+            await releaseResolution.promise;
+            return 'expanded-first';
+          }
+          return 'expanded-second';
+        }),
+      },
+      queue: {
+        captureSteerTarget: mock(() => {
+          captureCount += 1;
+          return captureCount === 1 ? firstTarget : secondTarget;
+        }),
+      },
+    });
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'focus @notes.txt',
+      clientRequestId: 'request-steer-ordered-duplicate',
+      clientMessageId: 'message-steer-ordered-duplicate',
+    };
+
+    const first = service.submitSteer(input);
+    await resolutionStarted.promise;
+    const second = service.submitSteer(input);
+    expect(fileMentions.resolve).toHaveBeenCalledTimes(1);
+
+    releaseResolution.resolve();
+    await expect(first).resolves.toMatchObject({ status: 'accepted', turnId: 'turn-first' });
+    await expect(second).resolves.toMatchObject({ status: 'duplicate', turnId: 'turn-first' });
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledTimes(1);
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledWith(expect.objectContaining({
+      providerContent: 'expanded-first',
+      target: firstTarget,
+    }));
+  });
+
+  it('delivers distinct steers in admission order when the first file preparation is delayed', async () => {
+    const resolutionStarted = deferred();
+    const releaseResolution = deferred();
+    const firstDeliveryStarted = deferred();
+    const releaseFirstDelivery = deferred();
+    const secondResolutionStarted = deferred();
+    const target = { attempt: {}, identity: { turnId: 'turn-active' } };
+    const deliveries = [];
+    const { service, queue, fileMentions } = makeService({
+      fileMentions: {
+        resolve: mock(async (content) => {
+          if (content.startsWith('first')) {
+            resolutionStarted.resolve();
+            await releaseResolution.promise;
+            return 'expanded-first';
+          }
+          secondResolutionStarted.resolve();
+          return 'expanded-second';
+        }),
+      },
+      queue: {
+        captureSteerTarget: mock(() => target),
+        deliverAcceptedSteer: mock(async (input) => {
+          deliveries.push({
+            clientRequestId: input.command.clientRequestId,
+            providerContent: input.providerContent,
+          });
+          if (input.command.clientRequestId === 'request-steer-ordered-first') {
+            firstDeliveryStarted.resolve();
+            await releaseFirstDelivery.promise;
+          }
+          await input.settlement.markScheduled(input.command, target.identity.turnId);
+          await input.settlement.settleSteerSuccess(input.command, target.identity.turnId);
+          return { turnId: target.identity.turnId };
+        }),
+      },
+    });
+
+    const first = service.submitSteer({
+      chatId: SOURCE_CHAT_ID,
+      content: 'first @slow.txt',
+      clientRequestId: 'request-steer-ordered-first',
+      clientMessageId: 'message-steer-ordered-first',
+    });
+    await resolutionStarted.promise;
+    const second = service.submitSteer({
+      chatId: SOURCE_CHAT_ID,
+      content: 'second @fast.txt',
+      clientRequestId: 'request-steer-ordered-second',
+      clientMessageId: 'message-steer-ordered-second',
+    });
+    expect(fileMentions.resolve).toHaveBeenCalledTimes(1);
+    expect(queue.deliverAcceptedSteer).not.toHaveBeenCalled();
+
+    releaseResolution.resolve();
+    await firstDeliveryStarted.promise;
+    await secondResolutionStarted.promise;
+    expect(deliveries).toEqual([{
+      clientRequestId: 'request-steer-ordered-first',
+      providerContent: 'expanded-first',
+    }]);
+
+    releaseFirstDelivery.resolve();
+    await expect(first).resolves.toMatchObject({ status: 'accepted' });
+    await expect(second).resolves.toMatchObject({ status: 'accepted' });
+    expect(deliveries).toEqual([
+      {
+        clientRequestId: 'request-steer-ordered-first',
+        providerContent: 'expanded-first',
+      },
+      {
+        clientRequestId: 'request-steer-ordered-second',
+        providerContent: 'expanded-second',
+      },
+    ]);
+  });
+
+  it('bounds stalled steering file preparation and skips additional uncancellable reads', async () => {
+    const resolutionStarted = deferred();
+    const releaseResolution = deferred();
+    const target = { attempt: {}, identity: { turnId: 'turn-active' } };
+    const deliveries = [];
+    const { service, queue, fileMentions } = makeService({
+      fileMentions: {
+        resolve: mock(async () => {
+          resolutionStarted.resolve();
+          await releaseResolution.promise;
+          return 'late expanded context';
+        }),
+      },
+      queue: {
+        captureSteerTarget: mock(() => target),
+        deliverAcceptedSteer: mock(async (input) => {
+          deliveries.push({
+            clientRequestId: input.command.clientRequestId,
+            providerContent: input.providerContent,
+          });
+          await input.settlement.markScheduled(input.command, target.identity.turnId);
+          await input.settlement.settleSteerSuccess(input.command, target.identity.turnId);
+          return { turnId: target.identity.turnId };
+        }),
+      },
+    });
+    const firstInput = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'first @stalled.txt',
+      clientRequestId: 'request-steer-stalled-first',
+      clientMessageId: 'message-steer-stalled-first',
+    };
+
+    const first = service.submitSteer(firstInput);
+    await resolutionStarted.promise;
+    const duplicate = service.submitSteer(firstInput);
+    const later = service.submitSteer({
+      chatId: SOURCE_CHAT_ID,
+      content: 'later without mentions',
+      clientRequestId: 'request-steer-after-stall',
+      clientMessageId: 'message-steer-after-stall',
+    });
+
+    const results = await Promise.all([first, duplicate, later]);
+    releaseResolution.resolve();
+
+    expect(results).toEqual([
+      expect.objectContaining({ status: 'accepted', turnId: 'turn-active' }),
+      expect.objectContaining({ status: 'duplicate', turnId: 'turn-active' }),
+      expect.objectContaining({ status: 'accepted', turnId: 'turn-active' }),
+    ]);
+    expect(fileMentions.resolve).toHaveBeenCalledTimes(1);
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledTimes(2);
+    expect(deliveries).toEqual([
+      {
+        clientRequestId: 'request-steer-stalled-first',
+        providerContent: 'first @stalled.txt',
+      },
+      {
+        clientRequestId: 'request-steer-after-stall',
+        providerContent: 'later without mentions',
+      },
+    ]);
+  });
+
+  it('records session deletion while steering waits for the chat mutation lock', async () => {
+    const lock = new KeyedPromiseLock();
+    const entered = deferred();
+    const release = deferred();
+    const held = lock.runExclusive(`chat:${SOURCE_CHAT_ID}`, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const target = { attempt: {}, identity: { turnId: 'turn-initial' } };
+    const { service, queue, ledger, sessions } = makeService({
+      chatMutationLock: lock,
+      queue: { captureSteerTarget: mock(() => target) },
+    });
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'do not steer a deleted chat',
+      clientRequestId: 'request-steer-deleted',
+      clientMessageId: 'message-steer-deleted',
+    };
+
+    const steering = service.submitSteer(input);
+    sessions.delete(SOURCE_CHAT_ID);
+    release.resolve();
+
+    await expect(steering).rejects.toMatchObject({
+      code: 'SESSION_NOT_FOUND',
+      status: 404,
+    });
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'SESSION_NOT_FOUND',
+      status: 404,
+    });
+    await held;
+    expect(queue.deliverAcceptedSteer).not.toHaveBeenCalled();
+    expect(await readLedgerRecord(ledger, 'steer', input.clientRequestId)).toMatchObject({
+      status: 'rejected',
+      errorCode: 'SESSION_NOT_FOUND',
+    });
+  });
+
+  it('replays a completed steer identity after its chat is deleted', async () => {
+    const target = { attempt: {}, identity: { turnId: 'turn-active' } };
+    const { service, queue, sessions } = makeService({
+      queue: { captureSteerTarget: mock(() => target) },
+    });
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'retain this outcome',
+      clientRequestId: 'request-steer-retained-after-delete',
+      clientMessageId: 'message-steer-retained-after-delete',
+    };
+
+    await expect(service.submitSteer(input)).resolves.toMatchObject({
+      status: 'accepted',
+      turnId: 'turn-active',
+    });
+    sessions.delete(SOURCE_CHAT_ID);
+
+    await expect(service.submitSteer(input)).resolves.toMatchObject({
+      status: 'duplicate',
+      turnId: 'turn-active',
+    });
+    await expect(service.submitSteer({ ...input, content: 'changed content' })).rejects.toMatchObject({
+      code: 'IDEMPOTENCY_CONFLICT',
+      status: 409,
+    });
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays an unknown steer outcome after its chat is deleted', async () => {
+    const target = { attempt: {}, identity: { turnId: 'turn-active' } };
+    const deliveryError = new SteerDeliveryError(new Error('connection closed'), 'unknown');
+    const { service, queue, sessions } = makeService({
+      queue: {
+        captureSteerTarget: mock(() => target),
+        deliverAcceptedSteer: mock(async (input) => {
+          await input.settlement.markScheduled(input.command, target.identity.turnId);
+          await input.settlement.settleSteerFailure(input.command, deliveryError);
+          throw deliveryError;
+        }),
+      },
+    });
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'retain this ambiguity',
+      clientRequestId: 'request-steer-unknown-after-delete',
+      clientMessageId: 'message-steer-unknown-after-delete',
+    };
+
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_OUTCOME_UNKNOWN',
+    });
+    sessions.delete(SOURCE_CHAT_ID);
+
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_OUTCOME_UNKNOWN',
+    });
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays a compact steering tombstone after its chat is deleted', async () => {
+    const ledger = new CommandLedger(workspaceDir);
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'retain compact evidence',
+      clientRequestId: 'request-steer-compact-after-delete',
+      clientMessageId: 'message-steer-compact-after-delete',
+    };
+    const accepted = await ledger.accept({
+      commandType: 'steer',
+      chatId: input.chatId,
+      clientRequestId: input.clientRequestId,
+      payload: {
+        chatId: input.chatId,
+        content: input.content,
+        clientMessageId: input.clientMessageId,
+      },
+    });
+    await ledger.settleTerminal(accepted.record.key, 'finished', { turnId: 'turn-compact' });
+    for (let index = 0; index <= LEDGER_RECORD_LIMIT; index += 1) {
+      const result = await ledger.accept({
+        commandType: 'agent-run',
+        chatId: SOURCE_CHAT_ID,
+        clientRequestId: `compact-filler-${index}`,
+        payload: { index },
+      });
+      await ledger.settleTerminal(result.record.key, 'finished');
+    }
+    const { service, queue, sessions } = makeService({ ledger });
+    sessions.delete(SOURCE_CHAT_ID);
+
+    await expect(service.submitSteer(input)).resolves.toMatchObject({
+      status: 'duplicate',
+      turnId: 'turn-compact',
+    });
+    expect(queue.captureSteerTarget).not.toHaveBeenCalled();
+    expect(queue.deliverAcceptedSteer).not.toHaveBeenCalled();
+  });
+
+  it('settles a missing steer target terminally without queue fallback', async () => {
+    const { service, queue, ledger } = makeService();
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'too late',
+      clientRequestId: 'request-steer-missing',
+      clientMessageId: 'message-steer-missing',
+    };
+
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_TURN_UNAVAILABLE',
+      status: 409,
+    });
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_TURN_UNAVAILABLE',
+      status: 409,
+    });
+
+    expect(queue.deliverAcceptedSteer).not.toHaveBeenCalled();
+    expect(queue.createChatQueueEntry).not.toHaveBeenCalled();
+    expect(await readLedgerRecord(ledger, 'steer', input.clientRequestId)).toMatchObject({
+      status: 'rejected',
+      errorCode: 'STEER_TURN_UNAVAILABLE',
+    });
+  });
+
+  it('rejects new steer identities after the process-lifetime capacity is exhausted', async () => {
+    const ledger = new CommandLedger(workspaceDir, { steerIdentityLimit: 1 });
+    const retained = await ledger.accept({
+      commandType: 'steer',
+      chatId: SOURCE_CHAT_ID,
+      clientRequestId: 'request-steer-retained',
+      payload: {
+        chatId: SOURCE_CHAT_ID,
+        content: 'retained',
+        clientMessageId: 'message-steer-retained',
+      },
+    });
+    await ledger.settleTerminal(retained.record.key, 'finished', { turnId: 'turn-retained' });
+    const { service, queue } = makeService({ ledger });
+
+    await expect(service.submitSteer({
+      chatId: SOURCE_CHAT_ID,
+      content: 'new steer',
+      clientRequestId: 'request-steer-capacity',
+      clientMessageId: 'message-steer-capacity',
+    })).rejects.toMatchObject({
+      code: 'STEER_CAPACITY_EXHAUSTED',
+      status: 503,
+      retryable: false,
+    });
+    expect(queue.deliverAcceptedSteer).not.toHaveBeenCalled();
+    expect(await ledger.accept({
+      commandType: 'steer',
+      chatId: SOURCE_CHAT_ID,
+      clientRequestId: 'request-steer-retained',
+      payload: {
+        chatId: SOURCE_CHAT_ID,
+        content: 'retained',
+        clientMessageId: 'message-steer-retained',
+      },
+    })).toMatchObject({ kind: 'duplicate' });
+  });
+
+  it('never redelivers a steer whose provider outcome is unknown', async () => {
+    const target = { attempt: {}, identity: { turnId: 'turn-active' } };
+    const deliveryError = new SteerDeliveryError(new Error('connection closed'), 'unknown');
+    const { service, queue, ledger } = makeService({
+      queue: {
+        captureSteerTarget: mock(() => target),
+        deliverAcceptedSteer: mock(async (input) => {
+          await input.settlement.markScheduled(input.command, target.identity.turnId);
+          await input.settlement.settleSteerFailure(input.command, deliveryError);
+          throw deliveryError;
+        }),
+      },
+    });
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'deliver once',
+      clientRequestId: 'request-steer-unknown',
+      clientMessageId: 'message-steer-unknown',
+    };
+
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_OUTCOME_UNKNOWN',
+      outcome: 'unknown',
+    });
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_OUTCOME_UNKNOWN',
+    });
+
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledTimes(1);
+    expect(await readLedgerRecord(ledger, 'steer', input.clientRequestId)).toMatchObject({
+      status: 'failed',
+      errorCode: 'STEER_OUTCOME_UNKNOWN',
+    });
+  });
+
+  it('never redelivers the same steer identity after a definite pre-send failure', async () => {
+    const target = { attempt: {}, identity: { turnId: 'turn-active' } };
+    const deliveryError = new SteerDeliveryError(new Error('serialization failed'), 'not-sent');
+    const { service, queue, ledger } = makeService({
+      queue: {
+        captureSteerTarget: mock(() => target),
+        deliverAcceptedSteer: mock(async (input) => {
+          await input.settlement.settleSteerFailure(input.command, deliveryError);
+          throw deliveryError;
+        }),
+      },
+    });
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      content: 'deliver at most once',
+      clientRequestId: 'request-steer-not-sent',
+      clientMessageId: 'message-steer-not-sent',
+    };
+
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_NOT_DELIVERED',
+      outcome: 'not-sent',
+    });
+    await expect(service.submitSteer(input)).rejects.toMatchObject({
+      code: 'STEER_NOT_DELIVERED',
+    });
+
+    expect(queue.deliverAcceptedSteer).toHaveBeenCalledTimes(1);
+    expect(await readLedgerRecord(ledger, 'steer', input.clientRequestId)).toMatchObject({
+      status: 'failed',
+      errorCode: 'STEER_NOT_DELIVERED',
     });
   });
 
@@ -2404,9 +3013,9 @@ describe('ChatCommandService', () => {
     const { service, queue, ledger } = makeService({
       queue: {
         readChatExecutionControl: mock(() => Promise.resolve(storedQueue())),
-        deliverActiveInput: mock(async () => {
+        deliverGoalControlInput: mock(async () => {
           attempts += 1;
-          if (attempts === 1) throw new ActiveInputDeliveryError(new Error('live registration failed'), false);
+          if (attempts === 1) throw new GoalControlDeliveryError(new Error('live registration failed'), false);
           return false;
         }),
         createChatQueueEntry: mock(() =>
@@ -2427,13 +3036,13 @@ describe('ChatCommandService', () => {
       content: 'retry me',
       clientRequestId: 'request-retry',
     };
-    await expect(service.submitActiveInput(input)).rejects.toMatchObject({
-      message: ACTIVE_INPUT_NOT_DELIVERED_MESSAGE,
+    await expect(service.submitGoalControl(input)).rejects.toMatchObject({
+      message: GOAL_CONTROL_NOT_DELIVERED_MESSAGE,
       cause: expect.objectContaining({ message: 'live registration failed' }),
       deliveryAccepted: false,
       retryable: true,
     });
-    let record = await readLedgerRecord(ledger, 'active-input', input.clientRequestId);
+    let record = await readLedgerRecord(ledger, 'goal-control', input.clientRequestId);
     expect(record).toEqual(
       expect.objectContaining({
         status: 'failed',
@@ -2441,16 +3050,16 @@ describe('ChatCommandService', () => {
       }),
     );
 
-    await expect(service.submitActiveInput(input)).resolves.toEqual(
+    await expect(service.submitGoalControl(input)).resolves.toEqual(
       expect.objectContaining({
         status: 'accepted',
         delivery: 'queued',
         entryId: 'queued-retry',
       }),
     );
-    record = await readLedgerRecord(ledger, 'active-input', input.clientRequestId);
+    record = await readLedgerRecord(ledger, 'goal-control', input.clientRequestId);
     expect(record.status).toBe('finished');
-    expect(queue.deliverActiveInput).toHaveBeenCalledTimes(2);
+    expect(queue.deliverGoalControlInput).toHaveBeenCalledTimes(2);
     expect(queue.createChatQueueEntry).toHaveBeenCalledOnce();
   });
 
@@ -2572,9 +3181,9 @@ describe('ChatCommandService', () => {
     const { service, queue, ledger } = makeService({
       queue: {
         readChatExecutionControl: mock(() => Promise.resolve(storedQueue())),
-        deliverActiveInput: mock(async (_chatId, _content, _options, afterPendingRegistered) => {
+        deliverGoalControlInput: mock(async (_chatId, _content, _options, afterPendingRegistered) => {
           await afterPendingRegistered();
-          throw new ActiveInputDeliveryError(new Error('live steer failed after acceptance'), true);
+          throw new GoalControlDeliveryError(new Error('live steer failed after acceptance'), true);
         }),
       },
     });
@@ -2584,24 +3193,24 @@ describe('ChatCommandService', () => {
       clientRequestId: 'request-accepted',
     };
 
-    await expect(service.submitActiveInput(input)).rejects.toMatchObject({
-      message: ACTIVE_INPUT_OUTCOME_UNKNOWN_MESSAGE,
+    await expect(service.submitGoalControl(input)).rejects.toMatchObject({
+      message: GOAL_CONTROL_OUTCOME_UNKNOWN_MESSAGE,
       cause: expect.objectContaining({
         message: 'live steer failed after acceptance',
       }),
       deliveryAccepted: true,
       retryable: false,
     });
-    let record = await readLedgerRecord(ledger, 'active-input', input.clientRequestId);
+    let record = await readLedgerRecord(ledger, 'goal-control', input.clientRequestId);
     expect(record).toEqual(
       expect.objectContaining({
         status: 'accepted',
-        error: ACTIVE_INPUT_OUTCOME_UNKNOWN_MESSAGE,
+        error: GOAL_CONTROL_OUTCOME_UNKNOWN_MESSAGE,
       }),
     );
-    expect(record.errorCode).toBe('ACTIVE_INPUT_OUTCOME_UNKNOWN');
+    expect(record.errorCode).toBe('GOAL_CONTROL_OUTCOME_UNKNOWN');
 
-    const recovered = await service.submitActiveInput(input);
+    const recovered = await service.submitGoalControl(input);
     expect(recovered).toMatchObject({
       status: 'duplicate',
       delivery: 'queued',
@@ -2613,9 +3222,9 @@ describe('ChatCommandService', () => {
         },
       },
     });
-    record = await readLedgerRecord(ledger, 'active-input', input.clientRequestId);
+    record = await readLedgerRecord(ledger, 'goal-control', input.clientRequestId);
     expect(record).toMatchObject({ status: 'finished', entryId: recovered.entryId });
-    expect(queue.deliverActiveInput).toHaveBeenCalledTimes(1);
+    expect(queue.deliverGoalControlInput).toHaveBeenCalledTimes(1);
     expect(queue.triggerDrain).toHaveBeenCalledTimes(1);
   });
 
@@ -2624,13 +3233,13 @@ describe('ChatCommandService', () => {
       loadNativeMessages: mock(async () => []),
       getRetainedHistoryMessages: mock(() => []),
     });
-    const submitActiveInput = mock(async (_chatId, _content, _options, beforeDelivery) => {
+    const submitGoalControl = mock(async (_chatId, _content, _options, beforeDelivery) => {
       await beforeDelivery(runtimeHandoff());
       throw new Error('connection closed after provider acceptance');
     });
     const queueService = makeRealQueue(pendingInputsService, {
       isChatRunning: mock(() => true),
-      submitActiveInput,
+      submitGoalControl,
     });
     const { service, ledger } = makeService({
       queueService,
@@ -2642,9 +3251,9 @@ describe('ChatCommandService', () => {
       clientRequestId: 'request-real-active-recovery',
     };
 
-    await expect(service.submitActiveInput(input)).rejects.toMatchObject({
+    await expect(service.submitGoalControl(input)).rejects.toMatchObject({
       deliveryAccepted: true,
-      message: ACTIVE_INPUT_OUTCOME_UNKNOWN_MESSAGE,
+      message: GOAL_CONTROL_OUTCOME_UNKNOWN_MESSAGE,
     });
     const uncertain = await queueService.readChatExecutionControl(SOURCE_CHAT_ID);
     expect(uncertain.entries).toHaveLength(1);
@@ -2661,7 +3270,7 @@ describe('ChatCommandService', () => {
       entryId: uncertain.entries[0].id,
     }));
 
-    const recovered = await service.submitActiveInput(input);
+    const recovered = await service.submitGoalControl(input);
     expect(recovered).toMatchObject({
       status: 'duplicate',
       delivery: 'queued',
@@ -2676,26 +3285,26 @@ describe('ChatCommandService', () => {
         },
       },
     });
-    expect(submitActiveInput).toHaveBeenCalledTimes(1);
-    expect(await readLedgerRecord(ledger, 'active-input', input.clientRequestId)).toMatchObject({
+    expect(submitGoalControl).toHaveBeenCalledTimes(1);
+    expect(await readLedgerRecord(ledger, 'goal-control', input.clientRequestId)).toMatchObject({
       status: 'finished',
       entryId: uncertain.entries[0].id,
     });
 
-    const repeated = await service.submitActiveInput(input);
+    const repeated = await service.submitGoalControl(input);
     expect(repeated).toMatchObject({
       status: 'duplicate',
       delivery: 'queued',
       entryId: uncertain.entries[0].id,
     });
     expect((await queueService.readChatExecutionControl(SOURCE_CHAT_ID)).entries).toHaveLength(1);
-    expect(submitActiveInput).toHaveBeenCalledTimes(1);
+    expect(submitGoalControl).toHaveBeenCalledTimes(1);
   });
 
-  it('does not report an incomplete active-input ledger record as delivered', async () => {
+  it('does not report an incomplete goal-control ledger record as delivered', async () => {
     const { service, queue, ledger } = makeService();
     await ledger.accept({
-      commandType: 'active-input',
+      commandType: 'goal-control',
       chatId: SOURCE_CHAT_ID,
       clientRequestId: 'request-active-incomplete',
       payload: { chatId: SOURCE_CHAT_ID, content: 'uncertain delivery' },
@@ -2703,7 +3312,7 @@ describe('ChatCommandService', () => {
     });
 
     await expect(
-      service.submitActiveInput({
+      service.submitGoalControl({
         chatId: SOURCE_CHAT_ID,
         content: 'uncertain delivery',
         clientRequestId: 'request-active-incomplete',
@@ -2714,7 +3323,7 @@ describe('ChatCommandService', () => {
       retryable: false,
     });
 
-    expect(queue.deliverActiveInput).not.toHaveBeenCalled();
+    expect(queue.deliverGoalControlInput).not.toHaveBeenCalled();
     expect(queue.createChatQueueEntry).not.toHaveBeenCalled();
   });
 

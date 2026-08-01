@@ -14,8 +14,17 @@ const MAX_LINES = 1000;
 // This is the ceiling for the execution-ownership unification: steps in that
 // work offset each other rather than raising it, because the concepts it
 // removes live outside the measured directories and would otherwise let the
-// footprint grow while the subsystem is supposedly getting simpler.
-const EXECUTION_FOOTPRINT_BUDGET = 6615;
+// footprint grow while the subsystem is supposedly getting simpler. Strict
+// same-turn steering adds a separately reviewed 461-line command admission,
+// immutable target, delivery settlement, and pending-input increment. Its
+// adversarial-review corrections add 191 lines for bounded identity retention,
+// bounded correlation IDs, constant-time conflict lookup, deletion revalidation,
+// opaque provider targets, and complete command-outcome telemetry.
+// The fourth review adds 58 lines for post-deletion replay and for resolving
+// provider file context outside the command lock without changing transcript content.
+// The fifth review adds 7 lines for a separate FIFO steering preparation lock.
+// The sixth review adds 33 lines for time and resource bounds on uncancellable file reads.
+const EXECUTION_FOOTPRINT_BUDGET = 7365;
 
 const GRANDFATHER = {
   'server/git/diff-engine.ts': 1575,

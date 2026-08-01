@@ -3,6 +3,7 @@ import {
   CommandLedger,
   LEDGER_RECORD_LIMIT,
   PRE_SCHEDULE_FAILURE_ERROR_CODE,
+  SteerIdentityCapacityError,
   commandLedgerKey,
   commandPayloadHash,
 } from '../command-ledger.ts';
@@ -110,9 +111,20 @@ describe('CommandLedger', () => {
       commandType: 'queue-entry-delete',
       clientRequestId: 'queue-2',
     }));
+    const goalControl = await ledger.accept(acceptedInput({
+      commandType: 'goal-control',
+      clientRequestId: 'goal-control-1',
+    }));
+    await ledger.accept(acceptedInput({
+      commandType: 'steer',
+      clientRequestId: 'steer-1',
+    }));
     await ledger.settleTerminal(first.record.key, 'finished');
 
-    expect(ledger.unsettledQueueReceiptKeys('chat-1')).toEqual(new Set([second.record.key]));
+    expect(ledger.unsettledQueueReceiptKeys('chat-1')).toEqual(new Set([
+      second.record.key,
+      goalControl.record.key,
+    ]));
   });
 
   it('keeps unsettled and fork-preparation records while trimming old terminal records', async () => {
@@ -135,6 +147,78 @@ describe('CommandLedger', () => {
     expect(await ledger.getRecord(unsettled.record.key)).not.toBeNull();
     expect(await ledger.getRecord(fork.record.key)).not.toBeNull();
     expect(await ledger.getRecord(commandLedgerKey('agent-run', 'chat-1', 'terminal-0'))).toBeNull();
+  });
+
+  it('retains compact steering identities for process-lifetime at-most-once delivery', async () => {
+    const ledger = new CommandLedger();
+    const steerInput = acceptedInput({
+      commandType: 'steer',
+      clientRequestId: 'steer-retained',
+      payload: {
+        chatId: 'chat-1',
+        content: 'sensitive steering content',
+        clientMessageId: 'message-retained',
+      },
+    });
+    const steer = await ledger.accept(steerInput);
+    await ledger.settleTerminal(steer.record.key, 'finished', { turnId: 'turn-1' });
+
+    for (let index = 0; index < LEDGER_RECORD_LIMIT + 5; index += 1) {
+      const result = await ledger.accept(acceptedInput({ clientRequestId: `terminal-${index}` }));
+      await ledger.settleTerminal(result.record.key, 'finished');
+    }
+
+    expect(await ledger.accept(steerInput)).toMatchObject({
+      kind: 'duplicate',
+      record: { payload: {}, status: 'finished', turnId: 'turn-1' },
+    });
+    expect(await ledger.observe(steerInput)).toMatchObject({
+      kind: 'duplicate',
+      record: { payload: {}, status: 'finished', turnId: 'turn-1' },
+    });
+    expect(await ledger.accept({
+      ...steerInput,
+      payload: { ...steerInput.payload, content: 'changed content' },
+    })).toMatchObject({ kind: 'conflict' });
+    expect(await ledger.observe({
+      ...steerInput,
+      payload: { ...steerInput.payload, content: 'changed content' },
+    })).toMatchObject({ kind: 'conflict' });
+    expect(await ledger.accept(acceptedInput({
+      commandType: 'agent-run',
+      clientRequestId: 'steer-retained',
+    }))).toMatchObject({ kind: 'conflict' });
+  });
+
+  it('bounds retained steering identities without evicting known outcomes', async () => {
+    const ledger = new CommandLedger(undefined, { steerIdentityLimit: 2 });
+    const first = acceptedInput({ commandType: 'steer', clientRequestId: 'steer-1' });
+    const second = acceptedInput({ commandType: 'steer', clientRequestId: 'steer-2' });
+    const firstResult = await ledger.accept(first);
+    const secondResult = await ledger.accept(second);
+    await ledger.settleTerminal(firstResult.record.key, 'finished', { turnId: 'turn-1' });
+    await ledger.settleTerminal(secondResult.record.key, 'failed', {
+      error: 'No active turn',
+      errorCode: 'STEER_TURN_UNAVAILABLE',
+    });
+
+    await expect(ledger.accept(acceptedInput({
+      commandType: 'steer',
+      clientRequestId: 'steer-3',
+    }))).rejects.toBeInstanceOf(SteerIdentityCapacityError);
+    expect(await ledger.accept(first)).toMatchObject({
+      kind: 'duplicate',
+      record: { status: 'finished', turnId: 'turn-1' },
+    });
+    expect(await ledger.accept({ ...first, commandType: 'agent-run' })).toMatchObject({
+      kind: 'conflict',
+    });
+    expect(await ledger.accept(acceptedInput({ clientRequestId: 'ordinary-after-capacity' })))
+      .toMatchObject({ kind: 'accepted' });
+    expect(await ledger.observe(acceptedInput({
+      commandType: 'steer',
+      clientRequestId: 'unseen-after-capacity',
+    }))).toBeNull();
   });
 
   it('does not share records between process-lifetime ledger instances', async () => {

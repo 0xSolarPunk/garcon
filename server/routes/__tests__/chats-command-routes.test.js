@@ -7,6 +7,12 @@ import { randomUUID } from 'crypto';
 
 let testBasePath;
 let workspaceDir;
+const routeLogger = {
+  debug: mock(() => undefined),
+  info: mock(() => undefined),
+  warn: mock(() => undefined),
+  error: mock(() => undefined),
+};
 
 class MalformedJsonError extends Error {
   constructor() {
@@ -24,6 +30,10 @@ mock.module('../../config.js', () => ({
   getProjectBasePath: mock(() => testBasePath),
   getWorkspaceDir: mock(() => workspaceDir),
   isHttpCompressionEnabled: mock(() => true),
+}));
+
+mock.module('../../lib/log.js', () => ({
+  createLogger: mock(() => routeLogger),
 }));
 
 mock.module('../../chats/title-generator.js', () => ({
@@ -44,6 +54,7 @@ import { ModelSelectionError } from '../../api-providers/endpoint-resolver.js';
 import { AgentSwitchError } from '../../agents/agent-switch-service.js';
 import {
   DomainError,
+  SteerDeliveryError,
   TRANSCRIPT_TEMPORARILY_UNAVAILABLE_MESSAGE,
 } from '../../lib/domain-error.js';
 import {
@@ -262,25 +273,34 @@ function createRouteAgent(sessionOverrides = {}) {
         throw error;
       }
     }),
-    deliverAcceptedActiveInput: mock(async (input) => {
-      const delivered = await queue.deliverActiveInput(
+    deliverAcceptedGoalControl: mock(async (input) => {
+      const delivered = await queue.deliverGoalControlInput(
         input.command.chatId,
         input.content,
         { clientRequestId: input.command.clientRequestId, turnId: input.command.turnId },
         () => input.settlement.markScheduled(input.command, input.command.turnId),
       );
       if (delivered) {
-        await input.settlement.settleActiveInput(input.command);
+        await input.settlement.settleGoalControl(input.command);
         return { delivery: 'active', control: await queue.readChatExecutionControl(input.command.chatId) };
       }
       const result = await queue.enqueueAccepted(input);
       return { delivery: 'queued', entryId: result.entryId, control: result.control };
     }),
-    recoverAcceptedActiveInput: mock(async (input) => ({
+    recoverAcceptedGoalControl: mock(async (input) => ({
       delivery: 'queued',
       entryId: input.command.entryId,
       control: await queue.readChatExecutionControl(input.command.chatId),
     })),
+    captureSteerTarget: mock(() => ({
+      attempt: {},
+      identity: { turnId: 'turn-active' },
+    })),
+    deliverAcceptedSteer: mock(async (input) => {
+      await input.settlement.markScheduled(input.command, input.target.identity.turnId);
+      await input.settlement.settleSteerSuccess(input.command, input.target.identity.turnId);
+      return { turnId: input.target.identity.turnId };
+    }),
     deleteChatQueueFile: mock(() => Promise.resolve(undefined)),
     submit: mock(() => Promise.resolve(undefined)),
     registerPendingUserInput: mock(() => Promise.resolve(undefined)),
@@ -351,7 +371,7 @@ function createRouteAgent(sessionOverrides = {}) {
         rebased: false,
       }),
     ),
-    deliverActiveInput: mock(async (_chatId, _content, _options, beforeDelivery) => {
+    deliverGoalControlInput: mock(async (_chatId, _content, _options, beforeDelivery) => {
       await beforeDelivery();
       return true;
     }),
@@ -518,6 +538,10 @@ describe('REST chat command routes', () => {
     await fs.mkdir(workspaceDir, { recursive: true });
     parseJsonBody.mockClear();
     forkChatFileCopy.mockClear();
+    routeLogger.debug.mockClear();
+    routeLogger.info.mockClear();
+    routeLogger.warn.mockClear();
+    routeLogger.error.mockClear();
   });
 
   afterEach(async () => {
@@ -893,22 +917,60 @@ describe('REST chat command routes', () => {
     expect(result.body.control.queue.dispatchingEntryId).toBe('entry-3');
   });
 
-  it('POST /active-input uses the independent active delivery command', async () => {
+  it('POST /goal-control preserves immediate goal delivery', async () => {
     const agent = createRouteAgent();
-    const result = await callJson(agent.routes['/api/v1/chats/active-input'].POST, {
-      clientRequestId: 'req-steer-1',
+	    const result = await callJson(agent.routes['/api/v1/chats/goal-control'].POST, {
+	      clientRequestId: 'req-goal-1',
+	      chatId: CHAT_ID,
+	      content: '/goal pause',
+	    });
+
+	    expect(result.response.status).toBe(202);
+	    expect(result.body.delivery).toBe('active');
+	    expect(agent.queue.deliverGoalControlInput).toHaveBeenCalledWith(
+	      CHAT_ID,
+	      '/goal pause',
+	      expect.objectContaining({ clientRequestId: 'req-goal-1' }),
+	      expect.any(Function),
+	    );
+	  });
+
+	  it('POST /steer returns the captured current turn without queue state', async () => {
+	    const agent = createRouteAgent();
+	    const result = await callJson(agent.routes['/api/v1/chats/steer'].POST, {
+	      clientRequestId: 'req-steer-1',
+	      clientMessageId: 'message-steer-1',
+	      chatId: CHAT_ID,
+	      content: 'focus here',
+	    });
+
+	    expect(result.response.status).toBe(202);
+	    expect(result.body).toMatchObject({
+	      commandType: 'steer',
+	      chatId: CHAT_ID,
+	      turnId: 'turn-active',
+	    });
+	    expect(result.body.delivery).toBeUndefined();
+	    expect(result.body.control).toBeUndefined();
+	    expect(agent.queue.deliverAcceptedSteer).toHaveBeenCalledOnce();
+	    expect(agent.routes['/api/v1/chats/active-input']).toBeUndefined();
+	  });
+
+  it('POST /steer does not duplicate command-boundary delivery logging', async () => {
+    const agent = createRouteAgent();
+    agent.queue.deliverAcceptedSteer.mockImplementationOnce(() => Promise.reject(
+      new SteerDeliveryError(new Error('transport closed'), 'unknown'),
+    ));
+
+    const result = await callJson(agent.routes['/api/v1/chats/steer'].POST, {
+      clientRequestId: 'req-steer-unknown',
+      clientMessageId: 'message-steer-unknown',
       chatId: CHAT_ID,
       content: 'focus here',
     });
 
-    expect(result.response.status).toBe(202);
-    expect(result.body.delivery).toBe('active');
-    expect(agent.queue.deliverActiveInput).toHaveBeenCalledWith(
-      CHAT_ID,
-      'focus here',
-      expect.objectContaining({ clientRequestId: 'req-steer-1' }),
-      expect.any(Function),
-    );
+    expect(result.response.status).toBe(500);
+    expect(routeLogger.error).not.toHaveBeenCalled();
   });
 
   it('POST /queue/entries rejects conflicting retries', async () => {
