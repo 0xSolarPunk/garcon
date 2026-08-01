@@ -11,15 +11,19 @@ import { parseForkCommand } from '$lib/chat/composer/fork-command.js';
 import {
 	parseCompactCommand,
 	isCodexGoalCommand,
+	parseMoveChatBoundaryCommand,
 	parseRenameCommand,
 	parseScheduleInCommand,
 	parseSteerCommand,
+	parseTagCommand,
 } from '$lib/chat/composer/slash-commands.js';
 import { createClientChatId } from '$lib/chat/sessions/client-chat-id.js';
 import { createClientCommandId } from '$lib/chat/conversation/client-command-id.js';
 import type {
 	ScheduleInCommandError,
 	ScheduleInCommandParseResult,
+	MoveChatBoundaryCommandParseResult,
+	TagCommandParseResult,
 } from '$lib/chat/composer/slash-commands.js';
 import { formatScheduledInstant } from '$lib/scheduling/local-schedule.js';
 import {
@@ -36,11 +40,18 @@ import {
 import type { ChatViewMessage } from '$shared/chat-view';
 import type { ConversationSubmissionOutcome } from './conversation-submission-outcome.js';
 import * as m from '$lib/paraglide/messages.js';
+import type { ReorderChatResponse } from '$shared/chat-order-contracts';
+import { normalizeTags } from '$shared/tags';
 
 interface SlashCommandSessions {
 	selectedChatId: string | null;
 	byId: Record<string, ChatSessionRecord>;
 	renameChat(chatId: string, newTitle: string): Promise<boolean>;
+	moveChatToBoundary(
+		chatId: string,
+		boundary: 'top' | 'bottom',
+	): Promise<ReorderChatResponse | null>;
+	setChatTags(chatId: string, tags: string[]): Promise<boolean>;
 	upsertServerChat(entry: ChatListEntry): void;
 	setSelectedChatId(chatId: string | null): void;
 }
@@ -56,6 +67,7 @@ interface SlashCommandChatState {
 interface SlashCommandComposerState {
 	inputText: string;
 	images: File[];
+	readonly contentRevision: number;
 	clearAfterSubmit(chatId: string): void;
 	saveDraft(chatId: string): void;
 }
@@ -102,6 +114,8 @@ export type SlashCommandSubmissionResolution =
 
 export class ConversationSlashCommandService {
 	readonly #scheduleInFlight = new Set<string>();
+	// Serializes each chat's complete incremental tag read-modify-write operation.
+	readonly #tagMutationTails = new Map<string, Promise<void>>();
 
 	constructor(
 		private readonly deps: ConversationSlashCommandDeps,
@@ -121,6 +135,28 @@ export class ConversationSlashCommandService {
 			return {
 				kind: 'handled',
 				outcome: this.submitRenameCommand(chatId, chat, rename.title, images, ownsComposer),
+			};
+		}
+
+		const move = parseMoveChatBoundaryCommand(text);
+		if (move.kind !== 'not-command') {
+			return {
+				kind: 'handled',
+				outcome: this.submitMoveChatBoundaryCommand(
+					chatId,
+					chat,
+					move,
+					images,
+					ownsComposer,
+				),
+			};
+		}
+
+		const tag = parseTagCommand(text);
+		if (tag.kind !== 'not-command') {
+			return {
+				kind: 'handled',
+				outcome: this.submitTagCommand(chatId, chat, tag, images, ownsComposer),
 			};
 		}
 
@@ -252,7 +288,7 @@ export class ConversationSlashCommandService {
 		chat: ChatSessionRecord,
 		title: string,
 		images: File[],
-		clearComposer: boolean,
+		ownsComposer: boolean,
 	): Promise<ConversationSubmissionOutcome> {
 		const { deps } = this;
 		if (!title) {
@@ -270,14 +306,163 @@ export class ConversationSlashCommandService {
 
 		const previousText = deps.composerState.inputText;
 		const previousImages = [...deps.composerState.images];
-		if (clearComposer) deps.composerState.clearAfterSubmit(chatId);
+		if (ownsComposer) deps.composerState.clearAfterSubmit(chatId);
+		const clearedContentRevision = deps.composerState.contentRevision;
 		const renamed = await deps.sessions.renameChat(chatId, title);
-		if (!renamed && clearComposer && deps.sessions.selectedChatId === chatId) {
-			deps.composerState.inputText = previousText;
-			deps.composerState.images = previousImages;
-			deps.composerState.saveDraft(chatId);
+		if (!renamed) {
+			this.#restoreComposerIfUntouched({
+				chatId,
+				ownsComposer,
+				text: previousText,
+				images: previousImages,
+				clearedContentRevision,
+			});
 		}
 		return renamed ? 'accepted' : 'rejected';
+	}
+
+	async submitMoveChatBoundaryCommand(
+		chatId: string,
+		chat: ChatSessionRecord,
+		command: MoveChatBoundaryCommandParseResult,
+		images: File[],
+		ownsComposer: boolean,
+	): Promise<ConversationSubmissionOutcome> {
+		const { deps } = this;
+		if (command.kind === 'invalid') {
+			deps.chatState.appendLocalNotice('error', m.chat_notice_move_arguments());
+			return 'rejected';
+		}
+		if (command.kind !== 'valid') return 'no-op';
+		if (chat.status === 'draft') {
+			deps.chatState.appendLocalNotice('error', m.chat_notice_move_draft());
+			return 'rejected';
+		}
+		if (images.length > 0) {
+			deps.chatState.appendLocalNotice('error', m.chat_notice_move_attachments());
+			return 'rejected';
+		}
+
+		const previousText = deps.composerState.inputText;
+		const previousImages = [...deps.composerState.images];
+		if (ownsComposer) deps.composerState.clearAfterSubmit(chatId);
+		const clearedContentRevision = deps.composerState.contentRevision;
+		const result = await deps.sessions.moveChatToBoundary(chatId, command.boundary);
+		if (!result) {
+			this.#restoreComposerIfUntouched({
+				chatId,
+				ownsComposer,
+				text: previousText,
+				images: previousImages,
+				clearedContentRevision,
+			});
+			return 'rejected';
+		}
+
+		if (deps.chatState.activeChatId === chatId) {
+			deps.chatState.appendLocalNotice(
+				'info',
+				moveChatNotice(command.boundary, result.changed),
+			);
+			deps.chatState.isUserScrolledUp = false;
+			deps.scrollToBottom();
+		}
+		return 'accepted';
+	}
+
+	async submitTagCommand(
+		chatId: string,
+		chat: ChatSessionRecord,
+		command: TagCommandParseResult,
+		images: File[],
+		ownsComposer: boolean,
+	): Promise<ConversationSubmissionOutcome> {
+		const { deps } = this;
+		if (command.kind === 'invalid') {
+			deps.chatState.appendLocalNotice('error', m.chat_notice_tag_arguments());
+			return 'rejected';
+		}
+		if (command.kind !== 'valid') return 'no-op';
+		if (images.length > 0) {
+			deps.chatState.appendLocalNotice('error', m.chat_notice_tag_attachments());
+			return 'rejected';
+		}
+
+		const previousText = deps.composerState.inputText;
+		const previousImages = [...deps.composerState.images];
+		if (ownsComposer) deps.composerState.clearAfterSubmit(chatId);
+		const clearedContentRevision = deps.composerState.contentRevision;
+
+		return this.#enqueueTagMutation(chatId, async () => {
+			const currentTags = normalizeTags(deps.sessions.byId[chatId]?.tags ?? chat.tags);
+			const requested = new Set(command.tags);
+			const nextTags =
+				command.action === 'add'
+					? normalizeTags([...currentTags, ...command.tags])
+					: currentTags.filter((tag) => !requested.has(tag));
+			const changedTags =
+				command.action === 'add'
+					? nextTags.filter((tag) => !currentTags.includes(tag))
+					: currentTags.filter((tag) => !nextTags.includes(tag));
+			const updated =
+				changedTags.length === 0 ? true : await deps.sessions.setChatTags(chatId, nextTags);
+			if (!updated) {
+				this.#restoreComposerIfUntouched({
+					chatId,
+					ownsComposer,
+					text: previousText,
+					images: previousImages,
+					clearedContentRevision,
+				});
+				return 'rejected';
+			}
+
+			if (deps.chatState.activeChatId === chatId) {
+				const content =
+					changedTags.length === 0
+						? m.chat_notice_tags_unchanged()
+						: command.action === 'add'
+							? m.chat_notice_tags_added({ tags: changedTags.join(', ') })
+							: m.chat_notice_tags_removed({ tags: changedTags.join(', ') });
+				deps.chatState.appendLocalNotice('info', content);
+				deps.chatState.isUserScrolledUp = false;
+				deps.scrollToBottom();
+			}
+			return 'accepted';
+		});
+	}
+
+	#enqueueTagMutation(
+		chatId: string,
+		mutation: () => Promise<ConversationSubmissionOutcome>,
+	): Promise<ConversationSubmissionOutcome> {
+		const previous = this.#tagMutationTails.get(chatId) ?? Promise.resolve();
+		const result = previous.then(mutation, mutation);
+		const settled = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#tagMutationTails.set(chatId, settled);
+		void settled.then(() => {
+			if (this.#tagMutationTails.get(chatId) === settled) this.#tagMutationTails.delete(chatId);
+		});
+		return result;
+	}
+
+	#restoreComposerIfUntouched(input: {
+		chatId: string;
+		ownsComposer: boolean;
+		text: string;
+		images: File[];
+		clearedContentRevision: number;
+	}): void {
+		const { deps } = this;
+		if (!input.ownsComposer || deps.sessions.selectedChatId !== input.chatId) return;
+		if (deps.composerState.contentRevision !== input.clearedContentRevision) return;
+		if (deps.composerState.inputText !== '' || deps.composerState.images.length !== 0) return;
+		deps.composerState.inputText = input.text;
+		deps.composerState.images = [...input.images];
+		deps.composerState.saveDraft(input.chatId);
 	}
 
 	async submitCompactCommand(
@@ -511,6 +696,17 @@ function forkFailureNotice(error: unknown): string {
 	return error instanceof ApiError && error.errorCode === 'MESSAGE_NOT_IN_NATIVE_HISTORY'
 		? m.chat_notice_fork_message_not_in_native_history()
 		: m.chat_notice_failed_fork_chat({ detail: errorDetail(error) });
+}
+
+function moveChatNotice(boundary: 'top' | 'bottom', changed: boolean): string {
+	if (boundary === 'top') {
+		return changed
+			? m.chat_notice_move_top_success()
+			: m.chat_notice_move_top_unchanged();
+	}
+	return changed
+		? m.chat_notice_move_bottom_success()
+		: m.chat_notice_move_bottom_unchanged();
 }
 
 function scheduleInErrorMessage(error: ScheduleInCommandError): string {

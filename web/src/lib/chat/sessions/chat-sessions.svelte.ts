@@ -12,6 +12,8 @@ import {
 	deleteChat as deleteChatApi,
 	generateChatTitle,
 	listChats,
+	reorderChat as reorderChatApi,
+	setChatTags as setChatTagsApi,
 	setLastSelectedChat,
 } from '$lib/api/chats.js';
 import { updateSessionName } from '$lib/api/settings.js';
@@ -20,6 +22,10 @@ import type { ChatSessionRecord, ChatStartupConfig } from '$lib/types/chat-sessi
 import * as m from '$lib/paraglide/messages.js';
 import type { ChatListEntry, ChatOrderGroup } from '$shared/chat-list';
 import type { ChatProcessingEntry, ChatProcessingPhase } from '$shared/chat-types';
+import type {
+	ChatOrderBoundary,
+	ReorderChatResponse,
+} from '$shared/chat-order-contracts';
 
 export interface ChatProcessingTransition {
 	chatId: string;
@@ -33,6 +39,8 @@ export interface ChatSessionsStoreDeps {
 	setLastSelectedChat?: typeof setLastSelectedChat;
 	generateChatTitle?: typeof generateChatTitle;
 	updateSessionName?: typeof updateSessionName;
+	reorderChat?: typeof reorderChatApi;
+	setChatTags?: typeof setChatTagsApi;
 	notifyError?: (message: string) => void;
 }
 
@@ -45,6 +53,11 @@ export interface ChatSessionsPort {
 	setSelectedChatId(chatId: string | null): void;
 	quietRefreshChats(): Promise<void>;
 	renameChat(chatId: string, newTitle: string): Promise<boolean>;
+	moveChatToBoundary(
+		chatId: string,
+		boundary: ChatOrderBoundary,
+	): Promise<ReorderChatResponse | null>;
+	setChatTags(chatId: string, tags: string[]): Promise<boolean>;
 	hasChat(chatId: string): boolean;
 	isDraft(chatId: string): boolean;
 	patchDraftStartup(chatId: string, patch: Partial<ChatStartupConfig>): void;
@@ -353,6 +366,48 @@ export class ChatSessionsStore implements ChatSessionsPort {
 		} catch (err) {
 			console.error('[ChatSessionsStore] Rename failed:', err);
 			this.#deps.notifyError?.(m.notifications_rename_chat_failed());
+			return false;
+		}
+	}
+
+	async moveChatToBoundary(
+		chatId: string,
+		boundary: ChatOrderBoundary,
+	): Promise<ReorderChatResponse | null> {
+		try {
+			const reorderRemoteChat = this.#deps.reorderChat ?? reorderChatApi;
+			const result = await reorderRemoteChat({
+				chatId,
+				placement: { kind: 'boundary', boundary },
+			});
+			await this.quietRefreshChats();
+			return result;
+		} catch (err) {
+			console.error('[ChatSessionsStore] Reorder failed:', err);
+			this.#deps.notifyError?.(m.notifications_reorder_chats_failed());
+			return null;
+		}
+	}
+
+	async setChatTags(chatId: string, tags: string[]): Promise<boolean> {
+		const chat = this.byId[chatId];
+		if (!chat) return false;
+		if (chat.status === 'draft') {
+			this.patchDraftStartup(chatId, { tags });
+			this.patchChat(chatId, { tags });
+			return true;
+		}
+
+		try {
+			const setRemoteTags = this.#deps.setChatTags ?? setChatTagsApi;
+			const result = await setRemoteTags(chatId, tags);
+			if (!result.success) return false;
+			this.patchChat(chatId, { tags: result.tags });
+			await this.quietRefreshChats();
+			return true;
+		} catch (err) {
+			console.error('[ChatSessionsStore] Tag update failed:', err);
+			this.#deps.notifyError?.(m.notifications_update_chat_tags_failed());
 			return false;
 		}
 	}

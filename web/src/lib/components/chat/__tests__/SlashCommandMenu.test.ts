@@ -63,6 +63,57 @@ describe('SlashCommandMenu', () => {
 		expect(screen.getByText('Rename the current chat')).toBeTruthy();
 	});
 
+	it('lists the Manual order move command', () => {
+		render(SlashCommandMenuTestHost, {
+			...baseProps,
+			isVisible: true,
+			query: 'move',
+			onSelect: vi.fn(),
+			onClose: vi.fn(),
+		});
+
+		expect(screen.getByText('/move')).toBeTruthy();
+		expect(
+			screen.getByText('Move this chat to the top or bottom of its section in Manual order'),
+		).toBeTruthy();
+	});
+
+	it('deduplicates discovered move and tag commands behind the built-ins', async () => {
+		mockedGetSlashCommands.mockResolvedValue([
+			{ name: 'move', source: 'command', description: 'Agent move' },
+			{ name: 'tag', source: 'command', description: 'Agent tag' },
+		]);
+		render(SlashCommandMenuTestHost, {
+			...baseProps,
+			projectPath: '/repo',
+			isVisible: true,
+			query: '',
+			onSelect: vi.fn(),
+			onClose: vi.fn(),
+		});
+
+		expect(await screen.findByText('/move')).toBeTruthy();
+		expect(screen.getAllByText('/move')).toHaveLength(1);
+		expect(screen.getAllByText('/tag')).toHaveLength(1);
+		expect(screen.queryByText('Agent move')).toBeNull();
+		expect(screen.queryByText('Agent tag')).toBeNull();
+	});
+
+	it('selects a boundary command', async () => {
+		const onSelect = vi.fn();
+		render(SlashCommandMenuTestHost, {
+			...baseProps,
+			isVisible: true,
+			query: 'move',
+			onSelect,
+			onClose: vi.fn(),
+		});
+
+		await fireEvent.click(screen.getByRole('button', { name: /\/move/ }));
+
+		expect(onSelect).toHaveBeenCalledWith('move');
+	});
+
 	it('lists /snippet and its /s alias without advertising a plural command', () => {
 		const { unmount } = render(SlashCommandMenuTestHost, {
 			...baseProps,
