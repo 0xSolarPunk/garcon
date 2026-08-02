@@ -408,7 +408,7 @@ function createDeps(chat = createRunningChat()) {
 			]),
 			supportsFork: vi.fn(() => true),
 			supportsForkWhileRunning: vi.fn(() => false),
-			supportsSteering: vi.fn((agentId: string) => agentId === 'codex'),
+			supportsSteering: vi.fn((agentId: string) => agentId === 'claude' || agentId === 'codex'),
 			supportsGoals: vi.fn((agentId: string) => agentId === 'codex'),
 		},
 		readReceiptOutbox: {
@@ -2331,6 +2331,26 @@ describe('ConversationSessionController', () => {
 		expect(deps.chatState.localNotices[0]).toMatchObject({
 			noticeType: 'error',
 			content: 'The active turn changed before steering could be applied.',
+		});
+	});
+
+	it('uses a provider-neutral notice when a turn is not ready for steering', async () => {
+		const { deps } = createDeps(createRunningChat({ agentId: 'claude', isProcessing: true }));
+		deps.composerState.inputText = '/steer Keep the current turn';
+		deps.composerState.clearAfterSubmit.mockImplementation(() => {
+			deps.composerState.inputText = '';
+		});
+		mockSteerChat.mockRejectedValueOnce(new ApiError(
+			409,
+			'No active turn',
+			'STEER_TURN_UNAVAILABLE',
+		));
+
+		await new ConversationSessionController(deps).submitForChat('chat-1');
+
+		expect(deps.chatState.localNotices[0]).toMatchObject({
+			noticeType: 'error',
+			content: "There isn't a turn ready for steering.",
 		});
 	});
 
