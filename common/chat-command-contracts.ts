@@ -21,10 +21,15 @@ import type { ChatStopOutcome } from './chat-types.js';
 export type CommandStatus = 'accepted' | 'duplicate';
 
 export const COMMAND_CORRELATION_ID_MAX_BYTES = 256;
-const commandCorrelationIdEncoder = new TextEncoder();
+export const QUEUE_ENTRY_ID_MAX_BYTES = 128;
+const utf8Encoder = new TextEncoder();
 
 export function isCommandCorrelationIdWithinLimit(value: string): boolean {
-  return commandCorrelationIdEncoder.encode(value).byteLength <= COMMAND_CORRELATION_ID_MAX_BYTES;
+  return utf8Encoder.encode(value).byteLength <= COMMAND_CORRELATION_ID_MAX_BYTES;
+}
+
+export function isQueueEntryIdWithinLimit(value: string): boolean {
+  return utf8Encoder.encode(value).byteLength <= QUEUE_ENTRY_ID_MAX_BYTES;
 }
 
 export type CommandErrorCode = Extract<
@@ -35,6 +40,7 @@ export type CommandErrorCode = Extract<
   | 'CHAT_ID_COLLISION'
   | 'QUEUE_ENTRY_NOT_FOUND'
   | 'QUEUE_ENTRY_ALREADY_SENT'
+  | 'QUEUE_ENTRY_IN_FLIGHT'
   | 'QUEUE_ENTRY_REVISION_CONFLICT'
   | 'QUEUE_ENTRY_REORDER_CONFLICT'
   | 'QUEUE_PAUSE_CHANGED'
@@ -45,6 +51,8 @@ export type CommandErrorCode = Extract<
   | 'STEER_TURN_CHANGED'
   | 'STEER_TURN_NOT_STEERABLE'
   | 'STEER_CAPACITY_EXHAUSTED'
+  | 'QUEUE_STEER_FINALIZATION_FAILED'
+  | 'QUEUE_STEER_RECOVERY_FAILED'
   | 'GOAL_CONTROL_NOT_DELIVERED'
   | 'GOAL_CONTROL_OUTCOME_UNKNOWN'
   | 'UNSUPPORTED_AGENT'
@@ -218,6 +226,29 @@ export interface SteerCommandResponse extends CommandAcceptedResponse {
   commandType: 'steer';
   chatId: string;
   turnId: string;
+}
+
+export interface QueueEntrySteerCommandRequest {
+  clientRequestId: string;
+  clientMessageId: string;
+  chatId: string;
+  entryId: string;
+  expectedRevision: number;
+  expectedReorderRevision: number;
+}
+
+export interface QueueEntrySteerCommandResponse extends SteerCommandResponse {
+  serverInstanceId: string;
+  control?: ChatExecutionControlState;
+}
+
+export type SteerDeliveryOutcome = 'not-sent' | 'unknown' | 'accepted';
+
+export interface QueueEntrySteerErrorResponse extends HttpErrorResponse {
+  errorCode: CommandErrorCode;
+  deliveryOutcome: SteerDeliveryOutcome;
+  serverInstanceId: string;
+  control?: ChatExecutionControlState;
 }
 
 export interface GoalControlCommandRequest {
@@ -553,7 +584,7 @@ export function parseQueueEntryReplaceCommandRequest(value: unknown): QueueEntry
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
     chatId: requiredChatId(body, 'chatId'),
-    entryId: requiredString(body, 'entryId'),
+    entryId: requiredQueueEntryId(body, 'entryId'),
     content: requiredContent(body, 'content'),
     expectedRevision: Number(body.expectedRevision),
   };
@@ -564,14 +595,14 @@ export function parseQueueEntryDeleteCommandRequest(value: unknown): QueueEntryD
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
     chatId: requiredChatId(body, 'chatId'),
-    entryId: requiredString(body, 'entryId'),
+    entryId: requiredQueueEntryId(body, 'entryId'),
   };
 }
 
 export function parseQueueEntryMoveCommandRequest(value: unknown): QueueEntryMoveCommandRequest {
   const body = requestRecord(value);
-  const entryId = requiredString(body, 'entryId');
-  const targetEntryId = requiredString(body, 'targetEntryId');
+  const entryId = requiredQueueEntryId(body, 'entryId');
+  const targetEntryId = requiredQueueEntryId(body, 'targetEntryId');
   if (entryId === targetEntryId) {
     throw new CommandRequestValidationError('entryId and targetEntryId must differ');
   }
@@ -615,6 +646,29 @@ export function parseSteerCommandRequest(value: unknown): SteerCommandRequest {
     clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     chatId: requiredChatId(body, 'chatId'),
     content: requiredContent(body, 'content'),
+  };
+}
+
+export function parseQueueEntrySteerCommandRequest(value: unknown): QueueEntrySteerCommandRequest {
+  const body = requestRecord(value);
+  if (!Number.isSafeInteger(body.expectedRevision) || Number(body.expectedRevision) < 1) {
+    throw new CommandRequestValidationError('expectedRevision must be a positive integer');
+  }
+  if (
+    !Number.isSafeInteger(body.expectedReorderRevision)
+    || Number(body.expectedReorderRevision) < 0
+  ) {
+    throw new CommandRequestValidationError(
+      'expectedReorderRevision must be a non-negative integer',
+    );
+  }
+  return {
+    clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
+    clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
+    chatId: requiredChatId(body, 'chatId'),
+    entryId: requiredQueueEntryId(body, 'entryId'),
+    expectedRevision: Number(body.expectedRevision),
+    expectedReorderRevision: Number(body.expectedReorderRevision),
   };
 }
 
@@ -710,6 +764,16 @@ function requiredCommandCorrelationId(body: Record<string, unknown>, field: stri
   if (!isCommandCorrelationIdWithinLimit(value)) {
     throw new CommandRequestValidationError(
       `${field} must be at most ${COMMAND_CORRELATION_ID_MAX_BYTES} bytes`,
+    );
+  }
+  return value;
+}
+
+function requiredQueueEntryId(body: Record<string, unknown>, field: string): string {
+  const value = requiredString(body, field);
+  if (!isQueueEntryIdWithinLimit(value)) {
+    throw new CommandRequestValidationError(
+      `${field} must be at most ${QUEUE_ENTRY_ID_MAX_BYTES} bytes`,
     );
   }
   return value;

@@ -131,6 +131,7 @@ type SessionConversationUiState = Pick<
 	| 'getExecutionControl'
 	| 'setExecutionControlFromLiveUpdate'
 	| 'setExecutionControlFromRefresh'
+	| 'isExecutionControlSocketInstanceConfirmed'
 	| 'setPendingPermissionRequests'
 	| 'setPreviousPermissionMode'
 >;
@@ -774,6 +775,12 @@ export class ConversationSessionController {
 		reorderRevision: number,
 	): Promise<void> {
 		await this.#queue.moveForChat(chatId, source, target, placement, reorderRevision);
+	}
+
+	async handleSteerQueuedInput(entry: QueueEntry, reorderRevision: number): Promise<void> {
+		const chatId = this.deps.sessions.selectedChatId;
+		if (!chatId) return;
+		await this.#queue.steerHeadForChat(chatId, entry, reorderRevision);
 	}
 
 	async handleDeleteQueuedInput(entryId: string): Promise<void> {

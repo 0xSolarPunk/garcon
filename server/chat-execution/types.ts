@@ -1,5 +1,8 @@
 import crypto from 'crypto';
-import type { QueueEntryPlacement } from '../../common/chat-command-contracts.ts';
+import type {
+  QueueEntryPlacement,
+  SteerDeliveryOutcome,
+} from '../../common/chat-command-contracts.ts';
 import type { AutomaticQueuePauseKind, QueueEntry } from '../../common/queue-state.ts';
 import type {
   ChatImage,
@@ -47,6 +50,7 @@ export class QueueEntryMutationError extends DomainError {
     code:
       | 'QUEUE_ENTRY_NOT_FOUND'
       | 'QUEUE_ENTRY_ALREADY_SENT'
+      | 'QUEUE_ENTRY_IN_FLIGHT'
       | 'QUEUE_ENTRY_REVISION_CONFLICT'
       | 'QUEUE_ENTRY_REORDER_CONFLICT',
     message: string,
@@ -111,7 +115,11 @@ export interface CommandSettlementPort {
     deliveryAccepted: boolean,
   ): Promise<void>;
   settleSteerSuccess(command: AcceptedExecutionCommand, turnId: string): Promise<void>;
-  settleSteerFailure(command: AcceptedExecutionCommand, error: unknown): Promise<void>;
+  settleSteerFailure(
+    command: AcceptedExecutionCommand,
+    error: unknown,
+    deliveryOutcome?: SteerDeliveryOutcome,
+  ): Promise<void>;
   settleOperationFailure(command: AcceptedExecutionCommand, error: unknown): Promise<void>;
 }
 
@@ -186,6 +194,16 @@ export interface AcceptedSteerInput {
   clientMessageId: string;
   target: CapturedSteerTarget;
   settlement: CommandSettlementPort;
+}
+
+export interface AcceptedQueueEntrySteer extends AcceptedSteerInput {
+  command: AcceptedExecutionCommand & { entryId: string };
+  expectedRevision: number;
+  expectedReorderRevision: number;
+}
+
+export interface AcceptedQueueEntrySteerOutcome extends AcceptedSteerOutcome {
+  control: StoredChatExecutionControlState;
 }
 
 export interface AcceptedSteerOutcome {
@@ -312,6 +330,10 @@ export interface ChatExecutionCommands {
   moveAccepted(input: AcceptedQueueMove): Promise<QueueCommandMutationResult>;
   captureSteerTarget(chatId: string): CapturedSteerTarget | null;
   deliverAcceptedSteer(input: AcceptedSteerInput): Promise<AcceptedSteerOutcome>;
+  deliverAcceptedQueueEntrySteer(
+    input: AcceptedQueueEntrySteer,
+  ): Promise<AcceptedQueueEntrySteerOutcome>;
+  recoverQueueEntrySteer(chatId: string, entryId: string): Promise<StoredChatExecutionControlState>;
   deliverAcceptedGoalControl(input: AcceptedGoalControl): Promise<AcceptedGoalControlOutcome>;
   recoverAcceptedGoalControl(input: AcceptedGoalControl): Promise<AcceptedGoalControlOutcome>;
   stopActiveTurn(chatId: string): Promise<StopActiveTurnResult>;
@@ -413,6 +435,7 @@ export interface ChatExecutionService
     options: AgentSteerOptions,
     target: CapturedSteerTarget,
     afterPendingRegistered: (turnId: string) => Promise<void>,
+    notSentDisposition?: 'mark-failed' | 'queue-handler-settles',
   ): Promise<AcceptedSteerOutcome>;
   requeueAndPauseChat(
     chatId: string,
@@ -454,6 +477,12 @@ export function transitionError(
       return new QueueEntryMutationError(
         rejection.code,
         'This queued message has already been sent',
+        control,
+      );
+    case 'QUEUE_ENTRY_IN_FLIGHT':
+      return new QueueEntryMutationError(
+        rejection.code,
+        'This queued message is already being steered',
         control,
       );
     case 'QUEUE_ENTRY_REVISION_CONFLICT':

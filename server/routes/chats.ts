@@ -42,6 +42,7 @@ import { jsonError, jsonErrorFromUnknown } from '../lib/http-error.js';
 import {
   GoalControlDeliveryError,
   DomainError,
+  QueueEntrySteerError,
   transcriptUnavailableMessage,
   ValidationDomainError,
 } from '../lib/domain-error.js';
@@ -75,12 +76,14 @@ import type {
   AgentModelPatchRequest,
   CommandAcceptedResponse,
   QueueCommandErrorResponse,
+  QueueEntrySteerErrorResponse,
   RunningChatsResponse,
 } from '../../common/chat-command-contracts.ts';
 import {
   CommandRequestValidationError,
   parseGoalControlCommandRequest,
   parseSteerCommandRequest,
+  parseQueueEntrySteerCommandRequest,
   parseAgentInterruptAndSendCommandRequest,
   parseAgentRunCommandRequest,
   parseAgentStopCommandRequest,
@@ -972,6 +975,38 @@ export default function createChatRoutes({
     }
   }
 
+  async function postQueueEntrySteer(body: unknown): Promise<Response> {
+    let chatId: string | null = null;
+    try {
+      const input = parseCommandRequest(parseQueueEntrySteerCommandRequest, body);
+      chatId = input.chatId;
+      const result = await commands.submitQueueEntrySteer(input);
+      return Response.json(result, { status: 202 });
+    } catch (error: unknown) {
+      if (error instanceof QueueEntrySteerError && chatId) {
+        const control = error.control
+          ? toClientChatExecutionControlState(error.control)
+          : undefined;
+        const serverInstanceId = control?.serverInstanceId
+          ?? (await queue.readChatExecutionControl(chatId)).serverInstanceId;
+        const response: QueueEntrySteerErrorResponse = {
+          success: false,
+          error: error.message,
+          errorCode: error.code,
+          retryable: error.retryable,
+          deliveryOutcome: error.deliveryOutcome,
+          serverInstanceId,
+          ...(control ? { control } : {}),
+        };
+        return Response.json(response, { status: error.status });
+      }
+      if (error instanceof CommandValidationError) {
+        return jsonError(error.message, error.status, error.code, error.retryable);
+      }
+      return jsonErrorFromUnknown(error);
+    }
+  }
+
   async function postQueueMutation(body: unknown, action: 'clear' | 'pause' | 'resume'): Promise<Response> {
     try {
       const input = action === 'resume'
@@ -1180,6 +1215,7 @@ export default function createChatRoutes({
     },
     '/api/v1/chats/goal-control': { POST: withJsonBody(postGoalControl) },
     '/api/v1/chats/steer': { POST: withJsonBody(postSteer) },
+    '/api/v1/chats/queue/entries/steer': { POST: withJsonBody(postQueueEntrySteer) },
     '/api/v1/chats/queue/clear': {
       POST: withJsonBody((body: unknown) => postQueueMutation(body, 'clear')),
     },

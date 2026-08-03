@@ -13,6 +13,8 @@ const DEFINITIVE_ERROR_CODES = new Set<string>(
 		'STEER_TURN_CHANGED',
 		'STEER_TURN_NOT_STEERABLE',
 		'STEER_CAPACITY_EXHAUSTED',
+		'QUEUE_STEER_FINALIZATION_FAILED',
+		'QUEUE_STEER_RECOVERY_FAILED',
 		'GOAL_CONTROL_NOT_DELIVERED',
 	] satisfies CommandErrorCode[],
 );
@@ -32,6 +34,10 @@ function isAmbiguousCommandFailure(error: unknown): boolean {
 	return error.status >= 500;
 }
 
+function isStructuredOutcomeUnknownFailure(error: unknown): boolean {
+	return error instanceof ApiError && OUTCOME_UNKNOWN_ERROR_CODES.has(error.errorCode ?? '');
+}
+
 /** Retries one ambiguous transport outcome with the caller's unchanged command identity. */
 export async function submitIdempotentCommand<T>(submit: () => Promise<T>): Promise<T> {
 	try {
@@ -41,8 +47,12 @@ export async function submitIdempotentCommand<T>(submit: () => Promise<T>): Prom
 		try {
 			return await submit();
 		} catch (secondError) {
-			if (!isAmbiguousCommandFailure(secondError)) throw secondError;
-			throw new CommandOutcomeUnknownError({ cause: secondError });
+			throw new CommandOutcomeUnknownError({
+				cause:
+					isStructuredOutcomeUnknownFailure(firstError) || !isAmbiguousCommandFailure(secondError)
+						? firstError
+						: secondError,
+			});
 		}
 	}
 }

@@ -82,4 +82,78 @@ describe('submitIdempotentCommand', () => {
 		);
 		expect(submit).toHaveBeenCalledTimes(2);
 	});
+
+	it('does not downgrade an explicit unknown outcome after a replacement server rejects retry', async () => {
+		const firstError = new ApiError(500, 'accepted outcome unknown', 'STEER_OUTCOME_UNKNOWN');
+		const submit = vi
+			.fn()
+			.mockRejectedValueOnce(firstError)
+			.mockRejectedValueOnce(new ApiError(404, 'Session not found', 'SESSION_NOT_FOUND'));
+
+		const rejection = await submitIdempotentCommand(submit).catch((error) => error);
+
+		expect(rejection).toBeInstanceOf(CommandOutcomeUnknownError);
+		if (!(rejection instanceof CommandOutcomeUnknownError)) {
+			throw new Error('Expected an unknown command outcome');
+		}
+		expect(rejection.cause).toBe(firstError);
+		expect(submit).toHaveBeenCalledTimes(2);
+	});
+
+	it('retains a structured unknown outcome when its retry also loses the response', async () => {
+		const firstError = new ApiError(
+			500,
+			'accepted outcome unknown',
+			'STEER_OUTCOME_UNKNOWN',
+			undefined,
+			false,
+			{
+				success: false,
+				error: 'accepted outcome unknown',
+				errorCode: 'STEER_OUTCOME_UNKNOWN',
+				retryable: false,
+				deliveryOutcome: 'unknown',
+				control: { serverInstanceId: 'server-a' },
+			},
+		);
+		const submit = vi
+			.fn()
+			.mockRejectedValueOnce(firstError)
+			.mockRejectedValueOnce(new TypeError('retry response lost'));
+
+		const rejection = await submitIdempotentCommand(submit).catch((error) => error);
+
+		expect(rejection).toBeInstanceOf(CommandOutcomeUnknownError);
+		if (!(rejection instanceof CommandOutcomeUnknownError)) {
+			throw new Error('Expected an unknown command outcome');
+		}
+		expect(rejection.cause).toBe(firstError);
+		expect(submit).toHaveBeenCalledTimes(2);
+	});
+
+	it('does not downgrade a lost first response after a replacement server rejects retry', async () => {
+		const firstError = new TypeError('connection reset after send');
+		const submit = vi
+			.fn()
+			.mockRejectedValueOnce(firstError)
+			.mockRejectedValueOnce(
+				new ApiError(404, 'Queued entry not found', 'QUEUE_ENTRY_NOT_FOUND', undefined, false, {
+					success: false,
+					error: 'Queued entry not found',
+					errorCode: 'QUEUE_ENTRY_NOT_FOUND',
+					retryable: false,
+					deliveryOutcome: 'not-sent',
+					control: { serverInstanceId: 'replacement-server' },
+				}),
+			);
+
+		const rejection = await submitIdempotentCommand(submit).catch((error) => error);
+
+		expect(rejection).toBeInstanceOf(CommandOutcomeUnknownError);
+		if (!(rejection instanceof CommandOutcomeUnknownError)) {
+			throw new Error('Expected an unknown command outcome');
+		}
+		expect(rejection.cause).toBe(firstError);
+		expect(submit).toHaveBeenCalledTimes(2);
+	});
 });

@@ -20,7 +20,9 @@
 	let { editor, onCreate, onReplace, onClose }: Props = $props();
 	let editorTextarea: HTMLTextAreaElement | null = $state(null);
 	const canQueueDraftAsNew = $derived(
-		(editor.phase === 'sent' || editor.phase === 'removed') && !editor.queueDraftOutcomeUnknown,
+		(editor.phase === 'sent' || editor.phase === 'removed') &&
+			!editor.mutationBlocked &&
+			!editor.queueDraftOutcomeUnknown,
 	);
 
 	$effect(() => {
@@ -48,7 +50,7 @@
 	}
 
 	async function replaceLatest(): Promise<void> {
-		if (!editor.liveEntry || !editor.entryId || !editor.draft.trim()) return;
+		if (editor.mutationBlocked || !editor.liveEntry || !editor.entryId || !editor.draft.trim()) return;
 		editor.rebaseOnLatest();
 		await saveEdit();
 	}
@@ -56,6 +58,7 @@
 	async function queueDraftAsNew(): Promise<void> {
 		if (
 			!canQueueDraftAsNew ||
+			editor.mutationBlocked ||
 			!editor.entryId ||
 			!editor.draft.trim() ||
 			editor.mutation !== 'idle'
@@ -110,6 +113,14 @@
 			<p class="font-medium">{m.chat_queue_changed_elsewhere()}</p>
 			<p class="mt-0.5 text-xs">{m.chat_queue_changed_elsewhere_detail()}</p>
 		</div>
+	{:else if editor.phase === 'steering'}
+		<div class="mb-3 rounded-lg border border-border bg-card px-3 py-2 text-sm" role="status">
+			<p class="font-medium">{m.chat_queue_steering()}</p>
+		</div>
+	{:else if editor.mutationBlocked}
+		<div class="mb-3 rounded-lg border border-border bg-card px-3 py-2 text-sm" role="status">
+			<p class="font-medium">{m.chat_queue_other_message_steering()}</p>
+		</div>
 	{:else if editor.phase === 'dispatching' || editor.phase === 'sent'}
 		<div class="mb-3 rounded-lg border border-border bg-card px-3 py-2 text-sm" role="status">
 			<p class="font-medium">{m.chat_queue_already_sent()}</p>
@@ -130,8 +141,9 @@
 			bind:value={editor.draft}
 			onkeydown={handleEditorKeydown}
 			disabled={editor.mutation !== 'idle'}
+			readonly={editor.mutationBlocked}
 			rows="4"
-			class="max-h-48 min-h-24 w-full resize-y rounded-lg border border-input bg-background px-3 py-2 text-base leading-5 text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-70 sm:pointer-fine:text-sm"
+			class="max-h-48 min-h-24 w-full resize-y rounded-lg border border-input bg-background px-3 py-2 text-base leading-5 text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-70 read-only:cursor-wait read-only:opacity-70 sm:pointer-fine:text-sm"
 		></textarea>
 	</label>
 
@@ -168,7 +180,7 @@
 			<button
 				type="button"
 				onclick={() => void replaceLatest()}
-				disabled={!editor.draft.trim() || editor.mutation !== 'idle'}
+				disabled={!editor.draft.trim() || editor.mutation !== 'idle' || editor.mutationBlocked}
 				class="inline-flex min-h-9 items-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50"
 			>
 				<Undo2 class="h-4 w-4" />
@@ -178,7 +190,7 @@
 			<button
 				type="button"
 				onclick={() => void queueDraftAsNew()}
-				disabled={!editor.draft.trim() || editor.mutation !== 'idle'}
+				disabled={!editor.draft.trim() || editor.mutation !== 'idle' || editor.mutationBlocked}
 				class="inline-flex min-h-9 items-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50"
 			>
 				{#if editor.mutation === 'queueing-draft'}

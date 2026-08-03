@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
   COMMAND_CORRELATION_ID_MAX_BYTES,
+  QUEUE_ENTRY_ID_MAX_BYTES,
   CommandRequestValidationError,
   parseAgentRunCommandRequest,
   parseForkChatCommandRequest,
@@ -8,6 +9,7 @@ import {
   parseGoalControlCommandRequest,
   parsePermissionDecisionCommandRequest,
   parseQueueEntryMoveCommandRequest,
+  parseQueueEntrySteerCommandRequest,
   parseQueueEntryReplaceCommandRequest,
   parseStartChatCommandRequest,
   parseSteerCommandRequest,
@@ -122,6 +124,40 @@ describe('chat command request parsers', () => {
     })).toThrow(CommandRequestValidationError);
   });
 
+  it('parses queue steering with explicit entry concurrency preconditions', () => {
+    expect(parseQueueEntrySteerCommandRequest({
+      clientRequestId: ' request-steer-queue ',
+      clientMessageId: ' message-steer-queue ',
+      chatId: CHAT_ID,
+      entryId: ' entry-1 ',
+      expectedRevision: 2,
+      expectedReorderRevision: 4,
+    })).toEqual({
+      clientRequestId: 'request-steer-queue',
+      clientMessageId: 'message-steer-queue',
+      chatId: CHAT_ID,
+      entryId: 'entry-1',
+      expectedRevision: 2,
+      expectedReorderRevision: 4,
+    });
+    expect(() => parseQueueEntrySteerCommandRequest({
+      clientRequestId: 'request-steer-queue',
+      clientMessageId: 'message-steer-queue',
+      chatId: CHAT_ID,
+      entryId: 'entry-1',
+      expectedRevision: 0,
+      expectedReorderRevision: 0,
+    })).toThrow('expectedRevision must be a positive integer');
+    expect(() => parseQueueEntrySteerCommandRequest({
+      clientRequestId: 'request-steer-queue',
+      clientMessageId: 'message-steer-queue',
+      chatId: CHAT_ID,
+      entryId: 'entry-1',
+      expectedRevision: 1,
+      expectedReorderRevision: -1,
+    })).toThrow('expectedReorderRevision must be a non-negative integer');
+  });
+
   it('bounds command correlation identities by UTF-8 byte length', () => {
     const base = {
       clientRequestId: 'request-steer',
@@ -142,6 +178,29 @@ describe('chat command request parsers', () => {
       ...base,
       clientMessageId: '\u00e9'.repeat((COMMAND_CORRELATION_ID_MAX_BYTES / 2) + 1),
     })).toThrow(`clientMessageId must be at most ${COMMAND_CORRELATION_ID_MAX_BYTES} bytes`);
+  });
+
+  it('bounds queue entry identities by UTF-8 byte length', () => {
+    const base = {
+      clientRequestId: 'request-steer-queue',
+      clientMessageId: 'message-steer-queue',
+      chatId: CHAT_ID,
+      expectedRevision: 1,
+      expectedReorderRevision: 0,
+    };
+
+    expect(parseQueueEntrySteerCommandRequest({
+      ...base,
+      entryId: 'x'.repeat(QUEUE_ENTRY_ID_MAX_BYTES),
+    }).entryId).toHaveLength(QUEUE_ENTRY_ID_MAX_BYTES);
+    expect(() => parseQueueEntrySteerCommandRequest({
+      ...base,
+      entryId: 'x'.repeat(QUEUE_ENTRY_ID_MAX_BYTES + 1),
+    })).toThrow(`entryId must be at most ${QUEUE_ENTRY_ID_MAX_BYTES} bytes`);
+    expect(() => parseQueueEntrySteerCommandRequest({
+      ...base,
+      entryId: '\u00e9'.repeat((QUEUE_ENTRY_ID_MAX_BYTES / 2) + 1),
+    })).toThrow(`entryId must be at most ${QUEUE_ENTRY_ID_MAX_BYTES} bytes`);
   });
 
   it('keeps goal control on its request-only command identity', () => {

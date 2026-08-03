@@ -30,7 +30,14 @@ const MAX_LINES = 1000;
 // increment for the consultation CLI.
 // Runtime-scoped execution controls add 9 lines for repository identity injection,
 // client projection, and rejection of foreign-instance state.
-const EXECUTION_FOOTPRINT_BUDGET = 7938;
+// Atomic queue-sourced steering adds 823 lines for head reservation, delivery
+// settlement, idempotent recovery, and provider-neutral pending-input cleanup.
+// Follow-up hardening adds 8 lines for uncertainty-token invalidation
+// and post-commit pending-status publication isolation.
+// Adversarial hardening adds 12 lines for bounded queue-entry identities and
+// non-throwing delivery-status publication diagnostics.
+// Response identity hardening adds one net line for control-free error authority.
+const EXECUTION_FOOTPRINT_BUDGET = 8782;
 
 const GRANDFATHER = {
   'server/git/diff-engine.ts': 1575,

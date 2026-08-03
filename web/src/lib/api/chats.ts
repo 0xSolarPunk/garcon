@@ -49,6 +49,8 @@ import type {
 	QueueEntryDeleteResponse,
 	QueueEntryMoveCommandRequest,
 	QueueEntryReplaceCommandRequest,
+	QueueEntrySteerCommandRequest,
+	QueueEntrySteerCommandResponse,
 	QueueMutationResponse,
 	QueuePauseRequest,
 	QueueResumeRequest,
@@ -66,6 +68,7 @@ import type { ChatSearchRequest, ChatSearchResponse } from '$shared/chat-search'
 import type { ChatDetailsResponse } from '$shared/chat-details';
 import {
 	parseChatExecutionControlState,
+	parseExecutionControlServerInstanceId,
 	type ChatExecutionControlState,
 } from '$shared/chat-execution-control';
 import { CHAT_STOP_OUTCOMES, type ChatStopOutcome } from '$shared/chat-types';
@@ -251,6 +254,24 @@ export async function submitGoalControl(
 
 export async function steerChat(params: SteerCommandRequest): Promise<SteerCommandResponse> {
 	return apiPost<SteerCommandResponse>('/api/v1/chats/steer', params);
+}
+
+export async function steerQueuedEntry(
+	params: QueueEntrySteerCommandRequest,
+): Promise<QueueEntrySteerCommandResponse> {
+	const response = await apiPost<QueueEntrySteerCommandResponse>(
+		'/api/v1/chats/queue/entries/steer',
+		params,
+	);
+	const serverInstanceId = parseExecutionControlServerInstanceId(response.serverInstanceId);
+	if (!serverInstanceId) throw new Error('Invalid queued steer server instance response');
+	if (!response.control) return { ...response, serverInstanceId };
+	const control = parseChatExecutionControlState(response.control);
+	if (!control) throw new Error('Invalid queued steer execution control response');
+	if (control.serverInstanceId !== serverInstanceId) {
+		throw new Error('Mismatched queued steer server instance response');
+	}
+	return { ...response, serverInstanceId, control };
 }
 
 export async function getChatExecutionControl(

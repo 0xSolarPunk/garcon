@@ -4,6 +4,10 @@ import type {
   PendingUserInput,
   PendingUserInputClearReason,
 } from '../../common/pending-user-input.js';
+import { errorMessage } from '../lib/errors.ts';
+import { createLogger } from '../lib/log.ts';
+
+const logger = createLogger('pending-user-input-store');
 
 export type PendingUserInputRecord = PendingUserInput;
 export type PendingUserInputStoreClearReason = PendingUserInputClearReason;
@@ -88,7 +92,14 @@ export class PendingUserInputStore extends EventEmitter<PendingUserInputEvents> 
     if (!record) return false;
     if (record.deliveryStatus === deliveryStatus) return true;
     record.deliveryStatus = deliveryStatus;
-    this.emit('status-updated', chatId, clientRequestId, deliveryStatus);
+    try {
+      this.emit('status-updated', chatId, clientRequestId, deliveryStatus);
+    } catch (error) {
+      logger.warn(
+        'delivery-status listener failed after update:',
+        errorMessage(error, 'Unknown delivery-status listener failure'),
+      );
+    }
     return true;
   }
 

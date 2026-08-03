@@ -6,6 +6,9 @@ import {
   moveQueueEntry,
   pauseQueue,
   popNextQueueEntry,
+  reserveQueueSteer,
+  releaseQueueSteer,
+  consumeQueueSteer,
   removeSentQueueEntry,
   replaceQueueEntry,
   requeueAndPause,
@@ -103,6 +106,120 @@ describe('chat execution control transitions', () => {
       status: 'rejected',
       rejection: { code: 'QUEUE_ENTRY_NOT_FOUND', entryId: 'missing' },
     });
+  });
+
+  it('reserves, releases, and consumes the exact queue head without exposing it to dispatch', () => {
+    const current = emptyStoredChatExecutionControl('server-instance-test');
+    current.entries = [storedEntry('head'), storedEntry('future')];
+    current.entries[0].delivery = {
+      clientRequestId: 'request-head',
+      clientMessageId: 'message-head',
+      turnId: 'turn-head',
+    };
+    current.pause = { id: 'pause-1', kind: 'manual', pausedAt: context().now };
+    current.reorderRevision = 3;
+
+    const reserved = reserveQueueSteer(current, {
+      entryId: 'head',
+      expectedRevision: 1,
+      expectedReorderRevision: 3,
+    }, context(1));
+    expect(value(reserved).entry).toMatchObject({ id: 'head', status: 'steering' });
+    value(reserved).entry.delivery.clientRequestId = 'mutated-request';
+    expect(reserved.next.entries[0].delivery.clientRequestId).toBe('request-head');
+    expect(current.entries[0].delivery.clientRequestId).toBe('request-head');
+    expect(reserved.next.entries.map((entry) => entry.id)).toEqual(['head', 'future']);
+    expect(value(popNextQueueEntry(reserved.next, context(2)))).toBeNull();
+
+    const released = releaseQueueSteer(reserved.next, 'head', context(3));
+    expect(released.next.entries[0].status).toBe('queued');
+    expect(released.next.pause).toEqual(current.pause);
+
+    const reservedAgain = reserveQueueSteer(released.next, {
+      entryId: 'head',
+      expectedRevision: 1,
+      expectedReorderRevision: 3,
+    }, context(4));
+    const consumed = consumeQueueSteer(reservedAgain.next, 'head', context(5));
+    expect(consumed.next.entries.map((entry) => entry.id)).toEqual(['future']);
+    expect(consumed.next.recentlyDispatched).toContainEqual(expect.objectContaining({
+      entryId: 'head',
+      revision: 1,
+    }));
+    expect(consumed.next.pause).toEqual(current.pause);
+    expect(current.entries.every((entry) => entry.status === 'queued')).toBe(true);
+  });
+
+  it('rejects stale or competing steering reservations without changing the queue', () => {
+    const current = emptyStoredChatExecutionControl('server-instance-test');
+    current.entries = [storedEntry('head'), storedEntry('future')];
+    current.reorderRevision = 2;
+
+    expect(reserveQueueSteer(current, {
+      entryId: 'future',
+      expectedRevision: 1,
+      expectedReorderRevision: 2,
+    }, context()).outcome).toEqual({
+      status: 'rejected',
+      rejection: { code: 'QUEUE_ENTRY_REORDER_CONFLICT' },
+    });
+    const reserved = reserveQueueSteer(current, {
+      entryId: 'head',
+      expectedRevision: 1,
+      expectedReorderRevision: 2,
+    }, context());
+    expect(reserveQueueSteer(reserved.next, {
+      entryId: 'head',
+      expectedRevision: 1,
+      expectedReorderRevision: 2,
+    }, context(1)).outcome).toEqual({
+      status: 'rejected',
+      rejection: { code: 'QUEUE_ENTRY_IN_FLIGHT', entryId: 'head' },
+    });
+    expect(replaceQueueEntry(reserved.next, {
+      entryId: 'head',
+      content: 'changed',
+      expectedRevision: 1,
+    }, context(1)).outcome).toEqual({
+      status: 'rejected',
+      rejection: { code: 'QUEUE_ENTRY_IN_FLIGHT', entryId: 'head' },
+    });
+  });
+
+  it('moves a queued entry around a steering target and bumps reorder revision', () => {
+    const current = emptyStoredChatExecutionControl('server-instance-test');
+    current.entries = [storedEntry('steering', 'steering'), storedEntry('source')];
+
+    const moved = moveQueueEntry(current, {
+      entryId: 'source',
+      targetEntryId: 'steering',
+      placement: 'before',
+      expectedReorderRevision: 0,
+      expectedSourceRevision: 1,
+      expectedTargetRevision: 1,
+    }, context());
+
+    expect(value(moved).rebased).toBe(false);
+    expect(moved.next.entries.map((entry) => entry.id)).toEqual(['source', 'steering']);
+    expect(moved.next.reorderRevision).toBe(1);
+  });
+
+  it('preserves pause ownership while a steering entry remains and clears it when removed', () => {
+    const current = emptyStoredChatExecutionControl('server-instance-test');
+    current.entries = [storedEntry('steering', 'steering'), storedEntry('queued')];
+    current.pause = { id: 'pause-1', kind: 'manual', pausedAt: context().now };
+
+    const deleted = deleteQueueEntry(current, { entryId: 'queued' }, context(1));
+    expect(deleted.next.entries).toEqual([expect.objectContaining({ id: 'steering' })]);
+    expect(deleted.next.pause).toEqual(current.pause);
+
+    const consumed = consumeQueueSteer(deleted.next, 'steering', context(2));
+    expect(consumed.next.entries).toEqual([]);
+    expect(consumed.next.pause).toBeNull();
+
+    const cleared = clearQueue(current, context(3));
+    expect(cleared.next.entries).toEqual([]);
+    expect(cleared.next.pause).toBeNull();
   });
 
   it('retains unresolved receipts while enforcing the receipt bound', () => {
@@ -251,6 +368,36 @@ describe('chat execution control transitions', () => {
     expect(value(popNextQueueEntry(resumed.next, context(3))).entry.id).toBe('target');
   });
 
+  it('rebases a move past a dispatching target before the steering head', () => {
+    const current = emptyStoredChatExecutionControl('server-instance-test');
+    current.entries = [
+      storedEntry('target', 'sending'),
+      storedEntry('steering', 'steering'),
+      storedEntry('source'),
+    ];
+    current.recentlyDispatched = [{
+      entryId: 'target',
+      revision: 1,
+      dispatchedAt: '2026-07-19T00:00:00.000Z',
+    }];
+
+    const moved = moveQueueEntry(current, {
+      entryId: 'source',
+      targetEntryId: 'target',
+      placement: 'before',
+      expectedReorderRevision: 0,
+      expectedSourceRevision: 1,
+      expectedTargetRevision: 1,
+    }, context());
+
+    expect(value(moved).rebased).toBe(true);
+    expect(moved.next.entries.map((entry) => entry.id)).toEqual([
+      'target',
+      'source',
+      'steering',
+    ]);
+  });
+
   it('rebases past a completed target only when its dispatched revision still matches', () => {
     const current = emptyStoredChatExecutionControl('server-instance-test');
     current.entries = [storedEntry('a'), storedEntry('source'), storedEntry('b')];
@@ -363,9 +510,23 @@ describe('chat execution control transitions', () => {
     }, context());
     expect(uncertain.next.entries[0]).toMatchObject({
       status: 'queued',
+      revision: 2,
+      updatedAt: context().now,
       delivery: current.entries[0].delivery,
     });
     expect(uncertain.next.pause?.kind).toBe('completion-uncertain');
+    expect(reserveQueueSteer(uncertain.next, {
+      entryId: 'entry-1',
+      expectedRevision: 1,
+      expectedReorderRevision: 0,
+    }, context(1)).outcome).toEqual({
+      status: 'rejected',
+      rejection: {
+        code: 'QUEUE_ENTRY_REVISION_CONFLICT',
+        entryId: 'entry-1',
+        actualRevision: 2,
+      },
+    });
 
     const stopped = restoreStoppedQueueEntry(current, 'entry-1', context());
     expect(stopped.next.pause?.kind).toBe('manual');

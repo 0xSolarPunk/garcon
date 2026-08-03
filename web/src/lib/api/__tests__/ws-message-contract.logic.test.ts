@@ -46,6 +46,7 @@ function emptyExecutionControl(version = 4, serverInstanceId = 'server-instance-
 		queue: {
 			entries: [],
 			dispatchingEntryId: null,
+			steeringEntryId: null,
 			recentlyDispatched: [],
 			pause: null,
 			reorderRevision: 0,

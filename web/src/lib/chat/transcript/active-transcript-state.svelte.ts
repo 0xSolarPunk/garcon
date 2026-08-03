@@ -12,6 +12,7 @@ export const INITIAL_SWITCH_VISIBLE_MESSAGES = 20;
 export const ACTIVE_TRANSCRIPT_RETENTION_LIMIT = 200;
 const SWITCH_REVEAL_BATCH_SIZE = 20;
 type ChatPage = Awaited<ReturnType<typeof getChatMessages>>;
+type SnapshotBatch = { generationId: string; messages: ChatViewMessage[]; noticeRevision: number };
 export type MessageApplyResult = 'applied' | 'generation-changed' | 'gap-detected';
 type PageApplyResult = MessageApplyResult | 'stale';
 type InitialRevealPhase = 'pending' | 'revealing' | 'complete';
@@ -54,11 +55,6 @@ export interface ChatTranscriptRow {
 }
 
 export type ChatDisplayRow = ChatTranscriptRow | LocalNoticeRow;
-
-function localMessageId(): string {
-	return createRandomId();
-}
-
 function pendingInputsFromPage(page: Pick<ChatPage, 'pendingUserInputs'>): PendingUserInput[] {
 	return sortPendingInputs(
 		page.pendingUserInputs
@@ -101,7 +97,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 	lastSeq = $state(0);
 	oldestSeq = $state(0);
 	pendingUserInputs = $state<PendingUserInput[]>([]);
-	localNotices = $state<LocalNoticeRow[]>([]);
+	localNotices = $state<(LocalNoticeRow & { revision: number })[]>([]);
 	visibleMessageCount = $state(INITIAL_VISIBLE_MESSAGES);
 	isLoadingMessages = $state(false);
 	hasEarlierMessages = $state(false);
@@ -113,8 +109,10 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 	isUserScrolledUp = $state(false);
 	loadStatus = $state<ChatLoadStatus>('idle');
 	loadError = $state<string | null>(null);
-	#snapshotBuffer: Array<{ generationId: string; messages: ChatViewMessage[] }> | null = null;
+	#snapshotBuffer: SnapshotBatch[] | null = null;
 	#loadEpoch = 0;
+	#localNoticeRevision = 0;
+	#localNoticeRevisionAtLoadStart = 0;
 	#pendingUserInputsRevision = 0;
 	#pendingUserInputsRevisionAtLoadStart = 0;
 	#pageLoadPromise: Promise<TranscriptPageLoadResult> | null = null;
@@ -279,10 +277,11 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		chatId: string,
 		generationId: string,
 		messages: ChatViewMessage[],
+		noticeRevision = this.#localNoticeRevision,
 	): MessageApplyResult {
 		if (this.#snapshotBuffer) {
 			this.transcriptCache.applyMessages(chatId, generationId, messages);
-			this.#snapshotBuffer.push({ generationId, messages });
+			this.#snapshotBuffer.push({ generationId, messages, noticeRevision });
 			return 'applied';
 		}
 		if (this.generationId && generationId !== this.generationId) {
@@ -310,7 +309,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 			this.generationId = generationId;
 			this.lastSeq = result.lastSeq;
 			if (result.changed) {
-				this.localNotices = [];
+				this.clearLocalNotices(noticeRevision);
 			}
 			if (this.entries.length > 0 && this.loadStatus !== 'error') {
 				this.loadStatus = 'loaded';
@@ -318,6 +317,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 			return 'applied';
 		}
 		const applied = applyChatViewMessages(this.entries, messages, this.lastSeq);
+		const visibleChanged = applied.status === 'applied' && applied.changed;
 		if (applied.status === 'applied') {
 			const shouldCompact =
 				!this.isUserScrolledUp && this.visibleMessageCount <= INITIAL_VISIBLE_MESSAGES;
@@ -341,8 +341,8 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 			this.lastSeq = restored.lastSeq;
 			this.oldestSeq = restored.oldestSeq;
 		}
-		if (result.changed) {
-			this.localNotices = [];
+		if (result.changed || visibleChanged) {
+			this.clearLocalNotices(noticeRevision);
 		}
 		this.totalMessages = this.entries.length;
 		if (this.entries.length > 0 && this.loadStatus !== 'error') {
@@ -353,7 +353,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 
 	beginSnapshotLoad(): number {
 		const epoch = this.#beginLoadEpoch();
-		this.#snapshotBuffer = [];
+		this.#snapshotBuffer ??= [];
 		this.isLoadingMessages = true;
 		this.loadStatus = 'loading';
 		this.loadError = null;
@@ -364,6 +364,22 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		if (epoch !== this.#loadEpoch) return;
 		this.#snapshotBuffer = null;
 		this.isLoadingMessages = false;
+	}
+
+	#finishFailedSnapshotLoad(chatId: string, epoch: number): boolean {
+		if (epoch !== this.#loadEpoch) return false;
+		if (this.activeChatId && this.activeChatId !== chatId) {
+			this.abortSnapshotLoad(epoch);
+			return false;
+		}
+
+		const buffered = this.#snapshotBuffer ?? [];
+		this.#snapshotBuffer = null;
+		this.isLoadingMessages = false;
+		for (const { generationId, messages, noticeRevision } of buffered) {
+			if (this.applyMessages(chatId, generationId, messages, noticeRevision) !== 'applied') break;
+		}
+		return true;
 	}
 
 	replaceGeneration(
@@ -438,12 +454,12 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		if (this.#pendingUserInputsRevision === this.#pendingUserInputsRevisionAtLoadStart) {
 			this.#replacePendingUserInputs(pendingInputsFromPage(page));
 		}
-		this.localNotices = [];
+		this.clearLocalNotices(this.#localNoticeRevisionAtLoadStart);
 		this.loadStatus = page.messages.length === 0 ? 'empty' : 'loaded';
 		this.loadError = null;
 		this.isLoadingMessages = false;
-		for (const batch of buffered) {
-			const result = this.applyMessages(chatId, batch.generationId, batch.messages);
+		for (const { generationId, messages, noticeRevision } of buffered) {
+			const result = this.applyMessages(chatId, generationId, messages, noticeRevision);
 			if (result !== 'applied') return result;
 		}
 		this.#resolvePendingInitialReveal();
@@ -476,9 +492,10 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 
 				this.abortSnapshotLoad(epoch);
 			} catch (error) {
-				this.abortSnapshotLoad(epoch);
-				this.loadStatus = 'error';
-				this.loadError = error instanceof Error ? error.message : 'Failed to load messages';
+				if (this.#finishFailedSnapshotLoad(chatId, epoch)) {
+					this.loadStatus = 'error';
+					this.loadError = error instanceof Error ? error.message : 'Failed to load messages';
+				}
 				throw error;
 			}
 		}
@@ -629,16 +646,17 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 			...this.localNotices,
 			{
 				kind: 'local-notice',
-				id: `local_${localMessageId()}`,
+				id: `local_${createRandomId()}`,
 				noticeType,
 				content,
 				timestamp: new Date().toISOString(),
+				revision: ++this.#localNoticeRevision,
 			},
 		];
 	}
 
-	clearLocalNotices(): void {
-		this.localNotices = [];
+	clearLocalNotices(throughRevision = this.#localNoticeRevision): void {
+		this.localNotices = this.localNotices.filter((notice) => notice.revision > throughRevision);
 	}
 
 	setPendingUserInputs(inputs: PendingUserInput[]): void {
@@ -696,6 +714,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 		this.totalMessages = 0;
 		this.loadStatus = 'idle';
 		this.loadError = null;
+		this.isLoadingMessages = false;
 		this.#snapshotBuffer = null;
 		this.#initialRevealPhase = 'complete';
 	}
@@ -839,6 +858,7 @@ export class ActiveTranscriptState implements ActiveTranscriptPort {
 
 	#beginLoadEpoch(): number {
 		this.#pendingUserInputsRevisionAtLoadStart = this.#pendingUserInputsRevision;
+		this.#localNoticeRevisionAtLoadStart = this.#localNoticeRevision;
 		return ++this.#loadEpoch;
 	}
 

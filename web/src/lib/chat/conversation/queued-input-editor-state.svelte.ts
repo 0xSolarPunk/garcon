@@ -4,6 +4,7 @@ export type QueuedInputEditPhase =
 	| 'closed'
 	| 'editable'
 	| 'conflict'
+	| 'steering'
 	| 'dispatching'
 	| 'sent'
 	| 'removed';
@@ -30,6 +31,7 @@ export class QueuedInputEditorState {
 
 	phase = $derived.by<QueuedInputEditPhase>(() => {
 		if (!this.entryId) return 'closed';
+		if (this.options.queue?.steeringEntryId === this.entryId) return 'steering';
 		if (this.liveEntry) {
 			return this.liveEntry.revision === this.baseRevision ? 'editable' : 'conflict';
 		}
@@ -39,9 +41,13 @@ export class QueuedInputEditorState {
 		}
 		return 'removed';
 	});
+	mutationBlocked = $derived.by(() => this.options.queue?.steeringEntryId != null);
 
 	canSave = $derived(
-		this.phase === 'editable' && this.mutation === 'idle' && this.draft.trim().length > 0,
+		this.phase === 'editable' &&
+			!this.mutationBlocked &&
+			this.mutation === 'idle' &&
+			this.draft.trim().length > 0,
 	);
 
 	constructor(private readonly options: QueuedInputEditorOptions) {}
