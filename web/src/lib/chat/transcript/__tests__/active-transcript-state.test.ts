@@ -1,11 +1,17 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	ACTIVE_TRANSCRIPT_RETENTION_LIMIT,
 	ActiveTranscriptState,
 	INITIAL_VISIBLE_MESSAGES,
 } from '../active-transcript-state.svelte.js';
 import { ChatTranscriptCache } from '../chat-transcript-cache.svelte';
-import { AssistantMessage, ErrorMessage, UserMessage, type ChatMessage } from '$shared/chat-types';
+import {
+	AssistantMessage,
+	BashToolUseMessage,
+	ErrorMessage,
+	UserMessage,
+	type ChatMessage,
+} from '$shared/chat-types';
 import type { ChatViewMessage } from '$shared/chat-view';
 import type { PendingUserInput } from '$shared/pending-user-input';
 import { getChatMessages } from '$lib/api/chats.js';
@@ -76,11 +82,54 @@ describe('ActiveTranscriptState', () => {
 		vi.mocked(getChatMessages).mockReset();
 	});
 
+	afterEach(() => vi.restoreAllMocks());
+
 	it('starts with an empty generation cursor', () => {
 		const chat = new ActiveTranscriptState();
 
 		expect(chat.getCursor()).toEqual({ generationId: '', lastSeq: 0 });
 		expect(chat.chatMessages).toEqual([]);
+		expect(chat.feedMutationClock.dataRevision).toBe(0);
+	});
+
+	it('records applied feed mutations by provenance without counting duplicates', () => {
+		const chat = new ActiveTranscriptState();
+
+		chat.applyMessages('chat-1', 'generation-1', [entry(1, assistant('hello'))]);
+		const liveRevision = chat.feedMutationClock.dataRevision;
+		expect(chat.feedMutationClock.lastRevisionByKind['live-append']).toBe(liveRevision);
+		expect(chat.feedMutationClock.lastResponseRevisionByMessageType).toEqual({
+			'assistant-message': liveRevision,
+		});
+
+		const entriesBeforeDuplicate = chat.entries;
+		const rowsBeforeDuplicate = chat.visibleRows;
+		chat.applyMessages('chat-1', 'generation-1', [entry(1, assistant('duplicate'))]);
+		expect(chat.feedMutationClock.dataRevision).toBe(liveRevision);
+		expect(chat.entries).toBe(entriesBeforeDuplicate);
+		expect(chat.visibleRows).toBe(rowsBeforeDuplicate);
+		chat.applyMessages('chat-1', 'generation-1', [entry(2, user('next prompt'))]);
+		expect(chat.feedMutationClock.lastResponseRevisionByMessageType).toEqual({
+			'assistant-message': liveRevision,
+		});
+		chat.applyMessages('chat-1', 'generation-1', [
+			entry(3, new BashToolUseMessage(TS, 'tool-1', 'pwd')),
+		]);
+		const toolRevision = chat.feedMutationClock.dataRevision;
+		expect(chat.feedMutationClock.lastResponseRevisionByMessageType).toEqual({
+			'assistant-message': liveRevision,
+			'bash-tool-use': toolRevision,
+		});
+
+		chat.appendLocalNotice('warning', 'notice');
+		expect(chat.feedMutationClock.lastRevisionByKind['presentation-structure']).toBe(
+			chat.feedMutationClock.dataRevision,
+		);
+
+		chat.clearMessages();
+		expect(chat.feedMutationClock.lastRevisionByKind.replacement).toBe(
+			chat.feedMutationClock.dataRevision,
+		);
 	});
 
 	it('applies same-generation messages by seq and ignores duplicates', () => {
@@ -157,6 +206,132 @@ describe('ActiveTranscriptState', () => {
 		expect(chat.visibleMessageCount).toBe(INITIAL_VISIBLE_MESSAGES);
 	});
 
+	it('deduplicates overlapping earlier pages before extending the loaded window', async () => {
+		const chat = new ActiveTranscriptState();
+		chat.replaceGeneration(
+			'chat-1',
+			'generation-1',
+			Array.from({ length: 50 }, (_, index) =>
+				entry(index + 51, assistant(`message-${index + 51}`)),
+			),
+			{ lastSeq: 100, pageOldestSeq: 51, hasMore: true },
+		);
+		vi.mocked(getChatMessages).mockResolvedValueOnce({
+			chatId: 'chat-1',
+			limit: 50,
+			...page({
+				messages: [
+					entry(50, assistant('message-50')),
+					entry(50, assistant('duplicate-50')),
+					entry(51, assistant('overlap-51')),
+				],
+				lastSeq: 100,
+				pageOldestSeq: 50,
+				hasMore: false,
+			}),
+		});
+
+		await expect(chat.loadEarlierPage('chat-1')).resolves.toBe('loaded');
+		expect(chat.entries.map((message) => message.seq)).toEqual(
+			Array.from({ length: 51 }, (_, index) => index + 50),
+		);
+		expect(chat.visibleMessageCount).toBe(INITIAL_VISIBLE_MESSAGES + 1);
+	});
+
+	it('fails an earlier page that claims more history without advancing', async () => {
+		const chat = new ActiveTranscriptState();
+		chat.replaceGeneration('chat-1', 'generation-1', [entry(51, assistant('message-51'))], {
+			lastSeq: 100,
+			pageOldestSeq: 51,
+			hasMore: true,
+		});
+		vi.mocked(getChatMessages).mockResolvedValueOnce({
+			chatId: 'chat-1',
+			limit: 50,
+			...page({
+				messages: [entry(51, assistant('duplicate-51'))],
+				lastSeq: 100,
+				pageOldestSeq: 51,
+				hasMore: true,
+			}),
+		});
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		await expect(chat.loadEarlierPage('chat-1')).resolves.toBe('failed');
+		expect(chat.pageStates.earlier).toMatchObject({
+			status: 'error',
+			error: 'Earlier transcript page did not advance the loaded window',
+		});
+		expect(chat.chatMessages).toHaveLength(1);
+	});
+
+	it('fails an empty earlier page that still claims more history', async () => {
+		const chat = new ActiveTranscriptState();
+		chat.replaceGeneration('chat-1', 'generation-1', [entry(51, assistant('message-51'))], {
+			lastSeq: 100,
+			pageOldestSeq: 51,
+			hasMore: true,
+		});
+		vi.mocked(getChatMessages).mockResolvedValueOnce({
+			chatId: 'chat-1',
+			limit: 50,
+			...page({ messages: [], lastSeq: 100, pageOldestSeq: 0, hasMore: true }),
+		});
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		await expect(chat.loadEarlierPage('chat-1')).resolves.toBe('failed');
+		expect(chat.pageStates.earlier).toMatchObject({
+			status: 'error',
+			error: 'Earlier transcript page did not advance the loaded window',
+		});
+		expect(chat.hasEarlierMessages).toBe(true);
+	});
+
+	it('invalidates an earlier page when gap recovery replaces the loaded window', async () => {
+		const chat = new ActiveTranscriptState();
+		chat.replaceGeneration(
+			'chat-1',
+			'generation-1',
+			Array.from({ length: 50 }, (_, index) =>
+				entry(index + 51, assistant(`message-${index + 51}`)),
+			),
+			{ lastSeq: 100, pageOldestSeq: 51, hasMore: true },
+		);
+		let resolveEarlier!: (value: Awaited<ReturnType<typeof getChatMessages>>) => void;
+		vi.mocked(getChatMessages).mockReturnValueOnce(
+			new Promise((resolve) => {
+				resolveEarlier = resolve;
+			}),
+		);
+		const earlierLoad = chat.loadEarlierPage('chat-1');
+
+		chat.entries = Array.from({ length: 50 }, (_, index) =>
+			entry(index + 1, assistant(`stale-${index + 1}`)),
+		);
+		chat.oldestSeq = 1;
+		chat.lastSeq = 50;
+		expect(chat.applyMessages('chat-1', 'generation-1', [entry(101, assistant('live'))])).toBe(
+			'applied',
+		);
+		resolveEarlier({
+			chatId: 'chat-1',
+			limit: 50,
+			...page({
+				messages: Array.from({ length: 50 }, (_, index) =>
+					entry(index + 1, assistant(`earlier-${index + 1}`)),
+				),
+				lastSeq: 101,
+				pageOldestSeq: 1,
+				hasMore: false,
+			}),
+		});
+
+		await expect(earlierLoad).resolves.toBe('invalidated');
+		expect(chat.entries.map((message) => message.seq)).toEqual(
+			Array.from({ length: 51 }, (_, index) => index + 51),
+		);
+	});
+
 	it('signals generation changes without replacing the current generation', () => {
 		const chat = new ActiveTranscriptState();
 		chat.applyMessages('chat-1', 'generation-1', [entry(1, user('old'))]);
@@ -196,7 +371,7 @@ describe('ActiveTranscriptState', () => {
 		const chat = new ActiveTranscriptState();
 		chat.applyMessages('chat-1', 'generation-1', [entry(1, user('server'))]);
 		chat.appendLocalNotice('warning', 'Chat interrupted by user.');
-		const noticeBottomRowId = chat.bottomVisibleRowId;
+		const noticeBottomRowId = chat.visibleRows.at(-1)?.id;
 		expect(chat.displayMessageCount).toBe(2);
 		expect(noticeBottomRowId).toMatch(/^local_/);
 
@@ -211,8 +386,8 @@ describe('ActiveTranscriptState', () => {
 
 		expect(chat.visibleRows.map(rowContentOf)).toEqual(['server', 'continue']);
 		expect(chat.displayMessageCount).toBe(2);
-		expect(chat.bottomVisibleRowId).toBe('pending:req-1');
-		expect(chat.bottomVisibleRowId).not.toBe(noticeBottomRowId);
+		expect(chat.visibleRows.at(-1)?.id).toBe('pending:req-1');
+		expect(chat.visibleRows.at(-1)?.id).not.toBe(noticeBottomRowId);
 	});
 
 	it('keeps transient local messages when replay only overlaps existing server messages', () => {
@@ -343,6 +518,7 @@ describe('ActiveTranscriptState', () => {
 		);
 
 		const snapshotLoad = chat.loadMessages('chat-1');
+		const revisionBeforeLiveMessage = chat.feedMutationClock.dataRevision;
 		expect(chat.applyMessages('chat-1', 'generation-1', [entry(2, assistant('live'))])).toBe(
 			'applied',
 		);
@@ -353,6 +529,12 @@ describe('ActiveTranscriptState', () => {
 		expect(chat.chatMessages.map(contentOf)).toEqual(['existing', 'live']);
 		expect(chat.visibleRows.map(rowContentOf)).toEqual(['existing', 'live', 'newer notice']);
 		expect(chat.getCursor()).toEqual({ generationId: 'generation-1', lastSeq: 2 });
+		expect(chat.feedMutationClock.lastRevisionByKind['live-append']).toBeGreaterThan(
+			revisionBeforeLiveMessage,
+		);
+		expect(chat.feedMutationClock.lastResponseRevisionByMessageType['assistant-message']).toBe(
+			chat.feedMutationClock.lastRevisionByKind['live-append'],
+		);
 		expect(chat.loadStatus).toBe('error');
 		expect(chat.loadError).toBe('snapshot unavailable');
 	});
@@ -777,7 +959,7 @@ describe('ActiveTranscriptState', () => {
 		expect(restored.chatMessages.map(contentOf)).toEqual(['first', 'second']);
 	});
 
-	it('reveals a restored transcript window in bounded switch batches', () => {
+	it('restores the bounded transcript window immediately', () => {
 		const transcriptCache = new ChatTranscriptCache({ limit: 100 });
 		const messages = Array.from({ length: 100 }, (_, index) =>
 			entry(index + 1, assistant(`message-${index + 1}`)),
@@ -793,17 +975,30 @@ describe('ActiveTranscriptState', () => {
 
 		chat.activateChat('chat-1');
 
-		expect(chat.visibleRows).toHaveLength(20);
-		expect(chat.hasInitialMessagesToReveal).toBe(true);
-		chat.revealInitialMessages();
-		expect(chat.visibleRows).toHaveLength(40);
-		for (let index = 0; index < 3; index += 1) chat.revealInitialMessages();
 		expect(chat.visibleRows).toHaveLength(100);
-		expect(chat.hasInitialMessagesToReveal).toBe(false);
 		expect(chat.visibleMessageCount).toBe(INITIAL_VISIBLE_MESSAGES);
 	});
 
-	it('permanently completes a partial restored transcript after revealing its snapshot', () => {
+	it('restores the earlier-page boundary with a cached tail window', () => {
+		const transcriptCache = new ChatTranscriptCache({ limit: 100 });
+		const messages = Array.from({ length: 100 }, (_, index) =>
+			entry(index + 101, assistant(`message-${index + 101}`)),
+		);
+		transcriptCache.replaceFromPage('chat-1', {
+			generationId: 'generation-1',
+			messages,
+			lastSeq: 200,
+			pageOldestSeq: 101,
+			hasMore: true,
+		});
+		const chat = new ActiveTranscriptState(transcriptCache);
+
+		chat.activateChat('chat-1');
+
+		expect(chat.canLoadEarlier).toBe(true);
+	});
+
+	it('keeps a partial restored transcript visible through later growth', () => {
 		const transcriptCache = new ChatTranscriptCache({ limit: 100 });
 		const messages = Array.from({ length: 30 }, (_, index) =>
 			entry(index + 1, assistant(`message-${index + 1}`)),
@@ -818,11 +1013,9 @@ describe('ActiveTranscriptState', () => {
 		const chat = new ActiveTranscriptState(transcriptCache);
 
 		chat.activateChat('chat-1');
-		chat.revealInitialMessages();
 
 		expect(chat.visibleRows).toHaveLength(30);
 		expect(chat.visibleMessageCount).toBe(INITIAL_VISIBLE_MESSAGES);
-		expect(chat.hasInitialMessagesToReveal).toBe(false);
 
 		chat.applyMessages(
 			'chat-1',
@@ -833,10 +1026,9 @@ describe('ActiveTranscriptState', () => {
 		);
 
 		expect(chat.visibleRows).toHaveLength(60);
-		expect(chat.hasInitialMessagesToReveal).toBe(false);
 	});
 
-	it('reveals every already-loaded row for explicit navigation', () => {
+	it('keeps every explicitly revealed row visible as live messages append', () => {
 		const chat = new ActiveTranscriptState();
 		const messages = Array.from({ length: 175 }, (_, index) =>
 			entry(index + 1, assistant(`message-${index + 1}`)),
@@ -852,7 +1044,103 @@ describe('ActiveTranscriptState', () => {
 
 		expect(chat.visibleRows).toHaveLength(175);
 		expect(chat.visibleRows[0]).toMatchObject({ id: 'generation-1:1', seq: 1 });
-		expect(chat.hasInitialMessagesToReveal).toBe(false);
+
+		chat.upsertPendingUserInput(
+			pendingInput({ clientRequestId: 'request-176', content: 'message-176' }),
+		);
+		chat.applyMessages('chat-1', 'generation-1', [
+			entry(176, user('message-176', { clientRequestId: 'request-176' })),
+		]);
+		chat.clearPendingUserInput('request-176');
+		chat.applyMessages('chat-1', 'generation-1', [entry(177, assistant('message-177'))]);
+
+		expect(chat.visibleRows).toHaveLength(177);
+		expect(chat.visibleRows[0]).toMatchObject({ id: 'generation-1:1', seq: 1 });
+	});
+
+	it('does not re-arm expanded-window growth from replacement-generation count slack', async () => {
+		const chat = new ActiveTranscriptState();
+		chat.replaceGeneration(
+			'chat-1',
+			'generation-1',
+			Array.from({ length: 175 }, (_, index) => entry(index + 1, assistant(`old-${index + 1}`))),
+			{ lastSeq: 175, pageOldestSeq: 1, hasMore: false },
+		);
+		chat.revealAllLoadedMessages();
+		const epoch = chat.beginSnapshotLoad();
+
+		expect(
+			chat.setFromPage(
+				'chat-1',
+				page({
+					generationId: 'generation-2',
+					messages: Array.from({ length: 50 }, (_, index) =>
+						entry(index + 51, assistant(`new-${index + 51}`)),
+					),
+					lastSeq: 100,
+					pageOldestSeq: 51,
+					hasMore: true,
+				}),
+				epoch,
+			),
+		).toBe('applied');
+		expect(chat.visibleMessageCount).toBe(INITIAL_VISIBLE_MESSAGES);
+
+		vi.mocked(getChatMessages).mockResolvedValueOnce({
+			chatId: 'chat-1',
+			limit: 50,
+			...page({
+				generationId: 'generation-2',
+				messages: Array.from({ length: 50 }, (_, index) =>
+					entry(index + 1, assistant(`new-${index + 1}`)),
+				),
+				lastSeq: 100,
+				pageOldestSeq: 1,
+				hasMore: false,
+			}),
+		});
+		await expect(chat.loadEarlierPage('chat-1')).resolves.toBe('loaded');
+		chat.applyMessages(
+			'chat-1',
+			'generation-2',
+			Array.from({ length: 126 }, (_, index) =>
+				entry(index + 101, assistant(`new-${index + 101}`)),
+			),
+		);
+
+		expect(chat.visibleRows).toHaveLength(150);
+		expect(chat.visibleRows[0]).toMatchObject({ id: 'generation-2:77', seq: 77 });
+	});
+
+	it('retains expanded-window growth across a same-generation snapshot', () => {
+		const chat = new ActiveTranscriptState();
+		const messages = Array.from({ length: 175 }, (_, index) =>
+			entry(index + 1, assistant(`message-${index + 1}`)),
+		);
+		chat.replaceGeneration('chat-1', 'generation-1', messages, {
+			lastSeq: 175,
+			pageOldestSeq: 1,
+			hasMore: false,
+		});
+		chat.revealAllLoadedMessages();
+		const epoch = chat.beginSnapshotLoad();
+
+		expect(
+			chat.setFromPage(
+				'chat-1',
+				page({
+					generationId: 'generation-1',
+					messages,
+					lastSeq: 175,
+					pageOldestSeq: 1,
+				}),
+				epoch,
+			),
+		).toBe('applied');
+		chat.applyMessages('chat-1', 'generation-1', [entry(176, assistant('message-176'))]);
+
+		expect(chat.visibleRows).toHaveLength(176);
+		expect(chat.visibleRows[0]).toMatchObject({ id: 'generation-1:1', seq: 1 });
 	});
 
 	it.each([0, 20])(
@@ -877,7 +1165,6 @@ describe('ActiveTranscriptState', () => {
 			);
 
 			expect(chat.visibleMessageCount).toBe(INITIAL_VISIBLE_MESSAGES);
-			expect(chat.hasInitialMessagesToReveal).toBe(false);
 
 			chat.applyMessages(
 				'chat-1',
@@ -888,11 +1175,10 @@ describe('ActiveTranscriptState', () => {
 			);
 
 			expect(chat.visibleRows).toHaveLength(40);
-			expect(chat.hasInitialMessagesToReveal).toBe(false);
 		},
 	);
 
-	it('bounds the first render when a switched chat is not cached yet', () => {
+	it('bounds the first loaded window when a switched chat is not cached yet', () => {
 		const chat = new ActiveTranscriptState();
 		const messages = Array.from({ length: 100 }, (_, index) =>
 			entry(index + 1, assistant(`message-${index + 1}`)),
@@ -913,8 +1199,7 @@ describe('ActiveTranscriptState', () => {
 			epoch,
 		);
 
-		expect(chat.visibleRows).toHaveLength(20);
-		expect(chat.hasInitialMessagesToReveal).toBe(true);
+		expect(chat.visibleRows).toHaveLength(INITIAL_VISIBLE_MESSAGES);
 	});
 
 	it('loads only the first page for initial-prompt navigation', async () => {
@@ -1262,6 +1547,45 @@ describe('ActiveTranscriptState', () => {
 
 		const initial = chat.navigateToWindow('chat-1', 'initial');
 		await expect(chat.navigateToWindow('chat-1', 'latest')).resolves.toBe('loaded');
+		resolveInitial({
+			chatId: 'chat-1',
+			limit: 50,
+			...page({
+				messages: Array.from({ length: 50 }, (_, index) =>
+					entry(index + 1, assistant(`initial-${index + 1}`)),
+				),
+				lastSeq: 100,
+				pageOldestSeq: 1,
+				hasMore: false,
+			}),
+		});
+
+		await expect(initial).resolves.toBe('invalidated');
+		expect(chat.chatMessages.map(contentOf)).toEqual(
+			Array.from({ length: 50 }, (_, index) => `latest-${index + 51}`),
+		);
+		expect(chat.hasLaterMessages).toBe(false);
+	});
+
+	it('discards a pending window navigation after explicit invalidation', async () => {
+		const chat = new ActiveTranscriptState();
+		const latestWindow = Array.from({ length: 50 }, (_, index) =>
+			entry(index + 51, assistant(`latest-${index + 51}`)),
+		);
+		chat.replaceGeneration('chat-1', 'generation-1', latestWindow, {
+			lastSeq: 100,
+			pageOldestSeq: 51,
+			hasMore: true,
+		});
+		let resolveInitial!: (value: Awaited<ReturnType<typeof getChatMessages>>) => void;
+		vi.mocked(getChatMessages).mockReturnValueOnce(
+			new Promise((resolve) => {
+				resolveInitial = resolve;
+			}),
+		);
+
+		const initial = chat.navigateToWindow('chat-1', 'initial');
+		chat.invalidatePendingWindowNavigation();
 		resolveInitial({
 			chatId: 'chat-1',
 			limit: 50,
@@ -1634,8 +1958,7 @@ describe('ActiveTranscriptState', () => {
 		const initialLoad = chat.navigateToWindow('chat-1', 'initial');
 		expect(getChatMessages).toHaveBeenCalledOnce();
 		chat.activateChat('chat-2');
-		expect(chat.visibleRows).toHaveLength(20);
-		expect(chat.hasInitialMessagesToReveal).toBe(true);
+		expect(chat.visibleRows).toHaveLength(30);
 
 		resolvePage({
 			chatId: 'chat-1',
@@ -1652,8 +1975,7 @@ describe('ActiveTranscriptState', () => {
 		await expect(initialLoad).resolves.toBe('invalidated');
 
 		expect(chat.activeChatId).toBe('chat-2');
-		expect(chat.visibleRows).toHaveLength(20);
-		expect(chat.hasInitialMessagesToReveal).toBe(true);
+		expect(chat.visibleRows).toHaveLength(30);
 	});
 
 	it('lets a new chat paginate while the previous chat page request is still pending', async () => {

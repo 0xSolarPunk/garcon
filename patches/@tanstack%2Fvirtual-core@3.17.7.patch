@@ -1,0 +1,127 @@
+diff --git a/dist/cjs/index.cjs b/dist/cjs/index.cjs
+index aab0e59d80c6dac3c926c1c25c6dfbfdf8cce679..605458399a19e02e28467b6ea633afc4518c54dc 100644
+--- a/dist/cjs/index.cjs
++++ b/dist/cjs/index.cjs
+@@ -218,6 +218,10 @@ class Virtualizer {
+                 }
+                 return;
+               }
++              if (!this.isIndexInRange(index)) return;
++              const key = this.options.getItemKey(index);
++              const prevNode = this.elementsCache.get(key);
++              if (prevNode !== void 0 && prevNode !== node && prevNode.isConnected) return;
+               if (this.shouldMeasureDuringScroll(index)) {
+                 this.resizeItem(
+                   index,
+@@ -805,6 +809,7 @@ class Virtualizer {
+       }
+       return true;
+     };
++    this.isIndexInRange = (index) => index >= 0 && index < this.options.count;
+     this.measureElement = (node) => {
+       if (!node) {
+         this.elementsCache.forEach((cached, key2) => {
+@@ -816,6 +821,7 @@ class Virtualizer {
+         return;
+       }
+       const index = this.indexFromElement(node);
++      if (!this.isIndexInRange(index)) return;
+       const key = this.options.getItemKey(index);
+       const prevNode = this.elementsCache.get(key);
+       if (prevNode !== node) {
+@@ -831,7 +837,7 @@ class Virtualizer {
+     };
+     this.resizeItem = (index, size) => {
+       var _a, _b;
+-      if (index < 0 || index >= this.options.count) return;
++      if (!this.isIndexInRange(index)) return;
+       let cachedSize;
+       let itemStart;
+       let key;
+diff --git a/dist/esm/index.js b/dist/esm/index.js
+index 015d77d5f60a174de2ca9a3777e8a842110ee6e8..f8630eb37a03ca0aa54c989f688bd5ef6e45b4b4 100644
+--- a/dist/esm/index.js
++++ b/dist/esm/index.js
+@@ -216,6 +216,10 @@ class Virtualizer {
+                 }
+                 return;
+               }
++              if (!this.isIndexInRange(index)) return;
++              const key = this.options.getItemKey(index);
++              const prevNode = this.elementsCache.get(key);
++              if (prevNode !== void 0 && prevNode !== node && prevNode.isConnected) return;
+               if (this.shouldMeasureDuringScroll(index)) {
+                 this.resizeItem(
+                   index,
+@@ -803,6 +807,7 @@ class Virtualizer {
+       }
+       return true;
+     };
++    this.isIndexInRange = (index) => index >= 0 && index < this.options.count;
+     this.measureElement = (node) => {
+       if (!node) {
+         this.elementsCache.forEach((cached, key2) => {
+@@ -814,6 +819,7 @@ class Virtualizer {
+         return;
+       }
+       const index = this.indexFromElement(node);
++      if (!this.isIndexInRange(index)) return;
+       const key = this.options.getItemKey(index);
+       const prevNode = this.elementsCache.get(key);
+       if (prevNode !== node) {
+@@ -829,7 +835,7 @@ class Virtualizer {
+     };
+     this.resizeItem = (index, size) => {
+       var _a, _b;
+-      if (index < 0 || index >= this.options.count) return;
++      if (!this.isIndexInRange(index)) return;
+       let cachedSize;
+       let itemStart;
+       let key;
+diff --git a/src/index.ts b/src/index.ts
+index e209208a6d1b4e0713f78deab96598819ed697ad..db55892a3e966a300bbc2058872a92d1fa593844 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -489,6 +489,14 @@ export class Virtualizer<
+               return
+             }
+ 
++            if (!this.isIndexInRange(index)) return
++
++            // A delayed entry can retain an in-range index that now names another key.
++            // The connected cache owner remains authoritative until direct measurement replaces it.
++            const key = this.options.getItemKey(index)
++            const prevNode = this.elementsCache.get(key)
++            if (prevNode !== undefined && prevNode !== node && prevNode.isConnected) return
++
+             if (this.shouldMeasureDuringScroll(index)) {
+               this.resizeItem(
+                 index,
+@@ -1171,6 +1179,9 @@ export class Virtualizer<
+     },
+   )
+ 
++  private isIndexInRange = (index: number): boolean =>
++    index >= 0 && index < this.options.count
++
+   private getMeasurements = memo(
+     () => [this.getMeasurementOptions(), this.itemSizeCacheVersion],
+     (
+@@ -1511,6 +1522,8 @@ export class Virtualizer<
+     }
+ 
+     const index = this.indexFromElement(node)
++    if (!this.isIndexInRange(index)) return
++
+     const key = this.options.getItemKey(index)
+     const prevNode = this.elementsCache.get(key)
+ 
+@@ -1534,7 +1547,7 @@ export class Virtualizer<
+   }
+ 
+   resizeItem = (index: number, size: number) => {
+-    if (index < 0 || index >= this.options.count) return
++    if (!this.isIndexInRange(index)) return
+ 
+     // Fast field reads. For lanes===1 we read raw start/size from the flat
+     // typed array, avoiding a Proxy.get + VirtualItem allocation per call.
