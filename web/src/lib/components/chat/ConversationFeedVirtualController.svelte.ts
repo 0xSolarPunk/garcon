@@ -16,6 +16,7 @@ import {
 	classifyConversationVirtualStructure,
 	classifyMeasuredConversationViewportFill,
 	createRetainedConversationRangeExtractor,
+	selectConversationReadingRestoreAnchor,
 	shouldPreserveConversationVirtualEdge,
 } from './conversation-feed-viewport-geometry.js';
 import type { ConversationVirtualFeedModel } from './conversation-feed-virtual-items.js';
@@ -520,17 +521,15 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 		});
 		const restorePolicyEnd =
 			snapshot.endBehavior === 'restore-if-pinned' && untrack(() => this.options.pinned);
-		// The pinned core carries upstream #1246, so count shrink preserves surviving keyed
-		// measurements and ignores stale connected indexes without a Garcon reset pass.
+		// Upstream #1246 preserves keyed measurements across count shrink without a Garcon reset.
 		const resetMeasurements = snapshot.measurementReset === 'all';
-		// The pre-commit anchor records old TanStack coordinates; the keyed restore applies them
-		// after Svelte commits the new sizer.
+		// The keyed restore reapplies pre-commit TanStack coordinates after Svelte commits the sizer.
 		const preserveEdgeReadingPosition = shouldPreserveConversationVirtualEdge({
 			structure,
 			endBehavior: snapshot.endBehavior,
 			restorePolicyEnd,
 		});
-		const shouldCaptureReadingPosition =
+		const readingPositionPolicyApplies =
 			this.options.visible &&
 			this.#activeTargetScrolls === 0 &&
 			(structure === 'interior-only' || resetMeasurements || preserveEdgeReadingPosition) &&
@@ -541,14 +540,20 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 			snapshot.geometryRevision,
 			preferTranscriptAnchor,
 		);
-		const preservationAnchor = shouldCaptureReadingPosition
+		const candidateAnchor = readingPositionPolicyApplies
 			? (this.#pendingReadingAnchor ??
 				preCommitAnchor ??
 				this.#captureVirtualAnchor(preferTranscriptAnchor))
 			: null;
+		const preservationAnchor = selectConversationReadingRestoreAnchor({
+			candidateAnchor,
+			pendingAnchor: this.#pendingReadingAnchor,
+			previous: { keys: this.#configuredKeys, estimates: this.#configuredEstimates },
+			next: snapshot,
+		});
 		if (preservationAnchor && !restorePolicyEnd) {
 			this.#pendingReadingAnchor = preservationAnchor;
-		} else if (!shouldCaptureReadingPosition || restorePolicyEnd) {
+		} else {
 			this.#pendingReadingAnchor = null;
 		}
 
@@ -931,11 +936,12 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 	}
 
 	#committedVirtualRangeSignature(): string | null {
-		// Delayed measurements can expand the range until TanStack closes its scroll cycle.
+		// The paint gate waits for TanStack to settle and committed rows to cover the viewport.
 		if (this.#instance().isScrolling) return null;
-		return this.#mountedItems.committedRangeSignature(
-			this.#instance().getVirtualItems(),
+		return this.#mountedItems.committedViewportRangeSignature(
+			this.#instance(),
 			this.#configuredKeys,
+			this.options.viewport,
 		);
 	}
 
