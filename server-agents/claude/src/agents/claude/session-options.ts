@@ -1,4 +1,3 @@
-import type { AgentAttachment } from '@garcon/common/agent-execution';
 import type {
   ClaudeThinkingMode,
   PermissionMode,
@@ -14,7 +13,6 @@ export interface ClaudeSessionOptions {
   permissionMode: PermissionMode;
   thinkingMode: ThinkingMode;
   claudeThinkingMode?: ClaudeThinkingMode;
-  images?: readonly AgentAttachment[];
   envOverrides?: Record<string, string>;
 }
 
@@ -32,7 +30,6 @@ export function mergeClaudeSessionOptions(
     thinkingMode: next.thinkingMode ?? current.thinkingMode,
     claudeThinkingMode: next.claudeThinkingMode ?? current.claudeThinkingMode,
     envOverrides: next.envOverrides ?? current.envOverrides,
-    images: next.images,
   };
 }
 
