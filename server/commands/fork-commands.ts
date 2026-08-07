@@ -112,12 +112,8 @@ export class ForkCommands {
     await this.support.assertAttachmentsSupported({
       agentId: source.agentId,
       model: input.options?.model ?? source.model,
-      apiProviderId: input.options?.apiProviderId === undefined
-        ? source.apiProviderId
-        : input.options.apiProviderId,
-      modelEndpointId: input.options?.modelEndpointId === undefined
-        ? source.modelEndpointId
-        : input.options.modelEndpointId,
+      apiProviderId: input.options?.apiProviderId === undefined ? source.apiProviderId : input.options.apiProviderId,
+      modelEndpointId: input.options?.modelEndpointId === undefined ? source.modelEndpointId : input.options.modelEndpointId,
       attachments: input.images ?? [],
     });
     if (preparedFork?.sourceNextForkOrdinal !== undefined) {
