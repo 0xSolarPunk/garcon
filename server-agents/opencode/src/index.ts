@@ -57,6 +57,7 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
   } as const;
 
   readonly descriptor = OPENCODE_DESCRIPTOR;
+  readonly attachments = null;
   readonly execution;
   readonly transcript: AgentTranscript;
   readonly catalog;

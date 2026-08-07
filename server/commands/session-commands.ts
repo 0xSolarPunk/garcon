@@ -79,6 +79,13 @@ export class SessionCommands {
         422,
       );
     }
+    await this.support.assertAttachmentsSupported({
+      agentId: chat.agentId,
+      model: input.model ?? chat.model!,
+      apiProviderId: chat.apiProviderId,
+      modelEndpointId: chat.modelEndpointId,
+      attachments: input.images ?? [],
+    });
     const effectivePermissionMode = input.permissionMode ?? chat.permissionMode;
     if (
       input.permissionFallbackPolicy === 'require-explicit-bypass'

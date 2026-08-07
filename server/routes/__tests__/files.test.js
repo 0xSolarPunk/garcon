@@ -859,4 +859,28 @@ describe('files route', () => {
     });
     expect(body.images).toEqual(body.attachments);
   });
+
+  it('uploads video attachments with their browser MIME type', async () => {
+    const routes = createFilesRoutes({ getChat: () => null });
+    const formData = new FormData();
+    formData.append(
+      'attachments',
+      new File(['video-bytes'], 'clip.mp4', { type: 'video/mp4' }),
+    );
+    const url = new URL('http://localhost/api/v1/files/upload-attachments');
+    const response = await routes['/api/v1/files/upload-attachments'].POST(
+      new Request(url, { method: 'POST', body: formData }),
+      url,
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.attachments).toHaveLength(1);
+    expect(body.attachments[0]).toMatchObject({
+      name: 'clip.mp4',
+      mimeType: 'video/mp4',
+      size: 'video-bytes'.length,
+    });
+    expect(body.attachments[0].data).toStartWith('data:video/mp4;base64,');
+  });
 });

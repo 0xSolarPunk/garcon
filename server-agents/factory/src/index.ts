@@ -53,6 +53,7 @@ export default class FactoryAgentIntegration implements AgentIntegration {
   } as const;
 
   readonly descriptor = FACTORY_DESCRIPTOR;
+  readonly attachments = null;
   readonly execution;
   readonly transcript: AgentTranscript;
   readonly catalog;

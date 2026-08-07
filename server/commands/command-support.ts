@@ -28,6 +28,7 @@ import type {
   StartedAgentSession,
 } from '../agents/session-types.js';
 import type { ChatExecutionCommands } from '../chat-execution/chat-execution-coordinator.js';
+import { assertAttachmentsSupported } from '../attachments/support.js';
 import type { StoredChatExecutionControlState } from '../chat-execution/control-state.ts';
 import type { AgentOwnershipJournal } from '../chats/agent-ownership-journal.js';
 import type { ChatIdAllocator } from '../chats/chat-id-allocator.js';
@@ -92,6 +93,7 @@ export type AgentRegistryDep = Pick<
   AgentRegistryServiceContract,
   | 'hasAgent'
   | 'supportsImages'
+  | 'supportsFileAttachmentMimeType'
   | 'modelSupportsImages'
   | 'startSession'
   | 'resolvePermission'
@@ -383,6 +385,16 @@ export class CommandSupport {
     if (!command.trim() && (!images || images.length === 0)) {
       throw new CommandValidationError('VALIDATION_FAILED', 'command or attachments are required');
     }
+  }
+
+  async assertAttachmentsSupported(input: {
+    agentId: string;
+    model: string;
+    apiProviderId?: string | null;
+    modelEndpointId?: string | null;
+    attachments: NonNullable<RunAgentTurnOptions['images']>;
+  }): Promise<void> {
+    await assertAttachmentsSupported(this.deps.agents, input);
   }
 
   optionsWithoutAttachments(options: RunAgentTurnOptions | undefined): RunAgentTurnOptions {

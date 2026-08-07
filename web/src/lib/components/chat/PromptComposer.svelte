@@ -21,10 +21,11 @@
 		getTransientLayers,
 	} from '$lib/context';
 	import {
-		CHAT_ATTACHMENT_ACCEPT,
+		chatAttachmentAccept,
 		ImageAttachmentState,
 		isImageAttachment,
 		isSupportedChatAttachment,
+		isVideoChatAttachment,
 	} from '$lib/chat/composer/image-attachment.svelte.js';
 	import { shouldSubmitOnEnter, canSubmitComposer } from '$lib/chat/composer/composer-shortcuts.js';
 	import type { SnippetInsertionResult } from '$lib/chat/composer/snippet-insertion.js';
@@ -59,6 +60,8 @@
 		setLocalStorageItem,
 	} from '$lib/utils/local-persistence';
 	import FileText from '@lucide/svelte/icons/file-text';
+	import FileVideo from '@lucide/svelte/icons/file-video';
+	import { CHAT_FILE_ATTACHMENT_MIME_TYPES } from '@garcon/common/attachments';
 	import ImagePlus from '@lucide/svelte/icons/image-plus';
 	import X from '@lucide/svelte/icons/x';
 	import type { PermissionMode, ThinkingMode } from '$lib/types/chat';
@@ -81,7 +84,6 @@
 	import { transientLayerAttachment } from '$lib/workspace/transient-layer-action.js';
 	import { allocateTransientLayerId } from '$lib/workspace/transient-layer-id.js';
 	import { isDirectAgentId, nonDirectAgentIds } from '$lib/agents/direct-agents.js';
-
 	interface Props {
 		onsubmit: () => void;
 		onModelChange?: (selection: ModelSelectorChange) => void;
@@ -422,14 +424,9 @@
 			)
 				return 'cancelled';
 			const replacement = range
-				? applySnippetTriggerReplacement(
-						sourceText,
-						range,
-						result.response.expandedText,
-					)
+				? applySnippetTriggerReplacement(sourceText, range, result.response.expandedText)
 				: {
-						text:
-							sourceText.slice(0, start) + result.response.expandedText + sourceText.slice(end),
+						text: sourceText.slice(0, start) + result.response.expandedText + sourceText.slice(end),
 						caret: start + result.response.expandedText.length,
 					};
 			composerState.inputText = replacement.text;
@@ -564,7 +561,7 @@
 	function handleFileChange(event: Event) {
 		const input = event.target as HTMLInputElement;
 		if (!input.files) return;
-		composerState.addImages(Array.from(input.files));
+		composerState.addImages(Array.from(input.files), attachmentSupport);
 		input.value = '';
 	}
 
@@ -585,8 +582,10 @@
 		composerState.isDragActive = false;
 		const files = event.dataTransfer?.files;
 		if (!files) return;
-		const attachments = Array.from(files).filter(isSupportedChatAttachment);
-		composerState.addImages(attachments);
+		const attachments = Array.from(files).filter((file) =>
+			isSupportedChatAttachment(file, attachmentSupport),
+		);
+		composerState.addImages(attachments, attachmentSupport);
 	}
 
 	// Paste handler for images from clipboard.
@@ -602,7 +601,7 @@
 			}
 		}
 		if (imageFiles.length > 0) {
-			composerState.addImages(imageFiles);
+			composerState.addImages(imageFiles, attachmentSupport);
 		}
 	}
 
@@ -627,9 +626,11 @@
 	const thinkingOptions = $derived(
 		buildThinkingOptions(modelCatalog.getThinkingModes(agentState.agentId), agentState.model),
 	);
-	const canAttachImages = $derived(
-		modelCatalog.supportsImages(agentState.agentId, agentState.model),
-	);
+	const canAttachImages = $derived(modelCatalog.supportsImages(agentState.agentId, agentState.model));
+	const fileAttachmentMimeTypes = $derived(modelCatalog.fileAttachmentMimeTypes?.(agentState.agentId) ?? CHAT_FILE_ATTACHMENT_MIME_TYPES);
+	const attachmentSupport = $derived({ allowImages: canAttachImages, fileMimeTypes: fileAttachmentMimeTypes });
+	const canAttachAttachments = $derived(canAttachImages || fileAttachmentMimeTypes.length > 0);
+	const attachmentAccept = $derived(chatAttachmentAccept(attachmentSupport));
 	const quickCommitRunningActionVisible = $derived(
 		selectedIsProcessing &&
 			localSettings.showQuickCommitTray &&
@@ -826,13 +827,13 @@
 											<img src={url} alt={file.name} class="w-full h-full object-cover" />
 										{/if}
 									{:else}
-										<div
-											class="flex h-full w-full flex-col items-center justify-center gap-1 bg-background px-1 text-muted-foreground"
-										>
-											<FileText class="h-5 w-5" aria-hidden="true" />
-											<span class="w-full truncate text-center text-[10px] leading-tight"
-												>{file.name}</span
-											>
+										<div class="flex h-full w-full flex-col items-center justify-center gap-1 bg-background px-1 text-muted-foreground">
+											{#if isVideoChatAttachment(file)}
+												<FileVideo class="h-5 w-5" aria-hidden="true" />
+											{:else}
+												<FileText class="h-5 w-5" aria-hidden="true" />
+											{/if}
+											<span class="w-full truncate text-center text-[10px] leading-tight">{file.name}</span>
 										</div>
 									{/if}
 								</div>
@@ -855,7 +856,7 @@
 			<input
 				bind:this={fileInput}
 				type="file"
-				accept={CHAT_ATTACHMENT_ACCEPT}
+				accept={attachmentAccept}
 				multiple
 				class="hidden"
 				onchange={handleFileChange}
@@ -888,7 +889,7 @@
 			</div>
 
 			<ComposerBottomBar
-				{canAttachImages}
+				canAttachImages={canAttachAttachments}
 				attachImagesTooltip={m.chat_composer_image_attachments_unavailable()}
 				onAddImage={handleImagePick}
 				onOpenSnippetPalette={() => ui.snippetPalette.openFromMenu()}

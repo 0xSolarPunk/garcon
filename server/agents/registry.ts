@@ -53,6 +53,7 @@ export interface AgentRegistryServiceContract {
   supportsUpdateProjectPath(agentId: string): boolean;
   requiresNativePathForProjectPathUpdate(agentId: string): boolean;
   supportsImages(agentId: string): boolean;
+  supportsFileAttachmentMimeType(agentId: string, mimeType: string): boolean;
   requiresStrictModelDiscovery(agentId: string): boolean;
   isAgentSessionRunning(agentId: string, agentSessionId: string | null | undefined): boolean;
   captureSteerTarget(chatId: string): AgentSteerTarget | null;
@@ -184,6 +185,9 @@ export class AgentRegistry implements AgentRegistryServiceContract {
     return this.#directory.get(agentId)?.descriptor.requiresNativePathForProjectPathUpdate ?? false;
   }
   supportsImages(agentId: string): boolean { return this.#directory.get(agentId)?.descriptor.supportsImages ?? false; }
+  supportsFileAttachmentMimeType(agentId: string, mimeType: string): boolean {
+    return this.#directory.get(agentId)?.attachments?.fileMimeTypes.includes(mimeType.toLowerCase()) ?? false;
+  }
 
   requiresStrictModelDiscovery(agentId: string): boolean {
     return this.#catalog.requiresStrictModelDiscovery(agentId);

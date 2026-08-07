@@ -4,7 +4,10 @@
 
 import { browseDirectory } from '$lib/api/files.js';
 import { validateStart, type ValidateStartErrorCode } from '$lib/api/chats.js';
-import { ImageAttachmentState } from '$lib/chat/composer/image-attachment.svelte.js';
+import {
+	ImageAttachmentState,
+	type ChatAttachmentSupport,
+} from '$lib/chat/composer/image-attachment.svelte.js';
 import { getGitWorktrees, gitCreateWorktree } from '$lib/api/git.js';
 import type { GitWorktreeItem } from '$lib/api/git.js';
 import type { NewChatConfig, SessionAgentId } from '$lib/types/app.js';
@@ -314,8 +317,8 @@ export class NewChatFormState {
 		return this.#images.urlFor(file, idx);
 	}
 
-	addImages(files: File[]): void {
-		this.#images.add(files);
+	addImages(files: File[], support?: ChatAttachmentSupport): void {
+		this.#images.add(files, support);
 	}
 
 	removeImage(index: number): void {

@@ -43,6 +43,10 @@ const MIME_EXTENSIONS: Record<string, string> = {
   'application/pdf': '.pdf',
   'text/markdown': '.md',
   'text/plain': '.txt',
+  'video/mp4': '.mp4',
+  'video/quicktime': '.mov',
+  'video/webm': '.webm',
+  'video/x-matroska': '.mkv',
 };
 
 export function codexSandboxSettings(permissionMode: PermissionMode): CodexSandboxSettings {
@@ -228,19 +232,24 @@ export async function writeAttachmentsToTempFiles(images?: readonly AgentAttachm
   const imagePaths: string[] = [];
   const filePaths: string[] = [];
 
-  for (let i = 0; i < images.length; i++) {
-    const attachment = images[i];
-    const parts = parseAttachmentDataUrl(attachment.data);
-    if (!parts) continue;
+  try {
+    for (let i = 0; i < images.length; i++) {
+      const attachment = images[i];
+      const parts = parseAttachmentDataUrl(attachment.data);
+      if (!parts) continue;
 
-    const mimeType = attachmentMimeType(attachment);
-    const ext = MIME_EXTENSIONS[mimeType];
-    if (!ext) continue;
-    const prefix = isImageAttachment(attachment) ? 'image' : 'attachment';
-    const filePath = path.join(tmpDir, `${prefix}-${i}${ext}`);
-    await fs.writeFile(filePath, Buffer.from(parts.base64, 'base64'));
-    if (isImageAttachment(attachment)) imagePaths.push(filePath);
-    else filePaths.push(filePath);
+      const mimeType = attachmentMimeType(attachment);
+      const ext = MIME_EXTENSIONS[mimeType];
+      if (!ext) continue;
+      const prefix = isImageAttachment(attachment) ? 'image' : 'attachment';
+      const filePath = path.join(tmpDir, `${prefix}-${i}${ext}`);
+      await fs.writeFile(filePath, Buffer.from(parts.base64, 'base64'));
+      if (isImageAttachment(attachment)) imagePaths.push(filePath);
+      else filePaths.push(filePath);
+    }
+  } catch (error) {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
   }
 
   return {

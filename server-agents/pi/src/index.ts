@@ -61,6 +61,7 @@ export default class PiAgentIntegration implements AgentIntegration {
   } as const;
 
   readonly descriptor = PI_DESCRIPTOR;
+  readonly attachments = null;
   readonly execution;
   readonly transcript: AgentTranscript;
   readonly catalog;

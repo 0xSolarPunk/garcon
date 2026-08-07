@@ -1,4 +1,5 @@
 import { PERMISSION_MODE_VALUES, THINKING_MODE_VALUES } from '@garcon/common/chat-modes';
+import { TEXT_FILE_ATTACHMENT_MIME_TYPES } from '@garcon/common/attachments';
 import {
   DIRECT_OPENAI_CHAT_COMPLETIONS_COMPATIBLE_AGENT_ID,
   DIRECT_OPENAI_CHAT_COMPLETIONS_COMPATIBLE_AGENT_LABEL,
@@ -55,6 +56,9 @@ export default class DirectOpenAiCompatibleIntegration implements AgentIntegrati
   } as const;
 
   readonly descriptor = DESCRIPTOR;
+  readonly attachments = {
+    fileMimeTypes: TEXT_FILE_ATTACHMENT_MIME_TYPES,
+  } as const;
   readonly execution;
   readonly transcript;
   readonly catalog;

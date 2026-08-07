@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import type { StartChatCommandResponse } from '../../common/chat-command-contracts.js';
-import type { RunAgentTurnOptions } from '../agents/session-types.js';
+
 import { maybeGenerateChatTitle } from '../chats/title-generator.js';
 import { createLogger } from '../lib/log.js';
 import { assertRealWithinProjectBase, isProjectBoundaryError } from '../lib/path-boundary.js';
@@ -61,12 +61,12 @@ export class StartCommands {
       throw new CommandValidationError('UNSUPPORTED_AGENT', `Unsupported agent: ${input.agentId}`);
     }
     this.support.assertContent(input.command, images);
-    await this.assertStartImagesSupported({
+    await this.support.assertAttachmentsSupported({
       agentId: input.agentId,
       model: input.model,
       apiProviderId: input.apiProviderId,
       modelEndpointId: input.modelEndpointId,
-      images,
+      attachments: images,
     });
 
     if (!input.agentSettings || input.agentSettings.ownerId !== input.agentId) {
@@ -93,30 +93,6 @@ export class StartCommands {
     };
   }
 
-  private async assertStartImagesSupported(input: {
-    agentId: string;
-    model: string;
-    apiProviderId?: string | null;
-    modelEndpointId?: string | null;
-    images: NonNullable<RunAgentTurnOptions['images']>;
-  }): Promise<void> {
-    if (input.images.length === 0) return;
-
-    let modelSupportsImages = false;
-    try {
-      modelSupportsImages = await this.deps.agents.modelSupportsImages({
-        agentId: input.agentId,
-        model: input.model,
-        apiProviderId: input.apiProviderId,
-        modelEndpointId: input.modelEndpointId,
-      });
-    } catch {}
-    const hasBackendSelection = Boolean(input.apiProviderId && input.modelEndpointId);
-    const supportsImages = hasBackendSelection ? modelSupportsImages : this.deps.agents.supportsImages(input.agentId);
-    if (!supportsImages) {
-      throw new CommandValidationError('UNSUPPORTED_AGENT', `Attachments unsupported for agent: ${input.agentId}`, 422);
-    }
-  }
 
   private async submitNormalizedStart(input: NormalizedChatStart): Promise<StartChatCommandResponse> {
     const existing = this.deps.chats.getChat(input.chatId);

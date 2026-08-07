@@ -1,6 +1,7 @@
 import os from 'node:os';
 import { stat } from 'node:fs/promises';
 import { PERMISSION_MODE_VALUES, THINKING_MODE_VALUES } from '@garcon/common/chat-modes';
+import { CHAT_FILE_ATTACHMENT_MIME_TYPES } from '@garcon/common/attachments';
 import { CODEX_MODELS } from '@garcon/common/models';
 import {
   AgentIntegrationError,
@@ -70,6 +71,9 @@ export default class CodexAgentIntegration implements AgentIntegration {
   } as const;
 
   readonly descriptor = CODEX_DESCRIPTOR;
+  readonly attachments = {
+    fileMimeTypes: CHAT_FILE_ATTACHMENT_MIME_TYPES,
+  } as const;
   readonly execution;
   readonly transcript;
   readonly catalog;

@@ -32,6 +32,10 @@ export interface AgentCatalog {
   }>;
 }
 
+export interface AgentAttachments {
+  readonly fileMimeTypes: readonly string[];
+}
+
 export interface AgentSettings {
   describe(): readonly AgentSettingDescriptor[];
   defaults(): AgentSettingsEnvelope;

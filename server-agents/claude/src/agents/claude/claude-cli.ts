@@ -64,6 +64,7 @@ import {
   buildClaudeUserInputFrame,
 } from './user-input.js';
 import { handleClaudeInterruptReceipt } from './interrupt-receipt.js';
+import { materializeClaudeVideoAttachments } from './video-attachments.js';
 import {
   CLAUDE_STEER_IDLE_FENCE_TIMEOUT_MS,
   CLAUDE_STEER_WRITE_TIMEOUT_MS,
@@ -1102,12 +1103,15 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
     // Another start may supersede this one while the version probe is pending.
     if (this.#runningSessions.get(agentSessionId) !== session) return agentSessionId;
 
+    let cleanupVideoAttachments = async () => {};
     try {
       assertClaudeExecutionOpen(requestAdmission);
       this.emitSessionCreated(chatId);
       await this.#spawnCLI(session, allOpts, false, cliVersion);
       assertClaudeExecutionOpen(requestAdmission);
-      await this.#sendUserMessage(session, activeTurn, command, images);
+      const prepared = await materializeClaudeVideoAttachments(command, images);
+      cleanupVideoAttachments = prepared.cleanup;
+      await this.#sendUserMessage(session, activeTurn, prepared.command, images);
       executionAdmission?.markStarted();
       this.emitProcessing(chatId, true);
       onAbortable?.();
@@ -1121,6 +1125,7 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
       throw error;
     } finally {
       this.#completeSessionInitialization(session);
+      await cleanupVideoAttachments();
     }
     return agentSessionId;
   }
@@ -1204,6 +1209,7 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
     }
 
     let ownedTurn: ClaudeActiveTurn | null = null;
+    let cleanupVideoAttachments = async () => {};
     try {
       if (chatId !== session.chatId) {
         throw new Error('Chat ID mismatch');
@@ -1275,7 +1281,9 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
         claudeEventMetadata({ clientRequestId, turnId }),
       );
       ownedTurn = activeTurn;
-      await this.#sendUserMessage(session, activeTurn, command, images);
+      const prepared = await materializeClaudeVideoAttachments(command, images);
+      cleanupVideoAttachments = prepared.cleanup;
+      await this.#sendUserMessage(session, activeTurn, prepared.command, images);
       executionAdmission?.markStarted();
       this.emitProcessing(chatId, true);
       onAbortable?.();
@@ -1285,6 +1293,8 @@ class ClaudeCliRuntime extends AgentEventEmitterRuntime {
         await this.#retireSession(session);
       }
       throw error;
+    } finally {
+      await cleanupVideoAttachments();
     }
   }
 

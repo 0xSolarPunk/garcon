@@ -74,6 +74,7 @@ export default class CursorAgentIntegration implements AgentIntegration {
   } as const;
 
   readonly descriptor = CURSOR_DESCRIPTOR;
+  readonly attachments = null;
   readonly execution;
   readonly transcript: AgentTranscript;
   readonly catalog;

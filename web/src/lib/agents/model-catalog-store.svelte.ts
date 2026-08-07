@@ -55,6 +55,7 @@ export interface AgentMetadata {
 	supportsSteering: boolean;
 	supportsGoals: boolean;
 	supportsImages: boolean;
+	fileAttachmentMimeTypes: string[];
 	acceptsApiProviderEndpoints: boolean;
 	supportedProtocols: ApiProtocol[];
 	authLoginSupported: boolean;
@@ -104,6 +105,11 @@ function normalizeProtocols(value: unknown): ApiProtocol[] {
 	return value.filter(
 		(p): p is ApiProtocol => p === 'openai-compatible' || p === 'anthropic-messages',
 	);
+}
+
+function normalizeMimeTypes(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter((mimeType): mimeType is string => typeof mimeType === 'string');
 }
 
 function normalizePermissionModes(value: unknown): PermissionMode[] {
@@ -335,6 +341,7 @@ function parseCatalogResponse(data: unknown): {
 			supportsSteering: Boolean(entry.supportsSteering),
 			supportsGoals: Boolean(entry.supportsGoals),
 			supportsImages: Boolean(entry.supportsImages),
+			fileAttachmentMimeTypes: normalizeMimeTypes(entry.fileAttachmentMimeTypes),
 			acceptsApiProviderEndpoints: Boolean(entry.acceptsApiProviderEndpoints),
 			supportedProtocols: normalizeProtocols(entry.supportedProtocols),
 			authLoginSupported: Boolean(entry.authLoginSupported),
@@ -559,6 +566,11 @@ export class ModelCatalogStore {
 			}
 		}
 		return this.agentMetadata[agentId]?.supportsImages ?? false;
+	}
+
+	fileAttachmentMimeTypes(agentId: SessionAgentId): readonly string[] {
+		if (!isAgentId(agentId)) return [];
+		return this.agentMetadata[agentId]?.fileAttachmentMimeTypes ?? [];
 	}
 
 	isLocalModel(agentId: SessionAgentId, model: string, modelEndpointId?: string | null): boolean {

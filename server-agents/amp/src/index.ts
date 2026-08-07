@@ -48,6 +48,7 @@ export default class AmpAgentIntegration implements AgentIntegration {
   } as const;
 
   readonly descriptor = AMP_DESCRIPTOR;
+  readonly attachments = null;
   readonly execution;
   readonly transcript: AgentTranscript;
   readonly catalog;

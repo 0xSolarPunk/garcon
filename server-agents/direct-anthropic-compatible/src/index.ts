@@ -1,5 +1,9 @@
 import { PERMISSION_MODE_VALUES, THINKING_MODE_VALUES } from '@garcon/common/chat-modes';
 import {
+  DOCUMENT_FILE_ATTACHMENT_MIME_TYPES,
+  TEXT_FILE_ATTACHMENT_MIME_TYPES,
+} from '@garcon/common/attachments';
+import {
   DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
   DIRECT_ANTHROPIC_COMPATIBLE_AGENT_LABEL,
 } from '@garcon/common/agents';
@@ -55,6 +59,12 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
   } as const;
 
   readonly descriptor = DESCRIPTOR;
+  readonly attachments = {
+    fileMimeTypes: [
+      ...TEXT_FILE_ATTACHMENT_MIME_TYPES,
+      ...DOCUMENT_FILE_ATTACHMENT_MIME_TYPES,
+    ],
+  } as const;
   readonly execution;
   readonly transcript;
   readonly catalog;

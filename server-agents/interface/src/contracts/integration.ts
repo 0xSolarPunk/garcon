@@ -3,6 +3,7 @@ import type { AgentExecution } from './execution.js';
 import type { AgentHost } from './host.js';
 import type {
   AgentAuth,
+  AgentAttachments,
   AgentCatalog,
   AgentCommands,
   AgentEndpoints,
@@ -19,6 +20,7 @@ import type { AgentTranscript } from './transcript.js';
 
 export interface AgentIntegration {
   readonly descriptor: AgentDescriptor;
+  readonly attachments: AgentAttachments | null;
   readonly execution: AgentExecution;
   readonly transcript: AgentTranscript;
   readonly catalog: AgentCatalog;

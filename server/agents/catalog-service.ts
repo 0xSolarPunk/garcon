@@ -85,6 +85,7 @@ export class AgentCatalogService {
       supportsSteering: integration.steering !== null,
       supportsGoals: integration.goals !== null,
       supportsImages: integration.descriptor.supportsImages,
+      fileAttachmentMimeTypes: [...(integration.attachments?.fileMimeTypes ?? [])],
       acceptsApiProviderEndpoints: integration.endpoints !== null,
       supportedProtocols: [...integration.descriptor.supportedEndpointProtocols],
       authLoginSupported: Boolean(integration.auth?.launchLogin),

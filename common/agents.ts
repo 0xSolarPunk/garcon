@@ -47,6 +47,7 @@ export interface AgentCatalogEntry {
   supportsSteering: boolean;
   supportsGoals: boolean;
   supportsImages: boolean;
+  fileAttachmentMimeTypes?: string[];
   acceptsApiProviderEndpoints: boolean;
   supportedProtocols: ApiProtocol[];
   authLoginSupported: boolean;

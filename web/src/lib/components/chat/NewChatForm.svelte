@@ -6,8 +6,9 @@
 	import type { NewChatConfig } from '$lib/types/app.js';
 	import { NewChatFormState } from '$lib/chat/new-chat/new-chat-form-state.svelte.js';
 	import {
-		CHAT_ATTACHMENT_ACCEPT,
+		chatAttachmentAccept,
 		isImageAttachment,
+		isVideoChatAttachment,
 	} from '$lib/chat/composer/image-attachment.svelte.js';
 	import { shouldSubmitOnEnter } from '$lib/chat/composer/composer-shortcuts.js';
 	import type { SnippetInsertionResult } from '$lib/chat/composer/snippet-insertion.js';
@@ -43,6 +44,8 @@
 	import Loader2 from '@lucide/svelte/icons/loader-2';
 	import Check from '@lucide/svelte/icons/check';
 	import FileText from '@lucide/svelte/icons/file-text';
+	import FileVideo from '@lucide/svelte/icons/file-video';
+	import { CHAT_FILE_ATTACHMENT_MIME_TYPES } from '@garcon/common/attachments';
 	import X from '@lucide/svelte/icons/x';
 	import ComposerModelSelector from '$lib/components/model-selector/ComposerModelSelector.svelte';
 	import type {
@@ -88,6 +91,14 @@
 			return newChatAgentIds;
 		},
 	});
+	const canAttachImages = $derived(modelCatalog.supportsImages(form.agentId, form.modelValue));
+	const fileAttachmentMimeTypes = $derived(modelCatalog.fileAttachmentMimeTypes?.(form.agentId) ?? CHAT_FILE_ATTACHMENT_MIME_TYPES);
+	const attachmentSupport = $derived({
+		allowImages: canAttachImages,
+		fileMimeTypes: fileAttachmentMimeTypes,
+	});
+	const canAttachAttachments = $derived(canAttachImages || fileAttachmentMimeTypes.length > 0);
+	const attachmentAccept = $derived(chatAttachmentAccept(attachmentSupport));
 	const snippetExpansion = new SnippetExpansionController();
 	const snippetExpansionLayer = transientLayerAttachment({
 		registry: transientLayers,
@@ -219,7 +230,7 @@
 	function handleImageInputChange(event: Event): void {
 		const input = event.target as HTMLInputElement;
 		if (!input.files) return;
-		form.addImages(Array.from(input.files));
+		form.addImages(Array.from(input.files), attachmentSupport);
 		input.value = '';
 	}
 
@@ -233,7 +244,7 @@
 			const file = item.getAsFile();
 			if (file) pastedImages.push(file);
 		}
-		if (pastedImages.length > 0) form.addImages(pastedImages);
+		if (pastedImages.length > 0) form.addImages(pastedImages, attachmentSupport);
 	}
 
 	function autoResizeTextarea(): void {
@@ -319,8 +330,7 @@
 			const replacement = range
 				? applySnippetTriggerReplacement(sourceText, range, result.response.expandedText)
 				: {
-						text:
-							sourceText.slice(0, start) + result.response.expandedText + sourceText.slice(end),
+						text: sourceText.slice(0, start) + result.response.expandedText + sourceText.slice(end),
 						caret: start + result.response.expandedText.length,
 					};
 			form.firstMessage = replacement.text;
@@ -590,7 +600,7 @@
 				<input
 					bind:this={imageInputRef}
 					type="file"
-					accept={CHAT_ATTACHMENT_ACCEPT}
+					accept={attachmentAccept}
 					multiple
 					class="hidden"
 					onchange={handleImageInputChange}
@@ -608,7 +618,7 @@
 					rows="2"></textarea>
 
 				<ComposerBottomBar
-					canAttachImages={modelCatalog.supportsImages(form.agentId, form.modelValue)}
+					canAttachImages={canAttachAttachments}
 					attachImagesTooltip={m.chat_composer_image_attachments_unavailable()}
 					onAddImage={openImagePicker}
 					onOpenSnippetPalette={() => snippetPalette.openFromMenu()}
@@ -696,7 +706,11 @@
 										<div
 											class="flex h-full w-full flex-col items-center justify-center gap-1 bg-background px-1 text-muted-foreground"
 										>
-											<FileText class="h-5 w-5" aria-hidden="true" />
+											{#if isVideoChatAttachment(file)}
+												<FileVideo class="h-5 w-5" aria-hidden="true" />
+											{:else}
+												<FileText class="h-5 w-5" aria-hidden="true" />
+											{/if}
 											<span class="w-full truncate text-center text-[10px] leading-tight"
 												>{file.name}</span
 											>

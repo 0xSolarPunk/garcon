@@ -513,6 +513,9 @@ function makeService(overrides = {}) {
   const agents = {
     hasAgent: mock(() => true),
     supportsImages: mock(() => true),
+    supportsFileAttachmentMimeType: mock(
+      (_agentId, mimeType) => mimeType === 'video/mp4',
+    ),
     modelSupportsImages: mock(() => Promise.resolve(true)),
     startSession: mock(() => Promise.resolve(undefined)),
     resolvePermission: mock(() => undefined),
@@ -724,6 +727,28 @@ describe('ChatCommandService', () => {
 
     expect(chats.addChat).not.toHaveBeenCalled();
     expect(agents.startSession).not.toHaveBeenCalled();
+  });
+
+  it('rejects videos when the selected agent does not advertise their MIME type', async () => {
+    const unsupported = makeService({
+      agents: { supportsFileAttachmentMimeType: mock(() => false) },
+    });
+    await expect(
+      unsupported.service.submitStart({
+        chatId: TARGET_CHAT_ID,
+        agentId: 'claude',
+        projectPath: projectBaseDir,
+        command: 'inspect this clip',
+        model: 'opus',
+        images: [attachment('video/mp4')],
+        agentSettings: agentSettings(),
+        clientRequestId: 'req-video-unsupported',
+        clientMessageId: 'msg-video-unsupported',
+      }),
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED_AGENT', status: 422 });
+
+    expect(unsupported.chats.addChat).not.toHaveBeenCalled();
+    expect(unsupported.agents.startSession).not.toHaveBeenCalled();
   });
 
   it('rejects a colliding chat ID before accepting a command ledger record', async () => {

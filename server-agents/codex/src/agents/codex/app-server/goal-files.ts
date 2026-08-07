@@ -17,6 +17,10 @@ const MIME_EXTENSIONS: Record<string, string> = {
   'application/pdf': '.pdf',
   'text/markdown': '.md',
   'text/plain': '.txt',
+  'video/mp4': '.mp4',
+  'video/quicktime': '.mov',
+  'video/webm': '.webm',
+  'video/x-matroska': '.mkv',
 };
 
 export interface MaterializedGoalDraft {
