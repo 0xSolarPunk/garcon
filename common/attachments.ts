@@ -15,6 +15,11 @@ export const CHAT_FILE_ATTACHMENT_MIME_TYPES = [
   ...VIDEO_FILE_ATTACHMENT_MIME_TYPES,
 ] as const;
 
+export const MAX_CHAT_ATTACHMENT_COUNT = 5;
+export const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 25 * 1024 * 1024;
+export const MAX_CHAT_ATTACHMENT_FILE_BYTES = 10 * 1024 * 1024;
+export const MAX_CHAT_VIDEO_ATTACHMENT_FILE_BYTES = 25 * 1024 * 1024;
+
 const CHAT_ATTACHMENT_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
   gif: 'image/gif',
   jpeg: 'image/jpeg',
