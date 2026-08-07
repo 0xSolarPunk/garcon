@@ -3540,7 +3540,7 @@ describe('CodexAppServerRuntime', () => {
       { objective: 'Replacement work', status: 'active' },
       { objective: 'Existing work', status: 'paused', tokenBudget: 50_000 },
     ]);
-    expect(fake.getThreadGoal).toHaveBeenCalledTimes(2);
+    expect(fake.getThreadGoal).toHaveBeenCalledTimes(3);
     expect(provider.isRunning('thread-1')).toBe(false);
     expect(emitted.at(-1)?.content).toContain('replacement rejected');
   });
@@ -3674,7 +3674,7 @@ describe('CodexAppServerRuntime', () => {
       nativePath: null,
     }));
 
-    expect(fake.getThreadGoal).toHaveBeenCalledTimes(2);
+    expect(fake.getThreadGoal).toHaveBeenCalledTimes(3);
     expect(fake.setThreadGoal).toHaveBeenCalledTimes(1);
     expect(fake.setThreadGoal).toHaveBeenCalledWith('thread-1', {
       objective: 'Existing work',
@@ -3710,7 +3710,7 @@ describe('CodexAppServerRuntime', () => {
     }));
 
     expect(fake.setThreadGoal).toHaveBeenCalledTimes(2);
-    expect(fake.getThreadGoal).toHaveBeenCalledTimes(2);
+    expect(fake.getThreadGoal).toHaveBeenCalledTimes(3);
     expect(provider.isRunning('thread-1')).toBe(false);
     expect(fake.shutdown).toHaveBeenCalledTimes(1);
   });
@@ -5600,6 +5600,144 @@ describe('CodexAppServerRuntime', () => {
 
     await expect(fs.access(ownedDir)).rejects.toThrow();
     await expect(fs.access(unownedDir)).resolves.toBeNull();
+  });
+
+  it('cleans server-owned goal files after a runtime restart', async () => {
+    let outputDir;
+    let fake;
+    fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      setThreadGoal: async (threadId, params) => {
+        outputDir = path.dirname(params.objective.match(/- \[File #1\]: (.+)/)[1]);
+        queueMicrotask(() => fake.emit('notification', {
+          method: 'turn/started',
+          params: { threadId, turn: makeTurn({ id: 'goal-turn', status: 'inProgress' }) },
+        }));
+        return { goal: makeGoal(threadId, params.objective) };
+      },
+    });
+    const original = new CodexAppServerRuntime({ createClient: () => fake });
+    await original.runTurn(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'set', objective: 'Inspect video' },
+      images: [{ name: 'clip.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,dmlkZW8=' }],
+      nativePath: null,
+    }));
+    await original.shutdown();
+
+    const restored = new CodexAppServerRuntime({ createClient: () => new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+    }) });
+    await restored.runTurn(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'clear' },
+      nativePath: null,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await expect(fs.access(outputDir)).rejects.toThrow();
+  });
+
+  it('retains a new goal draft when set commits before its response is lost', async () => {
+    let currentGoal = null;
+    let filePath;
+    let fake;
+    fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      getThreadGoal: async () => ({ goal: currentGoal }),
+      setThreadGoal: async (threadId, params) => {
+        currentGoal = makeGoal(threadId, params.objective);
+        filePath = params.objective.match(/- \[File #1\]: (.+)/)[1];
+        queueMicrotask(() => fake.emit('notification', {
+          method: 'turn/started',
+          params: { threadId, turn: makeTurn({ id: 'goal-turn', status: 'inProgress' }) },
+        }));
+        throw new Error('response lost');
+      },
+    });
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+
+    await provider.runTurn(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'set', objective: 'Inspect video' },
+      images: [{ name: 'clip.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,dmlkZW8=' }],
+      nativePath: null,
+    }));
+
+    await expect(fs.access(filePath)).resolves.toBeNull();
+  });
+
+  it('retains an edited goal draft when its response is lost', async () => {
+    let currentGoal = null;
+    let filePath;
+    let fake;
+    fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      getThreadGoal: async () => ({ goal: currentGoal }),
+      setThreadGoal: async (threadId, params) => {
+        currentGoal = makeGoal(threadId, params.objective, params.status);
+        queueMicrotask(() => fake.emit('notification', {
+          method: 'turn/started',
+          params: { threadId, turn: makeTurn({ id: `goal-turn-${fake.setThreadGoal.mock.calls.length}`, status: 'inProgress' }) },
+        }));
+        if (fake.setThreadGoal.mock.calls.length === 2) {
+          filePath = params.objective.match(/- \[File #1\]: (.+)/)[1];
+          throw new Error('edit response lost');
+        }
+        return { goal: currentGoal };
+      },
+    });
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+    await provider.runTurn(makeRequest({
+      agentSessionId: 'thread-1', codexGoalCommand: { kind: 'set', objective: 'Initial goal' }, nativePath: null,
+    }));
+
+    await provider.submitGoalControl(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'edit', objective: 'Inspect video' },
+      images: [{ name: 'clip.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,dmlkZW8=' }],
+      nativePath: null,
+    }));
+
+    await expect(fs.access(filePath)).resolves.toBeNull();
+  });
+
+  it('retains a replacement draft when replacement commits before its response is lost', async () => {
+    let currentGoal = null;
+    let filePath;
+    let fake;
+    fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      getThreadGoal: async () => ({ goal: currentGoal }),
+      clearThreadGoal: async () => { currentGoal = null; return { cleared: true }; },
+      setThreadGoal: async (threadId, params) => {
+        const call = fake.setThreadGoal.mock.calls.length;
+        if (call === 3) throw new Error('rollback response lost');
+        currentGoal = makeGoal(threadId, params.objective, params.status);
+        queueMicrotask(() => fake.emit('notification', {
+          method: 'turn/started',
+          params: { threadId, turn: makeTurn({ id: `goal-turn-${call}`, status: 'inProgress' }) },
+        }));
+        if (call === 2) {
+          filePath = params.objective.match(/- \[File #1\]: (.+)/)[1];
+          throw new Error('replacement response lost');
+        }
+        return { goal: currentGoal };
+      },
+    });
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+    await provider.runTurn(makeRequest({
+      agentSessionId: 'thread-1', codexGoalCommand: { kind: 'set', objective: 'Initial goal' }, nativePath: null,
+    }));
+
+    await provider.submitGoalControl(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'replace', objective: 'Inspect video' },
+      images: [{ name: 'clip.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,dmlkZW8=' }],
+      nativePath: null,
+    }));
+
+    await expect(fs.access(filePath)).resolves.toBeNull();
   });
 
   it('stores oversized goal objectives in a durable Codex attachment file', async () => {
