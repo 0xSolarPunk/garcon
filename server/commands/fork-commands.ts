@@ -108,6 +108,18 @@ export class ForkCommands {
     const forkAlreadyCreated = preparedFork !== undefined
       && this.deps.chats.getChat(input.chatId) !== null;
     const forkContext = await this.validateFork(input, { allowExistingTarget: forkAlreadyCreated });
+    const source = forkContext.sourceSession;
+    await this.support.assertAttachmentsSupported({
+      agentId: source.agentId,
+      model: input.options?.model ?? source.model,
+      apiProviderId: input.options?.apiProviderId === undefined
+        ? source.apiProviderId
+        : input.options.apiProviderId,
+      modelEndpointId: input.options?.modelEndpointId === undefined
+        ? source.modelEndpointId
+        : input.options.modelEndpointId,
+      attachments: input.images ?? [],
+    });
     if (preparedFork?.sourceNextForkOrdinal !== undefined) {
       forkContext.sourceNextForkOrdinal = preparedFork.sourceNextForkOrdinal;
     }

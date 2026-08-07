@@ -751,6 +751,46 @@ describe('ChatCommandService', () => {
     expect(unsupported.agents.startSession).not.toHaveBeenCalled();
   });
 
+  it('checks run attachments against the requested backend override', async () => {
+    const { service, agents } = makeService();
+
+    await service.submitRun({
+      chatId: SOURCE_CHAT_ID,
+      command: 'inspect this image with the override',
+      images: [attachment('image/png')],
+      model: 'override-model',
+      apiProviderId: 'override-provider',
+      modelEndpointId: 'override-endpoint',
+      clientRequestId: 'req-run-backend-override',
+      clientMessageId: 'msg-run-backend-override',
+    });
+
+    expect(agents.modelSupportsImages).toHaveBeenCalledWith({
+      agentId: 'claude',
+      model: 'override-model',
+      apiProviderId: 'override-provider',
+      modelEndpointId: 'override-endpoint',
+    });
+  });
+
+  it('rejects unsupported fork-run attachments before creating the fork', async () => {
+    const unsupported = makeService({
+      agents: { supportsFileAttachmentMimeType: mock(() => false) },
+    });
+
+    await expect(unsupported.service.submitForkRun({
+      sourceChatId: SOURCE_CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      command: 'inspect this clip in a fork',
+      images: [attachment('video/mp4')],
+      clientRequestId: 'req-fork-video-unsupported',
+      clientMessageId: 'msg-fork-video-unsupported',
+    })).rejects.toMatchObject({ code: 'UNSUPPORTED_AGENT', status: 422 });
+
+    expect(unsupported.forkChatFileCopy).not.toHaveBeenCalled();
+    expect(unsupported.queue.runReservedTurn).not.toHaveBeenCalled();
+  });
+
   it('rejects a colliding chat ID before accepting a command ledger record', async () => {
     const { service, ledger, queue } = makeService();
 

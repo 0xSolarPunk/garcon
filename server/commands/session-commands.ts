@@ -82,8 +82,12 @@ export class SessionCommands {
     await this.support.assertAttachmentsSupported({
       agentId: chat.agentId,
       model: input.model ?? chat.model!,
-      apiProviderId: chat.apiProviderId,
-      modelEndpointId: chat.modelEndpointId,
+      apiProviderId: input.apiProviderId === undefined
+        ? chat.apiProviderId
+        : input.apiProviderId,
+      modelEndpointId: input.modelEndpointId === undefined
+        ? chat.modelEndpointId
+        : input.modelEndpointId,
       attachments: input.images ?? [],
     });
     const effectivePermissionMode = input.permissionMode ?? chat.permissionMode;
