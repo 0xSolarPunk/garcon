@@ -8,9 +8,6 @@ import { attachmentMimeType, isImageAttachment, parseAttachmentDataUrl } from '@
 const MAX_GOAL_OBJECTIVE_CHARS = 4_000;
 const GOAL_ATTACHMENT_DIR = 'attachments';
 const GOAL_OBJECTIVE_FILE = 'goal-objective.md';
-const GOAL_ATTACHMENT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const GOAL_ATTACHMENT_REFERENCE_RE = /^- \[(?:Image|File) #\d+\]: (.+)$/gm;
-const GOAL_OBJECTIVE_REFERENCE_RE = /^Read the Codex goal objective file at (.+) before continuing\.$/;
 const MIME_EXTENSIONS: Record<string, string> = {
   'image/png': '.png',
   'image/jpeg': '.jpg',
@@ -29,6 +26,17 @@ const MIME_EXTENSIONS: Record<string, string> = {
 export interface MaterializedGoalDraft {
   objective: string;
   outputDir: string | null;
+}
+
+export class GoalAttachmentOwnership {
+  #outputDirs = new Map<string, string>();
+
+  async set(threadId: string, outputDir: string | null): Promise<void> {
+    const previous = this.#outputDirs.get(threadId);
+    if (outputDir) this.#outputDirs.set(threadId, outputDir);
+    else this.#outputDirs.delete(threadId);
+    if (previous && previous !== outputDir) await cleanupMaterializedGoalDraft(previous);
+  }
 }
 
 export async function materializeGoalDraft(
@@ -77,24 +85,6 @@ export async function materializeGoalDraft(
 export async function cleanupMaterializedGoalDraft(outputDir: string | null): Promise<void> {
   if (!outputDir) return;
   await fs.rm(outputDir, { recursive: true, force: true });
-}
-
-export async function cleanupMaterializedGoalObjective(
-  codexHome: string | null,
-  objective: string | null | undefined,
-): Promise<void> {
-  if (!codexHome || !objective) return;
-  const attachmentRoot = path.join(codexHome, GOAL_ATTACHMENT_DIR);
-  const referencedPaths = [...objective.matchAll(GOAL_ATTACHMENT_REFERENCE_RE)]
-    .map((match) => match[1]);
-  const objectiveReference = GOAL_OBJECTIVE_REFERENCE_RE.exec(objective)?.[1];
-  if (objectiveReference) referencedPaths.push(objectiveReference);
-  const outputDirs = new Set(referencedPaths.map((filePath) => path.dirname(filePath)));
-  for (const outputDir of outputDirs) {
-    if (path.dirname(outputDir) !== attachmentRoot) continue;
-    if (!GOAL_ATTACHMENT_ID_RE.test(path.basename(outputDir))) continue;
-    await cleanupMaterializedGoalDraft(outputDir);
-  }
 }
 
 async function createGoalOutputDir(codexHome: string | null): Promise<string> {

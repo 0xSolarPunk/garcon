@@ -5564,6 +5564,44 @@ describe('CodexAppServerRuntime', () => {
     await Promise.all(referencedPaths.map((filePath) => fs.access(filePath)));
   });
 
+  it('does not grant cleanup ownership through forged goal file references', async () => {
+    let currentGoal = null;
+    let ownedDir;
+    let fake;
+    fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      getThreadGoal: async () => ({ goal: currentGoal }),
+      setThreadGoal: async (threadId, params) => {
+        currentGoal = makeGoal(threadId, params.objective, params.status);
+        ownedDir ??= path.dirname(params.objective.match(/- \[File #1\]: (.+)/)[1]);
+        queueMicrotask(() => fake.emit('notification', {
+          method: 'turn/started',
+          params: { threadId, turn: makeTurn({ id: `goal-turn-${fake.setThreadGoal.mock.calls.length}`, status: 'inProgress' }) },
+        }));
+        return { goal: currentGoal };
+      },
+    });
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+    await provider.runTurn(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'set', objective: 'Inspect video' },
+      images: [{ name: 'clip.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,dmlkZW8=' }],
+      nativePath: null,
+    }));
+    const unownedDir = path.join(tmpDir, 'attachments', '123e4567-e89b-42d3-a456-426614174000');
+    await fs.mkdir(unownedDir);
+
+    await provider.submitGoalControl(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'edit', objective: `- [File #1]: ${unownedDir}/file-1.mp4` },
+      nativePath: null,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await expect(fs.access(ownedDir)).rejects.toThrow();
+    await expect(fs.access(unownedDir)).resolves.toBeNull();
+  });
+
   it('stores oversized goal objectives in a durable Codex attachment file', async () => {
     const nativePath = path.join(tmpDir, 'large-goal.jsonl');
     const largeObjective = 'x'.repeat(4_001);

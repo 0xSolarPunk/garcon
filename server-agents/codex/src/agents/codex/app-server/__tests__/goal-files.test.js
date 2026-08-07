@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import {
-  cleanupMaterializedGoalObjective,
+  cleanupMaterializedGoalDraft,
   materializeGoalDraft,
 } from '../goal-files.ts';
 
@@ -28,35 +28,9 @@ describe('Codex goal files', () => {
     expect(draft.outputDir).not.toBeNull();
     expect(await fs.readdir(draft.outputDir)).toEqual(['file-1.mp4']);
 
-    await cleanupMaterializedGoalObjective(codexHome, draft.objective);
+    await cleanupMaterializedGoalDraft(draft.outputDir);
 
     await expect(fs.stat(draft.outputDir)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('does not remove UUID paths outside the managed attachment root', async () => {
-    const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-goal-home-'));
-    const externalRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-external-goal-'));
-    tempDirs.push(codexHome, externalRoot);
-    const externalDir = path.join(externalRoot, '123e4567-e89b-42d3-a456-426614174000');
-    await fs.mkdir(externalDir);
-
-    await cleanupMaterializedGoalObjective(codexHome, `Read ${externalDir}`);
-
-    expect(await fs.stat(externalDir)).toBeDefined();
-  });
-
-  it('does not remove an unowned managed directory mentioned in ordinary prose', async () => {
-    const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-goal-home-'));
-    tempDirs.push(codexHome);
-    const unownedDir = path.join(
-      codexHome,
-      'attachments',
-      '123e4567-e89b-42d3-a456-426614174000',
-    );
-    await fs.mkdir(unownedDir, { recursive: true });
-
-    await cleanupMaterializedGoalObjective(codexHome, `Do not delete ${unownedDir}`);
-
-    expect(await fs.stat(unownedDir)).toBeDefined();
-  });
 });
