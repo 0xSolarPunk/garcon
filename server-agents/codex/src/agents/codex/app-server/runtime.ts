@@ -61,7 +61,11 @@ import {
 } from './request-builders.js';
 import { CodexSkillDiscovery, type CodexSkillRef } from '../slash-command-discovery.js';
 import type { CodexGoalCommand } from '../goal-command.js';
-import { cleanupMaterializedGoalDraft, materializeGoalDraft } from './goal-files.js';
+import {
+  cleanupMaterializedGoalDraft,
+  cleanupMaterializedGoalObjective,
+  materializeGoalDraft,
+} from './goal-files.js';
 import { editedGoalStatus, formatGoalStatusMessage, formatGoalUpdatedMessage, goalStatusLabel } from './goal-display.js';
 import { CodexTurnItemLedger } from './turn-item-ledger.js';
 import {
@@ -277,6 +281,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
             throw error;
           }
           session.goal = response.goal;
+          this.#cleanupGoalAttachments(session, current.goal?.objective);
           await this.#waitForTurnStart(session, GOAL_TURN_START_TIMEOUT_MS);
           return;
         }
@@ -293,7 +298,9 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
           return;
         }
         case 'clear': {
+          const current = session.goal ?? (await client.getThreadGoal(session.threadId)).goal;
           const response = await client.clearThreadGoal(session.threadId);
+          if (response.cleared) this.#cleanupGoalAttachments(session, current?.objective);
           const message = response.cleared ? 'Codex goal cleared.' : 'No Codex goal was set.';
           this.emitMessages(session.chatId, [new AssistantMessage(new Date().toISOString(), message)]);
           if (!keepSession || !session.activeTurnId) this.#finishSession(session);
@@ -362,6 +369,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
             throw error;
           }
           session.goal = response.goal;
+          this.#cleanupGoalAttachments(session, current.objective);
           if (response.goal.status === 'active') {
             await this.#waitForTurnStart(session, GOAL_TURN_START_TIMEOUT_MS);
           } else {
@@ -622,6 +630,15 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
     session.cleanupAttachments = previous
       ? async () => { await Promise.all([previous(), cleanup()]); }
       : cleanup;
+  }
+
+  #cleanupGoalAttachments(session: RunningCodexSession, objective: string | null | undefined): void {
+    void cleanupMaterializedGoalObjective(session.codexHome, objective).catch((error) => {
+      this.#logger.warn('Codex goal attachment cleanup failed', {
+        chatId: session.chatId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
   }
 
   async startSession(request: CodexStartRequest): Promise<CodexStartedSession> {
@@ -1235,7 +1252,9 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       session.ignoredGoalClears -= 1;
       return;
     }
+    const previousGoal = session.goal;
     session.goal = null;
+    this.#cleanupGoalAttachments(session, previousGoal?.objective);
     if (session.managesGoalLifecycle && !session.activeTurnId) this.#finishSession(session);
   }
 
