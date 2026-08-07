@@ -12,6 +12,7 @@ import {
 } from '../client.ts';
 import { convertCodexAppServerItem, convertCodexAppServerLiveItem, convertCodexRawCodeModeItem } from '../converter.ts';
 import { waitForMaterializedThread } from '../durability.ts';
+import { cleanupOwnedGoalAttachments, materializeGoalDraft } from '../goal-files.ts';
 import { CodexAppServerRuntime } from '../runtime.ts';
 import { loadCodexChatMessages } from '../../history-loader.ts';
 import { ChatExecutionCoordinator } from '../../../../../../../server/chat-execution/chat-execution-coordinator.ts';
@@ -5738,6 +5739,143 @@ describe('CodexAppServerRuntime', () => {
     }));
 
     await expect(fs.access(filePath)).resolves.toBeNull();
+  });
+
+  it('preserves an externally selected goal when a failed mutation reconciles to a third objective', async () => {
+    const external = await materializeGoalDraft(tmpDir, 'thread-1', 'External goal', [
+      { name: 'external.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,ZXh0ZXJuYWw=' },
+    ]);
+    let attemptedDir;
+    let goalReadCount = 0;
+    const fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      getThreadGoal: async (threadId) => ({
+        goal: goalReadCount++ === 0 ? null : makeGoal(threadId, external.objective),
+      }),
+      setThreadGoal: async (_threadId, params) => {
+        attemptedDir = path.dirname(params.objective.match(/- \[File #1\]: (.+)/)[1]);
+        throw new Error('mutation response lost');
+      },
+    });
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+
+    await provider.runTurn(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'set', objective: 'Attempted goal' },
+      images: [{ name: 'attempt.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,YXR0ZW1wdA==' }],
+      nativePath: null,
+    }));
+
+    await expect(fs.access(attemptedDir)).rejects.toThrow();
+    await expect(fs.access(external.outputDir)).resolves.toBeNull();
+  });
+
+  it('serializes goal cleanup before materializing the next edited goal', async () => {
+    let currentGoal = null;
+    let fake;
+    let releaseCleanup;
+    let signalCleanupStarted;
+    const cleanupStarted = new Promise((resolve) => { signalCleanupStarted = resolve; });
+    const cleanupGate = new Promise((resolve) => { releaseCleanup = resolve; });
+    let cleanupCount = 0;
+    const referencedFiles = [];
+    const delayedCleanup = mock(async (...args) => {
+      cleanupCount += 1;
+      if (cleanupCount === 2) {
+        signalCleanupStarted();
+        await cleanupGate;
+      }
+      await cleanupOwnedGoalAttachments(...args);
+    });
+    fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      getThreadGoal: async () => ({ goal: currentGoal }),
+      setThreadGoal: async (threadId, params) => {
+        currentGoal = makeGoal(threadId, params.objective, params.status);
+        const reference = params.objective.match(/- \[File #1\]: (.+)/)?.[1];
+        if (reference) referencedFiles.push(reference);
+        queueMicrotask(() => fake.emit('notification', {
+          method: 'turn/started',
+          params: { threadId, turn: makeTurn({ id: `goal-turn-${fake.setThreadGoal.mock.calls.length}`, status: 'inProgress' }) },
+        }));
+        return { goal: currentGoal };
+      },
+    });
+    const provider = new CodexAppServerRuntime({
+      createClient: () => fake,
+      cleanupOwnedGoalAttachments: delayedCleanup,
+    });
+    await provider.runTurn(makeRequest({
+      agentSessionId: 'thread-1', codexGoalCommand: { kind: 'set', objective: 'Initial goal' }, nativePath: null,
+    }));
+
+    const firstEdit = provider.submitGoalControl(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'edit', objective: 'First edit' },
+      images: [{ name: 'first.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,Zmlyc3Q=' }],
+      nativePath: null,
+    }));
+    await cleanupStarted;
+    const secondEdit = provider.submitGoalControl(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'edit', objective: 'Second edit' },
+      images: [{ name: 'second.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,c2Vjb25k' }],
+      nativePath: null,
+    }));
+    await Promise.resolve();
+
+    expect(fake.setThreadGoal).toHaveBeenCalledTimes(2);
+    releaseCleanup();
+    await Promise.all([firstEdit, secondEdit]);
+
+    expect(fake.setThreadGoal).toHaveBeenCalledTimes(3);
+    await expect(fs.access(referencedFiles[0])).rejects.toThrow();
+    await expect(fs.access(referencedFiles[1])).resolves.toBeNull();
+  });
+
+  it('ignores a delayed explicit-clear notification after a new attached goal commits', async () => {
+    let currentGoal = null;
+    let replacementFile;
+    let fake;
+    fake = new FakeClient({
+      connect: async () => ({ userAgent: 'codex', codexHome: tmpDir, platformFamily: 'unix', platformOs: 'linux' }),
+      getThreadGoal: async () => ({ goal: currentGoal }),
+      clearThreadGoal: async () => {
+        currentGoal = null;
+        return { cleared: true };
+      },
+      setThreadGoal: async (threadId, params) => {
+        currentGoal = makeGoal(threadId, params.objective, params.status);
+        replacementFile = params.objective.match(/- \[File #1\]: (.+)/)?.[1] ?? replacementFile;
+        queueMicrotask(() => fake.emit('notification', {
+          method: 'turn/started',
+          params: { threadId, turn: makeTurn({ id: `goal-turn-${fake.setThreadGoal.mock.calls.length}`, status: 'inProgress' }) },
+        }));
+        return { goal: currentGoal };
+      },
+    });
+    const provider = new CodexAppServerRuntime({ createClient: () => fake });
+    await provider.runTurn(makeRequest({
+      agentSessionId: 'thread-1', codexGoalCommand: { kind: 'set', objective: 'Initial goal' }, nativePath: null,
+    }));
+    await provider.submitGoalControl(makeRequest({
+      agentSessionId: 'thread-1', codexGoalCommand: { kind: 'clear' }, nativePath: null,
+    }));
+    await provider.submitGoalControl(makeRequest({
+      agentSessionId: 'thread-1',
+      codexGoalCommand: { kind: 'set', objective: 'Replacement goal' },
+      images: [{ name: 'replacement.mp4', mimeType: 'video/mp4', data: 'data:video/mp4;base64,cmVwbGFjZW1lbnQ=' }],
+      nativePath: null,
+    }));
+
+    fake.emit('notification', {
+      method: 'thread/goal/cleared',
+      params: { threadId: 'thread-1' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await expect(fs.access(replacementFile)).resolves.toBeNull();
+    expect(provider.isRunning('thread-1')).toBe(true);
   });
 
   it('stores oversized goal objectives in a durable Codex attachment file', async () => {

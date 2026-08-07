@@ -61,8 +61,8 @@ import {
 } from './request-builders.js';
 import { CodexSkillDiscovery, type CodexSkillRef } from '../slash-command-discovery.js';
 import type { CodexGoalCommand } from '../goal-command.js';
-import { cleanupMaterializedGoalDraft, cleanupOwnedGoalAttachments, materializeGoalDraft } from './goal-files.js';
-import { recoverGoalDraftAfterError } from './goal-recovery.js';
+import { GoalAttachmentOperationQueue, GoalAttachmentOperations } from './goal-attachment-operations.js';
+import { cleanupMaterializedGoalDraft, cleanupOwnedGoalAttachments } from './goal-files.js';
 import { editedGoalStatus, formatGoalStatusMessage, formatGoalUpdatedMessage, goalStatusLabel } from './goal-display.js';
 import { CodexTurnItemLedger } from './turn-item-ledger.js';
 import {
@@ -119,6 +119,7 @@ interface RunningCodexSession {
   completedGoalTurn: boolean;
   ignoredGoalClears: number;
   activeInputChain: Promise<void>;
+  goalAttachments: GoalAttachmentOperations;
   activeDeliveryReservations: number;
   pendingFinish: FinishSessionOptions | null;
   liveCodeModeResultToolIds: Map<string, string>;
@@ -139,6 +140,7 @@ export interface CodexAppServerRuntimeOptions {
   nativePathDiscoveryRefresh?: NativePathDiscoveryRefreshLimiterOptions;
   logger?: AgentLogger;
   skillDiscovery?: CodexSkillDiscovery;
+  cleanupOwnedGoalAttachments?: typeof cleanupOwnedGoalAttachments;
 }
 
 export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
@@ -161,6 +163,8 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
   #nativePathDiscoveryRefresh: NativePathDiscoveryRefreshLimiter;
   #logger: AgentLogger;
   #skillDiscovery: CodexSkillDiscovery;
+  #cleanupOwnedGoalAttachments: typeof cleanupOwnedGoalAttachments;
+  #goalAttachmentQueue = new GoalAttachmentOperationQueue();
   #history: CodexHistoryService;
   #idlePurger = new IdleSessionPurger<RunningCodexSession>({
     sessions: () => this.#sessions.entries(),
@@ -182,6 +186,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
     this.#capacityRetryDelay = options.capacityRetryDelay ?? delay;
     this.#nativePathDiscoveryRefresh = new NativePathDiscoveryRefreshLimiter(options.nativePathDiscoveryRefresh);
     this.#logger = options.logger ?? NOOP_LOGGER;
+    this.#cleanupOwnedGoalAttachments = options.cleanupOwnedGoalAttachments ?? cleanupOwnedGoalAttachments;
     this.#history = new CodexHistoryService({
       createClient: this.#createClient,
       logger: this.#logger,
@@ -267,19 +272,15 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
             if (!keepSession) this.#finishSession(session);
             return;
           }
-          const draft = await materializeGoalDraft(session.codexHome, session.threadId, command.objective, request.images);
-          let response: ThreadGoalSetResponse;
-          try {
-            response = current.goal
-              ? await this.#replaceThreadGoal(client, session, current.goal, draft.objective)
-              : await this.#setNewThreadGoal(client, session, draft.objective);
-          } catch (error) {
-            response = await recoverGoalDraftAfterError(
-              client, session.codexHome, session.threadId, draft, current.goal?.objective ?? null, error,
-            );
-          }
+          const response = await session.goalAttachments.set(
+            client,
+            command.objective,
+            request.images,
+            (objective) => current.goal
+              ? this.#replaceThreadGoal(client, session, current.goal, objective)
+              : this.#setNewThreadGoal(client, session, objective),
+          );
           session.goal = response.goal;
-          this.#setGoalAttachmentOwnership(session, draft.outputDir);
           await this.#waitForTurnStart(session, GOAL_TURN_START_TIMEOUT_MS);
           return;
         }
@@ -296,8 +297,8 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
           return;
         }
         case 'clear': {
-          const response = await client.clearThreadGoal(session.threadId);
-          if (response.cleared) this.#setGoalAttachmentOwnership(session, null);
+          const response = await session.goalAttachments.clear(() => this.#clearThreadGoal(client, session));
+          if (response.cleared) session.goal = null;
           const message = response.cleared ? 'Codex goal cleared.' : 'No Codex goal was set.';
           this.emitMessages(session.chatId, [new AssistantMessage(new Date().toISOString(), message)]);
           if (!keepSession || !session.activeTurnId) this.#finishSession(session);
@@ -339,6 +340,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
             if (!keepSession) this.#finishSession(session);
             return;
           }
+          const editedObjective = command.objective;
           const current = goalSynchronized
             ? session.goal
             : (await client.getThreadGoal(session.threadId)).goal;
@@ -351,23 +353,21 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
             return;
           }
           const status = editedGoalStatus(current.status);
-          const draft = await materializeGoalDraft(session.codexHome, session.threadId, command.objective, request.images);
-          let response: ThreadGoalSetResponse;
           const previouslyManaged = session.managesGoalLifecycle;
-          try {
-            if (status === 'active') session.managesGoalLifecycle = true;
-            response = await client.setThreadGoal(session.threadId, {
-              objective: draft.objective,
-              status,
-              tokenBudget: current.tokenBudget,
-            });
-          } catch (error) {
-            response = await recoverGoalDraftAfterError(
-              client, session.codexHome, session.threadId, draft, current.objective, error,
-            );
-          }
+          const response = await session.goalAttachments.set(
+            client,
+            editedObjective,
+            request.images,
+            async (objective) => {
+              if (status === 'active') session.managesGoalLifecycle = true;
+              return client.setThreadGoal(session.threadId, {
+                objective,
+                status,
+                tokenBudget: current.tokenBudget,
+              });
+            },
+          );
           session.goal = response.goal;
-          this.#setGoalAttachmentOwnership(session, draft.outputDir);
           if (response.goal.status === 'active') {
             await this.#waitForTurnStart(session, GOAL_TURN_START_TIMEOUT_MS);
           } else {
@@ -628,15 +628,6 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
     session.cleanupAttachments = previous
       ? async () => { await Promise.all([previous(), cleanup()]); }
       : cleanup;
-  }
-
-  #setGoalAttachmentOwnership(session: RunningCodexSession, outputDir: string | null): void {
-    void cleanupOwnedGoalAttachments(session.codexHome, session.threadId, outputDir).catch((error) => {
-      this.#logger.warn('Codex goal attachment cleanup failed', {
-        chatId: session.chatId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
   }
 
   async startSession(request: CodexStartRequest): Promise<CodexStartedSession> {
@@ -1119,6 +1110,14 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       completedGoalTurn: false,
       ignoredGoalClears: 0,
       activeInputChain: Promise.resolve(),
+      goalAttachments: new GoalAttachmentOperations({
+        codexHome: args.codexHome,
+        threadId: args.threadId,
+        cleanup: this.#cleanupOwnedGoalAttachments,
+        logger: this.#logger,
+        chatId: args.chatId,
+        queue: this.#goalAttachmentQueue,
+      }),
       activeDeliveryReservations: 0,
       pendingFinish: null,
       liveCodeModeResultToolIds: new Map(),
@@ -1251,15 +1250,20 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
       return;
     }
     session.goal = null;
-    this.#setGoalAttachmentOwnership(session, null);
+    session.goalAttachments.queueClear();
     if (session.managesGoalLifecycle && !session.activeTurnId) this.#finishSession(session);
   }
 
-  async #clearGoalForReplacement(client: CodexAppServerClient, session: RunningCodexSession): Promise<boolean> {
+  async #clearThreadGoal(client: CodexAppServerClient, session: RunningCodexSession) {
     session.ignoredGoalClears += 1;
-    const response = await client.clearThreadGoal(session.threadId);
-    if (!response.cleared) this.#releaseIgnoredGoalClear(session);
-    return response.cleared;
+    try {
+      const response = await client.clearThreadGoal(session.threadId);
+      if (!response.cleared) this.#releaseIgnoredGoalClear(session);
+      return response;
+    } catch (error) {
+      this.#releaseIgnoredGoalClear(session);
+      throw error;
+    }
   }
 
   async #setNewThreadGoal(
@@ -1280,7 +1284,7 @@ export class CodexAppServerRuntime extends AgentEventEmitterRuntime {
     const previouslyManaged = session.managesGoalLifecycle;
     let cleared: boolean;
     try {
-      cleared = await this.#clearGoalForReplacement(client, session);
+      cleared = (await this.#clearThreadGoal(client, session)).cleared;
     } catch (clearError) {
       let reconciled = false;
       let clearCommitted = false;

@@ -1,14 +1,14 @@
 import type { CodexAppServerClient } from './client.js';
-import { cleanupMaterializedGoalDraft, cleanupOwnedGoalAttachments, type MaterializedGoalDraft } from './goal-files.js';
+import { cleanupMaterializedGoalDraft, type MaterializedGoalDraft } from './goal-files.js';
 import type { CodexThreadGoal, ThreadGoalSetResponse } from './protocol.js';
 
 export async function recoverGoalDraftAfterError(
   client: CodexAppServerClient,
-  codexHome: string | null,
   threadId: string,
   draft: MaterializedGoalDraft,
-  previousObjective: string | null,
   deliveryError: unknown,
+  onCleanupError: (error: unknown) => void,
+  cleanupDraft: typeof cleanupMaterializedGoalDraft = cleanupMaterializedGoalDraft,
 ): Promise<ThreadGoalSetResponse> {
   let goal: CodexThreadGoal | null;
   try {
@@ -17,7 +17,10 @@ export async function recoverGoalDraftAfterError(
     throw deliveryError;
   }
   if (goal?.objective === draft.objective) return { goal };
-  if (goal?.objective === previousObjective) await cleanupMaterializedGoalDraft(draft.outputDir);
-  else await cleanupOwnedGoalAttachments(codexHome, threadId, null);
+  try {
+    await cleanupDraft(draft.outputDir);
+  } catch (error) {
+    onCleanupError(error);
+  }
   throw deliveryError;
 }
