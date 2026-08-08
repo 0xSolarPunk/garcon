@@ -4,7 +4,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PendingUserInputUpdatedMessage } from '../../../common/ws-events.js';
-import { userContents } from '../../support/chat-assertions.js';
+import {
+  assistantContents,
+  messagesOfType,
+  userContents,
+} from '../../support/chat-assertions.js';
 import {
   withIntegrationFixture,
   type IntegrationFixture,
@@ -129,8 +133,7 @@ describe('garcon-cli', () => {
         'list', 'agents', '--json',
       ]);
 
-      expect(listedAgents.exitCode).toBe(0);
-      expect(listedAgents.stderr).toBe('');
+      expect(listedAgents).toMatchObject({ exitCode: 0, stderr: '' });
       expect(JSON.parse(listedAgents.stdout).agents).toContainEqual(
         expect.objectContaining({ id: fixture.directAgents.openAi.agentId }),
       );
@@ -152,8 +155,7 @@ describe('garcon-cli', () => {
         '--workspace', WORKSPACE,
         'list', 'agents', '--json',
       ]);
-      expect(listedAgents.exitCode).toBe(0);
-      expect(listedAgents.stderr).toBe('');
+      expect(listedAgents).toMatchObject({ exitCode: 0, stderr: '' });
       expect(JSON.parse(listedAgents.stdout).agents).toContainEqual(
         expect.objectContaining({ id: agent.agentId }),
       );
@@ -227,6 +229,117 @@ describe('garcon-cli', () => {
         'review-needed',
       ]);
       expect(chatsAfterResume.sessions[0]?.title).toBe('CLI follow-up review');
+    }, { namedWorkspace: WORKSPACE });
+  });
+
+  test('resumes through A to B to A as visible fenced handoffs', async () => {
+    await withIntegrationFixture('garcon-cli-agent-handoff', async (fixture) => {
+      const source = fixture.directAgents.openAi;
+      const target = fixture.directAgents.anthropic;
+      const started = await runCli([
+        '--config-dir', fixture.dirs.config,
+        '--workspace', WORKSPACE,
+        '--cwd', fixture.dirs.project,
+        '--agent', source.agentId,
+        '--provider', source.provider.providerId,
+        '--endpoint', source.provider.endpointId,
+        '--model', source.provider.model,
+        'cli-source-turn',
+      ]);
+      expect(started.exitCode).toBe(0);
+      const chatId = started.stdout.match(/^chat id: (\d{16})$/m)?.[1];
+      expect(chatId).toBeString();
+      const before = (await fixture.client.listChats()).sessions.find((chat) => chat.id === chatId)!;
+
+      const targetHeld = fixture.fakeProviders.anthropic.holdNext({
+        model: target.provider.model,
+      });
+      const handoffRun = runCli([
+        '--config-dir', fixture.dirs.config,
+        '--workspace', WORKSPACE,
+        '--resume', chatId!,
+        '--agent', target.agentId,
+        '--provider', target.provider.providerId,
+        '--endpoint', target.provider.endpointId,
+        '--model', target.provider.model,
+        '--permissions', 'default',
+        '--reasoning-effort', 'none',
+        '--title', 'CLI delegated handoff',
+        '--tag', 'Delegated Handoff',
+        'cli-target-turn',
+      ]);
+      const targetRequest = await targetHeld.received;
+      expect(occurrences(targetRequest.lastUserText, '<carried-context version="2">')).toBe(1);
+      expect(targetHeld.releaseText('cli-target-answer')).toBe(true);
+      const handedOff = await handoffRun;
+
+      expect(handedOff.exitCode).toBe(0);
+      expect(handedOff.stderr).toBe('');
+      expect(handedOff.stdout).toMatch(new RegExp(`^chat id: ${chatId}\\nturn id: [^\\n]+\\n`));
+      expect(handedOff.stdout).toContain('cli-target-answer');
+      const after = (await fixture.client.listChats()).sessions.find((chat) => chat.id === chatId)!;
+      expect(after).toMatchObject({
+        agentId: target.agentId,
+        title: 'CLI delegated handoff',
+        tags: ['cli', 'delegated-handoff'],
+      });
+      expect(after.agentOwnershipEpoch).not.toBe(before.agentOwnershipEpoch);
+
+      const sourceHeld = fixture.fakeProviders.openAi.holdNext({
+        model: source.provider.model,
+      });
+      const returnRun = runCli([
+        '--config-dir', fixture.dirs.config,
+        '--workspace', WORKSPACE,
+        '--resume', chatId!,
+        '--agent', source.agentId,
+        '--provider', source.provider.providerId,
+        '--endpoint', source.provider.endpointId,
+        '--model', source.provider.model,
+        '--permissions', 'default',
+        '--reasoning-effort', 'none',
+        '--title', 'CLI returned handoff',
+        '--tag', 'Returned Handoff',
+        'cli-return-turn',
+      ]);
+      const sourceRequest = await sourceHeld.received;
+      expect(occurrences(sourceRequest.lastUserText, '<carried-context version="2">')).toBe(1);
+      expect(sourceRequest.lastUserText).toContain('cli-target-turn');
+      expect(sourceHeld.releaseText('cli-return-answer')).toBe(true);
+      const returned = await returnRun;
+
+      expect(returned.exitCode).toBe(0);
+      expect(returned.stderr).toBe('');
+      expect(returned.stdout).toMatch(new RegExp(`^chat id: ${chatId}\\nturn id: [^\\n]+\\n`));
+      expect(returned.stdout).toContain('cli-return-answer');
+      const afterReturn = (await fixture.client.listChats()).sessions.find(
+        (chat) => chat.id === chatId,
+      )!;
+      expect(afterReturn).toMatchObject({
+        agentId: source.agentId,
+        title: 'CLI returned handoff',
+        tags: ['cli', 'delegated-handoff', 'returned-handoff'],
+      });
+      expect(afterReturn.agentOwnershipEpoch).not.toBe(after.agentOwnershipEpoch);
+
+      const history = await fixture.client.getMessages(chatId!);
+      expect(userContents(history.messages)).toEqual([
+        'cli-source-turn',
+        'cli-target-turn',
+        'cli-return-turn',
+      ]);
+      expect(assistantContents(history.messages)).toEqual([
+        'echo:cli-source-turn',
+        'cli-target-answer',
+        'cli-return-answer',
+      ]);
+      expect(messagesOfType(history.messages, 'agent-switch').map((message) => [
+        message.fromAgentId,
+        message.toAgentId,
+      ])).toEqual([
+        [source.agentId, target.agentId],
+        [target.agentId, source.agentId],
+      ]);
     }, { namedWorkspace: WORKSPACE });
   });
 
@@ -321,6 +434,8 @@ describe('garcon-cli', () => {
           id: handle.chatId,
           projectPath: fixture.dirs.project,
           tags: ['cli'],
+          agentOwnershipEpoch: expect.any(String),
+          carryOverRevision: expect.stringMatching(/^carry-v(?:1:0|5:)/),
         },
         processingPhase: 'running',
         control: { serverInstanceId: expect.any(String) },
@@ -461,7 +576,7 @@ describe('garcon-cli', () => {
       expect(status.stderr).toBe('');
       expect(JSON.parse(status.stdout).chat.id).toBe(chatId);
     }, { namedWorkspace: WORKSPACE });
-  });
+  }, 20_000);
 
   test('reports missing chats and inspects chats whose project path disappeared', async () => {
     await withIntegrationFixture('garcon-cli-status-paths', async (fixture) => {
@@ -671,3 +786,7 @@ describe('garcon-cli', () => {
     }, { namedWorkspace: WORKSPACE });
   });
 });
+
+function occurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}

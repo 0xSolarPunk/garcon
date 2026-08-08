@@ -1,6 +1,6 @@
 import { describe, expect, it, mock } from 'bun:test';
 import { AssistantMessage, UserMessage } from '@garcon/common/chat-types';
-import { renderTranscriptSeed } from '@garcon/common/transcript-seed';
+import { renderCarriedContext } from '@garcon/common/transcript-seed';
 import { AgentEventEmitterRuntime } from '@garcon/server-agent-common/shared/event-emitter-runtime';
 import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
 import { AgentEventBus } from '../../../../../../server/agents/event-bus.ts';
@@ -64,7 +64,7 @@ function startRequest(overrides = {}) {
     },
     prompt: 'hello',
     attachments: [],
-    carryOver: [],
+    carriedContext: null,
     ...overrides,
   };
 }
@@ -84,7 +84,7 @@ function goalControlRequest(operation, beforeDelivery = commitHandoff) {
     },
     operation,
     beforeDelivery,
-    carryOver: undefined,
+    carriedContext: undefined,
   });
 }
 
@@ -130,6 +130,7 @@ describe('CodexExecution', () => {
           modelEndpointId: 'endpoint-1',
         },
       },
+      nativeSeedReceipt: null,
     });
     expect(request.admission.markStarted).toHaveBeenCalledTimes(1);
     expect(request.admission.markAbortable).toHaveBeenCalledTimes(1);
@@ -184,18 +185,26 @@ describe('CodexExecution', () => {
       createPathNativeSessionCodec('codex'),
       createConfig(),
     );
-    const carryOver = [new UserMessage('2026-07-19T00:00:00.000Z', 'earlier')];
+    const prefix = renderCarriedContext([
+      new UserMessage('2026-07-19T00:00:00.000Z', 'earlier'),
+    ]).prefix;
 
-    await execution.start(startRequest({
+    const started = await execution.start(startRequest({
       prompt: '/goal ship the migration',
-      carryOver,
+      carriedContext: { prefix },
     }));
 
     expect(runtime.startSession).toHaveBeenCalledWith(expect.objectContaining({
       command: 'ship the migration',
       codexGoalCommand: { kind: 'set', objective: 'ship the migration' },
-      codexSeedContext: renderTranscriptSeed(carryOver),
+      codexSeedContext: prefix,
     }));
+    expect(started.nativeSeedReceipt).toMatchObject({
+      agentSessionId: 'thread-1',
+      placement: 'provider-context',
+      format: 'v2-xml',
+      codeUnitLength: prefix.length,
+    });
   });
 
   it('rejects goal controls that cannot start a new thread', async () => {

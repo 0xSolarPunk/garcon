@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { writeJsonFileAtomic } from '../lib/json-file-store.js';
 
-export const CURRENT_WORKSPACE_VERSION = 3;
+export const CURRENT_WORKSPACE_VERSION = 5;
 
 const WORKSPACE_VERSION_FILE = 'workspace-version.json';
 const FRESH_WORKSPACE_IGNORED_FILES = new Set([
@@ -14,6 +14,8 @@ const MIGRATIONS = [
   { name: 'chat-id-migration', version: 1 },
   { name: 'core-record-migration', version: 2 },
   { name: 'ephemeral-queue-state-cleanup', version: 3 },
+  { name: 'carryover-node-migration', version: 4 },
+  { name: 'carryover-segment-migration', version: 5 },
 ] as const;
 
 export type WorkspaceMigrationName = typeof MIGRATIONS[number]['name'];
@@ -32,6 +34,10 @@ export class WorkspaceMigrationRunner {
     this.#workspaceDir = workspaceDir;
     this.#initialVersion = initialVersion;
     this.#skipLadder = skipLadder;
+  }
+
+  get initialVersion(): number {
+    return this.#initialVersion;
   }
 
   static async open(workspaceDir: string): Promise<WorkspaceMigrationRunner> {

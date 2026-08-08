@@ -51,6 +51,7 @@ function makeChat(overrides: Partial<ChatSessionRecord>): ChatSessionRecord {
 		status: 'draft',
 		tags: [],
 		...overrides,
+		agentOwnershipEpoch: overrides.agentOwnershipEpoch ?? null,
 	};
 }
 
@@ -123,11 +124,13 @@ describe('SidebarController', () => {
 		it('does not refresh after a mutation failure', async () => {
 			mockReorderChat.mockRejectedValue(new Error('reorder failed'));
 
-			await expect(controller.reorderChat('c-2', {
-				kind: 'relative',
-				referenceChatId: 'c-3',
-				position: 'before',
-			})).rejects.toThrow('reorder failed');
+			await expect(
+				controller.reorderChat('c-2', {
+					kind: 'relative',
+					referenceChatId: 'c-3',
+					position: 'before',
+				}),
+			).rejects.toThrow('reorder failed');
 
 			expect(quietRefresh).not.toHaveBeenCalled();
 		});
@@ -142,6 +145,11 @@ describe('SidebarController', () => {
 				lastActivityAt: '2025-01-02',
 				agentSessionId: 'agent-session-1',
 				transcriptSource: null,
+				carryOver: {
+					revision: 'carry-v1:0',
+					archivedMessageCount: 0,
+					segments: [],
+				},
 			};
 			mockGetChatDetails.mockResolvedValue(details);
 
@@ -159,6 +167,7 @@ describe('SidebarController', () => {
 				chat: {
 					id: 'c-fork',
 					agentId: 'claude',
+					agentOwnershipEpoch: 'epoch-fork',
 					model: 'sonnet',
 					permissionMode: 'default',
 					thinkingMode: 'none',

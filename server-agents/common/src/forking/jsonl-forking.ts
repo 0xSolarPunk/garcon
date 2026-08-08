@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import type { ChatMessage } from '@garcon/common/chat-types';
+import { retargetNativeSeedReceiptIfPreserved } from '@garcon/common/transcript-seed';
 import {
   AgentIntegrationError,
   computeAgentTranscriptRevisions,
@@ -8,7 +9,6 @@ import {
   type AgentForkRequest,
   type AgentForkOutcome,
   type AgentForking,
-  type AgentHost,
   type AgentStartedSession,
   type AgentTranscript,
 } from '@garcon/server-agent-interface';
@@ -23,7 +23,6 @@ import {
 } from './fork-jsonl.js';
 
 export interface JsonlForkingOptions {
-  readonly host: Pick<AgentHost, 'carryOver'>;
   readonly supportsWhileRunning: boolean;
   readonly transcript: Pick<AgentTranscript, 'load' | 'resolveNativeSession'>;
   readonly nativeSessions: PathNativeSessionCodec;
@@ -98,18 +97,22 @@ async function forkJsonlAtPoint(
   }
   const sourceSnapshot = request.point ? await snapshotJsonlSource(sourcePath) : undefined;
   if (request.point) {
-    const carryOver = await options.host.carryOver.load({
-      chatId: request.source.chatId,
-      expectedRevision: request.point.sourceRevision.carryOver,
-      currentAgentId: request.source.agentId,
-      currentModel: request.source.model,
-      signal: request.admission.signal,
-    });
+    if (
+      !Number.isSafeInteger(request.point.archivedMessageCount)
+      || request.point.archivedMessageCount < 0
+      || request.point.archivedMessageCount > request.point.messageSequence
+    ) {
+      throw new AgentIntegrationError(
+        'TRANSCRIPT_UNAVAILABLE',
+        'Fork carry-over count is invalid',
+        false,
+      );
+    }
     const native = await options.transcript.load({
       chat: request.source,
       signal: request.admission.signal,
     });
-    nativeSequence = Math.max(0, request.point.messageSequence - carryOver.messages.length);
+    nativeSequence = request.point.messageSequence - request.point.archivedMessageCount;
     if (nativeSequence > native.messages.length) {
       throw new AgentIntegrationError(
         'TRANSCRIPT_UNAVAILABLE',
@@ -182,7 +185,8 @@ async function forkJsonlAtPoint(
       modelEndpointId: request.endpoint?.endpointId ?? sourceNative.modelEndpointId,
     });
     const expectedDigest = result.expectedSemanticDigest ?? expectedForkDigest;
-    if (expectedDigest !== null) {
+    let forkedMessages: readonly ChatMessage[] | null = null;
+    if (expectedDigest !== null || request.source.nativeSeedReceipt) {
       const forked = await options.transcript.load({
         chat: {
           chatId: request.chatId,
@@ -192,14 +196,18 @@ async function forkJsonlAtPoint(
           model: request.model,
           nativeSession,
           carryOverRevision: '',
+          nativeSeedReceipt: null,
           settings: request.settings,
         },
         signal: request.admission.signal,
       });
-      const actualDigest = options.semanticDigest
-        ? options.semanticDigest(forked.messages)
-        : forkTranscriptDigest(forked.messages);
-      if (actualDigest !== expectedDigest) {
+      forkedMessages = forked.messages;
+      const actualDigest = expectedDigest === null
+        ? null
+        : options.semanticDigest
+          ? options.semanticDigest(forked.messages)
+          : forkTranscriptDigest(forked.messages);
+      if (expectedDigest !== null && actualDigest !== expectedDigest) {
         throw new AgentIntegrationError(
           'TRANSCRIPT_UNAVAILABLE',
           'The provider-native fork did not preserve the selected message prefix',
@@ -209,7 +217,15 @@ async function forkJsonlAtPoint(
     }
     return {
       kind: 'materialized',
-      session: { agentSessionId: result.agentSessionId, nativeSession },
+      session: {
+        agentSessionId: result.agentSessionId,
+        nativeSession,
+        nativeSeedReceipt: retargetNativeSeedReceiptIfPreserved(
+          request.source.nativeSeedReceipt,
+          result.agentSessionId,
+          forkedMessages ?? [],
+        ),
+      },
     };
   } catch (error) {
     if (request.point || options.transformEntries) {

@@ -8,8 +8,10 @@ import {
   type ThinkingMode,
 } from '@garcon/common/chat-modes';
 import type { JsonObject } from '@garcon/common/json';
+import type { NativeSeedReceipt } from '@garcon/common/transcript-seed';
 import type { AgentCommandImage } from '@garcon/common/ws-requests';
 import type { AgentNativeSessionRef } from '@garcon/server-agent-interface';
+import type { CarryOverSegmentRef } from '../chats/store.js';
 
 export type { AgentCommandImage, PermissionMode, ThinkingMode };
 export type AgentName = string;
@@ -61,6 +63,7 @@ export class UnsupportedAgentSettingError extends Error {
 export interface StartedAgentSession {
   agentSessionId: string;
   nativeSession: AgentNativeSessionRef | null;
+  nativeSeedReceipt: NativeSeedReceipt | null;
 }
 
 // Deliberate mirror of AgentForkOutcome: server core types depend only on
@@ -91,6 +94,9 @@ export interface AgentChatEntry {
   agentSettingsById?: Record<string, AgentSettingsEnvelope>;
   nativeSession?: AgentNativeSessionRef | null;
   agentOwnershipEpoch?: string;
+  nativeSeedReceipt?: NativeSeedReceipt | null;
+  carryOverSegments?: readonly CarryOverSegmentRef[];
+  carryOverMigrationQuarantine?: { artifactId: string; errorCode: string } | null;
 }
 
 export interface RequiredChatExecutionConfig extends PersistedChatExecutionConfig {

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import {
   isAbortAcknowledged,
   parseChatMessages,
@@ -10,7 +11,11 @@ import type { TurnEventMetadata } from './agents/event-bus.js';
 import type { AgentRegistry } from './agents/registry.js';
 import type { ChatRegistry } from './chats/store.js';
 import type { MetadataIndex } from './chats/metadata-store.js';
-import type { ChatViewStore } from './chats/chat-view-store.js';
+import type {
+  ChatHistoryPage,
+  ChatTranscriptSnapshot,
+  ChatViewStore,
+} from './chats/chat-view-store.js';
 import type { IdleNativeReconciler } from './chats/idle-native-reconciler.js';
 import type { ChatNativeReloader } from './chats/chat-native-reload.js';
 import type { PendingUserInputService } from './chats/pending-user-input-service.js';
@@ -82,11 +87,14 @@ export interface ServerEventWiringDeps {
   telegramSettings: TelegramSettingsStore;
   scheduledPrompts: ScheduledPromptScheduler;
   snippets: SnippetService;
-  loadNativeMessages(chatId: string): Promise<ChatMessage[]>;
+  loadChatSnapshot(chatId: string): Promise<ChatTranscriptSnapshot>;
+  loadChatPage(chatId: string, limit: number, offset: number): Promise<ChatHistoryPage | null>;
   searchIndex?: ChatSearchEventIndex;
 }
 
 export interface ServerEventWiring {
+  notifyAgentHandoff(chatId: string): void;
+  notifyTranscriptCompositionChanged(chatId: string): void;
   waitForIdle(): Promise<void>;
 }
 
@@ -108,7 +116,8 @@ export function wireServerEvents({
   telegramSettings,
   scheduledPrompts,
   snippets,
-  loadNativeMessages,
+  loadChatSnapshot,
+  loadChatPage,
   searchIndex,
 }: ServerEventWiringDeps): ServerEventWiring {
   const broadcast = (payload: unknown) =>
@@ -178,6 +187,28 @@ export function wireServerEvents({
       hasChatTaskError = false;
       throw error;
     }
+  }
+
+  function notifyAgentHandoff(chatId: string): void {
+    scheduleChatTask(chatId, 'server-events: agent handoff invalidation failed', () => {
+      if (!chatExists(chatId)) return;
+      chatViews.invalidateFence(chatId);
+      chatViews.invalidate(chatId);
+      markSearchCatalogDirty(chatId);
+      broadcast(new ChatListRefreshRequestedMessage('agent-handoff', chatId));
+      broadcast(new ChatGenerationResetMessage(
+        chatId,
+        crypto.randomUUID(),
+        'agent-handoff',
+        0,
+      ));
+    });
+  }
+
+  function notifyTranscriptCompositionChanged(chatId: string): void {
+    if (!chatExists(chatId)) return;
+    idleReconciler.noteHistoryChanged(chatId);
+    markSearchCatalogDirty(chatId);
   }
 
   scheduledPrompts.onInvalidated((reason) => {
@@ -371,6 +402,7 @@ export function wireServerEvents({
   ): Promise<void> {
     await settleExecutionCommand(chatId, turnMetadata, 'failed', agentErrorMessage);
     await reloadAfterProcessError(chatId, agentErrorMessage, turnMetadata);
+    await idleReconciler.ensureHistoryChangeReconciled(chatId);
     broadcastAgentFailure(chatId, agentErrorMessage, turnMetadata);
     await markPublicTurnTerminal(chatId, turnMetadata);
   }
@@ -388,6 +420,7 @@ export function wireServerEvents({
       pendingInputs.markFailed(chatId, options.clientRequestId);
     }
     await pendingInputs.reconcileNativeHistory(chatId);
+    await idleReconciler.ensureHistoryChangeReconciled(chatId);
     broadcastAgentFailure(chatId, queueErrorMessage, options);
     await markPublicTurnTerminal(chatId, options);
   }
@@ -423,7 +456,10 @@ export function wireServerEvents({
         const parsed = parseChatMessages(messages);
         const appended = await chatViews.appendAfterEnsuringGeneration(
           chatId,
-          () => loadNativeMessages(chatId),
+          {
+            loadAll: () => loadChatSnapshot(chatId),
+            loadPage: (limit, offset) => loadChatPage(chatId, limit, offset),
+          },
           parsed,
           { fence },
         );
@@ -506,6 +542,7 @@ export function wireServerEvents({
       if (queuedFinalization && await queuedFinalization !== 'committed') return;
       await settleExecutionCommand(chatId, turnMetadata, 'finished');
       if (!expectedAbort) await pendingInputs.reconcileNativeHistory(chatId);
+      await idleReconciler.ensureHistoryChangeReconciled(chatId);
       if (!chatExists(chatId)) return;
       broadcast(
         new AgentRunFinishedMessage(
@@ -540,8 +577,10 @@ export function wireServerEvents({
       return;
     }
     if (expectedAbort) {
-      scheduleChatTask(chatId, 'server-events: interrupted command settlement failed', () =>
-        settleExecutionCommand(chatId, turnMetadata, 'finished'));
+      scheduleChatTask(chatId, 'server-events: interrupted command settlement failed', async () => {
+        await settleExecutionCommand(chatId, turnMetadata, 'finished');
+        await idleReconciler.ensureHistoryChangeReconciled(chatId);
+      });
       queue.checkChatIdle(chatId).catch((err) => {
         logger.warn('queue: checkChatIdle error:', errorMessage(err));
       });
@@ -741,5 +780,5 @@ export function wireServerEvents({
     if (turn) agentRegistry.settleTurn(chatId, turn);
   });
 
-  return { waitForIdle };
+  return { notifyAgentHandoff, notifyTranscriptCompositionChanged, waitForIdle };
 }

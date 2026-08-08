@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { UserMessage, type ChatMessage } from '@garcon/common/chat-types';
+import { createNativeSeedReceipt } from '@garcon/common/transcript-seed';
 import {
   AgentIntegrationError,
   attachNativeMessageSource,
@@ -12,7 +13,6 @@ import {
   getNativeMessageRevisionSource,
   type AgentForkOutcome,
   type AgentForkRequest,
-  type AgentHost,
   type AgentTranscript,
 } from '@garcon/server-agent-interface';
 import { createPathNativeSessionCodec } from '../../native-session/path-native-session.js';
@@ -51,9 +51,7 @@ async function createFixture() {
   const controls: {
     afterSourceLoad?: () => void;
     transcriptFailure?: unknown;
-    carryOverFailure?: unknown;
-    carryOverMessages: ChatMessage[];
-  } = { carryOverMessages: [] };
+  } = {};
   const loadMessages = async (nativePath: string): Promise<ChatMessage[]> => {
     const content = await readFile(nativePath, 'utf8');
     const messages: ChatMessage[] = [];
@@ -93,15 +91,6 @@ async function createFixture() {
       return { messages, revision: computeAgentTranscriptRevision(messages) };
     },
   } satisfies Pick<AgentTranscript, 'load' | 'resolveNativeSession'>;
-  const host = {
-    carryOver: {
-      async load({ signal }) {
-        if (controls.carryOverFailure) throw controls.carryOverFailure;
-        signal.throwIfAborted();
-        return { revision: 'carry-over', messages: controls.carryOverMessages };
-      },
-    },
-  } satisfies Pick<AgentHost, 'carryOver'>;
   const sourceMessages = await loadMessages(sourcePath);
   const settings = { ownerId: 'test', schemaVersion: 1, values: {} } as const;
   const sourceNativeSession = nativeSessions.encode({
@@ -136,10 +125,12 @@ async function createFixture() {
       model: 'test-model',
       nativeSession: sourceNativeSession,
       carryOverRevision: 'carry-over',
+      nativeSeedReceipt: null,
       settings,
     },
     point: {
       messageSequence: 2,
+      archivedMessageCount: 0,
       sourceRevision: {
         nativePrefix: computeAgentTranscriptRevisions(sourceMessages, 2).prefix,
         carryOver: 'carry-over',
@@ -147,7 +138,6 @@ async function createFixture() {
     },
   } satisfies AgentForkRequest;
   const options = {
-    host,
     supportsWhileRunning: true,
     transcript,
     nativeSessions,
@@ -215,6 +205,43 @@ describe('createJsonlForking message validation', () => {
     );
   });
 
+  it('retargets a receipt only when the fork preserves its recorded prefix', async () => {
+    const fixture = await createFixture();
+    const prefix = 'first';
+    const receipt = createNativeSeedReceipt({
+      agentSessionId: sourceAgentSessionId,
+      placement: 'user-prefix',
+      prefix,
+    });
+    const source = { ...fixture.request.source, nativeSeedReceipt: receipt };
+
+    const preserved = materializedSession(await fixture.forking.fork({
+      ...fixture.request,
+      source,
+    }));
+    const rewritingFork = createJsonlForking({
+      ...fixture.options,
+      rewriteEntry(entry, context) {
+        const rewritten = fixture.options.rewriteEntry?.(entry, context) ?? entry;
+        const record = rewritten as Record<string, unknown>;
+        return record.type === 'message' && record.content === 'first'
+          ? { ...record, content: 'rewritten' }
+          : rewritten;
+      },
+    });
+    const removed = materializedSession(await rewritingFork.fork({
+      ...fixture.request,
+      source,
+      point: null,
+    }));
+
+    expect(preserved.nativeSeedReceipt).toEqual({
+      ...receipt,
+      agentSessionId: preserved.agentSessionId,
+    });
+    expect(removed.nativeSeedReceipt).toBeNull();
+  });
+
   it('rejects a rendered message mutation before the snapshot', async () => {
     const fixture = await createFixture();
     await writeFile(
@@ -275,39 +302,17 @@ describe('createJsonlForking error propagation', () => {
     await expect(fixture.forking.fork(fixture.request)).rejects.toBe(failure);
   });
 
-  it.each([
-    new Error('Carry-over storage is unavailable'),
-    new AgentIntegrationError('SOURCE_REVISION_CHANGED', 'Carry-over revision changed', true),
-  ])('preserves carry-over failures', async (failure) => {
+  it('rejects an archived count outside the selected sequence', async () => {
     const fixture = await createFixture();
-    fixture.controls.carryOverFailure = failure;
-
-    await expect(fixture.forking.fork(fixture.request)).rejects.toBe(failure);
-  });
-
-  it('preserves cancellation from carry-over loading', async () => {
-    const fixture = await createFixture();
-    const abortController = new AbortController();
-    const abortReason = new DOMException('Fork cancelled', 'AbortError');
-    const forking = createJsonlForking({
-      ...fixture.options,
-      host: {
-        carryOver: {
-          async load({ signal }) {
-            abortController.abort(abortReason);
-            signal.throwIfAborted();
-            throw new Error('unreachable');
-          },
-        },
-      },
-    });
-
     await expect(
-      forking.fork({
+      fixture.forking.fork({
         ...fixture.request,
-        admission: { ...fixture.request.admission, signal: abortController.signal },
+        point: {
+          ...fixture.request.point!,
+          archivedMessageCount: fixture.request.point!.messageSequence + 1,
+        },
       }),
-    ).rejects.toBe(abortReason);
+    ).rejects.toMatchObject({ code: 'TRANSCRIPT_UNAVAILABLE' });
   });
 });
 
@@ -367,11 +372,11 @@ describe('createJsonlForking empty native prefixes', () => {
         '',
       ].join('\n'),
     );
-    fixture.controls.carryOverMessages = [new UserMessage(timestamp, 'carried prompt')];
     const request = {
       ...fixture.request,
       point: {
         messageSequence: 1,
+        archivedMessageCount: 1,
         sourceRevision: {
           nativePrefix: computeAgentTranscriptRevisions([], 0).prefix,
           carryOver: 'carry-over',

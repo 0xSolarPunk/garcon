@@ -3,8 +3,10 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { UserMessage } from '../../../common/chat-types.js';
+import { createNativeSeedReceipt } from '@garcon/common/transcript-seed';
 import { AgentRuntimeRouter } from '../runtime-router.ts';
+
+const CARRY_OVER_HEAD = '11111111-1111-4111-8111-111111111111';
 
 let projectDir;
 
@@ -32,9 +34,21 @@ function makeRouter(overrides = {}) {
     tags: [],
     ...overrides.entry,
   };
-  const start = overrides.start ?? mock(async () => ({
+  const carriedContext = overrides.carriedContext ?? {
+    headId: CARRY_OVER_HEAD,
+    prefix: '<carried-context version="1">prior context</carried-context>\n\n',
+  };
+  const start = overrides.start ?? mock(async (request) => ({
     agentSessionId: 'native-1',
     nativeSession: { ownerId: 'test', schemaVersion: 1, value: { id: 'native-1' } },
+    nativeSeedReceipt: request.carriedContext
+      ? createNativeSeedReceipt({
+          headId: request.carriedContext.headId,
+          agentSessionId: 'native-1',
+          placement: 'user-prefix',
+          prefix: request.carriedContext.prefix,
+        })
+      : null,
   }));
   const resume = overrides.resume ?? mock(async () => undefined);
   const submitGoalControl = overrides.submitGoalControl ?? mock(async () => true);
@@ -47,7 +61,13 @@ function makeRouter(overrides = {}) {
       supportedPermissionModes: ['default'],
       supportedThinkingModes: ['none'],
     },
-    execution: { start, resume, isRunning: () => false, runningSessions: () => [] },
+    execution: {
+      start,
+      resume,
+      abort: mock(async () => true),
+      isRunning: () => false,
+      runningSessions: () => [],
+    },
     steering: { captureTarget, steer },
     goals: { submitControl: submitGoalControl },
     settings: { defaults: () => settings, parse: (input) => input },
@@ -83,9 +103,6 @@ function makeRouter(overrides = {}) {
     getActiveTurn: mock(() => activeTurn),
     markTurnAbortable: mock(() => undefined),
   };
-  const carryOver = overrides.carryOver ?? [
-    new UserMessage('2026-07-18T00:00:00.000Z', 'carried context'),
-  ];
   const endpointResolver = {
     resolveSelection: mock((request) => ({
       model: request.model,
@@ -96,6 +113,7 @@ function makeRouter(overrides = {}) {
     })),
     resolveEndpointReference: mock(() => null),
   };
+  const onCarryOverChanged = overrides.onCarryOverChanged ?? mock(() => undefined);
   const router = new AgentRuntimeRouter({
     registry,
     directory: {
@@ -106,7 +124,9 @@ function makeRouter(overrides = {}) {
     endpointResolver,
     events,
     getCarryOverRevision: () => 'carry-1',
-    loadCarryOver: () => carryOver,
+    loadCarriedContext: async () => carriedContext,
+    getCarryOverMessageCount: async () => 1,
+    onCarryOverChanged,
   });
   return {
     router,
@@ -118,8 +138,9 @@ function makeRouter(overrides = {}) {
     submitGoalControl,
     registry,
     events,
-    carryOver,
+    carriedContext,
     endpointResolver,
+    onCarryOverChanged,
   };
 }
 
@@ -134,7 +155,7 @@ describe('AgentRuntimeRouter fresh-session boundary', () => {
   });
 
   it('passes canonical carry-over separately from the resolved user prompt', async () => {
-    const { router, start, carryOver } = makeRouter();
+    const { router, start, carriedContext } = makeRouter();
 
     await router.runAgentTurn('chat-1', 'review @notes.txt', {
       clientRequestId: 'request-1',
@@ -144,7 +165,7 @@ describe('AgentRuntimeRouter fresh-session boundary', () => {
 
     expect(start).toHaveBeenCalledWith(expect.objectContaining({
       prompt: expect.stringContaining('USER FILE BODY'),
-      carryOver,
+      carriedContext,
       operation: {
         commandType: 'agent-run',
         clientRequestId: 'request-1',
@@ -253,7 +274,34 @@ describe('AgentRuntimeRouter fresh-session boundary', () => {
       apiProviderId: null,
       modelEndpointId: null,
       modelProtocol: null,
+      nativeSeedReceipt: null,
+      carryOverSegments: [],
     }, { flush: true });
+  });
+
+  it('invalidates cached history after reconciling an archived point-fork tail', async () => {
+    const archivedRef = {
+      id: '22222222-2222-4222-8222-222222222222',
+      agentId: 'other',
+      model: 'old-model',
+      capturedAt: '2026-01-01T00:00:00.000Z',
+      storedMessageCount: 1,
+      visibleMessageCount: 1,
+      trailingHandoff: null,
+    };
+    const { router, registry, onCarryOverChanged } = makeRouter({
+      entry: { carryOverSegments: [archivedRef] },
+    });
+
+    await router.startSession('chat-1', 'continue point fork', { turnId: 'turn-1' });
+
+    expect(registry.updateChat).toHaveBeenCalledWith('chat-1', expect.objectContaining({
+      carryOverSegments: [{
+        ...archivedRef,
+        trailingHandoff: { agentId: 'test', model: 'model-a' },
+      }],
+    }), { flush: true });
+    expect(onCarryOverChanged).toHaveBeenCalledWith('chat-1');
   });
 
   it('does not invoke an integration after execution admission closes', async () => {

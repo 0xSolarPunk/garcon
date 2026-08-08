@@ -1,25 +1,35 @@
 import { describe, expect, it, mock } from 'bun:test';
 import { IdleNativeReconciler } from '../idle-native-reconciler.ts';
 import { ChatRunningError } from '../errors.ts';
+import {
+  nativeReconciliation,
+  transcriptSnapshot,
+} from './chat-transcript-test-helpers.js';
+import { AssistantMessage } from '../../../common/chat-types.js';
 
 const CHAT_ID = 'chat-1';
+const TS = '2026-06-01T00:00:00.000Z';
 
 function harness(overrides = {}) {
   const state = {
     cursor: { generationId: 'gen-1', lastSeq: 4 },
-    nativeLastSeq: 2,
     ...overrides.state,
   };
   const views = {
     getCursor: mock(() => state.cursor),
-    getNativeHistoryLastSeq: mock(() => state.nativeLastSeq),
     reconcileNativeSnapshot: mock(async () => {
       state.cursor = { generationId: 'gen-2', lastSeq: 2 };
-      state.nativeLastSeq = 2;
+    }),
+    reconcileFullSnapshot: mock(async () => {
+      state.cursor = { generationId: 'gen-3', lastSeq: 3 };
     }),
     ...overrides.views,
   };
-  const source = { loadNativeMessages: mock(async () => []), ...overrides.source };
+  const source = {
+    loadNativeSnapshot: mock(async () => nativeReconciliation([])),
+    loadFullSnapshot: mock(async () => transcriptSnapshot([])),
+    ...overrides.source,
+  };
   const resets = [];
   const reconciler = new IdleNativeReconciler({
     views,
@@ -44,15 +54,52 @@ describe('IdleNativeReconciler', () => {
     expect(resets).toEqual([{ chatId: CHAT_ID, generationId: 'gen-2', lastSeq: 2 }]);
   });
 
-  it('does nothing when the view already addresses native positions', async () => {
+  it('still validates native content when the view and native totals match', async () => {
     const { reconciler, views, resets } = harness({
-      state: { cursor: { generationId: 'gen-1', lastSeq: 2 }, nativeLastSeq: 2 },
+      state: { cursor: { generationId: 'gen-1', lastSeq: 2 } },
+      views: {
+        reconcileNativeSnapshot: mock(async () => undefined),
+      },
     });
 
     await reconciler.ensureReconciled(CHAT_ID);
 
-    expect(views.reconcileNativeSnapshot).not.toHaveBeenCalled();
+    expect(views.reconcileNativeSnapshot).toHaveBeenCalledTimes(1);
     expect(resets).toEqual([]);
+  });
+
+  it('rebuilds the full transcript after its archived composition changes', async () => {
+    const { reconciler, views, source, resets } = harness();
+    reconciler.noteHistoryChanged(CHAT_ID);
+
+    await reconciler.ensureHistoryChangeReconciled(CHAT_ID);
+
+    expect(source.loadFullSnapshot).toHaveBeenCalledTimes(2);
+    expect(source.loadNativeSnapshot).not.toHaveBeenCalled();
+    expect(views.reconcileFullSnapshot).toHaveBeenCalledTimes(1);
+    expect(views.reconcileNativeSnapshot).not.toHaveBeenCalled();
+    expect(resets).toEqual([{ chatId: CHAT_ID, generationId: 'gen-3', lastSeq: 3 }]);
+  });
+
+  it('retains a changed-history request until two full snapshots agree', async () => {
+    let read = 0;
+    const { reconciler, views } = harness({
+      source: {
+        loadFullSnapshot: mock(async () => {
+          read += 1;
+          return transcriptSnapshot(
+            read === 1 ? [] : [new AssistantMessage(TS, 'settled')],
+          );
+        }),
+      },
+    });
+    reconciler.noteHistoryChanged(CHAT_ID);
+
+    await reconciler.ensureHistoryChangeReconciled(CHAT_ID);
+    expect(views.reconcileFullSnapshot).not.toHaveBeenCalled();
+
+    await reconciler.ensureHistoryChangeReconciled(CHAT_ID);
+    expect(views.reconcileFullSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it('declines while a turn owns the chat', async () => {
@@ -103,9 +150,11 @@ describe('IdleNativeReconciler', () => {
     let read = 0;
     const { reconciler, views } = harness({
       source: {
-        loadNativeMessages: mock(async () => {
+        loadNativeSnapshot: mock(async () => {
           read += 1;
-          return read < 2 ? [] : [{ type: 'assistant-message', content: 'settled' }];
+          return nativeReconciliation(
+            read < 2 ? [] : [new AssistantMessage(TS, 'settled')],
+          );
         }),
       },
     });

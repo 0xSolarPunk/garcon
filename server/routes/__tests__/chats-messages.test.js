@@ -19,14 +19,24 @@ import { PendingUserInputService } from '../../chats/pending-user-input-service.
 import { ChatNativeReloader } from '../../chats/chat-native-reload.js';
 import { ChatProcessErrorRecovery } from '../../chats/chat-process-error-recovery.js';
 import { AssistantMessage, UserMessage } from '../../../common/chat-types.js';
-import { transcriptRevision } from '../../lib/transcript-revision.js';
+import { CarryOverHistoryUnavailableError } from '../../chats/carryover-transcript-store.ts';
+import {
+  historyPage,
+  snapshotLoader,
+  transcriptLoader,
+  transcriptSnapshot,
+} from '../../chats/__tests__/chat-transcript-test-helpers.js';
 
 function createRoutesFixture(overrides = {}) {
-  const registry = {
+  const registry = overrides.registry ?? {
     getChat: mock(() => ({
       id: '123',
       agentId: 'claude',
       agentSessionId: 'provider-session-123',
+      agentOwnershipEpoch: 'epoch-1',
+      carryOverSegments: [],
+      carryOverMigrationQuarantine: null,
+      nativeSeedReceipt: null,
       projectPath: '/tmp/project',
       nativePath: '/tmp/session.jsonl',
     })),
@@ -118,6 +128,8 @@ function createRoutesFixture(overrides = {}) {
   };
   const commandLedger = createRouteCommandLedger('chats-messages');
   const chatListProjector = createRouteChatListProjector({ registry, settings, metadata, agents, pathCache });
+  const searchIndex = overrides.searchIndex;
+  const notifyHistoryChanged = overrides.notifyHistoryChanged ?? mock(() => undefined);
   const routes = createChatRoutes({
     registry,
     settings,
@@ -139,9 +151,18 @@ function createRoutesFixture(overrides = {}) {
       pathCache,
       chatListProjector,
     }),
+    ...(searchIndex === undefined ? {} : { searchIndex }),
+    notifyHistoryChanged,
   });
 
-  return { chatViews, pendingInputs, routes };
+  return {
+    chatViews,
+    pendingInputs,
+    registry,
+    routes,
+    searchIndex,
+    notifyHistoryChanged,
+  };
 }
 
 describe('GET /api/v1/chats/messages', () => {
@@ -153,6 +174,7 @@ describe('GET /api/v1/chats/messages', () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
+      historyState: { kind: 'complete' },
       chatId: '123',
       generationId: 'generation-1',
       messages: [],
@@ -164,6 +186,35 @@ describe('GET /api/v1/chats/messages', () => {
     });
     expect(pendingInputs.reconcileRetainedHistory).toHaveBeenCalledWith('123');
     expect(chatViews.getOrCreatePage).toHaveBeenCalledWith('123', 200, 10);
+  });
+
+  it('returns degraded carryover history without claiming sequence metadata', async () => {
+    const { pendingInputs, routes } = createRoutesFixture({
+      chatViews: {
+        getOrCreatePage: mock(async () => {
+          throw new CarryOverHistoryUnavailableError({
+            cause: new Error('private storage detail'),
+          });
+        }),
+        reconcileNativeSnapshot: mock(async () => undefined),
+      },
+    });
+    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123');
+
+    const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({
+      historyState: {
+        kind: 'degraded',
+        errorCode: 'CARRYOVER_HISTORY_UNAVAILABLE',
+        retryable: false,
+      },
+      chatId: '123',
+      messages: [],
+    });
+    expect(pendingInputs.reconcileRetainedHistory).not.toHaveBeenCalled();
   });
 
   it('rejects invalid beforeSeq values', async () => {
@@ -222,18 +273,7 @@ describe('GET /api/v1/chats/messages', () => {
       ),
     ];
     const loadAll = mock(async () => nativeMessages);
-    const loadPage = mock(async (limit, offset) => {
-      const end = nativeMessages.length - offset;
-      const start = Math.max(0, end - limit);
-      return {
-        messages: nativeMessages.slice(start, end),
-        total: nativeMessages.length,
-        hasMore: start > 0,
-        offset,
-        limit,
-        revision: transcriptRevision(nativeMessages),
-      };
-    });
+    const loadPage = mock(async (limit, offset) => historyPage(nativeMessages, limit, offset));
     const views = new ChatViewStore(() => false, { messageLimit: 2 });
     const pendingInputs = new PendingUserInputService({
       loadNativeMessages: loadAll,
@@ -252,7 +292,7 @@ describe('GET /api/v1/chats/messages', () => {
     });
     await views.appendAfterEnsuringGeneration(
       '123',
-      async () => history,
+      transcriptLoader(async () => history),
       [new UserMessage(
         '2026-06-01T00:00:02.000Z',
         'pending',
@@ -264,7 +304,7 @@ describe('GET /api/v1/chats/messages', () => {
     const chatViews = {
       getOrCreatePage: (chatId, limit, beforeSeq) => views.getOrCreatePage(
         chatId,
-        { loadAll, loadPage },
+        { loadAll: snapshotLoader(loadAll), loadPage },
         limit,
         beforeSeq,
       ),
@@ -313,7 +353,7 @@ describe('GET /api/v1/chats/messages', () => {
         data: `data:image/png;base64,${'b'.repeat(20_000)}`,
       }],
     });
-    await views.appendAfterEnsuringGeneration('123', async () => [], [
+    await views.appendAfterEnsuringGeneration('123', transcriptLoader(async () => []), [
       new UserMessage(
         '2026-06-01T00:00:00.000Z',
         'persisted before failure',
@@ -329,7 +369,11 @@ describe('GET /api/v1/chats/messages', () => {
     ]);
     const recovery = new ChatProcessErrorRecovery(
       views,
-      new ChatNativeReloader(views, { loadNativeMessages: loadAll }, () => false),
+      new ChatNativeReloader(
+        views,
+        { loadSnapshot: async () => transcriptSnapshot(await loadAll()) },
+        () => false,
+      ),
       pendingInputs,
     );
 
@@ -340,7 +384,7 @@ describe('GET /api/v1/chats/messages', () => {
     const chatViews = {
       getOrCreatePage: (chatId, limit, beforeSeq) => views.getOrCreatePage(
         chatId,
-        { loadAll },
+        { loadAll: snapshotLoader(loadAll) },
         limit,
         beforeSeq,
       ),
@@ -364,4 +408,107 @@ describe('GET /api/v1/chats/messages', () => {
     expect(loadAll).toHaveBeenCalledTimes(1);
   });
 
+});
+
+describe('POST /api/v1/chats/repair-history', () => {
+  const chatId = '1783725900000200';
+  const carryOverRevision = 'carry-v1:0';
+
+  function request(body) {
+    const url = new URL('http://localhost/api/v1/chats/repair-history');
+    return {
+      url,
+      request: new Request(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    };
+  }
+
+  it('clears only the fenced receipt and invalidates search', async () => {
+    const entry = {
+      id: chatId,
+      agentId: 'claude',
+      agentSessionId: 'provider-session-123',
+      agentOwnershipEpoch: 'epoch-1',
+      carryOverSegments: [],
+      carryOverMigrationQuarantine: null,
+      nativeSeedReceipt: {
+        agentSessionId: 'provider-session-123',
+        placement: 'user-prefix',
+        format: 'v2-xml',
+        sha256: 'a'.repeat(64),
+        codeUnitLength: 10,
+      },
+      projectPath: '/tmp/project',
+    };
+    const registry = {
+      getChat: mock(() => entry),
+      addChat: mock(() => true),
+      updateChat: mock(async () => ({ ...entry, nativeSeedReceipt: null })),
+      removeChat: mock(() => true),
+      listAllChats: mock(() => ({})),
+    };
+    const searchIndex = { catalogMayHaveChanged: mock(() => undefined) };
+    const { notifyHistoryChanged, routes } = createRoutesFixture({ registry, searchIndex });
+    const input = request({
+      action: 'accept-native',
+      chatId,
+      expectedCarryOverRevision: carryOverRevision,
+      expectedAgentOwnershipEpoch: 'epoch-1',
+    });
+
+    const response = await routes['/api/v1/chats/repair-history'].POST(input.request, input.url);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      success: true,
+      action: 'accept-native',
+      chatId,
+      receiptCleared: true,
+    });
+    expect(registry.updateChat).toHaveBeenCalledWith(
+      chatId,
+      { nativeSeedReceipt: null },
+      { flush: true },
+    );
+    expect(searchIndex.catalogMayHaveChanged).toHaveBeenCalledWith(chatId);
+    expect(notifyHistoryChanged).toHaveBeenCalledWith(chatId);
+  });
+
+  it('rejects a stale carryover revision or ownership epoch without mutation', async () => {
+    const updateChat = mock(async () => null);
+    const registry = {
+      getChat: mock(() => ({
+        id: chatId,
+        agentId: 'claude',
+        agentOwnershipEpoch: 'epoch-2',
+        carryOverSegments: [],
+        carryOverMigrationQuarantine: null,
+        nativeSeedReceipt: null,
+      })),
+      addChat: mock(() => true),
+      updateChat,
+      removeChat: mock(() => true),
+      listAllChats: mock(() => ({})),
+    };
+    const { routes } = createRoutesFixture({ registry });
+    const input = request({
+      action: 'accept-native',
+      chatId,
+      expectedCarryOverRevision: 'carry-v5:stale',
+      expectedAgentOwnershipEpoch: 'epoch-1',
+    });
+
+    const response = await routes['/api/v1/chats/repair-history'].POST(input.request, input.url);
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      success: false,
+      errorCode: 'STALE_CHAT_OWNERSHIP',
+      retryable: true,
+    });
+    expect(updateChat).not.toHaveBeenCalled();
+  });
 });

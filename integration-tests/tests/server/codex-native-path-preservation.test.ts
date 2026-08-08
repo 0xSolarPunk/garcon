@@ -32,21 +32,26 @@ describe('Codex native transcript path preservation', () => {
         const catalog = await fixture.client.listAgentCatalog();
         const codex = catalog.agents.find((agent) => agent.id === 'codex');
         if (!codex) throw new Error('Codex integration is missing from the agent catalog');
-        await fixture.client.switchAgentModel({
-          chatId: sourceChatId,
-          agentId: codex.id,
-          model: codex.defaultModel,
-        });
+        const sourceBeforeHandoff = (await fixture.client.listChats()).sessions.find(
+          (chat) => chat.id === sourceChatId,
+        );
+        if (!sourceBeforeHandoff) throw new Error('Source chat disappeared before handoff');
 
         const codexTurn = await fixture.client.runChat({
           clientRequestId: randomUUID(),
           clientMessageId: randomUUID(),
           chatId: sourceChatId,
           command: codexMarker,
-          permissionMode: 'default',
-          thinkingMode: 'none',
-          agentSettings: codex.defaultSettings,
-          model: codex.defaultModel,
+          handoff: {
+            expectedAgentOwnershipEpoch: sourceBeforeHandoff.agentOwnershipEpoch,
+            target: {
+              agentId: codex.id,
+              model: codex.defaultModel,
+              permissionMode: 'default',
+              thinkingMode: 'none',
+              agentSettings: codex.defaultSettings,
+            },
+          },
         });
         const codexTerminal = await fixture.client.waitForTurnTerminal(
           sourceChatId,
@@ -152,20 +157,17 @@ describe('Codex native transcript path preservation', () => {
         });
 
         const target = fixture.directAgents.openAi;
-        const switchFailure = await captureApiError(fixture.client.switchAgentModel({
+        const switchFailure = await captureApiError(fixture.client.handoffDirectChat({
           chatId,
-          agentId: target.agentId,
-          model: target.provider.model,
-          apiProviderId: target.provider.providerId,
-          modelEndpointId: target.provider.endpointId,
-          modelProtocol: target.provider.protocol,
+          content: 'attempt handoff from unavailable history',
+          agent: target,
         }));
         expect(switchFailure).toMatchObject({
-          status: 503,
+          status: 422,
           body: {
             success: false,
-            error: 'Chat transcript is temporarily unavailable. Retry the request.',
-            errorCode: 'TRANSCRIPT_UNAVAILABLE',
+            error: 'The source transcript is temporarily unavailable. Retry the handoff.',
+            errorCode: 'SOURCE_TRANSCRIPT_UNAVAILABLE',
             retryable: true,
           },
         });
@@ -196,6 +198,75 @@ describe('Codex native transcript path preservation', () => {
             projectPath: directories.project,
             carryUser: carryMarker,
             carryAssistant: `legacy-answer-${carryMarker}`,
+          });
+        },
+      },
+    );
+  }, 15_000);
+
+  test('rejects a handoff when migrated history is quarantined', async () => {
+    const chatId = String(Date.now() * 1_000 + 4);
+    const threadId = randomUUID();
+    let nativePath = '';
+
+    await withIntegrationFixture(
+      'codex-quarantined-carryover-handoff',
+      async (fixture) => {
+        const before = (await fixture.client.listChats()).sessions.find(
+          (chat) => chat.id === chatId,
+        );
+        if (!before) throw new Error('Quarantined chat is missing');
+        const nativeBefore = await readNativeSession(fixture.dirs.workspace, chatId);
+
+        const failure = await captureApiError(fixture.client.handoffDirectChat({
+          chatId,
+          content: 'do not discard quarantined history',
+          agent: fixture.directAgents.openAi,
+        }));
+        expect(failure).toMatchObject({
+          status: 422,
+          body: {
+            success: false,
+            error: 'Archived chat history is unavailable.',
+            errorCode: 'CARRYOVER_HISTORY_UNAVAILABLE',
+            retryable: false,
+          },
+        });
+
+        const after = (await fixture.client.listChats()).sessions.find(
+          (chat) => chat.id === chatId,
+        );
+        expect(after).toMatchObject({
+          agentId: before.agentId,
+          agentOwnershipEpoch: before.agentOwnershipEpoch,
+        });
+        await expect(readNativeSession(fixture.dirs.workspace, chatId)).resolves.toEqual(
+          nativeBefore,
+        );
+        await expect(readFile(nativePath, 'utf8')).resolves.toContain('quarantined-native');
+      },
+      {
+        serverEnvironment: codexServerEnvironment(),
+        async prepareWorkspace(directories) {
+          nativePath = await writeCodexTranscript({
+            home: directories.home,
+            projectPath: directories.project,
+            threadId,
+            userContent: 'quarantined-native',
+            assistantContent: 'quarantined-answer',
+          });
+          await seedWorkspace({
+            workspace: directories.workspace,
+            chatId,
+            threadId,
+            nativePath,
+            projectPath: directories.project,
+            carryUser: 'quarantined-carry',
+            carryAssistant: 'quarantined-carry-answer',
+            carryOverMigrationQuarantine: {
+              artifactId: randomUUID(),
+              errorCode: 'LEGACY_CHAT_INVALID',
+            },
           });
         },
       },
@@ -305,9 +376,6 @@ describe('Codex native transcript path preservation', () => {
 
         const recovered = await fixture.client.getMessages(chatId);
         expect(messageLabels(recovered.messages.map((entry) => entry.message))).toEqual([
-          carryMarker,
-          `retry-answer-${carryMarker}`,
-          'agent-switch',
           nativeMarker,
           `retry-answer-${nativeMarker}`,
         ]);
@@ -416,15 +484,19 @@ async function seedWorkspace(input: {
   projectPath: string;
   carryUser: string;
   carryAssistant: string;
+  carryOverMigrationQuarantine?: {
+    artifactId: string;
+    errorCode: string;
+  };
 }): Promise<void> {
   await writeFile(
     join(input.workspace, 'workspace-version.json'),
-    JSON.stringify({ version: CURRENT_WORKSPACE_VERSION }),
+    JSON.stringify({ version: 4 }),
   );
   await writeFile(
     join(input.workspace, 'chats.json'),
     JSON.stringify({
-      version: 3,
+      version: 4,
       sessions: {
         [input.chatId]: {
           agentId: 'codex',
@@ -449,6 +521,9 @@ async function seedWorkspace(input: {
           lastReadAt: null,
           permissionMode: 'default',
           thinkingMode: 'none',
+          carryOverHeadId: null,
+          nativeSeedReceipt: null,
+          carryOverMigrationQuarantine: input.carryOverMigrationQuarantine ?? null,
         },
       },
     }),

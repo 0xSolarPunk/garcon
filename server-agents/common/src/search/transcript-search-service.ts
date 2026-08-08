@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ChatMessage } from '@garcon/common/chat-types';
+import type { NativeSeedReceipt } from '@garcon/common/transcript-seed';
 import type { ChatSearchIndexStatus, ChatSearchQueryV1, ChatSearchResult } from '@garcon/common/chat-search';
 import type {
   AgentLogger,
@@ -56,6 +57,8 @@ export interface TranscriptSearchCatalogEntry {
     | { readonly state: 'absent' }
     | { readonly state: 'failed'; readonly code: string; readonly retryable: boolean };
   readonly carryOverRevision: string;
+  readonly agentSessionId: string | null;
+  readonly nativeSeedReceipt: NativeSeedReceipt | null;
 }
 
 export interface TranscriptSearchCatalogSnapshot {
@@ -595,7 +598,7 @@ export class TranscriptSearchService {
     const catalogEntry = this.#latestCatalog?.chats.find((entry) => entry.chatId === event.chatId);
     if (!handler || !catalogEntry || catalogEntry.agentId !== event.agentId
         || catalogEntry.source.state !== 'ready'
-        || canonicalDigest(catalogEntry.source.reference) !== event.sourceDescriptorHash) return;
+        || catalogSourceDescriptorHash(catalogEntry) !== event.sourceDescriptorHash) return;
     const dirtyGeneration = this.#dirtyReplay.get(event.chatId);
     if (dirtyGeneration && (compareGeneration(event.generation, dirtyGeneration) ?? -1) < 0) return;
     const controller = new AbortController();
@@ -699,7 +702,10 @@ export class TranscriptSearchService {
   ): void {
     if (lifecycleEpoch !== this.#indexer.epoch || !this.#indexer.available) return;
     const typedFailure = error instanceof TranscriptSearchCarryOverError ? error.failure : null;
-    const code = typedFailure?.code
+    const historyUnavailable = hasErrorCode(error, 'CARRYOVER_HISTORY_UNAVAILABLE');
+    const code = historyUnavailable
+      ? 'CARRY_OVER_UNAVAILABLE'
+      : typedFailure?.code
       ?? (error instanceof Error && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.message)
         ? error.message
         : 'CARRY_OVER_UNAVAILABLE');
@@ -712,7 +718,9 @@ export class TranscriptSearchService {
       messages: [],
       done: true,
       code,
-      retryable: typedFailure?.retryable ?? code !== 'CARRY_OVER_MESSAGE_TOO_LARGE',
+      retryable: historyUnavailable
+        ? false
+        : typedFailure?.retryable ?? code !== 'CARRY_OVER_MESSAGE_TOO_LARGE',
     });
   }
 
@@ -803,6 +811,16 @@ export class TranscriptSearchService {
   }
 }
 
+function catalogSourceDescriptorHash(entry: TranscriptSearchCatalogEntry): string | null {
+  return entry.source.state === 'ready'
+    ? canonicalDigest({
+        source: entry.source.reference,
+        agentSessionId: entry.agentSessionId,
+        nativeSeedReceipt: entry.nativeSeedReceipt,
+      })
+    : null;
+}
+
 function workerEventError(event: IndexerEvent | ReaderEvent): Error | null {
   return event.type === 'error'
     ? Object.assign(new Error(event.code), { retryable: event.retryable })
@@ -877,6 +895,13 @@ export async function cleanupObsoleteSearchArtifacts(
       logger.warn('Obsolete transcript search cleanup failed.', { code: 'SEARCH_CLEANUP_FAILED' });
     }
   }));
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && error.code === code;
 }
 
 function boundedFrames<T>(

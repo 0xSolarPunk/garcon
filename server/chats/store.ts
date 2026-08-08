@@ -25,10 +25,15 @@ import { writeJsonFileAtomic } from '../lib/json-file-store.js';
 import { createLogger } from '../lib/log.js';
 import type { ChatProjectPathUpdatedPayload } from '../../common/ws-events.js';
 import { normalizeTags } from '../../common/tags.js';
+import {
+  parseNativeSeedReceipt,
+  type NativeSeedReceipt,
+} from '../../common/transcript-seed.js';
+import { isCarryOverSegmentId } from './carryover-segment-types.js';
 
 const logger = createLogger('chats:store');
 
-const CHAT_REGISTRY_VERSION = 3;
+export const CHAT_REGISTRY_VERSION = 5;
 // Uses a fixed short debounce so registry mutations persist promptly while bursts coalesce.
 const REGISTRY_SAVE_DEBOUNCE_MS = 1000;
 const ALLOWED_PATCH_FIELDS = [
@@ -46,7 +51,30 @@ const ALLOWED_PATCH_FIELDS = [
   'lastReadAt',
   'permissionMode',
   'thinkingMode',
+  'carryOverSegments',
+  'nativeSeedReceipt',
+  'carryOverMigrationQuarantine',
 ] as const;
+
+export interface CarryOverMigrationQuarantine {
+  artifactId: string;
+  errorCode: string;
+}
+
+export interface CarryOverHandoffTarget {
+  readonly agentId: AgentName;
+  readonly model: string;
+}
+
+export interface CarryOverSegmentRef {
+  readonly id: string;
+  readonly agentId: AgentName;
+  readonly model: string;
+  readonly capturedAt: string;
+  readonly storedMessageCount: number;
+  readonly visibleMessageCount: number;
+  readonly trailingHandoff: CarryOverHandoffTarget | null;
+}
 
 export interface ChatRegistryEntry {
   agentId: AgentName;
@@ -64,6 +92,9 @@ export interface ChatRegistryEntry {
   lastReadAt?: string | null;
   permissionMode: PermissionMode;
   thinkingMode: ThinkingMode;
+  carryOverSegments: readonly CarryOverSegmentRef[];
+  nativeSeedReceipt: NativeSeedReceipt | null;
+  carryOverMigrationQuarantine: CarryOverMigrationQuarantine | null;
 }
 
 export interface ChatRegistrySnapshot {
@@ -87,6 +118,9 @@ export interface NewChatRegistryEntry {
   modelProtocol?: ApiProtocol | null;
   permissionMode?: PermissionMode;
   thinkingMode?: ThinkingMode;
+  carryOverSegments?: readonly CarryOverSegmentRef[];
+  nativeSeedReceipt?: NativeSeedReceipt | null;
+  carryOverMigrationQuarantine?: CarryOverMigrationQuarantine | null;
 }
 
 export type ChatRegistryPatch = Partial<Pick<ChatRegistryEntry, (typeof ALLOWED_PATCH_FIELDS)[number]>>;
@@ -196,9 +230,13 @@ function normalizeChatRegistryEntry(rawEntry: Record<string, unknown>): ChatRegi
   const nativeSession = normalizeNativeSession(rawEntry.nativeSession, agentId);
   const agentSettingsById = parseAgentSettingsById(rawEntry.agentSettingsById);
   if (!agentSettingsById) throw new Error(`Invalid agentSettingsById for ${agentId || 'unknown agent'}`);
+  const agentSessionId = normalizeNullableString(rawEntry.agentSessionId);
+  const carryOverSegments = parseCarryOverSegmentRefs(rawEntry.carryOverSegments);
+  const nativeSeedReceipt = normalizeNativeSeedReceipt(rawEntry.nativeSeedReceipt);
+  assertSeedReceiptBinding({ agentSessionId, nativeSeedReceipt });
   return {
     agentId,
-    agentSessionId: normalizeNullableString(rawEntry.agentSessionId),
+    agentSessionId,
     nativeSession,
     agentOwnershipEpoch: normalizeOwnershipEpoch(rawEntry.agentOwnershipEpoch),
     agentSettingsById,
@@ -213,7 +251,107 @@ function normalizeChatRegistryEntry(rawEntry: Record<string, unknown>): ChatRegi
     lastReadAt: normalizeNullableString(rawEntry.lastReadAt),
     nextForkOrdinal: normalizeNextForkOrdinal(rawEntry.nextForkOrdinal),
     ...normalizeRegistryModes(rawEntry),
+    carryOverSegments,
+    nativeSeedReceipt,
+    carryOverMigrationQuarantine: normalizeMigrationQuarantine(rawEntry.carryOverMigrationQuarantine),
   };
+}
+
+export function parseCarryOverSegmentRefs(value: unknown): readonly CarryOverSegmentRef[] {
+  if (!Array.isArray(value)) throw new Error('Invalid carryover segment references');
+  const ids = new Set<string>();
+  const refs = value.map((raw): CarryOverSegmentRef => {
+    if (!isObjectRecord(raw)) throw new Error('Invalid carryover segment reference');
+    if (!isCarryOverSegmentId(raw.id)) throw new Error('Invalid carryover segment ID');
+    if (ids.has(raw.id)) throw new Error('Duplicate carryover segment ID');
+    ids.add(raw.id);
+    const agentId = normalizeAgentName(raw.agentId, 'segment agent');
+    const model = requiredString(raw.model, 'segment model');
+    const capturedAt = requiredTimestamp(raw.capturedAt, 'segment capture time');
+    const storedMessageCount = nonNegativeSafeInteger(raw.storedMessageCount, 'stored message count');
+    const visibleMessageCount = nonNegativeSafeInteger(raw.visibleMessageCount, 'visible message count');
+    if (visibleMessageCount > storedMessageCount) {
+      throw new Error('Carryover segment cutoff is outside its artifact');
+    }
+    const trailingHandoff = parseCarryOverHandoffTarget(raw.trailingHandoff);
+    if (storedMessageCount === 0) {
+      if (visibleMessageCount !== 0 || trailingHandoff === null) {
+        throw new Error('Empty carryover segment must contain one handoff boundary');
+      }
+    } else if (visibleMessageCount === 0) {
+      throw new Error('Non-empty carryover segment must expose at least one message');
+    }
+    return Object.freeze({
+      id: raw.id,
+      agentId,
+      model,
+      capturedAt,
+      storedMessageCount,
+      visibleMessageCount,
+      trailingHandoff,
+    });
+  });
+  return Object.freeze(refs);
+}
+
+function parseCarryOverHandoffTarget(value: unknown): CarryOverHandoffTarget | null {
+  if (value === null) return null;
+  if (!isObjectRecord(value)) throw new Error('Invalid carryover handoff target');
+  return Object.freeze({
+    agentId: normalizeAgentName(value.agentId, 'handoff target agent'),
+    model: requiredString(value.model, 'handoff target model'),
+  });
+}
+
+function normalizeNativeSeedReceipt(value: unknown): NativeSeedReceipt | null {
+  if (value === null) return null;
+  const receipt = parseNativeSeedReceipt(value);
+  if (!receipt) throw new Error('Invalid native seed receipt');
+  return receipt;
+}
+
+function normalizeMigrationQuarantine(value: unknown): CarryOverMigrationQuarantine | null {
+  if (value === null) return null;
+  if (!isObjectRecord(value)) throw new Error('Invalid carryover migration quarantine');
+  const artifactId = normalizeString(value.artifactId);
+  const errorCode = normalizeString(value.errorCode);
+  if (!artifactId || !errorCode) throw new Error('Invalid carryover migration quarantine');
+  return { artifactId, errorCode };
+}
+
+function assertSeedReceiptBinding(entry: Pick<
+  ChatRegistryEntry,
+  'agentSessionId' | 'nativeSeedReceipt'
+>): void {
+  const receipt = entry.nativeSeedReceipt;
+  if (!receipt) return;
+  if (receipt.agentSessionId !== entry.agentSessionId) {
+    throw new Error('Native seed receipt session mismatch');
+  }
+}
+
+function normalizeAgentName(value: unknown, field: string): AgentName {
+  if (typeof value !== 'string' || !value) throw new Error(`Invalid carryover ${field}`);
+  return value as AgentName;
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== 'string') throw new Error(`Invalid carryover ${field}`);
+  return value;
+}
+
+function requiredTimestamp(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`Invalid carryover ${field}`);
+  }
+  return value;
+}
+
+function nonNegativeSafeInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error(`Invalid carryover ${field}`);
+  }
+  return Number(value);
 }
 
 function normalizeOwnershipEpoch(value: unknown): string {
@@ -294,12 +432,12 @@ export class ChatRegistry extends EventEmitter<ChatRegistryEvents> implements IC
         this.#registry = createEmptyRegistry();
         return this.#registry;
       }
+      if (parsed.version !== CHAT_REGISTRY_VERSION) {
+        throw new Error(`Unsupported chat registry version: ${String(parsed.version)}`);
+      }
       if (!isObjectRecord(parsed.sessions)) {
         this.#registry = createEmptyRegistry();
         return this.#registry;
-      }
-      if (parsed.version !== CHAT_REGISTRY_VERSION) {
-        throw new Error(`Unsupported chat registry version: ${String(parsed.version)}`);
       }
       const sessions: Record<string, ChatRegistryEntry> = {};
       for (const [rawChatId, rawEntry] of Object.entries(parsed.sessions)) {
@@ -374,15 +512,17 @@ export class ChatRegistry extends EventEmitter<ChatRegistryEvents> implements IC
     return true;
   }
 
-  // Returns a shallow copy of all sessions.
   listAllChats(): Record<string, ChatRegistryEntry> {
     const registry = this.getRegistry();
-    return Object.assign({}, registry.sessions);
+    return Object.fromEntries(
+      Object.entries(registry.sessions).map(([id, entry]) => [id, cloneRegistryEntry(entry)]),
+    );
   }
 
   getChat(id: string): ChatRegistryEntry | null {
     const registry = this.getRegistry();
-    return registry.sessions[id] || null;
+    const entry = registry.sessions[id];
+    return entry ? cloneRegistryEntry(entry) : null;
   }
 
   addChat({
@@ -401,6 +541,9 @@ export class ChatRegistry extends EventEmitter<ChatRegistryEvents> implements IC
     modelProtocol = null,
     permissionMode = 'default',
     thinkingMode = 'none',
+    carryOverSegments = [],
+    nativeSeedReceipt = null,
+    carryOverMigrationQuarantine = null,
   }: NewChatRegistryEntry): boolean {
     const chatId = parseChatId(id);
     if (!agentId) throw new Error('Agent not specified');
@@ -414,6 +557,13 @@ export class ChatRegistry extends EventEmitter<ChatRegistryEvents> implements IC
       throw new Error(`Native session owner mismatch for ${chatId}`);
     }
     const normalizedModes = normalizeRegistryModes({ permissionMode, thinkingMode });
+    const normalizedSegments = parseCarryOverSegmentRefs(carryOverSegments);
+    const normalizedReceipt = normalizeNativeSeedReceipt(nativeSeedReceipt);
+    const normalizedQuarantine = normalizeMigrationQuarantine(carryOverMigrationQuarantine);
+    assertSeedReceiptBinding({
+      agentSessionId,
+      nativeSeedReceipt: normalizedReceipt,
+    });
     registry.sessions[chatId] = {
       agentId,
       nativeSession,
@@ -428,6 +578,9 @@ export class ChatRegistry extends EventEmitter<ChatRegistryEvents> implements IC
       modelEndpointId,
       modelProtocol,
       ...normalizedModes,
+      carryOverSegments: normalizedSegments,
+      nativeSeedReceipt: normalizedReceipt,
+      carryOverMigrationQuarantine: normalizedQuarantine,
     };
     this.#setAgentSessionIdIndex(chatId, agentSessionId);
     this.#emitChatAdded(chatId);
@@ -461,6 +614,19 @@ export class ChatRegistry extends EventEmitter<ChatRegistryEvents> implements IC
     if ('agentSettingsById' in normalizedPatch && !parseAgentSettingsById(normalizedPatch.agentSettingsById)) {
       throw new Error(`Invalid agent settings for ${id}`);
     }
+    if ('carryOverSegments' in normalizedPatch) {
+      normalizedPatch.carryOverSegments = parseCarryOverSegmentRefs(normalizedPatch.carryOverSegments);
+    }
+    if ('nativeSeedReceipt' in normalizedPatch) {
+      normalizedPatch.nativeSeedReceipt = normalizeNativeSeedReceipt(normalizedPatch.nativeSeedReceipt);
+    }
+    if ('carryOverMigrationQuarantine' in normalizedPatch) {
+      normalizedPatch.carryOverMigrationQuarantine = normalizeMigrationQuarantine(
+        normalizedPatch.carryOverMigrationQuarantine,
+      );
+    }
+    const candidate = { ...existing, ...normalizedPatch };
+    assertSeedReceiptBinding(candidate);
     const previousAgentSessionId = existing.agentSessionId;
     const previousTags = existing.tags;
     Object.assign(existing, normalizedPatch);
@@ -618,4 +784,11 @@ export class ChatRegistry extends EventEmitter<ChatRegistryEvents> implements IC
       }
     }
   }
+}
+
+function cloneRegistryEntry(entry: ChatRegistryEntry): ChatRegistryEntry {
+  return {
+    ...entry,
+    carryOverSegments: entry.carryOverSegments,
+  };
 }
