@@ -27,7 +27,11 @@
 		isSupportedChatAttachment,
 		isVideoChatAttachment,
 	} from '$lib/chat/composer/image-attachment.svelte.js';
-	import { shouldSubmitOnEnter, canSubmitComposer } from '$lib/chat/composer/composer-shortcuts.js';
+	import {
+		resolveComposerKeydownAction,
+		canSubmitComposer,
+		type ComposerEnterAction,
+	} from '$lib/chat/composer/composer-shortcuts.js';
 	import type { SnippetInsertionResult } from '$lib/chat/composer/snippet-insertion.js';
 	import { applySnippetTriggerReplacement } from '$lib/chat/composer/snippet-trigger.js';
 	import { isChatProcessing } from '$lib/chat/sessions/chat-processing.js';
@@ -86,6 +90,7 @@
 	import { isDirectAgentId, nonDirectAgentIds } from '$lib/agents/direct-agents.js';
 	interface Props {
 		onsubmit: () => void;
+		onSteerPreferredSubmit: () => void;
 		onModelChange?: (selection: ModelSelectorChange) => void;
 		onPermissionModeChange?: (mode: PermissionMode) => void;
 		onThinkingModeChange?: (mode: ThinkingMode) => void;
@@ -106,6 +111,7 @@
 
 	let {
 		onsubmit,
+		onSteerPreferredSubmit,
 		onModelChange,
 		onPermissionModeChange,
 		onThinkingModeChange,
@@ -487,42 +493,31 @@
 		appShell.openSnippets(() => appShell.requestComposerFocus());
 	}
 
-	// Handles Enter/Shift+Enter submission depending on preference.
-	// Defers to the file menu while it is open.
-	function handleKeyDown(event: KeyboardEvent) {
-		if (snippetExpansion.pending) return;
-		if (ui.showFileMenu) {
-			if (fileMentionMenu?.handleKeyDown(event)) return;
-			if (['ArrowDown', 'ArrowUp', 'Enter', 'Tab'].includes(event.key)) {
-				event.preventDefault();
-				return;
-			}
-		}
-		if (ui.showSlashMenu) {
-			if (slashCommandMenu?.handleKeyDown(event)) return;
-			if (['ArrowDown', 'ArrowUp', 'Enter', 'Tab'].includes(event.key)) {
-				event.preventDefault();
-				return;
-			}
-		}
-		if (event.key !== 'Enter') return;
-		if (
-			!shouldSubmitOnEnter({
-				sendByShiftEnter: localSettings.sendByShiftEnter,
-				shiftKey: event.shiftKey,
-				ctrlKey: event.ctrlKey,
-				metaKey: event.metaKey,
-				isComposing: event.isComposing,
-				isMobile: appShell.isMobile,
-			})
-		)
-			return;
-
+	function handleCompletionKeyDown(event: KeyboardEvent): boolean {
+		if (!ui.showFileMenu && !ui.showSlashMenu) return false;
+		const menu = ui.showFileMenu ? fileMentionMenu : slashCommandMenu;
+		if (menu?.handleKeyDown(event)) return true;
+		if (!['ArrowDown', 'ArrowUp', 'Enter', 'Tab'].includes(event.key)) return false;
 		event.preventDefault();
-		handleFormSubmit();
+		return true;
 	}
 
-	function handleFormSubmit() {
+	function handleKeyDown(event: KeyboardEvent) {
+		if (snippetExpansion.pending) return;
+		if (handleCompletionKeyDown(event)) return;
+		if (event.key !== 'Enter') return;
+		const action = resolveComposerKeydownAction(event, {
+			sendByShiftEnter: localSettings.sendByShiftEnter,
+			steerWithCtrlEnter: localSettings.steerWithCtrlEnter,
+			isMobile: appShell.isMobile,
+		});
+		if (action === 'newline') return;
+
+		event.preventDefault();
+		handleFormSubmit(action);
+	}
+
+	function handleFormSubmit(action: Exclude<ComposerEnterAction, 'newline'> = 'submit') {
 		if (!canSubmit || snippetExpansion.pending) return;
 		const command = parseSnippetCommand(composerState.inputText);
 		if (command.kind === 'invalid') {
@@ -537,7 +532,8 @@
 			void expandSnippetInvocation(command);
 			return;
 		}
-		onsubmit();
+		if (action === 'steer-preferred') onSteerPreferredSubmit();
+		else onsubmit();
 	}
 
 	function handleInput(event: Event) {
@@ -908,7 +904,7 @@
 					onThinkingModeChange?.(mode);
 				}}
 				canSend={canSubmit}
-				onSend={handleFormSubmit}
+				onSend={() => handleFormSubmit()}
 				sendTitle={isQueueMode ? m.chat_composer_queue_message() : m.chat_composer_send_message()}
 				{sendButtonClass}
 			>

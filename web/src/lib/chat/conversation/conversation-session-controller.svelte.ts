@@ -60,6 +60,7 @@ import {
 	submitGoalControlRoute,
 	submitQueueRoute,
 	submitRunRoute,
+	submitSteerPreferenceRoute,
 	submitSteerRoute,
 } from '$lib/chat/conversation/submission-routes.js';
 import * as m from '$lib/paraglide/messages.js';
@@ -68,7 +69,6 @@ import {
 	executionSelectionFromProjection,
 	type ConversationExecutionSelection,
 } from './conversation-execution-draft-state.svelte.js';
-
 type SessionTranscriptState = Pick<
 	ActiveTranscriptPort,
 	| 'activeChatId'
@@ -560,16 +560,17 @@ export class ConversationSessionController {
 
 		const previousText = deps.composerState.inputText;
 		const previousImages = [...deps.composerState.images];
+		const handoffPending = selected.status !== 'draft' && this.#executionDraft.isHandoffPending;
 		const slash = this.#slashCommands.dispatchSubmission({
 			chatId,
 			chat: selected,
 			text,
 			images: [...submissionImages],
 			ownsComposer,
+			handoffPending,
 		});
 		if (slash.kind === 'handled') return slash.outcome;
-		const handoffPending = selected.status !== 'draft' && this.#executionDraft.isHandoffPending;
-		if (handoffPending && (slash.kind === 'steer' || slash.kind === 'goal-control')) {
+		if (handoffPending && slash.kind === 'goal-control') {
 			deps.chatState.appendLocalNotice('error', m.chat_notice_handoff_requires_idle());
 			return 'rejected';
 		}
@@ -709,6 +710,27 @@ export class ConversationSessionController {
 		} finally {
 			if (directAdmission) this.#releaseDirectAdmission(chatId, directAdmission);
 		}
+	}
+
+	async submitComposerWithSteerPreference(chatId: string): Promise<ConversationSubmissionOutcome> {
+		const { deps } = this;
+		if (deps.sessions.selectedChatId !== chatId || this.isDirectAdmissionPending(chatId)) {
+			return 'no-op';
+		}
+		const selected = deps.sessions.byId[chatId];
+		if (!selected?.projectPath) return 'no-op';
+		const text = deps.composerState.inputText.trim();
+		if (!text) return 'no-op';
+		if (selected.status !== 'running' || !selected.isProcessing) {
+			return this.submitForChat(chatId);
+		}
+		return submitSteerPreferenceRoute(deps, this.#acceptedInputs, {
+			chatId,
+			chat: selected,
+			text,
+			supportsSteering: deps.modelCatalog.supportsSteering(selected.agentId as SessionAgentId),
+			handoffPending: this.#executionDraft.isHandoffPending,
+		});
 	}
 
 	// Forks a chat without sending a new message, then selects the fork. Backs

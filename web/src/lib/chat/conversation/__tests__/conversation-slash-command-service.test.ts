@@ -203,6 +203,7 @@ describe('ConversationSlashCommandService', () => {
 			text: '/steer Focus on the failing assertion',
 			images: [],
 			ownsComposer: true,
+			handoffPending: false,
 		});
 
 		expect(result).toEqual({ kind: 'steer', content: 'Focus on the failing assertion' });
@@ -217,6 +218,7 @@ describe('ConversationSlashCommandService', () => {
 			text: '/steer Focus here',
 			images: [] as File[],
 			ownsComposer: true,
+			handoffPending: false,
 		};
 
 		expect(service.dispatchSubmission(input)).toEqual({ kind: 'handled', outcome: 'rejected' });
@@ -232,6 +234,14 @@ describe('ConversationSlashCommandService', () => {
 			'error',
 			'Remove attachments before steering the active turn.',
 		);
+
+		input.images = [];
+		input.handoffPending = true;
+		expect(service.dispatchSubmission(input)).toEqual({ kind: 'handled', outcome: 'rejected' });
+		expect(appendLocalNotice).toHaveBeenLastCalledWith(
+			'error',
+			'Wait for the current work and queued messages to finish before handing this chat to another agent.',
+		);
 	});
 
 	it('keeps active goal controls distinct from ordinary goal submissions', () => {
@@ -245,6 +255,7 @@ describe('ConversationSlashCommandService', () => {
 			text: '/goal pause',
 			images: [],
 			ownsComposer: true,
+			handoffPending: false,
 		};
 
 		expect(service.dispatchSubmission(input)).toEqual({
@@ -352,6 +363,7 @@ describe('ConversationSlashCommandService', () => {
 			text: '/move top',
 			images: [],
 			ownsComposer: true,
+			handoffPending: false,
 		});
 
 		expect(dispatch.kind).toBe('handled');
@@ -386,6 +398,7 @@ describe('ConversationSlashCommandService', () => {
 			text: '/MOVE BOTTOM ',
 			images: [],
 			ownsComposer: true,
+			handoffPending: false,
 		});
 
 		expect(dispatch.kind).toBe('handled');
@@ -414,6 +427,7 @@ describe('ConversationSlashCommandService', () => {
 				text: input.text,
 				images: input.images,
 				ownsComposer: true,
+				handoffPending: false,
 			});
 
 			expect(dispatch.kind).toBe('handled');
@@ -552,6 +566,7 @@ describe('ConversationSlashCommandService', () => {
 			text: composerState.inputText,
 			images: [],
 			ownsComposer: true,
+			handoffPending: false,
 		});
 
 		expect(dispatch.kind).toBe('handled');
@@ -744,6 +759,7 @@ describe('ConversationSlashCommandService', () => {
 				text: input.text,
 				images: input.images,
 				ownsComposer: true,
+				handoffPending: false,
 			});
 
 			expect(dispatch.kind).toBe('handled');
@@ -783,6 +799,7 @@ describe('ConversationSlashCommandService', () => {
 				text: '/move-to-top',
 				images: [],
 				ownsComposer: true,
+				handoffPending: false,
 			}),
 		).toEqual({
 			kind: 'continue',
