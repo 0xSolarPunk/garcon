@@ -174,12 +174,6 @@
 			isPreparingInitialScroll && 'invisible',
 		),
 	);
-	const showEarlierLoadingStatus = $derived(
-		!isPreparingInitialScroll &&
-			chatState.displayMessageCount > 0 &&
-			chatState.pageStates.earlier.status === 'loading' &&
-			chatState.pageStates.earlier.error === null,
-	);
 	const activePendingPermissionRequests = $derived.by(() =>
 		pendingPermissionRequests.filter(
 			(request) => !request.chatId || request.chatId === chatState.activeChatId,
@@ -372,6 +366,7 @@
 			data-chat-virtual-count={virtualItems.length}
 			data-chat-virtual-model-count={projection.model.items.length}
 			data-chat-virtual-data-revision={projection.projectedDataRevision}
+			data-chat-transcript-entry-count={chatState.entries.length}
 			data-chat-transcript-scale={String(textScale)}
 		>
 			{#each virtualItems as virtualItem (virtualItem.key)}
@@ -416,22 +411,6 @@
 				<Loader2 class="h-4 w-4 animate-spin" />
 				<span>{m.chat_chat_loading_chat_messages()}</span>
 			</div>
-		</div>
-	{:else if showEarlierLoadingStatus}
-		<!-- Keeps automatic loading outside TanStack geometry so prepends cannot move the reading anchor. -->
-		<div
-			class={cn(
-				'pointer-events-none absolute left-1/2 z-10 flex size-8 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-none',
-				reserveTopFloatingToolbar
-					? 'top-[calc(var(--workspace-floating-taskbar-inset)+0.5rem)]'
-					: 'top-2',
-			)}
-			role="status"
-			aria-live="polite"
-			data-chat-earlier-loading-indicator
-		>
-			<Loader2 class="size-3.5 animate-spin" aria-hidden="true" />
-			<span class="sr-only">{m.chat_transcript_loading_earlier()}</span>
 		</div>
 	{/if}
 	<!-- svelte-ignore a11y_no_noninteractive_tabindex -- scroll container needs programmatic focus for Ctrl+U/D; follow-up: CLEANUP_ROUND_TWO.md#a11y-suppression-register -->
