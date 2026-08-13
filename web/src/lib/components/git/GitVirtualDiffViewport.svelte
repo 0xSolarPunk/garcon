@@ -60,6 +60,10 @@
 	let measuredLayoutIdentity: string | null = null;
 	let performanceFrame: number | null = null;
 	let configuredMeasurementKey = '';
+	let configuredScrollElement: HTMLDivElement | null = null;
+	let presentedSource: GitVirtualReviewRowSource | null = null;
+	let presentedMeasurementRevision = '';
+	let scrollIntentRevision = 0;
 	let demandEffectRuns = 0;
 	let demandPublications = 0;
 	let rowLineHeight = $derived(Math.max(18, Math.round(fontSize * 1.5)));
@@ -114,6 +118,7 @@
 	});
 
 	function completeScrollRequest(): void {
+		scrollIntentRevision += 1;
 		if (servicedScrollRequestId) completedScrollRequestId = servicedScrollRequestId;
 	}
 
@@ -141,6 +146,9 @@
 		const scrollElement = viewportRef;
 		if (!scrollElement || nextLayoutIdentity === measuredLayoutIdentity) return;
 		measuredLayoutIdentity = nextLayoutIdentity;
+		scrollIntentRevision += 1;
+		presentedSource = null;
+		presentedMeasurementRevision = '';
 		lastScrollRequestKey = '';
 		pendingScrollRequestKey = '';
 		scrollRequestSequence += 1;
@@ -153,6 +161,32 @@
 		});
 	});
 
+	$effect.pre(() => {
+		const nextSource = source;
+		const nextMeasurementRevision = nextSource.measurementRevision;
+		const scrollElement = viewportRef;
+		const preserveScroll =
+			presentedSource !== null &&
+			presentedSource !== nextSource &&
+			presentedMeasurementRevision === nextMeasurementRevision;
+		presentedSource = nextSource;
+		presentedMeasurementRevision = nextMeasurementRevision;
+		if (!preserveScroll || !scrollElement) return;
+
+		const scrollTop = scrollElement.scrollTop;
+		const intentRevision = scrollIntentRevision;
+		void tick().then(() => {
+			if (
+				source === nextSource &&
+				viewportRef === scrollElement &&
+				nextSource.measurementRevision === nextMeasurementRevision &&
+				scrollIntentRevision === intentRevision
+			) {
+				if (scrollElement.scrollTop !== scrollTop) scrollElement.scrollTop = scrollTop;
+			}
+		});
+	});
+
 	$effect(() => {
 		const measurementRevision = source.measurementRevision;
 		const count = source.rowCount;
@@ -160,13 +194,18 @@
 		const rowOverscan = overscan;
 		const lineHeight = rowLineHeight;
 		untrack(() => {
-			const measurementKey = `${measurementRevision}\0${lineHeight}`;
-			if (measurementKey !== configuredMeasurementKey) {
-				configuredMeasurementKey = measurementKey;
-				const measurementSource = source;
-				estimateSizeForOptions = (index) => measurementSource.estimateRowHeight(index, lineHeight);
-				itemKeyForOptions = (index) => measurementSource.rowKey(index);
+			const measurementKey = `${measurementRevision}\0${count}\0${rowOverscan}\0${lineHeight}`;
+			if (
+				measurementKey === configuredMeasurementKey &&
+				scrollElement === configuredScrollElement
+			) {
+				return;
 			}
+			configuredMeasurementKey = measurementKey;
+			configuredScrollElement = scrollElement;
+			const measurementSource = source;
+			estimateSizeForOptions = (index) => measurementSource.estimateRowHeight(index, lineHeight);
+			itemKeyForOptions = (index) => measurementSource.rowKey(index);
 			$virtualizer.setOptions({
 				count,
 				getScrollElement: () => scrollElement,
@@ -273,6 +312,7 @@
 		}
 		const requestKey = `${requestId}\0${targetIndex}\0${targetState}`;
 		if (requestKey === lastScrollRequestKey || requestKey === pendingScrollRequestKey) return;
+		scrollIntentRevision += 1;
 		pendingScrollRequestKey = requestKey;
 		const requestSequence = ++scrollRequestSequence;
 		const start = Math.max(0, targetIndex - 6);
@@ -317,6 +357,7 @@
 				}
 				pendingScrollRequestKey = '';
 				lastScrollRequestKey = requestKey;
+				scrollIntentRevision += 1;
 				$virtualizer.scrollToIndex(targetIndex, { align: 'start' });
 				servicedScrollRequestId = requestId;
 				servicedScrollRequestState = targetState;
