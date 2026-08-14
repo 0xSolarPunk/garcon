@@ -11,6 +11,7 @@ import type {
 } from './chat-view-store.js';
 import { serializeCompositeTranscriptRevision } from './composite-transcript-revision.js';
 import type { ChatRegistryEntry, IChatRegistry } from './store.js';
+import type { NativeUserIdentityRegistry } from './native-user-identity-registry.js';
 
 export class OrderedChatTranscriptReader {
   constructor(private readonly deps: {
@@ -37,6 +38,10 @@ export class OrderedChatTranscriptReader {
       } | null>;
     };
     readonly carryOver: CarryOverTranscriptStore;
+    readonly nativeUserIdentities?: Pick<
+      NativeUserIdentityRegistry,
+      'apply' | 'applyFromNativeStart'
+    >;
   }) {}
 
   async loadCurrentNativeMessages(chatId: string): Promise<ChatMessage[]> {
@@ -88,8 +93,8 @@ export class OrderedChatTranscriptReader {
       const messages = limit === 0
         ? []
         : reachesNativeStart
-        ? this.#sanitizeNativeMessages(entry, page.messages)
-        : [...page.messages];
+          ? this.#sanitizeNativeMessages(entry, input.chatId, page.messages)
+          : this.#applyNativeUserIdentities(input.chatId, page.messages);
       this.#assertEntryUnchanged(input.chatId, entry);
       return {
         kind: 'page',
@@ -157,13 +162,14 @@ export class OrderedChatTranscriptReader {
   ) {
     const native = await this.deps.agents.loadTranscriptSnapshot(entry, chatId, signal);
     return {
-      messages: this.#sanitizeNativeMessages(entry, native.messages),
+      messages: this.#sanitizeNativeMessages(entry, chatId, native.messages),
       revision: native.revision,
     };
   }
 
   #sanitizeNativeMessages(
     entry: ChatRegistryEntry,
+    chatId: string,
     messages: readonly ChatMessage[],
   ): ChatMessage[] {
     const sanitized = sanitizeRecordedCarriedContext({
@@ -179,7 +185,22 @@ export class OrderedChatTranscriptReader {
         false,
       );
     }
-    return [...sanitized.messages];
+    return this.#applyNativeUserIdentitiesFromStart(chatId, sanitized.messages);
+  }
+
+  #applyNativeUserIdentities(
+    chatId: string,
+    messages: readonly ChatMessage[],
+  ): ChatMessage[] {
+    return this.deps.nativeUserIdentities?.apply(chatId, messages) ?? [...messages];
+  }
+
+  #applyNativeUserIdentitiesFromStart(
+    chatId: string,
+    messages: readonly ChatMessage[],
+  ): ChatMessage[] {
+    return this.deps.nativeUserIdentities?.applyFromNativeStart(chatId, messages)
+      ?? [...messages];
   }
 
   async loadAll(chatId: string): Promise<ChatTranscriptSnapshot> {

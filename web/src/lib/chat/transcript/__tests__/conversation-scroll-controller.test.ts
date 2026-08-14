@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
 import {
 	ConversationScrollController,
+	LIVE_HISTORY_PRUNE_IDLE_MS,
 	type ConversationScrollState,
 } from '../conversation-scroll-controller.svelte';
 import type { ConversationFeedMutationClock } from '../conversation-feed-mutations';
@@ -20,6 +21,7 @@ function mutationClock(
 			'live-append': 0,
 			'history-earlier': historyEarlierRevision,
 			'history-later': 0,
+			'history-pruned': 0,
 			replacement: 0,
 			'presentation-structure': 0,
 		},
@@ -34,13 +36,13 @@ function scrollState(
 	overrides: Partial<ConversationScrollState> = {},
 ): MutableConversationScrollState {
 	return {
-		compactToRecentMessages: vi.fn(() => false),
 		canAutoFillEarlier: false,
 		canLoadEarlier: false,
 		canLoadLater: false,
 		displayMessageCount: 1,
 		feedMutationClock: mutationClock(),
 		generationId: 'generation-1',
+		hasExpandedLiveHistory: false,
 		hasLaterMessages: false,
 		isLoadingMessages: false,
 		isUserScrolledUp: false,
@@ -54,6 +56,7 @@ function scrollState(
 			earlier: { status: 'idle', error: null },
 			later: { status: 'idle', error: null },
 		},
+		pruneLoadedHistoryAtLiveEnd: vi.fn(() => false),
 		revealEarlierLoadedRows: vi.fn(() => false),
 		windowRevision: 0,
 		...overrides,
@@ -165,6 +168,7 @@ describe('ConversationScrollController', () => {
 
 	afterEach(() => {
 		globalThis.ResizeObserver = originalResizeObserver;
+		vi.useRealTimers();
 	});
 
 	it('delegates physical end checks and end scrolling to the viewport', () => {
@@ -180,10 +184,145 @@ describe('ConversationScrollController', () => {
 		expect(controller.isPinnedToBottom).toBe(true);
 	});
 
+	it('prunes expanded history only after continuously following the live end', async () => {
+		vi.useFakeTimers();
+		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
+		const fixture = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
+		});
+
+		fixture.controller.scrollToBottom();
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 1);
+		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
+	});
+
+	it('restarts the prune delay after fresh bottom-edge input', async () => {
+		vi.useFakeTimers();
+		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
+		const fixture = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
+		});
+		fixture.controller.scrollToBottom();
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 60_000);
+
+		fixture.controller.noteUserScrollIntent('later');
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
+
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 60_000);
+		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
+	});
+
+	it('requires a fresh full delay after leaving and returning to live follow', async () => {
+		vi.useFakeTimers();
+		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
+		const fixture = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
+		});
+		fixture.controller.scrollToBottom();
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS / 2);
+
+		fixture.controller.setPinnedToBottom(false);
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS);
+		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
+
+		fixture.controller.setPinnedToBottom(true);
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 1);
+		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
+	});
+
+	it('keeps the prune deadline across pinned live appends and rechecks physical ownership', async () => {
+		vi.useFakeTimers();
+		let atEnd = false;
+		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
+		const fixture = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => atEnd) }),
+			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
+		});
+		fixture.controller.scrollToBottom();
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS / 2);
+		fixture.state.feedMutationClock = mutationClock(1);
+		fixture.controller.reconcilePinnedProjection();
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS / 2);
+
+		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
+		atEnd = true;
+		await vi.advanceTimersByTimeAsync(9_999);
+		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
+	});
+
+	it('starts the prune delay when pinned live growth expands a bounded window', async () => {
+		vi.useFakeTimers();
+		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
+		const fixture = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+			state: { hasExpandedLiveHistory: false, pruneLoadedHistoryAtLiveEnd },
+		});
+		fixture.controller.scrollToBottom();
+		expect(vi.getTimerCount()).toBe(0);
+
+		fixture.state.hasExpandedLiveHistory = true;
+		fixture.state.feedMutationClock = mutationClock(1);
+		fixture.controller.reconcilePinnedProjection();
+		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS);
+
+		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
+	});
+
+	it('cancels pending history pruning for chat switches, hidden viewports, and destruction', () => {
+		vi.useFakeTimers();
+		const state = {
+			hasExpandedLiveHistory: true,
+			pruneLoadedHistoryAtLiveEnd: vi.fn(() => true),
+		};
+		const first = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+			state,
+		});
+		first.controller.scrollToBottom();
+		expect(vi.getTimerCount()).toBe(1);
+		first.controller.prepareInitialBottomRestore('chat-2');
+		expect(vi.getTimerCount()).toBe(0);
+
+		const second = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+			state,
+		});
+		second.controller.scrollToBottom();
+		second.controller.setViewportVisible(false);
+		expect(vi.getTimerCount()).toBe(0);
+
+		const third = controllerFixture({
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+			state,
+		});
+		third.controller.scrollToBottom();
+		third.controller.destroy();
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
 	it('cancels pending layout work before recording every user gesture', () => {
 		const { controller, viewport } = controllerFixture();
 		controller.noteUserScrollIntent('earlier');
 		expect(viewport.cancelForUserIntent).toHaveBeenCalledWith('earlier');
+	});
+
+	it('returns the viewport suppression decision for a scrollbar drag', () => {
+		const cancelForUserIntent = vi.fn(() => true);
+		const { controller } = controllerFixture({ viewport: fakeViewport({ cancelForUserIntent }) });
+
+		expect(controller.noteUserScrollIntent('earlier', 'scrollbar-drag')).toBe(true);
+		expect(cancelForUserIntent).toHaveBeenCalledWith('earlier', 'scrollbar-drag');
 	});
 
 	it('requires fresh downward intent to repin inside the later threshold', () => {
@@ -1185,16 +1324,14 @@ describe('ConversationScrollController', () => {
 		expect(fixture.viewport.scrollToStart).toHaveBeenCalledOnce();
 	});
 
-	it('navigates to latest and compacts expanded history', async () => {
-		const compactToRecentMessages = vi.fn(() => true);
+	it('navigates to latest without discarding the loaded transcript', async () => {
 		const navigateToWindow = vi.fn(async () => 'loaded' as const);
 		const { controller, viewport } = controllerFixture({
-			state: { hasLaterMessages: true, compactToRecentMessages, navigateToWindow },
+			state: { hasLaterMessages: true, navigateToWindow },
 		});
 		await controller.scrollToLatest();
 		expect(navigateToWindow).toHaveBeenCalledWith('chat-1', 'latest');
 		expect(viewport.scrollToEnd).toHaveBeenCalledOnce();
-		expect(compactToRecentMessages).toHaveBeenCalledOnce();
 	});
 
 	it('finishes committed latest navigation when layout settling is superseded', async () => {
@@ -1264,7 +1401,6 @@ describe('ConversationScrollController', () => {
 		await navigation;
 
 		expect(fixture.viewport.scrollToEnd).not.toHaveBeenCalled();
-		expect(fixture.state.compactToRecentMessages).not.toHaveBeenCalled();
 		expect(fixture.state.invalidatePendingWindowNavigation).toHaveBeenCalledTimes(2);
 	});
 

@@ -59,6 +59,35 @@ describe('ChatTranscriptCache', () => {
 		expect(cache.get('chat-1')?.messages.map((item) => item.seq)).toEqual([1]);
 	});
 
+	it('keeps the complete memory window while persisting only the bounded tail', () => {
+		const storage = new LocalChatTranscriptStorage();
+		const cache = new ChatTranscriptCache({ limit: 2, storage });
+		cache.replaceFromPage(
+			'chat-1',
+			page('generation-1', [entry(1, 'one'), entry(2, 'two'), entry(3, 'three')]),
+		);
+
+		expect(cache.get('chat-1')?.messages.map((item) => item.seq)).toEqual([1, 2, 3]);
+		cache.flush();
+
+		const hydrated = new ChatTranscriptCache({ limit: 2, storage });
+		expect(hydrated.get('chat-1')?.messages.map((item) => item.seq)).toEqual([2, 3]);
+	});
+
+	it('bounds background growth without truncating ordinary active-cache writes', () => {
+		const cache = new ChatTranscriptCache({ limit: 2 });
+		cache.replaceFromPage(
+			'chat-1',
+			page('generation-1', [entry(1, 'one'), entry(2, 'two'), entry(3, 'three')]),
+		);
+
+		expect(cache.get('chat-1')?.messages.map((item) => item.seq)).toEqual([1, 2, 3]);
+		expect(
+			cache.applyBackgroundMessages('chat-1', 'generation-1', [entry(4, 'four')]),
+		).toMatchObject({ status: 'applied', lastSeq: 4 });
+		expect(cache.get('chat-1')?.messages.map((item) => item.seq)).toEqual([3, 4]);
+	});
+
 	it('allows live creation only when the first batch starts at seq 1', () => {
 		const cache = new ChatTranscriptCache({ limit: 100 });
 

@@ -3,6 +3,11 @@ import { PendingUserInputService } from '../pending-user-input-service.js';
 import { ChatViewStore } from '../chat-view-store.js';
 import { AssistantMessage, UserMessage } from '../../../common/chat-types.js';
 import {
+  attachNativeMessageSource,
+  getNativeMessageRevisionSource,
+} from '../../agents/shared/native-message-source.js';
+import { NativeUserIdentityRegistry } from '../native-user-identity-registry.js';
+import {
   historyPage,
   snapshotLoader,
   transcriptLoader,
@@ -25,7 +30,182 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function sourcedUser(entryId, content, metadata) {
+  return attachNativeMessageSource(
+    new UserMessage('2026-06-01T00:00:00.000Z', content, undefined, metadata),
+    { entryId, withinSourceOrdinal: 0 },
+  );
+}
+
 describe('PendingUserInputService', () => {
+  it('settles repeated identical prompts by structural native position', async () => {
+    const nativeMessages = [
+      sourcedUser('native-user-1', 'previous'),
+      sourcedUser('native-user-2', 'repeat'),
+      sourcedUser('native-user-3', 'repeat'),
+    ];
+    const identities = new NativeUserIdentityRegistry();
+    const service = new PendingUserInputService({
+      loadNativeMessages: async () => nativeMessages,
+      getRetainedHistoryMessages: () => [],
+    }, identities);
+    const previousNativeUserSourceKey = JSON.stringify([
+      'native-entry',
+      'native-user-1',
+      0,
+    ]);
+    await service.register('chat-1', 'repeat', {
+      clientRequestId: 'request-1',
+      clientMessageId: 'message-1',
+      turnId: 'turn-1',
+    });
+    service.bindNativeUserPosition('chat-1', 'request-1', {
+      previousNativeUserSourceKey,
+      userOffset: 1,
+    });
+    await service.register('chat-1', 'repeat', {
+      clientRequestId: 'request-2',
+      clientMessageId: 'message-2',
+      turnId: 'turn-2',
+    });
+    service.bindNativeUserPosition('chat-1', 'request-2', {
+      previousNativeUserSourceKey,
+      userOffset: 2,
+    });
+
+    await service.reconcileNativeHistory('chat-1');
+
+    expect(service.listForChat('chat-1')).toEqual([]);
+    const identified = identities.apply('chat-1', nativeMessages);
+    expect(identified.map((message) => ({
+      source: getNativeMessageRevisionSource(message)?.entryId,
+      clientRequestId: message.metadata?.clientRequestId,
+      upstreamRequestId: message.metadata?.upstreamRequestId,
+    }))).toEqual([
+      { source: 'native-user-1', clientRequestId: undefined, upstreamRequestId: undefined },
+      { source: 'native-user-2', clientRequestId: 'request-1', upstreamRequestId: 'message-1' },
+      { source: 'native-user-3', clientRequestId: 'request-2', upstreamRequestId: 'message-2' },
+    ]);
+  });
+
+  it('does not let a failed structural position claim the next delivered user row', async () => {
+    const nativeMessages = [
+      sourcedUser('native-user-1', 'previous'),
+      sourcedUser('native-user-2', 'delivered second'),
+    ];
+    const identities = new NativeUserIdentityRegistry();
+    const service = new PendingUserInputService({
+      loadNativeMessages: async () => nativeMessages,
+      getRetainedHistoryMessages: () => [],
+    }, identities);
+    const previousNativeUserSourceKey = JSON.stringify([
+      'native-entry',
+      'native-user-1',
+      0,
+    ]);
+    await service.register('chat-1', 'failed first', {
+      clientRequestId: 'request-1',
+      clientMessageId: 'message-1',
+      createdAt: '2026-06-01T00:00:01.000Z',
+    });
+    service.bindNativeUserPosition('chat-1', 'request-1', {
+      previousNativeUserSourceKey,
+      userOffset: 1,
+    });
+    service.markFailed('chat-1', 'request-1');
+    await service.register('chat-1', 'delivered second', {
+      clientRequestId: 'request-2',
+      clientMessageId: 'message-2',
+      createdAt: '2026-06-01T00:00:02.000Z',
+    });
+    service.bindNativeUserPosition('chat-1', 'request-2', {
+      previousNativeUserSourceKey,
+      userOffset: 2,
+    });
+
+    await service.reconcileNativeHistory('chat-1');
+
+    expect(service.listForChat('chat-1')).toMatchObject([
+      { clientRequestId: 'request-1', deliveryStatus: 'failed' },
+    ]);
+    expect(identities.apply('chat-1', nativeMessages).map((message) => ({
+      source: getNativeMessageRevisionSource(message)?.entryId,
+      clientRequestId: message.metadata?.clientRequestId,
+      upstreamRequestId: message.metadata?.upstreamRequestId,
+    }))).toEqual([
+      { source: 'native-user-1', clientRequestId: undefined, upstreamRequestId: undefined },
+      { source: 'native-user-2', clientRequestId: 'request-2', upstreamRequestId: 'message-2' },
+    ]);
+  });
+
+  it('retains a failed predecessor offset when exact native identity proves it persisted', async () => {
+    const nativeMessages = [
+      sourcedUser('native-user-1', 'previous'),
+      sourcedUser('native-user-2', 'failed but persisted', { upstreamRequestId: 'message-1' }),
+      sourcedUser('native-user-3', 'delivered second'),
+    ];
+    const identities = new NativeUserIdentityRegistry();
+    const service = new PendingUserInputService({
+      loadNativeMessages: async () => nativeMessages,
+      getRetainedHistoryMessages: () => [],
+    }, identities);
+    const previousNativeUserSourceKey = JSON.stringify([
+      'native-entry',
+      'native-user-1',
+      0,
+    ]);
+    await service.register('chat-1', 'failed but persisted', {
+      clientRequestId: 'request-1',
+      clientMessageId: 'message-1',
+      createdAt: '2026-06-01T00:00:01.000Z',
+    });
+    service.bindNativeUserPosition('chat-1', 'request-1', {
+      previousNativeUserSourceKey,
+      userOffset: 1,
+    });
+    service.markFailed('chat-1', 'request-1');
+    await service.register('chat-1', 'delivered second', {
+      clientRequestId: 'request-2',
+      clientMessageId: 'message-2',
+      createdAt: '2026-06-01T00:00:02.000Z',
+    });
+    service.bindNativeUserPosition('chat-1', 'request-2', {
+      previousNativeUserSourceKey,
+      userOffset: 2,
+    });
+
+    await service.reconcileNativeHistory('chat-1');
+
+    expect(service.listForChat('chat-1')).toEqual([]);
+    expect(identities.apply('chat-1', nativeMessages)[2].metadata).toMatchObject({
+      clientRequestId: 'request-2',
+      upstreamRequestId: 'message-2',
+    });
+  });
+
+  it('does not resolve a first-user position from an incomplete native tail', async () => {
+    const nativeUser = attachNativeMessageSource(
+      new UserMessage('2026-06-01T00:00:00.000Z', 'repeat'),
+      { entryId: 'native-user-tail', withinSourceOrdinal: 0 },
+    );
+    const identities = new NativeUserIdentityRegistry();
+    const service = new PendingUserInputService({
+      loadNativeMessages: async () => [nativeUser],
+      getRetainedHistoryMessages: () => [nativeUser],
+      hasCompleteHistory: () => false,
+    }, identities);
+    await service.register('chat-1', 'repeat', { clientRequestId: 'request-1' });
+    service.bindNativeUserPosition('chat-1', 'request-1', {
+      previousNativeUserSourceKey: null,
+      userOffset: 1,
+    });
+
+    await service.reconcileRetainedHistory('chat-1');
+
+    expect(service.listForChat('chat-1')).toHaveLength(1);
+    expect(identities.apply('chat-1', [nativeUser])[0].metadata).toBeUndefined();
+  });
+
   it('classifies pending delivery lifecycle for chat idleness', async () => {
     const service = new PendingUserInputService(createReader());
 
@@ -184,45 +364,29 @@ describe('PendingUserInputService', () => {
     expect(reader.loadNativeMessages).toHaveBeenCalledTimes(1);
   });
 
-  it('reconciles a nearby identityless native echo after the live view is replaced', async () => {
-    let messages = [];
-    const reader = {
-      loadNativeMessages: mock(async () => messages),
-      getRetainedHistoryMessages: mock(() => messages),
-    };
-    const service = new PendingUserInputService(reader);
-    await service.register('chat-1', 'persisted', {
-      clientRequestId: 'req-1',
-      turnId: 'turn-1',
-      createdAt: '2026-06-01T00:00:00.000Z',
-    });
-    messages = [new UserMessage('2026-06-01T00:00:00.125Z', 'persisted')];
-
-    await service.reconcileRetainedHistory('chat-1');
-
-    expect(service.listForChat('chat-1')).toEqual([]);
-  });
-
-  it('does not use an earlier identityless row as persistence evidence', async () => {
-    const messages = [new UserMessage('2026-06-01T00:00:00.000Z', 'repeat')];
+  it('does not use identical identityless content as persistence evidence', async () => {
+    const messages = [new UserMessage('2026-06-01T00:00:00.125Z', 'repeat')];
     const service = new PendingUserInputService({
       loadNativeMessages: mock(async () => messages),
       getRetainedHistoryMessages: mock(() => messages),
     });
     await service.register('chat-1', 'repeat', {
-      clientRequestId: 'req-later',
-      createdAt: '2026-06-01T00:00:10.000Z',
+      clientRequestId: 'req-1',
+      createdAt: '2026-06-01T00:00:00.000Z',
     });
 
     await service.reconcileNativeHistory('chat-1');
 
     expect(service.listForChat('chat-1')).toMatchObject([
-      { clientRequestId: 'req-later', deliveryStatus: 'accepted' },
+      { clientRequestId: 'req-1', deliveryStatus: 'accepted' },
     ]);
   });
 
-  it('consumes each identityless echo at most once across reconciliation calls', async () => {
-    let messages = [];
+  it('keeps repeated identityless rows and pending inputs distinct across reconciliations', async () => {
+    const messages = [
+      new UserMessage('2026-06-01T00:00:00.100Z', 'repeat'),
+      new UserMessage('2026-06-01T00:00:01.100Z', 'repeat'),
+    ];
     const reader = {
       loadNativeMessages: mock(async () => messages),
       getRetainedHistoryMessages: mock(() => messages),
@@ -232,91 +396,17 @@ describe('PendingUserInputService', () => {
       clientRequestId: 'req-1',
       createdAt: '2026-06-01T00:00:00.000Z',
     });
-    messages = [new UserMessage('2026-06-01T00:00:00.100Z', 'repeat')];
-    await service.reconcileRetainedHistory('chat-1');
-    expect(service.listForChat('chat-1')).toEqual([]);
-
     await service.register('chat-1', 'repeat', {
       clientRequestId: 'req-2',
-      createdAt: '2026-06-01T00:00:10.000Z',
+      createdAt: '2026-06-01T00:00:01.000Z',
     });
     await service.reconcileRetainedHistory('chat-1');
-
-    expect(service.listForChat('chat-1')).toMatchObject([{ clientRequestId: 'req-2' }]);
-
-    messages.push(new UserMessage('2026-06-01T00:00:10.100Z', 'repeat'));
-    await service.reconcileRetainedHistory('chat-1');
-
-    expect(service.listForChat('chat-1')).toEqual([]);
-  });
-
-  it('assigns ambiguous identityless evidence to the earliest pending input', async () => {
-    const timestamp = '2026-06-01T00:00:00.000Z';
-    const messages = [];
-    const service = new PendingUserInputService({
-      loadNativeMessages: mock(async () => messages),
-      getRetainedHistoryMessages: mock(() => messages),
-    });
-    await service.register('chat-1', 'repeat', {
-      clientRequestId: 'req-a',
-      createdAt: timestamp,
-    });
-    await service.register('chat-1', 'repeat', {
-      clientRequestId: 'req-b',
-      createdAt: timestamp,
-    });
-    messages.push(new UserMessage(timestamp, 'repeat'));
-
-    await service.reconcileRetainedHistory('chat-1');
+    await service.reconcileNativeHistory('chat-1');
 
     expect(service.listForChat('chat-1')).toMatchObject([
-      { clientRequestId: 'req-b', deliveryStatus: 'accepted' },
+      { clientRequestId: 'req-1', deliveryStatus: 'accepted' },
+      { clientRequestId: 'req-2', deliveryStatus: 'accepted' },
     ]);
-  });
-
-  it('conserves identityless evidence across repeated reconciliation batches', async () => {
-    const baseTime = Date.parse('2026-06-01T00:00:00.000Z');
-    const messages = [];
-    const service = new PendingUserInputService({
-      loadNativeMessages: mock(async () => messages),
-      getRetainedHistoryMessages: mock(() => messages),
-    });
-    const clearedRequestIds = [];
-    service.store.onCleared((_chatId, clientRequestId, reason) => {
-      if (reason === 'persisted') clearedRequestIds.push(clientRequestId);
-    });
-    for (let index = 0; index < 12; index += 1) {
-      await service.register('chat-1', 'repeat', {
-        clientRequestId: `req-${index}`,
-        createdAt: new Date(baseTime + index * 1_000).toISOString(),
-      });
-    }
-
-    for (let index = 0; index < 5; index += 1) {
-      messages.push(new UserMessage(
-        new Date(baseTime + index * 1_000 + 100).toISOString(),
-        'repeat',
-      ));
-    }
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await service.reconcileRetainedHistory('chat-1');
-    }
-
-    expect(service.listForChat('chat-1')).toHaveLength(7);
-    expect(clearedRequestIds).toHaveLength(5);
-
-    for (let index = 5; index < 9; index += 1) {
-      messages.push(new UserMessage(
-        new Date(baseTime + index * 1_000 + 100).toISOString(),
-        'repeat',
-      ));
-    }
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await service.reconcileRetainedHistory('chat-1');
-    }
-
-    expect(service.listForChat('chat-1')).toHaveLength(3);
-    expect(new Set(clearedRequestIds).size).toBe(9);
   });
 
   it('clears a failed input when later native evidence proves persistence', async () => {
@@ -447,10 +537,11 @@ describe('PendingUserInputService', () => {
     await service.reconcileNativeHistory('chat-1');
     expect(service.listForChat('chat-1')).toMatchObject([
       { clientRequestId: 'req-a', deliveryStatus: 'unconfirmed' },
+      { clientRequestId: 'req-b', deliveryStatus: 'accepted' },
     ]);
   });
 
-  it('requires request identity when settling a terminal cohort', async () => {
+  it('never settles a terminal cohort from identityless content', async () => {
     const timestamp = '2026-06-01T00:00:00.000Z';
     const nativeMessages = [new UserMessage(timestamp, 'same content')];
     const service = new PendingUserInputService({
@@ -469,7 +560,9 @@ describe('PendingUserInputService', () => {
       { clientRequestId: 'req-a', deliveryStatus: 'unconfirmed' },
     ]);
     await service.reconcileNativeHistory('chat-1');
-    expect(service.listForChat('chat-1')).toEqual([]);
+    expect(service.listForChat('chat-1')).toMatchObject([
+      { clientRequestId: 'req-a', deliveryStatus: 'unconfirmed' },
+    ]);
   });
 
   it('coalesces repeated native reconciliation into one dirty rerun', async () => {

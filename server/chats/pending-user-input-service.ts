@@ -16,19 +16,48 @@ import {
 import type { PendingInputHistoryReader } from './chat-message-reader.js';
 import { KeyedPromiseLock } from '../lib/keyed-lock.js';
 import { createLogger } from '../lib/log.js';
-import {
-  matchingRequestIds,
-  type IdentitylessEvidenceClaim,
-} from './pending-input-matching.js';
+import { matchingRequestIds } from './pending-input-matching.js';
 import {
   nativeUserMessages,
   scanCurrentNativeUserEvidence,
 } from './native-pending-evidence-scanner.js';
+import type { PendingNativeUserPosition } from './chat-view-contracts.js';
+import { NativeUserIdentityRegistry } from './native-user-identity-registry.js';
 
 const logger = createLogger('pending-inputs');
 
 function byCreatedAt(left: { createdAt: string }, right: { createdAt: string }): number {
   return left.createdAt.localeCompare(right.createdAt);
+}
+
+function positionAfterOmittedFailedPredecessors(
+  record: PendingUserInputRecord,
+  precedingRecords: readonly PendingUserInputRecord[],
+  exactRequestIds: ReadonlySet<string>,
+): PendingNativeUserPosition | null {
+  const position = record.nativeUserPosition;
+  if (
+    !position
+    || record.deliveryStatus === 'failed'
+    || exactRequestIds.has(record.clientRequestId)
+  ) {
+    return null;
+  }
+
+  let userOffset = position.userOffset;
+  for (const predecessor of precedingRecords) {
+    if (
+      predecessor.deliveryStatus !== 'failed'
+      || exactRequestIds.has(predecessor.clientRequestId)
+      || predecessor.nativeUserPosition?.previousNativeUserSourceKey
+        !== position.previousNativeUserSourceKey
+      || predecessor.nativeUserPosition.userOffset >= position.userOffset
+    ) {
+      continue;
+    }
+    userOffset -= 1;
+  }
+  return { ...position, userOffset };
 }
 
 export interface RegisterPendingUserInputOptions {
@@ -59,6 +88,11 @@ export interface PendingUserInputServiceContract {
   discard(chatId: string, clientRequestId: string): boolean;
   markFailed(chatId: string, clientRequestId: string): boolean;
   markUnconfirmed(chatId: string, clientRequestId: string): boolean;
+  bindNativeUserPosition(
+    chatId: string,
+    clientRequestId: string,
+    position: PendingNativeUserPosition,
+  ): boolean;
   register(chatId: string, content: string, options?: RegisterPendingUserInputOptions): Promise<PendingUserInput>;
   captureCohort(chatId: string): PendingUserInputCohort;
   reconcileRetainedHistory(chatId: string): Promise<void>;
@@ -70,12 +104,16 @@ export interface PendingUserInputServiceContract {
 export class PendingUserInputService implements PendingUserInputServiceContract {
   readonly store = new PendingUserInputStore();
   #messages: PendingInputHistoryReader;
+  #nativeUserIdentities: NativeUserIdentityRegistry;
   #nativeEvidenceLock = new KeyedPromiseLock();
   #nativeReconcileByChatId = new Map<string, NativeReconcileRun>();
-  #claimedIdentitylessEvidenceByChatId = new Map<string, Map<string, IdentitylessEvidenceClaim>>();
 
-  constructor(messages: PendingInputHistoryReader) {
+  constructor(
+    messages: PendingInputHistoryReader,
+    nativeUserIdentities = new NativeUserIdentityRegistry(),
+  ) {
     this.#messages = messages;
+    this.#nativeUserIdentities = nativeUserIdentities;
   }
 
   listForChat(chatId: string): PendingUserInput[] {
@@ -106,13 +144,11 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
 
   clearChat(chatId: string, reason: PendingUserInputClearReason = 'chat-removed'): void {
     this.store.clearChat(chatId, reason);
-    this.#claimedIdentitylessEvidenceByChatId.delete(chatId);
+    this.#nativeUserIdentities.clearChat(chatId);
   }
 
   discardChat(chatId: string): number {
-    const discarded = this.store.discardChat(chatId);
-    this.#claimedIdentitylessEvidenceByChatId.delete(chatId);
-    return discarded;
+    return this.store.discardChat(chatId);
   }
 
   discard(chatId: string, clientRequestId: string): boolean {
@@ -127,6 +163,14 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
     return this.store.updateDeliveryStatus(chatId, clientRequestId, 'unconfirmed');
   }
 
+  bindNativeUserPosition(
+    chatId: string,
+    clientRequestId: string,
+    position: PendingNativeUserPosition,
+  ): boolean {
+    return this.store.bindNativeUserPosition(chatId, clientRequestId, position);
+  }
+
   async register(chatId: string, content: string, options: RegisterPendingUserInputOptions = {}): Promise<PendingUserInput> {
     await this.reconcileRetainedHistory(chatId);
     const input: PendingUserInput = {
@@ -139,9 +183,7 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
       ...(options.turnId ? { turnId: options.turnId } : {}),
       ...(options.images ? { images: options.images } : {}),
     };
-    const registered = this.store.upsert(input);
-    this.#pruneIdentitylessEvidence(chatId);
-    return registered;
+    return this.store.upsert(input);
   }
 
   captureCohort(chatId: string): PendingUserInputCohort {
@@ -158,6 +200,7 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
       chatId,
       records,
       nativeUserMessages(this.#messages.getRetainedHistoryMessages(chatId)),
+      this.#messages.hasCompleteHistory?.(chatId) === true,
     );
   }
 
@@ -201,6 +244,7 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
         chatId,
         this.#currentCohortRecords(cohort),
         nativeUserMessages(this.#messages.getRetainedHistoryMessages(chatId)),
+        this.#messages.hasCompleteHistory?.(chatId) === true,
       );
     }
   }
@@ -210,7 +254,7 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
       const cohort = this.captureCohort(chatId);
       const records = this.#currentCohortRecords(cohort);
       if (records.length === 0) return;
-      await this.#scanNativeEvidence(cohort, true);
+      await this.#scanNativeEvidence(cohort);
     });
   }
 
@@ -220,12 +264,13 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
       if (records.length === 0) return;
 
       try {
-        const nativeMessages = await this.#scanNativeEvidence(cohort, false);
-        this.#settleCohort(cohort, nativeMessages);
+        const nativeMessages = await this.#scanNativeEvidence(cohort);
+        this.#settleCohort(cohort, nativeMessages, true);
       } catch {
         this.#settleCohort(
           cohort,
           nativeUserMessages(this.#messages.getRetainedHistoryMessages(cohort.chatId)),
+          this.#messages.hasCompleteHistory?.(cohort.chatId) === true,
         );
       }
     });
@@ -235,22 +280,22 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
     this.#settleCohort(
       cohort,
       nativeUserMessages(this.#messages.getRetainedHistoryMessages(cohort.chatId)),
+      this.#messages.hasCompleteHistory?.(cohort.chatId) === true,
     );
   }
 
   async #scanNativeEvidence(
     cohort: PendingUserInputCohort,
-    allowIdentityless: boolean,
   ): Promise<UserMessage[]> {
     return scanCurrentNativeUserEvidence({
       chatId: cohort.chatId,
       reader: this.#messages,
       shouldContinue: () => this.#currentCohortRecords(cohort).length > 0,
-      acceptEvidence: (messages) => this.#clearMatches(
+      acceptEvidence: (messages, includesNativeStart) => this.#clearMatches(
         cohort.chatId,
         this.#currentCohortRecords(cohort),
         messages,
-        allowIdentityless,
+        includesNativeStart,
       ),
     });
   }
@@ -265,12 +310,16 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
     return cohort.records.filter((record) => this.store.isCurrentRecord(cohort.chatId, record));
   }
 
-  #settleCohort(cohort: PendingUserInputCohort, messages: UserMessage[]): void {
+  #settleCohort(
+    cohort: PendingUserInputCohort,
+    messages: UserMessage[],
+    includesNativeStart: boolean,
+  ): void {
     this.#clearMatches(
       cohort.chatId,
       this.#currentCohortRecords(cohort),
       messages,
-      false,
+      includesNativeStart,
     );
     for (const record of this.#currentCohortRecords(cohort)) {
       if (record.deliveryStatus === 'failed') continue;
@@ -288,45 +337,31 @@ export class PendingUserInputService implements PendingUserInputServiceContract 
     chatId: string,
     records: PendingUserInputRecord[],
     messages: UserMessage[],
-    allowIdentityless = true,
+    includesNativeStart: boolean,
   ): void {
-    const claimedEvidence = this.#claimedIdentitylessEvidenceByChatId.get(chatId) ?? new Map();
-    const matches = matchingRequestIds(records, messages, claimedEvidence, allowIdentityless);
-    if (matches.identitylessRequestIds.size > 0) {
-      logger.debug('identityless pending input echoes matched', {
+    const exactRequestIds = matchingRequestIds(records, messages);
+    for (const [recordIndex, record] of records.entries()) {
+      const position = positionAfterOmittedFailedPredecessors(
+        record,
+        records.slice(0, recordIndex),
+        exactRequestIds,
+      );
+      if (!position) continue;
+      this.#nativeUserIdentities.bindPosition({
         chatId,
-        count: matches.identitylessRequestIds.size,
+        messages,
+        position,
+        includesNativeStart,
+        identity: {
+          clientRequestId: record.clientRequestId,
+          ...(record.clientMessageId ? { clientMessageId: record.clientMessageId } : {}),
+          ...(record.turnId ? { turnId: record.turnId } : {}),
+        },
       });
     }
-    for (const [key, evidence] of matches.identitylessEvidence) {
-      const prior = claimedEvidence.get(key);
-      claimedEvidence.set(key, {
-        count: Math.max(prior?.count ?? 0, evidence.count),
-        messageAt: evidence.messageAt,
-      });
-    }
-    if (claimedEvidence.size > 0) {
-      this.#claimedIdentitylessEvidenceByChatId.set(chatId, claimedEvidence);
-    }
-    for (const clientRequestId of matches.requestIds) {
+    const identifiedMessages = this.#nativeUserIdentities.apply(chatId, messages);
+    for (const clientRequestId of matchingRequestIds(records, identifiedMessages)) {
       this.store.clear(chatId, clientRequestId, 'persisted');
     }
   }
-
-  #pruneIdentitylessEvidence(chatId: string): void {
-    const claims = this.#claimedIdentitylessEvidenceByChatId.get(chatId);
-    if (!claims || claims.size === 0) return;
-    const earliestPendingAt = this.store
-      .listRecordsForChat(chatId)
-      .map((record) => Date.parse(record.createdAt))
-      .filter(Number.isFinite)
-      .reduce((earliest, createdAt) => Math.min(earliest, createdAt), Number.POSITIVE_INFINITY);
-    if (!Number.isFinite(earliestPendingAt)) return;
-    const oldestRelevantEvidenceAt = earliestPendingAt;
-    for (const [key, claim] of claims) {
-      if (claim.messageAt < oldestRelevantEvidenceAt) claims.delete(key);
-    }
-    if (claims.size === 0) this.#claimedIdentitylessEvidenceByChatId.delete(chatId);
-  }
-
 }

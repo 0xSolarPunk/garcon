@@ -195,7 +195,12 @@
 			applyVisiblePreviewMessages?.(chatId, generationId, messages, lastSeq),
 		markBackgroundStale: (chatId) => transcriptCache.markStale(chatId),
 		onBackgroundMessages: (chatId, generationId, messages, lastSeq) => {
-			const applied = transcriptCache.applyMessages(chatId, generationId, messages, lastSeq);
+			const applied = transcriptCache.applyBackgroundMessages(
+				chatId,
+				generationId,
+				messages,
+				lastSeq,
+			);
 			if (applied.status !== 'applied') return false;
 			const preview = selectPreviewFromBatch(messages.map((entry) => entry.message));
 			if (preview) sessions.patchPreview(chatId, preview.content, preview.timestamp);
@@ -347,6 +352,7 @@
 		chatState,
 		sessions,
 	});
+	onDestroy(() => scroll.destroy());
 	function scrollToBottomAndFill(): void {
 		void scroll.scrollToLatest().then(() => scroll.fillUnderfilledViewport());
 	}
@@ -647,7 +653,8 @@
 			<ConversationFeed
 				bind:scrollContainer
 				onscroll={() => scroll.handleScroll()}
-				onUserScrollIntent={(direction) => scroll.noteUserScrollIntent(direction)}
+				onUserScrollIntent={(direction, source) =>
+					scroll.noteUserScrollIntent(direction, source)}
 				onLoadEarlier={() => void scroll.requestPage('earlier', 'button')}
 				onLoadLater={() => void scroll.requestPage('later', 'button')}
 				onPermissionDecision={(id, d) => controller.handlePermissionDecision(id, d)}

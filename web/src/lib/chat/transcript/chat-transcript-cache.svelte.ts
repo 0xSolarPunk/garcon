@@ -1,5 +1,10 @@
 import { SvelteMap } from 'svelte/reactivity';
-import { applyChatViewMessages, type ChatViewMessage, type ChatViewPage } from '$shared/chat-view';
+import {
+	applyChatViewMessages,
+	isContiguousChatViewWindow,
+	type ChatViewMessage,
+	type ChatViewPage,
+} from '$shared/chat-view';
 import {
 	LocalChatTranscriptStorage,
 	type CachedChatCursor,
@@ -174,14 +179,16 @@ export class ChatTranscriptCache {
 		page: ChatViewPage,
 		options: { stale?: boolean } = {},
 	): ChatTranscriptSnapshot {
-		const windowed = page.messages.slice(-this.#limit);
+		if (!isContiguousChatViewWindow(page)) {
+			throw new Error('Cannot cache a non-contiguous transcript window');
+		}
 		const now = nowIso();
 		const entry: ChatTranscriptEntry = {
 			chatId,
 			generationId: page.generationId,
-			messages: windowed,
+			messages: page.messages,
 			lastSeq: page.lastSeq,
-			oldestSeq: windowed[0]?.seq ?? 0,
+			oldestSeq: page.messages[0]?.seq ?? 0,
 			stale: options.stale ?? false,
 			lastAccessedAt: now,
 			lastValidatedAt: now,
@@ -203,7 +210,7 @@ export class ChatTranscriptCache {
 			messages,
 			lastSeq,
 			pageOldestSeq: messages[0]?.seq ?? 0,
-			hasMore: false,
+			hasMore: (messages[0]?.seq ?? 1) > 1,
 		});
 	}
 
@@ -243,18 +250,39 @@ export class ChatTranscriptCache {
 			return { status: 'applied', changed: false, lastSeq: entry.lastSeq };
 		}
 
-		const windowed = applied.messages.slice(-this.#limit);
 		const next: ChatTranscriptEntry = {
 			...entry,
-			messages: windowed,
+			messages: applied.messages,
 			lastSeq: applied.lastSeq,
-			oldestSeq: windowed[0]?.seq ?? 0,
+			oldestSeq: applied.messages[0]?.seq ?? 0,
 			stale: false,
 			lastAccessedAt: nowIso(),
 		};
 		this.#entries.set(chatId, next);
 		this.#persistence.schedule(next);
 		return { status: 'applied', changed: true, lastSeq: next.lastSeq };
+	}
+
+	applyBackgroundMessages(
+		chatId: string,
+		generationId: string,
+		messages: ChatViewMessage[],
+		serverLastSeq?: number,
+	): ChatTranscriptApplyResult {
+		const result = this.applyMessages(chatId, generationId, messages, serverLastSeq);
+		if (result.status !== 'applied') return result;
+		const entry = this.#entries.get(chatId);
+		if (!entry || entry.messages.length <= this.#limit) return result;
+
+		const boundedMessages = entry.messages.slice(-this.#limit);
+		const boundedEntry: ChatTranscriptEntry = {
+			...entry,
+			messages: boundedMessages,
+			oldestSeq: boundedMessages[0]?.seq ?? 0,
+		};
+		this.#entries.set(chatId, boundedEntry);
+		this.#persistence.schedule(boundedEntry);
+		return result;
 	}
 
 	markStale(chatId: string): void {
@@ -330,14 +358,13 @@ export class ChatTranscriptCache {
 			this.markStale(chatId);
 			return { status: 'server-ahead', lastSeq: applied.lastSeq, serverLastSeq };
 		}
-		const windowed = applied.messages.slice(-this.#limit);
 		const now = nowIso();
 		const entry: ChatTranscriptEntry = {
 			chatId,
 			generationId,
-			messages: windowed,
+			messages: applied.messages,
 			lastSeq: applied.lastSeq,
-			oldestSeq: windowed[0]?.seq ?? 0,
+			oldestSeq: applied.messages[0]?.seq ?? 0,
 			stale: false,
 			lastAccessedAt: now,
 			lastValidatedAt: now,
