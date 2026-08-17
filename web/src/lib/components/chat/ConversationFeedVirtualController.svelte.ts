@@ -467,11 +467,8 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 			this.options.onInitialEndRestored?.();
 			return this.#earlierPrependAnchor.blocksViewportMutation(source);
 		}
-		const shouldSupersedeCore = this.#programmaticScroll.ownsPosition;
 		this.cancelPendingLayoutMutation();
-		if (shouldSupersedeCore && viewport && this.isReady()) {
-			this.#instance().scrollToOffset(viewport.scrollTop, { behavior: 'auto' });
-		}
+		this.#instance().cancelScroll();
 		this.options.onInitialEndRestored?.();
 		return false;
 	}

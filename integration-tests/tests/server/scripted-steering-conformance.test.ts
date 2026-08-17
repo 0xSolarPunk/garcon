@@ -1,12 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import type {
-  AgentRunCommandRequest,
-  StartChatCommandRequest,
-} from '../../../common/chat-command-contracts.js';
-import type {
-  ChatSessionStoppedMessage,
-  PendingUserInputUpdatedMessage,
-} from '../../../common/ws-events.js';
+import type { AgentRunCommandRequest, StartChatCommandRequest } from '../../../common/chat-command-contracts.js';
+import type { ChatSessionStoppedMessage } from '../../../common/ws-events.js';
 import { assistantContents, userContents } from '../../support/chat-assertions.js';
 import { claudeText } from '../../support/fake-claude-model.js';
 import { chatCompletionsText } from '../../support/fake-chat-completions-model.js';
@@ -38,7 +32,9 @@ import {
 } from '../../support/scripted-opencode.js';
 
 interface HeldModelTurn {
-  readonly requested: Promise<unknown>;
+  readonly requested: Promise<{
+    readonly userTexts: readonly string[];
+  }>;
   release(): void;
 }
 
@@ -59,7 +55,7 @@ interface SteeringContractDriver {
     projectPath: string;
     command: string;
   }): StartChatCommandRequest;
-  runRequest(input: { chatId: string; command: string }): AgentRunCommandRequest;
+  runRequest(input: { chatId: string; command: string }): Omit<AgentRunCommandRequest, 'transcriptViewId'>;
   holdReply(reply: string): HeldModelTurn;
   scriptReply(reply: string): void;
   markRequests(): number;
@@ -159,21 +155,21 @@ function defineSteeringConformance(
 
           const futureCursor = fixture.client.markEvents();
           await fixture.client.resumeQueue(chatId, stillPaused.queue.pause!.id);
-          const futureInput = await fixture.client.waitForEvent(
-            (event): event is PendingUserInputUpdatedMessage =>
-              event.type === 'pending-user-input-updated'
-              && event.input.chatId === chatId
-              && event.input.content === futurePrompt
-              && typeof event.input.turnId === 'string',
-            `${providerName} future queued turn identity`,
+          const futureInput = await fixture.client.waitForCommittedUserInput(
+            chatId,
+            futurePrompt,
             { afterIndex: futureCursor, timeoutMs: LIVE_TURN_TIMEOUT_MS },
           );
-          expect(futureInput.input.turnId).not.toBe(active.turnId);
-          expectFinished((await fixture.client.waitForTurnTerminal(
+          const futureTerminal = await fixture.client.waitForTurnTerminal(
             chatId,
-            futureInput.input.turnId,
-            { afterIndex: futureCursor, timeoutMs: LIVE_TURN_TIMEOUT_MS },
-          )).type);
+            undefined,
+            {
+              afterIndex: fixture.client.events().lastIndexOf(futureInput) + 1,
+              timeoutMs: LIVE_TURN_TIMEOUT_MS,
+            },
+          );
+          expect(futureTerminal.turnId).not.toBe(active.turnId);
+          expectFinished(futureTerminal.type);
 
           const transcript = await fixture.client.getMessages(chatId);
           expect(userContents(transcript.messages)).toEqual([
@@ -198,16 +194,20 @@ function defineSteeringConformance(
       }
     }, 120_000);
 
-    test('does not execute accepted guidance after stop', async () => {
+    test('keeps accepted guidance durable across best-effort stop', async () => {
       if (!environment) throw new Error(`${providerName} environment was not initialized.`);
       const { driver } = environment;
       const firstPrompt = marker(driver.id, 'STOP_FIRST_PROMPT');
       const steerPrompt = marker(driver.id, 'STOP_STEER_PROMPT');
       const cancelledReply = marker(driver.id, 'STOP_CANCELLED_REPLY');
+      const lateSteerReply = marker(driver.id, 'STOP_LATE_STEER_REPLY');
       const recoveryPrompt = marker(driver.id, 'STOP_RECOVERY_PROMPT');
       const recoveryReply = marker(driver.id, 'STOP_RECOVERY_REPLY');
       const requestCursor = driver.markRequests();
       const held = driver.holdReply(cancelledReply);
+      const lateSteerHeld = driver.emitsTurnTerminalOnStop === false
+        ? driver.holdReply(lateSteerReply)
+        : undefined;
 
       try {
         await withIntegrationFixture(`${driver.id}-scripted-steering-stop`, async (fixture) => {
@@ -226,6 +226,11 @@ function defineSteeringConformance(
             chatId,
             content: steerPrompt,
           })).toMatchObject({ status: 'accepted', turnId: active.turnId });
+          if (lateSteerHeld) {
+            held.release();
+            const lateSteerRequest = await lateSteerHeld.requested;
+            expect(lateSteerRequest.userTexts).toEqual([firstPrompt, steerPrompt]);
+          }
 
           const stopCursor = fixture.client.markEvents();
           expect(await fixture.client.stopChat({
@@ -258,6 +263,7 @@ function defineSteeringConformance(
           }
 
           held.release();
+          lateSteerHeld?.release();
           driver.scriptReply(recoveryReply);
           const recoveryCursor = fixture.client.markEvents();
           const recovery = await fixture.client.runChat(driver.runRequest({
@@ -273,9 +279,10 @@ function defineSteeringConformance(
           });
 
           const sampledUserText = driver.userTextsSince(requestCursor).join('\n');
-          expect(sampledUserText).not.toContain(steerPrompt);
+          expect(sampledUserText).toContain(steerPrompt);
+          expect(sampledUserText).toContain(recoveryPrompt);
           expect(assistantContents((await fixture.client.getMessages(chatId)).messages).join('\n'))
-            .not.toContain(cancelledReply);
+            .toContain(recoveryReply);
           driver.assertSettled();
         }, {
           serverEnvironment: driver.serverEnvironment,
@@ -286,6 +293,7 @@ function defineSteeringConformance(
         });
       } finally {
         held.release();
+        lateSteerHeld?.release();
         driver.reset();
       }
     }, 120_000);

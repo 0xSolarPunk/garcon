@@ -30,17 +30,6 @@ function expectSuccessfulTurnContract(
     chatId: input.chatId,
   }));
   expect(events).toContainEqual(expect.objectContaining({
-    type: 'pending-user-input-updated',
-    input: expect.objectContaining({
-      chatId: input.chatId,
-      content: input.content,
-      clientRequestId: input.clientRequestId,
-      clientMessageId: input.clientMessageId,
-      turnId: input.turnId,
-      deliveryStatus: 'accepted',
-    }),
-  }));
-  expect(events).toContainEqual(expect.objectContaining({
     type: 'chat-processing-updated',
     chatId: input.chatId,
     phase: 'running',
@@ -52,40 +41,35 @@ function expectSuccessfulTurnContract(
     && event.messages.some((entry) =>
       entry.message.type === 'user-message' && entry.message.content === input.content));
   expect(userEvent).toMatchObject({
-    clientRequestId: input.clientRequestId,
-    turnId: input.turnId,
+    clientRequestId: undefined,
+    turnId: undefined,
   });
   const user = userEvent?.messages.find((entry) =>
     entry.message.type === 'user-message' && entry.message.content === input.content);
   expect(user?.message).toMatchObject({
     metadata: {
-      clientRequestId: input.clientRequestId,
-      turnId: input.turnId,
-      deliveryStatus: 'accepted',
+      clientMessageId: input.clientMessageId,
     },
   });
+  expect(user?.message.type === 'user-message'
+    ? user.message.metadata?.clientRequestId
+    : undefined).toBeUndefined();
+  expect(user?.message.type === 'user-message'
+    ? user.message.metadata?.turnId
+    : undefined).toBeUndefined();
 
   const assistantIndex = events.findIndex((event) =>
     event.type === 'chat-messages'
     && event.chatId === input.chatId
-    && event.clientRequestId === input.clientRequestId
-    && event.turnId === input.turnId
     && event.messages.some((entry) =>
       entry.message.type === 'assistant-message' && entry.message.content === input.assistantContent));
-  const clearedIndex = events.findIndex((event) =>
-    event.type === 'pending-user-input-cleared'
-    && event.chatId === input.chatId
-    && event.clientRequestId === input.clientRequestId
-    && event.reason === 'persisted');
   const terminalIndex = events.findIndex((event) =>
     event.type === 'agent-run-finished'
     && event.chatId === input.chatId
     && event.clientRequestId === input.clientRequestId
     && event.turnId === input.turnId);
   expect(assistantIndex).toBeGreaterThanOrEqual(0);
-  expect(clearedIndex).toBeGreaterThanOrEqual(0);
   expect(terminalIndex).toBeGreaterThan(assistantIndex);
-  expect(terminalIndex).toBeGreaterThan(clearedIndex);
 }
 
 describe('chat lifecycle', () => {
@@ -140,12 +124,8 @@ describe('chat lifecycle', () => {
       expect(userContents(transcript.messages)).toEqual(['hello-integration']);
       expect(assistantContents(transcript.messages)).toEqual(['echo:hello-integration']);
       expect(countUserContent(transcript.messages, 'hello-integration')).toBe(1);
-      expect(userMessages(transcript.messages)[0].metadata?.deliveryStatus).not.toBe('failed');
-      expect(userMessages(transcript.messages)[0].metadata).toMatchObject({
-        clientRequestId,
-        turnId: accepted.turnId,
-      });
-      expect(transcript.pendingUserInputs).toEqual([]);
+      expect(userMessages(transcript.messages)[0].metadata).toEqual({ clientMessageId });
+      expect(transcript.resendCandidates).toEqual([]);
       expect(fixture.fakeProviders.openAi.requests()).toHaveLength(1);
     });
   });
@@ -284,7 +264,185 @@ describe('chat lifecycle', () => {
     });
   });
 
-  test('rejects a concurrent direct turn before mutating pending or transcript state', async () => {
+  test('does not dispatch a second command that reuses a committed client message identity', async () => {
+    await withIntegrationFixture('message-idempotency-across-commands', async (fixture) => {
+      const chatId = fixture.newChatId();
+      const clientMessageId = crypto.randomUUID();
+      const first = await fixture.client.startDirectChat({
+        chatId,
+        content: 'message-identity-once',
+        projectPath: fixture.dirs.project,
+        agent: fixture.directAgents.openAi,
+        clientMessageId,
+      });
+      await fixture.client.waitForTurnTerminal(chatId, first.turnId);
+      const beforeDuplicate = await fixture.client.getMessages(chatId);
+
+      await fixture.client.runDirectChat({
+        chatId,
+        content: 'message-identity-once',
+        agent: fixture.directAgents.openAi,
+        clientRequestId: crypto.randomUUID(),
+        clientMessageId,
+      });
+      await fixture.client.ping();
+
+      expect(fixture.fakeProviders.openAi.requests()).toHaveLength(1);
+      expect(await fixture.client.getMessages(chatId)).toEqual(beforeDuplicate);
+
+      const fresh = await fixture.client.runDirectChat({
+        chatId,
+        content: 'message-identity-fresh',
+        agent: fixture.directAgents.openAi,
+      });
+      await fixture.client.waitForTurnTerminal(chatId, fresh.turnId);
+
+      expect(fixture.fakeProviders.openAi.requests()).toHaveLength(2);
+      expect(fixture.fakeProviders.openAi.requests().at(-1)?.body.messages).toEqual([
+        { role: 'user', content: 'message-identity-once' },
+        { role: 'assistant', content: 'echo:message-identity-once' },
+        { role: 'user', content: 'message-identity-fresh' },
+      ]);
+      const transcript = await fixture.client.getMessages(chatId);
+      expect(userContents(transcript.messages)).toEqual([
+        'message-identity-once',
+        'message-identity-fresh',
+      ]);
+      expect(assistantContents(transcript.messages)).toEqual([
+        'echo:message-identity-once',
+        'echo:message-identity-fresh',
+      ]);
+    });
+  });
+
+  test('uses client message identity rather than content equality for duplicate submission', async () => {
+    await withIntegrationFixture('message-idempotency-not-content', async (fixture) => {
+      const chatId = fixture.newChatId();
+      const firstMessageId = crypto.randomUUID();
+      const secondMessageId = crypto.randomUUID();
+      const repeatedContent = 'equal-content-distinct-occurrences';
+      const first = await fixture.client.startDirectChat({
+        chatId,
+        content: repeatedContent,
+        projectPath: fixture.dirs.project,
+        agent: fixture.directAgents.openAi,
+        clientMessageId: firstMessageId,
+      });
+      await fixture.client.waitForTurnTerminal(chatId, first.turnId);
+
+      let conflictingReuse: unknown;
+      try {
+        await fixture.client.runDirectChat({
+          chatId,
+          content: 'different-content-with-reused-identity',
+          agent: fixture.directAgents.openAi,
+          clientRequestId: crypto.randomUUID(),
+          clientMessageId: firstMessageId,
+        });
+      } catch (error) {
+        conflictingReuse = error;
+      }
+      expect(conflictingReuse).toBeInstanceOf(GarconApiError);
+      expect((conflictingReuse as GarconApiError).body).toMatchObject({
+        errorCode: 'IDEMPOTENCY_CONFLICT',
+      });
+      await fixture.client.ping();
+
+      const second = await fixture.client.runDirectChat({
+        chatId,
+        content: repeatedContent,
+        agent: fixture.directAgents.openAi,
+        clientMessageId: secondMessageId,
+      });
+      await fixture.client.waitForTurnTerminal(chatId, second.turnId);
+
+      expect(fixture.fakeProviders.openAi.requests()).toHaveLength(2);
+      const transcript = await fixture.client.getMessages(chatId);
+      const userRows = transcript.messages.filter((entry) => entry.message.type === 'user-message');
+      expect(userRows.map((entry) => ({
+        ordinal: entry.ordinal,
+        content: entry.message.type === 'user-message' ? entry.message.content : null,
+        clientMessageId: entry.message.type === 'user-message'
+          ? entry.message.metadata?.clientMessageId
+          : null,
+      }))).toEqual([
+        {
+          ordinal: expect.any(Number),
+          content: repeatedContent,
+          clientMessageId: firstMessageId,
+        },
+        {
+          ordinal: expect.any(Number),
+          content: repeatedContent,
+          clientMessageId: secondMessageId,
+        },
+      ]);
+      expect(userRows[1]!.ordinal).toBeGreaterThan(userRows[0]!.ordinal);
+      expect(JSON.stringify(transcript.messages)).not.toContain('different-content-with-reused-identity');
+    });
+  }, 15_000);
+
+  test('qualifies committed submission identity by exact attachment content', async () => {
+    await withIntegrationFixture('message-idempotency-attachments', async (fixture) => {
+      const chatId = fixture.newChatId();
+      const clientMessageId = crypto.randomUUID();
+      const image = {
+        data: 'data:image/png;base64,YQ==',
+        name: 'diagram.png',
+        mimeType: 'image/png',
+      };
+      const firstRequest = {
+        ...fixture.client.directStartRequest({
+          chatId,
+          content: 'same-text-with-attachment',
+          projectPath: fixture.dirs.project,
+          agent: fixture.directAgents.anthropic,
+          clientMessageId,
+        }),
+        images: [image],
+      };
+      const first = await fixture.client.startChat(firstRequest);
+      await fixture.client.waitForTurnTerminal(chatId, first.turnId);
+      const beforeRetry = await fixture.client.getMessages(chatId);
+      const requestCount = fixture.fakeProviders.anthropic.requests().length;
+
+      await fixture.client.runChat({
+        ...fixture.client.directRunRequest({
+          chatId,
+          content: 'same-text-with-attachment',
+          agent: fixture.directAgents.anthropic,
+          clientRequestId: crypto.randomUUID(),
+          clientMessageId,
+        }),
+        images: [{
+          mimeType: image.mimeType,
+          data: image.data,
+          name: image.name,
+        }],
+      });
+      await fixture.client.ping();
+      expect(await fixture.client.getMessages(chatId)).toEqual(beforeRetry);
+      expect(fixture.fakeProviders.anthropic.requests()).toHaveLength(requestCount);
+
+      await expect(fixture.client.runChat({
+        ...fixture.client.directRunRequest({
+          chatId,
+          content: 'same-text-with-attachment',
+          agent: fixture.directAgents.anthropic,
+          clientRequestId: crypto.randomUUID(),
+          clientMessageId,
+        }),
+        images: [{ ...image, data: 'data:image/png;base64,Yg==' }],
+      })).rejects.toMatchObject({
+        status: 409,
+        body: { errorCode: 'IDEMPOTENCY_CONFLICT' },
+      });
+      expect(await fixture.client.getMessages(chatId)).toEqual(beforeRetry);
+      expect(fixture.fakeProviders.anthropic.requests()).toHaveLength(requestCount);
+    });
+  });
+
+  test('rejects a concurrent direct turn before mutating transcript state', async () => {
     await withIntegrationFixture('same-chat-direct-admission', async (fixture) => {
       const chatId = fixture.newChatId();
       const held = fixture.fakeProviders.openAi.holdNext({ lastUserText: 'admission-first' });
@@ -320,9 +478,6 @@ describe('chat lifecycle', () => {
 
       const rejectedEvents = fixture.client.eventsSince(cursor);
       expect(rejectedEvents.some((event) =>
-        event.type === 'pending-user-input-updated'
-        && event.input.clientRequestId === rejectedRequestId)).toBe(false);
-      expect(rejectedEvents.some((event) =>
         event.type === 'chat-messages'
         && (
           event.clientRequestId === rejectedRequestId
@@ -332,7 +487,7 @@ describe('chat lifecycle', () => {
         ))).toBe(false);
       const whileHeld = await fixture.client.getMessages(chatId);
       expect(userContents(whileHeld.messages)).toEqual(['admission-first']);
-      expect(whileHeld.pendingUserInputs.map((input) => input.content)).toEqual(['admission-first']);
+      expect(whileHeld.resendCandidates).toEqual([]);
       expect(fixture.fakeProviders.openAi.requests()).toHaveLength(1);
 
       held.releaseEcho();
@@ -340,9 +495,6 @@ describe('chat lifecycle', () => {
         .toBe('agent-run-finished');
       await fixture.client.ping();
       const afterTerminal = fixture.client.eventsSince(cursor);
-      expect(afterTerminal.some((event) =>
-        event.type === 'pending-user-input-updated'
-        && event.input.clientRequestId === rejectedRequestId)).toBe(false);
       expect(afterTerminal.some((event) =>
         event.type === 'chat-messages'
         && (
@@ -352,8 +504,6 @@ describe('chat lifecycle', () => {
             && entry.message.content === 'admission-rejected')
         ))).toBe(false);
       const afterTerminalMessages = await fixture.client.getMessages(chatId);
-      expect(afterTerminalMessages.pendingUserInputs.some((input) =>
-        input.clientRequestId === rejectedRequestId)).toBe(false);
       expect(countUserContent(afterTerminalMessages.messages, 'admission-rejected')).toBe(0);
 
       const later = await fixture.client.runDirectChat({

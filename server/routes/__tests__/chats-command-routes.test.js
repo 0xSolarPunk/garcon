@@ -4,6 +4,7 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { AgentIntegrationError } from '@garcon/server-agent-interface';
 
 let testBasePath;
 let workspaceDir;
@@ -55,6 +56,7 @@ import {
   DomainError,
   QueueEntrySteerError,
   SteerDeliveryError,
+  TRANSCRIPT_TEMPORARILY_UNAVAILABLE_MESSAGE,
 } from '../../lib/domain-error.js';
 import {
   QueueEntryMutationError,
@@ -65,7 +67,6 @@ import {
   createRouteCommandLedger,
   createRouteCommandService,
   createRoutePathCache,
-  createRoutePendingInputs,
 } from './chat-routes-test-utils.js';
 
 const CHAT_ID = '1783725900000700';
@@ -155,6 +156,7 @@ function createRouteAgent(sessionOverrides = {}) {
     }),
     removeChat: mock((chatId) => sessions.delete(chatId)),
     listAllChats: mock(() => Object.fromEntries(sessions.entries())),
+    flush: mock(() => Promise.resolve(undefined)),
   };
   const settings = {
     getChatName: mock(() => null),
@@ -163,6 +165,7 @@ function createRouteAgent(sessionOverrides = {}) {
       normalIds.unshift(chatId);
       return Promise.resolve(undefined);
     }),
+    setSessionName: mock(() => Promise.resolve(undefined)),
     recordChatStartup: mock(() => Promise.resolve(undefined)),
     removeFromAllOrderLists: mock(() => Promise.resolve(undefined)),
     removeSessionName: mock(() => Promise.resolve(undefined)),
@@ -408,12 +411,13 @@ function createRouteAgent(sessionOverrides = {}) {
     getChatMetadata: mock(() => null),
   };
   const chatViews = {
-    getOrCreatePage: mock(() =>
+    page: mock(() =>
       Promise.resolve({
+        transcriptViewId: 'view-1',
         messages: [],
-        generationId: 'generation-1',
-        lastSeq: 0,
-        pageOldestSeq: 0,
+        lastOrdinal: 0,
+        pageOldestOrdinal: 0,
+        pageNewestOrdinal: 0,
         hasMore: false,
       }),
     ),
@@ -426,6 +430,7 @@ function createRouteAgent(sessionOverrides = {}) {
     supportsUpdateProjectPath: mock(() => true),
     supportsImages: mock(() => true),
     isAgentSessionRunning: mock(() => false),
+    currentTranscriptViewId: mock(() => Promise.resolve('view-current')),
     getRunningSessions: mock(() => ({ claude: [{ id: CHAT_ID }] })),
     startSession: mock(() => Promise.resolve(undefined)),
     modelSupportsImages: mock(() => Promise.resolve(true)),
@@ -442,10 +447,10 @@ function createRouteAgent(sessionOverrides = {}) {
     resolvePermission: mock(() => undefined),
     resolveNativeSession: mock((chat) => Promise.resolve(chat.nativeSession ?? null)),
     prepareProjectPathUpdate: mock(() => Promise.resolve(undefined)),
+    publishSessionFact: mock(() => undefined),
     updateSessionSettings: mock((chatId, patch) => Promise.resolve(registry.updateChat(chatId, patch))),
   };
   const commandLedger = createRouteCommandLedger('chats-command-routes');
-  const pendingInputs = createRoutePendingInputs();
   const chatListProjector = createRouteChatListProjector({
     registry,
     settings,
@@ -457,11 +462,11 @@ function createRouteAgent(sessionOverrides = {}) {
     registry,
     settings,
     queue,
+    processing: { phase: mock(() => null) },
     pathCache,
     metadata,
     chatViews,
     agents,
-    pendingInputs,
     chatListProjector,
     commandService: createRouteCommandService({
       registry,
@@ -470,7 +475,6 @@ function createRouteAgent(sessionOverrides = {}) {
       metadata,
       agents,
       commandLedger,
-      pendingInputs,
       pathCache,
       chatListProjector,
       forkChatFileCopy: async (args) => {
@@ -506,12 +510,26 @@ function createRouteAgent(sessionOverrides = {}) {
     metadata,
     chatViews,
     agents,
+    commandLedger,
     routes,
   };
 }
 
 async function callJson(handler, body, method = 'POST') {
-  parseJsonBody.mockResolvedValueOnce(body);
+  const inputBody = body && typeof body === 'object' && 'chatId' in body
+    ? {
+        ...body,
+        ...((('clientMessageId' in body) || ('content' in body))
+          && !('transcriptViewId' in body)
+          ? { transcriptViewId: 'view-current' }
+          : {}),
+        ...('content' in body && 'clientRequestId' in body && !('clientMessageId' in body)
+          ? { clientMessageId: `message-${body.clientRequestId}` }
+          : {}),
+      }
+    : body;
+  const requestBody = inputBody;
+  parseJsonBody.mockResolvedValueOnce(requestBody);
   const response = await handler(new Request('http://localhost/test', { method }));
   return { response, body: await response.json() };
 }
@@ -592,6 +610,45 @@ describe('REST chat command routes', () => {
     );
 
     resolveRun();
+  });
+
+  it('[TLV5-ADOPT.10-RUN-ROUTE-UNIT-01] maps retryable transcript adoption failure to the typed run response', async () => {
+    const agent = createRouteAgent();
+    agent.agents.currentTranscriptViewId.mockRejectedValueOnce(new AgentIntegrationError(
+      'TRANSCRIPT_UNAVAILABLE',
+      'Transcript adoption source failed',
+      true,
+      { provider: 'claude', phase: 'legacy-history-import' },
+    ));
+
+    const { response, body } = await callJson(
+      agent.routes['/api/v1/chats/run'].POST,
+      agentRunBody(),
+    );
+
+    expect(response.status).toBe(503);
+    expect(body).toEqual({
+      success: false,
+      error: TRANSCRIPT_TEMPORARILY_UNAVAILABLE_MESSAGE,
+      errorCode: 'TRANSCRIPT_UNAVAILABLE',
+      retryable: true,
+    });
+    expect(agent.queue.scheduleDirectInput).not.toHaveBeenCalled();
+    expect(agent.queue.reserveDirectTurn).not.toHaveBeenCalled();
+    expect(agent.queue.registerPendingUserInput).not.toHaveBeenCalled();
+    expect(agent.queue.runReservedTurn).not.toHaveBeenCalled();
+    expect(await agent.commandLedger.getRecord(`agent-run:${CHAT_ID}:req-run-1`)).toBeNull();
+
+    const retry = await callJson(
+      agent.routes['/api/v1/chats/run'].POST,
+      agentRunBody(),
+    );
+    expect(retry.response.status).toBe(202);
+    expect(retry.body).toMatchObject({ success: true, status: 'accepted' });
+    expect(agent.queue.scheduleDirectInput).toHaveBeenCalledTimes(1);
+    expect(agent.queue.reserveDirectTurn).toHaveBeenCalledTimes(1);
+    expect(agent.queue.registerPendingUserInput).toHaveBeenCalledTimes(1);
+    expect(agent.queue.runReservedTurn).toHaveBeenCalledTimes(1);
   });
 
   it('POST /run deduplicates same payload retries without re-running side effects', async () => {
@@ -743,7 +800,7 @@ describe('REST chat command routes', () => {
     );
   });
 
-  it('POST /fork-run rejects busy source sessions before copying', async () => {
+  it('POST /fork-run copies committed source rows while the source is running', async () => {
     const agent = createRouteAgent();
     agent.agents.isAgentSessionRunning.mockReturnValue(true);
 
@@ -757,10 +814,39 @@ describe('REST chat command routes', () => {
       }),
     });
 
-    expect(response.status).toBe(409);
-    expect(body.errorCode).toBe('SESSION_BUSY');
-    expect(forkChatFileCopy).not.toHaveBeenCalled();
-    expect(agent.queue.registerPendingUserInput).not.toHaveBeenCalled();
+    expect(response.status).toBe(202);
+    expect(body.chatId).toBe(TARGET_CHAT_ID);
+    expect(forkChatFileCopy).toHaveBeenCalledOnce();
+    expect(agent.queue.registerPendingUserInput).toHaveBeenCalledOnce();
+  });
+
+  it('POST /fork-run carries handoff-fork consent and rejects a non-boolean', async () => {
+    const agent = createRouteAgent();
+    const request = agentRunBody({
+      clientRequestId: 'req-fork-run-consent',
+      clientMessageId: 'msg-fork-run-consent',
+      sourceChatId: CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      command: 'continue',
+    });
+
+    const accepted = await callJson(agent.routes['/api/v1/chats/fork-run'].POST, {
+      ...request,
+      allowHandoffFork: true,
+    });
+
+    expect(accepted.response.status).toBe(202);
+    expect(forkChatFileCopy).toHaveBeenCalledWith(
+      expect.objectContaining({ allowHandoffFork: true }),
+    );
+
+    const rejected = await callJson(agent.routes['/api/v1/chats/fork-run'].POST, {
+      ...request,
+      allowHandoffFork: 'yes',
+    });
+
+    expect(rejected.response.status).toBe(400);
+    expect(rejected.body).toMatchObject({ error: 'allowHandoffFork must be a boolean' });
   });
 
   it('POST /fork preserves retryable transcript-persistence refusals', async () => {
@@ -784,6 +870,28 @@ describe('REST chat command routes', () => {
       errorCode: 'TRANSCRIPT_NOT_YET_PERSISTED',
       retryable: true,
     });
+  });
+
+  it('POST /fork carries handoff-fork consent and rejects a non-boolean', async () => {
+    const agent = createRouteAgent();
+
+    const accepted = await callJson(agent.routes['/api/v1/chats/fork'].POST, {
+      sourceChatId: CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      allowHandoffFork: true,
+    });
+
+    expect(accepted.response.status).toBe(200);
+    expect(forkChatFileCopy.mock.calls.at(-1)[0]).toMatchObject({ allowHandoffFork: true });
+
+    const rejected = await callJson(agent.routes['/api/v1/chats/fork'].POST, {
+      sourceChatId: CHAT_ID,
+      chatId: TARGET_CHAT_ID,
+      allowHandoffFork: 'yes',
+    });
+
+    expect(rejected.response.status).toBe(400);
+    expect(rejected.body).toMatchObject({ error: 'allowHandoffFork must be a boolean' });
   });
 
   it('POST /queue/entries creates, deduplicates, and preserves queue state', async () => {
@@ -925,9 +1033,15 @@ describe('REST chat command routes', () => {
   it('PUT /queue/entries/move rejects a source that started processing', async () => {
     const agent = createRouteAgent();
     const currentQueue = storedQueue([
-      queueEntry('entry-3', 'processing', 'sending'),
       queueEntry('entry-1'),
-    ], { version: 5 });
+    ], {
+      version: 5,
+      recentlyDispatched: [{
+        entryId: 'entry-3',
+        revision: 1,
+        dispatchedAt: '2026-08-02T00:00:01.000Z',
+      }],
+    });
     agent.queue.moveChatQueueEntry.mockRejectedValueOnce(
       new QueueEntryMutationError(
         'QUEUE_ENTRY_ALREADY_SENT',
@@ -953,7 +1067,9 @@ describe('REST chat command routes', () => {
 
     expect(result.response.status).toBe(409);
     expect(result.body.errorCode).toBe('QUEUE_ENTRY_ALREADY_SENT');
-    expect(result.body.control.queue.dispatchingEntryId).toBe('entry-3');
+    expect(result.body.control.queue.recentlyDispatched).toContainEqual(
+      expect.objectContaining({ entryId: 'entry-3' }),
+    );
   });
 
   it('POST /goal-control preserves immediate goal delivery', async () => {
@@ -998,7 +1114,13 @@ describe('REST chat command routes', () => {
   it('POST /queue/entries/steer consumes the authoritative queue head idempotently', async () => {
     const agent = createRouteAgent();
     const queued = storedQueue([
-      queueEntry('entry-head', 'authoritative guidance', 'queued', 3),
+      {
+        ...queueEntry('entry-head', 'authoritative guidance', 'queued', 3),
+        submission: {
+          clientMessageId: 'message-queue-steer',
+          transcriptViewId: 'view-current',
+        },
+      },
     ], { reorderRevision: 7, version: 4 });
     const consumed = storedQueue([], {
       reorderRevision: 7,
@@ -1315,10 +1437,16 @@ describe('REST chat command routes', () => {
     const decision = {
       clientRequestId: 'req-permission-1',
       chatId: CHAT_ID,
-      permissionRequestId: 'perm-1',
+      permissionOccurrenceId: 'incarnation-1',
       allow: true,
       alwaysAllow: false,
       response: { outcome: { outcome: 'accepted' } },
+      control: {
+        serverInstanceId: 'server-instance-test',
+        chatId: CHAT_ID,
+        runId: 'run-1',
+        permissionOccurrenceId: 'incarnation-1',
+      },
     };
 
     const first = await callJson(handler, decision);
@@ -1330,11 +1458,11 @@ describe('REST chat command routes', () => {
     expect(conflict.response.status).toBe(409);
     expect(conflict.body.errorCode).toBe('IDEMPOTENCY_CONFLICT');
     expect(agent.agents.resolvePermission).toHaveBeenCalledTimes(1);
-    expect(agent.agents.resolvePermission).toHaveBeenCalledWith(CHAT_ID, 'perm-1', {
+    expect(agent.agents.resolvePermission).toHaveBeenCalledWith(CHAT_ID, 'incarnation-1', {
       allow: true,
       alwaysAllow: false,
       response: { outcome: { outcome: 'accepted' } },
-    });
+    }, decision.control);
   });
 
   it('POST /stop deduplicates pause-and-stop requests', async () => {

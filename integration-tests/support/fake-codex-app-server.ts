@@ -16,7 +16,22 @@ export {};
 
 const decoder = new TextDecoder();
 const startedThreads = new Map<string, string>();
+const routingControlDirectory = process.env.INTEGRATION_CODEX_ROUTING_CONTROL_DIR;
+const answeredApprovalControls = new Map<number, string>();
+const emittedApprovalControls = new Set<string>();
+const emittedMessageControls = new Set<string>();
+let processRole: 'started' | 'resumed' | null = null;
+let processThreadId: string | null = null;
+let processTurnId: string | null = null;
 let buffered = '';
+
+const routingControlPoll = routingControlDirectory
+  ? setInterval(() => {
+      publishControlledApprovals();
+      publishControlledMessages();
+    }, 10)
+  : null;
+routingControlPoll?.unref();
 
 for await (const chunk of Bun.stdin.stream()) {
   buffered += decoder.decode(chunk, { stream: true });
@@ -35,8 +50,14 @@ function respond(line: string): void {
     id?: number;
     method?: string;
     params?: Record<string, unknown>;
+    result?: unknown;
+    error?: unknown;
   };
   if (typeof request.id !== 'number') return;
+  if (!request.method && ('result' in request || 'error' in request)) {
+    recordApprovalResponse(request.id, request.result, request.error);
+    return;
+  }
   if (request.method === 'initialize') {
     write(request.id, {
       userAgent: 'integration-fake-codex',
@@ -64,6 +85,10 @@ function respond(line: string): void {
   }
   if (request.method === 'turn/start') {
     startTurn(request.id, request.params);
+    return;
+  }
+  if (request.method === 'turn/interrupt' && routingControlDirectory) {
+    write(request.id, {});
     return;
   }
   if (request.method === 'thread/list') {
@@ -186,6 +211,8 @@ function startThread(id: number, params: Record<string, unknown> | undefined): v
     { mode: 0o600 },
   );
   startedThreads.set(threadId, nativePath);
+  processRole = 'started';
+  processThreadId = threadId;
   write(id, {
     thread: { id: threadId, path: nativePath },
     model: typeof params?.model === 'string' ? params.model : 'gpt',
@@ -203,6 +230,8 @@ function resumeThread(id: number, params: Record<string, unknown> | undefined): 
     return;
   }
   startedThreads.set(threadId, nativePath);
+  processRole = 'resumed';
+  processThreadId = threadId;
   write(id, {
     thread: { id: threadId, path: nativePath },
     model: typeof params?.model === 'string' ? params.model : 'gpt',
@@ -271,6 +300,7 @@ function startTurn(id: number, params: Record<string, unknown> | undefined): voi
   );
 
   const turnId = randomUUID();
+  processTurnId = turnId;
   write(id, {
     turn: codexTurn(turnId, 'inProgress', timestamp),
   });
@@ -298,6 +328,10 @@ function startStreamingTurn(
   userContent: string,
 ): void {
   const timestamp = new Date().toISOString();
+  const turnId = randomUUID();
+  processTurnId = turnId;
+  const metadata = { turn_id: turnId };
+  const reasoningItemId = `${turnId}-reasoning`;
   appendFileSync(
     nativePath,
     [
@@ -306,8 +340,10 @@ function startStreamingTurn(
         type: 'response_item',
         payload: {
           type: 'message',
+          id: `${turnId}-user`,
           role: 'user',
           content: [{ type: 'input_text', text: userContent }],
+          internal_chat_message_metadata_passthrough: metadata,
         },
       }),
       JSON.stringify({
@@ -320,16 +356,27 @@ function startStreamingTurn(
         type: 'response_item',
         payload: {
           type: 'reasoning',
+          id: reasoningItemId,
           summary: [{ type: 'summary_text', text: `codex-reasoning-${userContent}` }],
+          internal_chat_message_metadata_passthrough: metadata,
         },
       }),
       '',
     ].join('\n'),
   );
 
-  const turnId = randomUUID();
   write(id, { turn: codexTurn(turnId, 'inProgress', timestamp) });
   notify('turn/started', { threadId, turn: codexTurn(turnId, 'inProgress', timestamp) });
+  notify('item/completed', {
+    threadId,
+    turnId,
+    item: {
+      type: 'reasoning',
+      id: reasoningItemId,
+      summary: [`codex-reasoning-${userContent}`],
+      content: [],
+    },
+  });
   streamedLiveAnswers(userContent).forEach((text, index) => {
     notify('item/completed', {
       threadId,
@@ -348,13 +395,15 @@ function startStreamingTurn(
     const completedAt = new Date().toISOString();
     appendFileSync(
       nativePath,
-      `${streamedLiveAnswers(userContent).map((text) => JSON.stringify({
+      `${streamedLiveAnswers(userContent).map((text, index) => JSON.stringify({
         timestamp: completedAt,
         type: 'response_item',
         payload: {
           type: 'message',
+          id: `${turnId}-live-${index}`,
           role: 'assistant',
           content: [{ type: 'output_text', text }],
+          internal_chat_message_metadata_passthrough: metadata,
         },
       })).join('\n')}\n`,
     );
@@ -509,4 +558,100 @@ function collectRolloutFiles(directory: string, files: Array<{ id: string; path:
   } catch {
     return;
   }
+}
+
+function publishControlledApprovals(): void {
+  if (!routingControlDirectory || !processRole || !processThreadId || !processTurnId) return;
+  let entries: string[];
+  try {
+    entries = readdirSync(routingControlDirectory);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith('.request.json') || emittedApprovalControls.has(entry)) continue;
+    try {
+      const control = JSON.parse(readFileSync(join(routingControlDirectory, entry), 'utf8')) as {
+        target?: unknown;
+        targetThreadId?: unknown;
+        requestId?: unknown;
+        command?: unknown;
+        method?: unknown;
+      };
+      if (control.target !== processRole) continue;
+      if (control.targetThreadId !== undefined && control.targetThreadId !== processThreadId) continue;
+      if (typeof control.requestId !== 'number' || !Number.isSafeInteger(control.requestId)) continue;
+      if (typeof control.command !== 'string' || !control.command) continue;
+      if (control.method !== undefined && (typeof control.method !== 'string' || !control.method)) continue;
+      emittedApprovalControls.add(entry);
+      answeredApprovalControls.set(control.requestId, entry);
+      notifyServerRequest(
+        control.requestId,
+        typeof control.method === 'string'
+          ? control.method
+          : 'item/commandExecution/requestApproval',
+        {
+          threadId: processThreadId,
+          turnId: processTurnId,
+          itemId: entry.slice(0, -'.request.json'.length),
+          command: control.command,
+        },
+      );
+      writeFileSync(join(routingControlDirectory, `${entry}.sent`), '');
+    } catch {
+      continue;
+    }
+  }
+}
+
+function publishControlledMessages(): void {
+  if (!routingControlDirectory || !processRole || !processThreadId || !processTurnId) return;
+  let entries: string[];
+  try {
+    entries = readdirSync(routingControlDirectory);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith('.message.json') || emittedMessageControls.has(entry)) continue;
+    try {
+      const control = JSON.parse(readFileSync(join(routingControlDirectory, entry), 'utf8')) as {
+        target?: unknown;
+        targetThreadId?: unknown;
+        content?: unknown;
+      };
+      if (control.target !== processRole) continue;
+      if (control.targetThreadId !== undefined && control.targetThreadId !== processThreadId) continue;
+      if (typeof control.content !== 'string' || !control.content) continue;
+      emittedMessageControls.add(entry);
+      notify('item/completed', {
+        threadId: processThreadId,
+        turnId: processTurnId,
+        item: {
+          type: 'agentMessage',
+          id: entry.slice(0, -'.message.json'.length),
+          text: control.content,
+          phase: null,
+          memoryCitation: null,
+        },
+      });
+      writeFileSync(join(routingControlDirectory, `${entry}.sent`), '');
+    } catch {
+      continue;
+    }
+  }
+}
+
+function notifyServerRequest(id: number, method: string, params: Record<string, unknown>): void {
+  process.stdout.write(`${JSON.stringify({ id, method, params })}\n`);
+}
+
+function recordApprovalResponse(id: number, result: unknown, error: unknown): void {
+  const control = answeredApprovalControls.get(id);
+  if (!routingControlDirectory || !control) return;
+  answeredApprovalControls.delete(id);
+  writeFileSync(
+    join(routingControlDirectory, `${control}.response.json`),
+    JSON.stringify({ result: result ?? null, error: error ?? null }),
+  );
 }

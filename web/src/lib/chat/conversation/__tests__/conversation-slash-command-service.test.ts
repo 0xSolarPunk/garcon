@@ -66,6 +66,7 @@ function createChat(overrides: Partial<ChatSessionRecord> = {}): ChatSessionReco
 		isProcessing: false,
 		processingPhase: null,
 		isUnread: false,
+		canReloadFromNativeHistory: false,
 		status: 'running',
 		tags: [],
 		...overrides,
@@ -95,11 +96,12 @@ function createServerEntry(id: string) {
 		isProcessing: false,
 		processingPhase: null,
 		isUnread: false,
+		canReloadFromNativeHistory: false,
 	};
 }
 
 function createDeps(chat = createChat()) {
-	const cursor = { generationId: 'generation-1', lastSeq: 9 };
+	const cursor = { transcriptViewId: 'view-1', lastOrdinal: 9 };
 	let inputText = 'original command';
 	let images: File[] = [];
 	let contentRevision = 0;
@@ -153,7 +155,7 @@ function createDeps(chat = createChat()) {
 		chatState: {
 			activeChatId: chat.id,
 			entries: [{
-				seq: 9,
+				ordinal: 9,
 				message: new AssistantMessage('2026-07-29T00:00:00.000Z', 'selected reply'),
 			}],
 			isUserScrolledUp: true,
@@ -180,6 +182,7 @@ function createDeps(chat = createChat()) {
 		},
 		navigation: { navigateToChat: vi.fn() },
 		refetchTranscript: vi.fn().mockResolvedValue(undefined),
+		confirmHandoffFork: vi.fn().mockResolvedValue(true),
 		scrollToBottom: vi.fn(),
 	} satisfies ConversationSlashCommandDeps;
 	return { deps, composerState, appendLocalNotice, cursor };
@@ -926,6 +929,51 @@ describe('ConversationSlashCommandService', () => {
 		expect(deps.lifecycle.beginTurn).toHaveBeenCalledWith('chat-2');
 	});
 
+	it('asks before a fork run falls back and repeats it with the same command identities', async () => {
+		const { deps } = createDeps();
+		const forked = createServerEntry('chat-2');
+		mockForkRunChat
+			.mockRejectedValueOnce(new ApiError(
+				409,
+				'The native fork is not materialized yet',
+				'TRANSCRIPT_NOT_YET_PERSISTED',
+				undefined,
+				true,
+			))
+			.mockResolvedValueOnce({
+				success: true,
+				commandType: 'fork-run',
+				clientRequestId: 'request-1',
+				chatId: 'chat-2',
+				turnId: 'turn-1',
+				status: 'accepted',
+				acceptedAt: '2026-07-14T00:00:00.000Z',
+				chat: forked,
+			});
+
+		await new ConversationSlashCommandService(deps).submitForkCommand(
+			'chat-1',
+			deps.sessions.byId['chat-1'],
+			'continue here',
+			[],
+			true,
+		);
+
+		expect(deps.confirmHandoffFork).toHaveBeenCalledOnce();
+		expect(mockForkRunChat).toHaveBeenCalledTimes(2);
+		const first = mockForkRunChat.mock.calls[0]![0];
+		const confirmed = mockForkRunChat.mock.calls[1]![0];
+		expect(first).not.toHaveProperty('allowHandoffFork');
+		expect(confirmed).toEqual({ ...first, allowHandoffFork: true });
+		expect(confirmed).toMatchObject({
+			clientRequestId: first.clientRequestId,
+			clientMessageId: first.clientMessageId,
+			chatId: first.chatId,
+		});
+		expect(deps.sessions.setSelectedChatId).toHaveBeenCalledWith('chat-2');
+		expect(deps.lifecycle.beginTurn).toHaveBeenCalledWith('chat-2');
+	});
+
 	it('retries an ambiguous fork response with the same command identity', async () => {
 		const { deps } = createDeps();
 		const forked = createServerEntry('chat-2');
@@ -977,7 +1025,7 @@ describe('ConversationSlashCommandService', () => {
 		);
 	});
 
-	it('forks without a message and preserves the requested sequence', async () => {
+	it('forks without a message and preserves the requested ordinal', async () => {
 		const { deps } = createDeps();
 		const forked = createServerEntry('chat-2');
 		mockForkChat.mockResolvedValueOnce({ success: true, chat: forked });
@@ -987,8 +1035,8 @@ describe('ConversationSlashCommandService', () => {
 		expect(mockForkChat).toHaveBeenCalledWith({
 			sourceChatId: 'chat-1',
 			chatId: expect.stringMatching(/^\d+$/),
-			upToSeq: 9,
-			generationId: 'generation-1',
+			upToOrdinal: 9,
+			transcriptViewId: 'view-1',
 		});
 		expect(deps.sessions.upsertServerChat).toHaveBeenCalledWith(forked);
 		expect(deps.lifecycle.setCurrentChatId).toHaveBeenCalledWith('chat-2');
@@ -1002,16 +1050,16 @@ describe('ConversationSlashCommandService', () => {
 			.mockRejectedValueOnce(new ApiError(
 				409,
 				'The view changed',
-				'STALE_VIEW_GENERATION',
+				'STALE_TRANSCRIPT_VIEW',
 				undefined,
 				true,
 			))
 			.mockResolvedValueOnce({ success: true, chat: forked });
 		deps.refetchTranscript.mockImplementationOnce(async () => {
-			cursor.generationId = 'generation-2';
-			cursor.lastSeq = 12;
+			cursor.transcriptViewId = 'view-2';
+			cursor.lastOrdinal = 12;
 			deps.chatState.entries = [{
-				seq: 12,
+				ordinal: 12,
 				message: new AssistantMessage('2026-07-29T01:00:00.000Z', 'selected reply'),
 			}];
 		});
@@ -1020,13 +1068,13 @@ describe('ConversationSlashCommandService', () => {
 
 		expect(mockForkChat).toHaveBeenCalledTimes(2);
 		expect(mockForkChat.mock.calls[0]?.[0]).toMatchObject({
-			upToSeq: 9,
-			generationId: 'generation-1',
+			upToOrdinal: 9,
+			transcriptViewId: 'view-1',
 		});
 		expect(mockForkChat.mock.calls[1]?.[0]).toMatchObject({
 			chatId: mockForkChat.mock.calls[0]?.[0].chatId,
-			upToSeq: 12,
-			generationId: 'generation-2',
+			upToOrdinal: 12,
+			transcriptViewId: 'view-2',
 		});
 		expect(deps.refetchTranscript).toHaveBeenCalledWith('chat-1');
 		expect(appendLocalNotice).not.toHaveBeenCalled();
@@ -1038,7 +1086,7 @@ describe('ConversationSlashCommandService', () => {
 		mockForkChat.mockRejectedValueOnce(new ApiError(
 			409,
 			'The original stale view',
-			'STALE_VIEW_GENERATION',
+			'STALE_TRANSCRIPT_VIEW',
 			undefined,
 			true,
 		));
@@ -1060,12 +1108,40 @@ describe('ConversationSlashCommandService', () => {
 		);
 	});
 
-	it('shows the native-history notice without attempting recovery', async () => {
+	it('asks before forking a point the provider has not persisted, then repeats it with consent', async () => {
 		const { deps, appendLocalNotice } = createDeps();
+		const forked = createServerEntry('chat-2');
+		mockForkChat
+			.mockRejectedValueOnce(new ApiError(
+				409,
+				'The transcript is not written yet',
+				'TRANSCRIPT_NOT_YET_PERSISTED',
+				undefined,
+				true,
+			))
+			.mockResolvedValueOnce({ success: true, chat: forked });
+
+		await new ConversationSlashCommandService(deps).forkChat('chat-1', 9);
+
+		expect(deps.confirmHandoffFork).toHaveBeenCalledTimes(1);
+		expect(mockForkChat).toHaveBeenCalledTimes(2);
+		expect(mockForkChat.mock.calls[0]?.[0]).not.toHaveProperty('allowHandoffFork');
+		expect(mockForkChat.mock.calls[1]?.[0]).toMatchObject({
+			chatId: mockForkChat.mock.calls[0]?.[0].chatId,
+			upToOrdinal: 9,
+			allowHandoffFork: true,
+		});
+		expect(appendLocalNotice).not.toHaveBeenCalled();
+		expect(deps.sessions.setSelectedChatId).toHaveBeenCalledWith('chat-2');
+	});
+
+	it('leaves the chat untouched when the handoff fork is declined', async () => {
+		const { deps, appendLocalNotice } = createDeps();
+		deps.confirmHandoffFork.mockResolvedValueOnce(false);
 		mockForkChat.mockRejectedValueOnce(new ApiError(
 			409,
-			'The message is not persisted',
-			'MESSAGE_NOT_IN_NATIVE_HISTORY',
+			'The transcript is not written yet',
+			'TRANSCRIPT_NOT_YET_PERSISTED',
 			undefined,
 			true,
 		));
@@ -1073,10 +1149,7 @@ describe('ConversationSlashCommandService', () => {
 		await new ConversationSlashCommandService(deps).forkChat('chat-1', 9);
 
 		expect(mockForkChat).toHaveBeenCalledTimes(1);
-		expect(deps.refetchTranscript).not.toHaveBeenCalled();
-		expect(appendLocalNotice).toHaveBeenCalledWith(
-			'error',
-			"This message hasn't been written to the provider's transcript yet. It becomes forkable once the turn finishes.",
-		);
+		expect(appendLocalNotice).not.toHaveBeenCalled();
+		expect(deps.sessions.setSelectedChatId).not.toHaveBeenCalled();
 	});
 });

@@ -7,6 +7,7 @@ import {
 	ExitPlanModeToolUseMessage,
 	GlobToolUseMessage,
 	PermissionCancelledMessage,
+	PermissionExpiredMessage,
 	PermissionRequestMessage,
 	PermissionResolvedMessage,
 	ReadToolUseMessage,
@@ -30,7 +31,7 @@ function rows(messages: ChatMessage[]) {
 	return messages.map((message, index) => ({
 		kind: 'message' as const,
 		id: `row-${index}`,
-		seq: index + 1,
+		ordinal: index + 1,
 		message,
 	}));
 }
@@ -61,11 +62,11 @@ function questionTool(toolId: string): AskUserQuestionToolUseMessage {
 }
 
 function pendingPermission(
-	permissionRequestId: string,
-	toolId = permissionRequestId,
+	permissionOccurrenceId: string,
+	toolId = permissionOccurrenceId,
 ): PendingPermissionRequest {
 	return {
-		permissionRequestId,
+		permissionOccurrenceId,
 		requestedTool: questionTool(toolId),
 		chatId: 'chat-1',
 		receivedAt: new Date(TS),
@@ -73,7 +74,7 @@ function pendingPermission(
 }
 
 describe('buildConversationFeedRenderItems', () => {
-	it('keeps every renderable transcript message in exact source order', () => {
+	it('[TLV5-UX.08-WEB-UNIT-01] keeps every renderable transcript message in exact source order', () => {
 		const messages = [
 			new UserMessage(TS, 'start'),
 			new BashToolUseMessage(TS, 'bash-1', 'pwd'),
@@ -160,7 +161,7 @@ describe('buildConversationFeedRenderItems', () => {
 					{ toolUseResult: { answers: { 'Which mode?': 'Careful' } } },
 					false,
 				),
-				new PermissionResolvedMessage(TS, 'permission-1', true),
+				new PermissionResolvedMessage(TS, 'incarnation-1', true),
 			]),
 		);
 
@@ -196,8 +197,9 @@ describe('buildConversationFeedRenderItems', () => {
 			rows([
 				tool,
 				result,
-				new PermissionResolvedMessage(TS, 'perm-1', true),
-				new PermissionCancelledMessage(TS, 'perm-2', 'cancelled'),
+				new PermissionResolvedMessage(TS, 'incarnation-1', true),
+				new PermissionCancelledMessage(TS, 'incarnation-2', 'cancelled'),
+				new PermissionExpiredMessage(TS, 'incarnation-3'),
 				new AssistantMessage(TS, 'done'),
 			]),
 		);
@@ -208,17 +210,37 @@ describe('buildConversationFeedRenderItems', () => {
 			'row-2',
 			'row-3',
 			'row-4',
+			'row-5',
 		]);
 		expect(model.toolResultByUseRowId.get('row-0')).toBe(result);
 		expect(model.items[1]).toMatchObject({ pairedToolUse: tool });
-		expect(model.permissionTerminalById.get('perm-1')).toEqual({
+		expect(conversationFeedItemLayout(model.items[4])).toBe('hidden');
+		expect(model.permissionTerminalByOccurrence.get('incarnation-1')).toEqual({
+			permissionOccurrenceId: 'incarnation-1',
 			state: 'resolved',
 			allowed: true,
 		});
-		expect(model.permissionTerminalById.get('perm-2')).toEqual({
+		expect(model.permissionTerminalByOccurrence.get('incarnation-2')).toEqual({
+			permissionOccurrenceId: 'incarnation-2',
 			state: 'cancelled',
 			reason: 'cancelled',
 		});
+		expect(model.permissionTerminalByOccurrence.get('incarnation-3')).toEqual({
+			permissionOccurrenceId: 'incarnation-3',
+			state: 'cancelled',
+			reason: 'expired',
+		});
+	});
+
+	it('[TLV5-PERM.08-WEB-UNIT-01] keeps terminal state separate across permission occurrences', () => {
+		const first = new PermissionCancelledMessage(TS, 'first-occurrence', 'cancelled');
+		const second = new PermissionResolvedMessage(TS, 'second-occurrence', true);
+		const model = buildConversationFeedRenderModel(rows([first, second]));
+
+		expect(model.permissionTerminalByOccurrence.size).toBe(2);
+		expect([...model.permissionTerminalByOccurrence.values()].map((terminal) => (
+			terminal.permissionOccurrenceId
+		))).toEqual(['first-occurrence', 'second-occurrence']);
 	});
 
 	it('pairs interleaved results to individual tool rows in source order', () => {
@@ -280,12 +302,12 @@ describe('buildConversationFeedRenderItems', () => {
 			false,
 		);
 		const assistant = new AssistantMessage(TS, 'done');
-		const resultRow = { kind: 'message' as const, id: 'row-2', seq: 2, message: result };
-		const assistantRow = { kind: 'message' as const, id: 'row-3', seq: 3, message: assistant };
+		const resultRow = { kind: 'message' as const, id: 'row-2', ordinal: 2, message: result };
+		const assistantRow = { kind: 'message' as const, id: 'row-3', ordinal: 3, message: assistant };
 
 		const suffix = buildConversationFeedRenderModel([resultRow, assistantRow]);
 		const prepended = buildConversationFeedRenderModel([
-			{ kind: 'message', id: 'row-1', seq: 1, message: tool },
+			{ kind: 'message', id: 'row-1', ordinal: 1, message: tool },
 			resultRow,
 			assistantRow,
 		]);
@@ -315,7 +337,7 @@ describe('buildConversationFeedRenderItems', () => {
 		const standalone = questionTool('tool-question');
 		const explicit = new PermissionRequestMessage(
 			TS,
-			'ask-user-question-tool-question',
+			'incarnation-1',
 			questionTool('tool-question'),
 		);
 
@@ -330,12 +352,12 @@ describe('buildConversationFeedRenderItems', () => {
 		const secondStandalone = questionTool('reused-question');
 		const firstWrapper = new PermissionRequestMessage(
 			TS,
-			'permission-1',
+			'incarnation-1',
 			questionTool('reused-question'),
 		);
 		const secondWrapper = new PermissionRequestMessage(
 			TS,
-			'permission-2',
+			'incarnation-2',
 			questionTool('reused-question'),
 		);
 		const laterStandalone = questionTool('reused-question');
@@ -356,7 +378,7 @@ describe('buildConversationFeedRenderItems', () => {
 	it('keeps a permission wrapper that precedes repeated standalone tools in source order', () => {
 		const wrapper = new PermissionRequestMessage(
 			TS,
-			'permission-1',
+			'incarnation-1',
 			questionTool('reused-question'),
 		);
 
@@ -370,7 +392,7 @@ describe('buildConversationFeedRenderItems', () => {
 	it('suppresses only the answered question result represented by the matching wrapper occurrence', () => {
 		const firstWrapper = new PermissionRequestMessage(
 			TS,
-			'permission-1',
+			'incarnation-1',
 			questionTool('reused-question'),
 		);
 		const firstResult = new ToolResultMessage(
@@ -426,7 +448,7 @@ describe('visiblePendingPermissionRequests', () => {
 	it('does not float an exit-plan request already represented by its canonical tool row', () => {
 		const exitPlan = new ExitPlanModeToolUseMessage(TS, 'plan-1', 'Implement carefully.');
 		const pending: PendingPermissionRequest = {
-			permissionRequestId: 'plan-exit-plan-1',
+			permissionOccurrenceId: 'plan-exit-plan-1',
 			requestedTool: exitPlan,
 			chatId: 'chat-1',
 			receivedAt: new Date(TS),
@@ -435,12 +457,41 @@ describe('visiblePendingPermissionRequests', () => {
 		expect(visiblePendingPermissionRequests(rows([exitPlan]), [pending])).toEqual([]);
 	});
 
+	it('does not hide a reused exit-plan request behind an older occurrence', () => {
+		const historical = new ExitPlanModeToolUseMessage(TS, 'plan-1', 'Historical plan.');
+		const current: PendingPermissionRequest = {
+			permissionOccurrenceId: 'current-occurrence',
+			requestedTool: new ExitPlanModeToolUseMessage(TS, 'plan-1', 'Current plan.'),
+			chatId: 'chat-1',
+			receivedAt: new Date(TS),
+		};
+
+		expect(visiblePendingPermissionRequests(rows([historical]), [current])).toEqual([current]);
+	});
+
 	it('omits terminal and replayed pending permission ids', () => {
 		const first = pendingPermission('perm-1');
 		const replay = pendingPermission('perm-1');
 		const second = pendingPermission('perm-2');
-		const visibleRows = rows([new PermissionResolvedMessage(TS, 'perm-2', true)]);
+		const visibleRows = rows([
+			new PermissionResolvedMessage(TS, 'perm-2', true),
+		]);
 
 		expect(visiblePendingPermissionRequests(visibleRows, [first, replay, second])).toEqual([first]);
+	});
+
+	it('does not let an old terminal suppress a distinct permission occurrence', () => {
+		const terminal = new PermissionCancelledMessage(TS, 'old-occurrence', 'cancelled');
+		const current = {
+			...pendingPermission('current-occurrence'),
+			control: {
+				serverInstanceId: 'server-1',
+				chatId: 'chat-1',
+				runId: 'run-2',
+				permissionOccurrenceId: 'current-occurrence',
+			},
+		};
+
+		expect(visiblePendingPermissionRequests(rows([terminal]), [current])).toEqual([current]);
 	});
 });

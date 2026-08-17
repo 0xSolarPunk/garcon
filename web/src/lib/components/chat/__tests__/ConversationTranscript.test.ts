@@ -1,14 +1,46 @@
-import { cleanup, render } from '@testing-library/svelte';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatDisplayRow } from '$lib/chat/transcript/active-transcript-state.svelte.js';
-import {
-	AskUserQuestionToolUseMessage,
-	ExitPlanModeToolUseMessage,
-	PermissionRequestMessage,
-	ToolResultMessage,
-	UserMessage,
-} from '$shared/chat-types';
+import type { PendingPermissionRequest } from '$lib/types/chat';
+import { BashToolUseMessage, PermissionRequestMessage, UserMessage } from '$shared/chat-types';
 import ConversationTranscriptTestHost from './ConversationTranscriptTestHost.svelte';
+
+const PERMISSION_TIMESTAMP = '2026-07-22T00:00:02.000Z';
+
+function permissionRow(permissionOccurrenceId: string): ChatDisplayRow {
+	return {
+		kind: 'message',
+		id: 'generation-1:2',
+		ordinal: 2,
+		message: new PermissionRequestMessage(
+			PERMISSION_TIMESTAMP,
+			permissionOccurrenceId,
+			new BashToolUseMessage(PERMISSION_TIMESTAMP, 'tool-1', 'pwd'),
+		),
+	};
+}
+
+function pendingPermission(
+	permissionOccurrenceId: string,
+	withCapability: boolean,
+): PendingPermissionRequest {
+	return {
+		chatId: 'chat-1',
+		permissionOccurrenceId,
+		requestedTool: new BashToolUseMessage(PERMISSION_TIMESTAMP, 'tool-1', 'pwd'),
+		...(withCapability
+			? {
+					control: {
+						serverInstanceId: 'server-1',
+						chatId: 'chat-1',
+						runId: 'run-1',
+						permissionOccurrenceId,
+					},
+					transcript: { transcriptViewId: 'generation-1', afterOrdinal: 2 },
+				}
+			: {}),
+	};
+}
 
 describe('ConversationTranscript', () => {
 	beforeEach(() => {
@@ -24,7 +56,7 @@ describe('ConversationTranscript', () => {
 			{
 				kind: 'message',
 				id: 'generation-1:1',
-				seq: 1,
+				ordinal: 1,
 				message: new UserMessage('2026-07-22T00:00:00.000Z', 'Durable message'),
 			},
 			{
@@ -50,105 +82,29 @@ describe('ConversationTranscript', () => {
 		).toEqual(['generation-1:1']);
 	});
 
-	it('renders answered historical questions from their canonical result row', () => {
-		const timestamp = '2026-07-22T00:00:00.000Z';
-		const rows: ChatDisplayRow[] = [
-			{
-				kind: 'message',
-				id: 'generation-1:1',
-				seq: 1,
-				message: new AskUserQuestionToolUseMessage(timestamp, 'question-1', undefined, [
-					{
-						id: 'mode',
-						prompt: 'Which mode?',
-						header: 'Mode',
-						allowMultiple: false,
-						options: [
-							{ id: 'fast', label: 'Fast', description: 'Quick path.' },
-							{ id: 'careful', label: 'Careful', description: 'Detailed path.' },
-						],
-					},
-				]),
-			},
-			{
-				kind: 'message',
-				id: 'generation-1:2',
-				seq: 2,
-				message: new ToolResultMessage(
-					timestamp,
-					'question-1',
-					{ toolUseResult: { answers: { mode: 'Careful' } } },
-					false,
-				),
-			},
-		];
+	it('keeps historical permission occurrences non-actionable without an exact transient match', () => {
+		render(ConversationTranscriptTestHost, {
+			rows: [permissionRow('historical-incarnation')],
+			pendingPermissionRequests: [
+				pendingPermission('historical-incarnation', false),
+				pendingPermission('different-incarnation', true),
+			],
+			onPermissionDecision: vi.fn(),
+		});
 
-		const { container, getByRole, getByText } = render(ConversationTranscriptTestHost, { rows });
-
-		expect(getByText('Which mode?')).toBeTruthy();
-		expect(getByText('Question answered')).toBeTruthy();
-		expect((getByRole('radio', { name: /Careful/ }) as HTMLInputElement).checked).toBe(true);
-		expect(container.querySelector('[data-chat-row-id="generation-1:2"]')).toBeTruthy();
+		expect(screen.queryByRole('button', { name: /allow once/i })).toBeNull();
+		expect(screen.queryByRole('button', { name: /^deny$/i })).toBeNull();
 	});
 
-	it('renders one answered question when a permission wrapper represents its tool occurrence', () => {
-		const timestamp = '2026-07-22T00:00:00.000Z';
-		const question = () =>
-			new AskUserQuestionToolUseMessage(timestamp, 'question-1', undefined, [
-				{
-					id: 'mode',
-					prompt: 'Which mode?',
-					header: 'Mode',
-					allowMultiple: false,
-					options: [
-						{ id: 'fast', label: 'Fast', description: 'Quick path.' },
-						{ id: 'careful', label: 'Careful', description: 'Detailed path.' },
-					],
-				},
-			]);
-		const rows: ChatDisplayRow[] = [
-			{ kind: 'message', id: 'generation-1:1', seq: 1, message: question() },
-			{
-				kind: 'message',
-				id: 'generation-1:2',
-				seq: 2,
-				message: new PermissionRequestMessage(timestamp, 'permission-1', question()),
-			},
-			{
-				kind: 'message',
-				id: 'generation-1:3',
-				seq: 3,
-				message: new ToolResultMessage(
-					timestamp,
-					'question-1',
-					{ toolUseResult: { answers: { mode: 'Careful' } } },
-					false,
-				),
-			},
-		];
+	it('makes a durable permission occurrence actionable only through its transient capability', async () => {
+		const onPermissionDecision = vi.fn();
+		render(ConversationTranscriptTestHost, {
+			rows: [permissionRow('active-incarnation')],
+			pendingPermissionRequests: [pendingPermission('active-incarnation', true)],
+			onPermissionDecision,
+		});
 
-		const { getAllByText } = render(ConversationTranscriptTestHost, { rows });
-
-		expect(getAllByText('Which mode?')).toHaveLength(1);
-	});
-
-	it('renders a completed exit plan from its canonical tool row', () => {
-		const rows: ChatDisplayRow[] = [
-			{
-				kind: 'message',
-				id: 'generation-1:1',
-				seq: 1,
-				message: new ExitPlanModeToolUseMessage(
-					'2026-07-22T00:00:00.000Z',
-					'plan-1',
-					'Implement carefully.',
-				),
-			},
-		];
-
-		const { getByText } = render(ConversationTranscriptTestHost, { rows });
-
-		expect(getByText('Implement carefully.')).toBeTruthy();
-		expect(getByText('Plan approved')).toBeTruthy();
+		await fireEvent.click(screen.getByRole('button', { name: /allow once/i }));
+		expect(onPermissionDecision).toHaveBeenCalledWith('active-incarnation', { allow: true });
 	});
 });

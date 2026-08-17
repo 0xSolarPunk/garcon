@@ -1,107 +1,127 @@
-import {
-	isDegradedChatHistoryResponse,
-	isContiguousChatViewWindow,
-	type ChatHistoryResponse,
-	type CompleteChatHistoryResponse,
-	type ChatViewMessage,
-	type ChatViewPage,
-	type ChatViewPageRequest,
+import type {
+	ResendCandidate,
+	TranscriptPage,
 } from '$shared/chat-view';
-import { getChatMessages } from '$lib/api/chats.js';
-import { validateRequestedTranscriptPage } from './transcript-page-progress.js';
+import type { ChatTranscriptSnapshot } from './chat-transcript-cache.svelte.js';
+import {
+	collapseBackwardTranscriptDemand,
+	loadTranscriptPageDemand,
+	type TranscriptPageDemandResult,
+} from './transcript-page-demand.js';
+import type { TranscriptWindowTarget } from './transcript-page-progress.js';
 
-const DEFAULT_PAGE_SIZE = 50;
-export const MAX_LATEST_TRANSCRIPT_WINDOW = 200;
+export type TranscriptWindowPage = TranscriptPage & {
+	resendCandidates?: ResendCandidate[];
+};
 
-export type TranscriptWindowStageResult = ChatHistoryResponse;
-type RetainableTranscriptPage = Pick<
-	CompleteChatHistoryResponse,
-	'generationId' | 'messages' | 'pageOldestSeq' | 'hasMore'
->;
+export type TranscriptSnapshotInstallMode = 'merge' | 'preserve-window' | 'replace';
 
-export function retainLoadedTranscriptPrefix<TPage extends RetainableTranscriptPage>(
-	currentGenerationId: string,
-	currentMessages: ChatViewMessage[],
-	page: TPage,
-): TPage {
-	if (page.generationId !== currentGenerationId || page.pageOldestSeq <= 1) return page;
-	const prefixEnd = currentMessages.findIndex((entry) => entry.seq >= page.pageOldestSeq);
-	if (prefixEnd <= 0) return page;
-	const prefix = currentMessages.slice(0, prefixEnd);
-	if (prefix.at(-1)?.seq !== page.pageOldestSeq - 1) return page;
-	if (prefix.some((entry, index) => index > 0 && entry.seq !== prefix[index - 1]!.seq + 1)) {
-		return page;
+export type TranscriptWindowPageResult =
+	| { kind: 'complete'; page: TranscriptWindowPage }
+	| Exclude<TranscriptPageDemandResult, { kind: 'complete' }>;
+
+export async function loadTranscriptWindowPage(options: {
+	chatId: string;
+	target: TranscriptWindowTarget;
+	transcriptViewId: string;
+	lastOrdinal: number;
+	visibleLimit: number;
+	isCurrent: () => boolean;
+}): Promise<TranscriptWindowPageResult> {
+	const demand = await loadTranscriptPageDemand(
+		options.target === 'initial'
+			? {
+					direction: 'later',
+					chatId: options.chatId,
+					transcriptViewId: options.transcriptViewId,
+					afterOrdinal: 0,
+					throughOrdinal: options.lastOrdinal,
+					visibleLimit: options.visibleLimit,
+					isCurrent: options.isCurrent,
+				}
+			: {
+					direction: 'backward',
+					chatId: options.chatId,
+					transcriptViewId: options.transcriptViewId,
+					visibleLimit: options.visibleLimit,
+					isCurrent: options.isCurrent,
+				},
+	);
+	if (demand.kind !== 'complete') return demand;
+	if (options.target === 'latest') {
+		return { kind: 'complete', page: collapseBackwardTranscriptDemand(demand) };
+	}
+
+	const firstPage = demand.pages[0];
+	const finalPage = demand.pages.at(-1);
+	if (!firstPage || !finalPage) {
+		throw new Error('Initial transcript demand completed without a page');
 	}
 	return {
-		...page,
-		messages: [...prefix, ...page.messages],
-		pageOldestSeq: prefix[0]!.seq,
-		hasMore: prefix[0]!.seq > 1,
+		kind: 'complete',
+		page: {
+			transcriptViewId: options.transcriptViewId,
+			messages: demand.messages,
+			lastOrdinal: Math.max(options.lastOrdinal, demand.lastOrdinal),
+			pageOldestOrdinal: demand.messages[0]?.ordinal ?? 0,
+			pageNewestOrdinal: finalPage.pageNewestOrdinal,
+			nextBeforeOrdinal: null,
+			hasMore: false,
+			resendCandidates: firstPage.resendCandidates,
+		},
 	};
 }
 
-export function pruneTranscriptToLatestWindow(
-	page: ChatViewPage,
-	limit: number,
-): ChatViewPage | null {
-	const boundedLimit = Math.max(0, Math.floor(limit));
+export function preferCachedLatestTranscriptPage(
+	page: TranscriptWindowPage,
+	cached: ChatTranscriptSnapshot | null,
+	resendCandidates: readonly ResendCandidate[],
+): TranscriptWindowPage {
 	if (
-		boundedLimit === 0 ||
-		page.messages.length <= boundedLimit ||
-		page.messages.at(-1)?.seq !== page.lastSeq ||
-		!isContiguousChatViewWindow(page)
-	) {
-		return null;
-	}
-	const messages = page.messages.slice(-boundedLimit);
-	const pageOldestSeq = messages[0]!.seq;
-	return { ...page, messages, pageOldestSeq, hasMore: pageOldestSeq > 1 };
-}
+		!cached
+		|| cached.stale
+		|| cached.transcriptViewId !== page.transcriptViewId
+		|| cached.lastOrdinal <= page.lastOrdinal
+	) return page;
 
-export async function stageLatestTranscriptWindow(
-	chatId: string,
-	minimumMessageCount: number,
-): Promise<TranscriptWindowStageResult> {
-	const targetCount = Math.min(
-		MAX_LATEST_TRANSCRIPT_WINDOW,
-		Math.max(DEFAULT_PAGE_SIZE, Math.floor(minimumMessageCount)),
-	);
-	const latestRequest = {
-		chatId,
-		limit: targetCount,
+	return {
+		...page,
+		messages: cached.messages,
+		lastOrdinal: cached.lastOrdinal,
+		pageOldestOrdinal: cached.oldestOrdinal,
+		pageNewestOrdinal: cached.lastOrdinal,
+		nextBeforeOrdinal: cached.nextBeforeOrdinal,
+		hasMore: cached.nextBeforeOrdinal !== null,
+		resendCandidates: [...resendCandidates],
 	};
-	const latest = await getChatMessages(latestRequest);
-	if (isDegradedChatHistoryResponse(latest)) return latest;
-	assertPage(chatId, latestRequest, latest);
-	return latest;
 }
 
-export async function stageTranscriptWindowNavigation(
-	chatId: string,
-	target: 'initial' | 'latest',
-	lastSeq: number,
-): Promise<TranscriptWindowStageResult> {
-	const request =
-		target === 'initial'
-			? {
-					chatId,
-					limit: DEFAULT_PAGE_SIZE,
-					beforeSeq: Math.min(lastSeq + 1, DEFAULT_PAGE_SIZE + 1),
-				}
-			: { chatId, limit: DEFAULT_PAGE_SIZE };
-	const page = await getChatMessages(request);
-	if (isDegradedChatHistoryResponse(page)) return page;
-	assertPage(chatId, request, page);
-	return page;
-}
-
-function assertPage(
-	chatId: string,
-	request: ChatViewPageRequest,
-	page: CompleteChatHistoryResponse,
-): void {
-	if (page.chatId !== chatId) throw new Error('Transcript page belongs to another chat');
-	if (!validateRequestedTranscriptPage(request, page)) {
-		throw new Error('Transcript page did not match its requested window');
+export function transcriptSnapshotInstallMode(options: {
+	activeChatId: string | null;
+	chatId: string;
+	transcriptViewId: string;
+	entryCount: number;
+	loadedThroughOrdinal: number;
+	nextBeforeOrdinal: number | null;
+	page: TranscriptPage;
+}): TranscriptSnapshotInstallMode {
+	if (
+		options.activeChatId !== options.chatId
+		|| options.transcriptViewId === ''
+		|| options.transcriptViewId !== options.page.transcriptViewId
+		|| options.entryCount === 0
+	) {
+		return 'replace';
 	}
+	const pageRawStartOrdinal = options.page.pageNewestOrdinal === 0
+		? 0
+		: options.page.nextBeforeOrdinal ?? 1;
+	const currentRawStartOrdinal = options.loadedThroughOrdinal === 0
+		? 0
+		: options.nextBeforeOrdinal ?? 1;
+	const intervalsTouch = options.page.pageNewestOrdinal === 0 || options.loadedThroughOrdinal === 0
+		? options.page.pageNewestOrdinal === options.loadedThroughOrdinal
+		: pageRawStartOrdinal <= options.loadedThroughOrdinal + 1
+			&& currentRawStartOrdinal <= options.page.pageNewestOrdinal + 1;
+	return intervalsTouch ? 'merge' : 'preserve-window';
 }

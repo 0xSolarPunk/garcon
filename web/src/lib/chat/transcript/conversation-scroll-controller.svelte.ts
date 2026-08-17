@@ -1,14 +1,11 @@
 import { tick } from 'svelte';
+import type { ActiveTranscriptState } from '$lib/chat/transcript/active-transcript-state.svelte.js';
 import type {
-	ActiveTranscriptState,
 	TranscriptPageDirection,
 	TranscriptPageLoadResult,
 	TranscriptWindowTarget,
-} from '$lib/chat/transcript/active-transcript-state.svelte.js';
-import type {
-	ConversationViewportIntentSource,
-	ConversationViewportPort,
-} from '$lib/chat/transcript/conversation-viewport-port.js';
+} from '$lib/chat/transcript/transcript-page-progress.js';
+import type { ConversationViewportPort } from '$lib/chat/transcript/conversation-viewport-port.js';
 import type {
 	UserMessageNavigatorSelectionResult,
 	UserMessageNavigatorTarget,
@@ -18,8 +15,6 @@ const USER_SCROLL_INTENT_WINDOW_MS = 2_000;
 const MIN_PAGE_PREFETCH_DISTANCE_PX = 100;
 const EARLIER_PAGE_PREFETCH_VIEWPORTS = 2;
 const LIVE_END_REPIN_THRESHOLD_PX = 50;
-export const LIVE_HISTORY_PRUNE_IDLE_MS = 3 * 60_000;
-const LIVE_HISTORY_PRUNE_RECHECK_MS = 10_000;
 
 // Buffers extra earlier history while preserving one-viewport later paging.
 function pagePrefetchDistance(direction: TranscriptPageDirection, viewportHeight: number): number {
@@ -36,15 +31,17 @@ interface UserScrollIntent {
 	receivedAt: number;
 }
 
+interface DeferredLiveEdgeIntent {
+	chatId: string;
+	epoch: number;
+}
+
 export type ConversationScrollState = Pick<
 	ActiveTranscriptState,
-	| 'canAutoFillEarlier'
 	| 'canLoadEarlier'
-	| 'canLoadLater'
 	| 'displayMessageCount'
 	| 'feedMutationClock'
-	| 'generationId'
-	| 'hasExpandedLiveHistory'
+	| 'transcriptViewId'
 	| 'hasLaterMessages'
 	| 'isLoadingMessages'
 	| 'isUserScrolledUp'
@@ -55,7 +52,6 @@ export type ConversationScrollState = Pick<
 	| 'loadStatus'
 	| 'navigateToWindow'
 	| 'pageStates'
-	| 'pruneLoadedHistoryAtLiveEnd'
 	| 'revealEarlierLoadedRows'
 	| 'windowRevision'
 >;
@@ -83,13 +79,19 @@ export class ConversationScrollController {
 	#followLiveRequiresIntentAfter = 0;
 	#previousScrollTop: number | null = null;
 	#viewportOperationEpoch = 0;
+	#deferredLiveEdgeIntent: DeferredLiveEdgeIntent | null = null;
 	#isPageMutationInProgress = false;
 	#activeTargetNavigations = $state(0);
 	#resumeAutoFillAfterTargets = false;
-	#historyPruneTimer: ReturnType<typeof setTimeout> | null = null;
-	#historyPruneEpoch = 0;
+	#lastObservedFeedChatId: string | null;
+	#lastObservedTranscriptViewId: string;
+	#lastObservedFeedDataRevision: number;
 
-	constructor(private deps: ScrollControllerDeps) {}
+	constructor(private deps: ScrollControllerDeps) {
+		this.#lastObservedFeedChatId = deps.sessions.selectedChatId;
+		this.#lastObservedTranscriptViewId = deps.chatState.transcriptViewId;
+		this.#lastObservedFeedDataRevision = deps.chatState.feedMutationClock.dataRevision;
+	}
 
 	isNearBottom(): boolean {
 		return this.deps.getViewport()?.isAtEnd(LIVE_END_REPIN_THRESHOLD_PX) ?? false;
@@ -136,25 +138,43 @@ export class ConversationScrollController {
 	setPinnedToBottom(isPinned: boolean): void {
 		this.isPinnedToBottom = isPinned;
 		this.deps.chatState.isUserScrolledUp = !isPinned;
-		if (isPinned) this.#scheduleHistoryPrune();
-		else this.#cancelHistoryPrune();
+		if (!isPinned) {
+			this.#deferredLiveEdgeIntent = null;
+		}
 	}
 
 	reconcilePinnedProjection(): void {
+		const chatId = this.deps.sessions.selectedChatId;
+		const transcriptViewId = this.deps.chatState.transcriptViewId;
+		const dataRevision = this.deps.chatState.feedMutationClock.dataRevision;
+		const feedChanged = chatId !== this.#lastObservedFeedChatId
+			|| transcriptViewId !== this.#lastObservedTranscriptViewId
+			|| dataRevision !== this.#lastObservedFeedDataRevision;
+		this.#lastObservedFeedChatId = chatId;
+		this.#lastObservedTranscriptViewId = transcriptViewId;
+		this.#lastObservedFeedDataRevision = dataRevision;
 		this.deps.chatState.isUserScrolledUp = !this.isPinnedToBottom;
-		this.#scheduleHistoryPrune();
+		const deferredIntent = this.#deferredLiveEdgeIntent;
+		const viewport = this.deps.getViewport();
+		if (
+			feedChanged
+			&& deferredIntent?.chatId === chatId
+			&& deferredIntent.epoch === this.#userScrollIntent.epoch
+			&& deferredIntent.epoch > this.#followLiveRequiresIntentAfter
+			&& !this.deps.chatState.hasLaterMessages
+			&& !viewport?.ownsScrollPosition()
+			&& this.isNearBottom()
+		) {
+			this.#deferredLiveEdgeIntent = null;
+			this.setPinnedToBottom(true);
+			this.#userScrollIntent = { ...this.#userScrollIntent, receivedAt: 0 };
+			viewport?.scrollToEnd();
+		}
 	}
 
-	noteUserScrollIntent(
-		direction: TranscriptPageDirection | null = null,
-		source: ConversationViewportIntentSource = 'viewport',
-	): boolean {
-		this.#cancelHistoryPrune();
-		const viewport = this.deps.getViewport();
-		const preventViewportMutation =
-			source === 'viewport'
-				? (viewport?.cancelForUserIntent(direction) ?? false)
-				: (viewport?.cancelForUserIntent(direction, source) ?? false);
+	noteUserScrollIntent(direction: TranscriptPageDirection | null = null): void {
+		this.#deferredLiveEdgeIntent = null;
+		this.deps.getViewport()?.cancelForUserIntent(direction);
 		// Continued scrolling owns the page's viewport position without cancelling its
 		// data request. Explicit navigation still advances the shared operation epoch.
 		if (this.#isPageMutationInProgress) {
@@ -185,8 +205,6 @@ export class ConversationScrollController {
 				this.#handleBoundaryProximity(direction, this.#isNearPageBoundary(direction));
 			});
 		}
-		this.#scheduleHistoryPrune();
-		return preventViewportMutation;
 	}
 
 	prepareInitialBottomRestore(chatId: string | null): void {
@@ -204,7 +222,6 @@ export class ConversationScrollController {
 		if (this.deps.chatState.displayMessageCount === 0) return;
 		this.#initialBottomPaintChatId = null;
 		this.#initialBottomRestoreChatId = null;
-		this.#scheduleHistoryPrune();
 	}
 
 	reconcileInitialBottomRestore(autoScrollToBottom: boolean): void {
@@ -250,10 +267,35 @@ export class ConversationScrollController {
 		if (!node || !this.#isViewportVisible || node.clientHeight <= 0) return;
 		const inferredDirection = this.#inferScrollDirection(node.scrollTop);
 		if (this.#isPageMutationInProgress) {
+			const shouldReaffirmUserOwnership =
+				inferredDirection !== null &&
+				this.#userScrollIntent.direction === inferredDirection &&
+				this.#hasRecentUserScrollIntent();
+			this.#applyInferredIntentDirection(inferredDirection);
+			if (shouldReaffirmUserOwnership) {
+				this.deps.getViewport()?.cancelForUserIntent(inferredDirection);
+			}
 			this.#preserveHistoryBrowsing();
 			return;
 		}
-		if (this.deps.getViewport()?.ownsScrollPosition()) return;
+		if (this.deps.getViewport()?.ownsScrollPosition()) {
+			const chatId = this.deps.sessions.selectedChatId;
+			if (
+				chatId
+				&& !this.deps.chatState.hasLaterMessages
+				&& this.#userScrollIntent.direction === 'later'
+				&& this.#userScrollIntent.epoch > this.#followLiveRequiresIntentAfter
+				&& this.#hasRecentUserScrollIntent()
+				&& this.isNearBottom()
+			) {
+				this.#deferredLiveEdgeIntent = {
+					chatId,
+					epoch: this.#userScrollIntent.epoch,
+				};
+			}
+			return;
+		}
+		this.#deferredLiveEdgeIntent = null;
 		this.#reconcileUserScroll(inferredDirection);
 	}
 
@@ -387,7 +429,7 @@ export class ConversationScrollController {
 	): Promise<UserMessageNavigatorSelectionResult> {
 		if (
 			this.deps.sessions.selectedChatId !== target.chatId ||
-			this.deps.chatState.generationId !== target.generationId
+			this.deps.chatState.transcriptViewId !== target.transcriptViewId
 		) {
 			return 'unavailable';
 		}
@@ -399,7 +441,7 @@ export class ConversationScrollController {
 			await tick();
 			if (
 				this.deps.sessions.selectedChatId !== target.chatId ||
-				this.deps.chatState.generationId !== target.generationId
+				this.deps.chatState.transcriptViewId !== target.transcriptViewId
 			) {
 				return 'cancelled';
 			}
@@ -487,7 +529,7 @@ export class ConversationScrollController {
 				if (this.deps.chatState.hasLaterMessages) {
 					if (!this.#canRequestPage('later')) return;
 					result = await this.#mutatePage('later', () => this.deps.chatState.loadLaterPage(chatId));
-				} else if (this.deps.chatState.canAutoFillEarlier) {
+				} else if (this.deps.chatState.canLoadEarlier) {
 					if (!this.#canRequestPage('earlier')) return;
 					if (this.deps.chatState.revealEarlierLoadedRows()) {
 						result = await this.#waitForCurrentLayout('loaded');
@@ -508,7 +550,6 @@ export class ConversationScrollController {
 				this.#refillViewportAfterCurrentFill = false;
 				void this.fillUnderfilledViewport();
 			}
-			this.#scheduleHistoryPrune();
 		}
 	}
 
@@ -523,7 +564,7 @@ export class ConversationScrollController {
 			if (!this.#isViewportVisible || this.#activeTargetNavigations > 0 || delta === 0) return;
 			const viewport = this.deps.getViewport();
 			if (!viewport) return;
-			if (this.isPinnedToBottom) viewport.scrollToEnd();
+			if (this.isPinnedToBottom) this.scrollToBottom();
 			else viewport.scrollBy(delta);
 		});
 		observer.observe(host);
@@ -539,7 +580,7 @@ export class ConversationScrollController {
 			if (nextHeight <= 0 || nextHeight === previousHeight) return;
 			previousHeight = nextHeight;
 			if (this.#isViewportVisible && this.#activeTargetNavigations === 0 && this.isPinnedToBottom) {
-				this.deps.getViewport()?.scrollToEnd();
+				this.scrollToBottom();
 			}
 		});
 		observer.observe(scroller);
@@ -553,10 +594,6 @@ export class ConversationScrollController {
 		this.#previousScrollTop = this.deps.getScrollContainer()?.scrollTop ?? null;
 		if (!isVisible) return;
 		void this.#restoreVisibleViewport();
-	}
-
-	destroy(): void {
-		this.#cancelHistoryPrune();
 	}
 
 	// Scrolls the feed through its virtual viewport and reconciles pinning state.
@@ -666,7 +703,7 @@ export class ConversationScrollController {
 		}
 		return direction === 'earlier'
 			? this.deps.chatState.canLoadEarlier
-			: this.deps.chatState.canLoadLater;
+			: this.deps.chatState.hasLaterMessages;
 	}
 
 	#syncBoundaryLatch(direction: TranscriptPageDirection): void {
@@ -687,7 +724,7 @@ export class ConversationScrollController {
 	#earlierBoundarySignature(): string {
 		return [
 			this.deps.sessions.selectedChatId ?? '',
-			this.deps.chatState.generationId,
+			this.deps.chatState.transcriptViewId,
 			this.deps.chatState.windowRevision,
 			this.deps.chatState.feedMutationClock.lastRevisionByKind['history-earlier'],
 		].join(':');
@@ -701,13 +738,13 @@ export class ConversationScrollController {
 	}
 
 	#beginViewportOperation(): number {
-		this.#cancelHistoryPrune();
+		this.#deferredLiveEdgeIntent = null;
 		this.deps.chatState.invalidatePendingWindowNavigation();
 		return ++this.#viewportOperationEpoch;
 	}
 
 	#cancelViewportOperations(): void {
-		this.#cancelHistoryPrune();
+		this.#deferredLiveEdgeIntent = null;
 		this.deps.chatState.invalidatePendingWindowNavigation();
 		this.#viewportOperationEpoch += 1;
 	}
@@ -773,75 +810,6 @@ export class ConversationScrollController {
 		);
 	}
 
-	#scheduleHistoryPrune(delayMs = LIVE_HISTORY_PRUNE_IDLE_MS): void {
-		if (this.#historyPruneTimer || !this.#canPruneHistoryAfterIdle()) return;
-		const chatId = this.deps.sessions.selectedChatId!;
-		const generationId = this.deps.chatState.generationId;
-		const userIntentEpoch = this.#userScrollIntent.epoch;
-		const viewportOperationEpoch = this.#viewportOperationEpoch;
-		const pruneEpoch = ++this.#historyPruneEpoch;
-		this.#historyPruneTimer = setTimeout(() => {
-			this.#runHistoryPrune(
-				pruneEpoch,
-				chatId,
-				generationId,
-				userIntentEpoch,
-				viewportOperationEpoch,
-			);
-		}, delayMs);
-	}
-
-	#runHistoryPrune(
-		pruneEpoch: number,
-		chatId: string,
-		generationId: string,
-		userIntentEpoch: number,
-		viewportOperationEpoch: number,
-	): void {
-		if (pruneEpoch !== this.#historyPruneEpoch) return;
-		this.#historyPruneTimer = null;
-		if (
-			!this.#canPruneHistoryAfterIdle() ||
-			this.deps.sessions.selectedChatId !== chatId ||
-			this.deps.chatState.generationId !== generationId ||
-			this.#userScrollIntent.epoch !== userIntentEpoch ||
-			this.#viewportOperationEpoch !== viewportOperationEpoch
-		) {
-			return;
-		}
-		const viewport = this.deps.getViewport();
-		if (!viewport?.isReady() || viewport.ownsScrollPosition() || !viewport.isAtEnd()) {
-			this.#scheduleHistoryPrune(LIVE_HISTORY_PRUNE_RECHECK_MS);
-			return;
-		}
-		this.deps.chatState.pruneLoadedHistoryAtLiveEnd();
-	}
-
-	#canPruneHistoryAfterIdle(): boolean {
-		return Boolean(
-			this.deps.sessions.selectedChatId &&
-			this.#isViewportVisible &&
-			this.isPinnedToBottom &&
-			!this.deps.chatState.isUserScrolledUp &&
-			this.deps.chatState.hasExpandedLiveHistory &&
-			!this.deps.chatState.hasLaterMessages &&
-			!this.deps.chatState.isLoadingMessages &&
-			!this.#isPageMutationInProgress &&
-			!this.#isAutoFillingViewport &&
-			this.#activeTargetNavigations === 0 &&
-			Object.values(this.deps.chatState.pageStates).every(
-				(pageState) => pageState.status === 'idle',
-			),
-		);
-	}
-
-	#cancelHistoryPrune(): void {
-		this.#historyPruneEpoch += 1;
-		if (!this.#historyPruneTimer) return;
-		clearTimeout(this.#historyPruneTimer);
-		this.#historyPruneTimer = null;
-	}
-
 	async #restoreVisibleViewport(): Promise<void> {
 		const operationEpoch = this.#viewportOperationEpoch;
 		await tick();
@@ -856,7 +824,6 @@ export class ConversationScrollController {
 		if (!viewport?.isReady()) return;
 		if (this.isPinnedToBottom) {
 			viewport.scrollToEnd();
-			this.#scheduleHistoryPrune();
 			void this.#reverifyEndAfterShow(operationEpoch);
 			return;
 		}

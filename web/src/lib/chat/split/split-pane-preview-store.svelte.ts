@@ -1,16 +1,19 @@
 import { SvelteMap } from 'svelte/reactivity';
-import { isDegradedChatHistoryResponse, type ChatViewMessage } from '$shared/chat-view';
-import { getChatMessages } from '$lib/api/chats.js';
+import type { TranscriptMessage } from '$shared/chat-view';
 import { ChatTranscriptCache } from '$lib/chat/transcript/chat-transcript-cache.svelte.js';
+import {
+	collapseBackwardTranscriptDemand,
+	loadTranscriptPageDemand,
+} from '$lib/chat/transcript/transcript-page-demand.js';
 import * as m from '$lib/paraglide/messages.js';
 
 const PREVIEW_LIMIT = 50;
 
 export interface SplitPanePreviewEntry {
 	chatId: string;
-	generationId: string | null;
-	lastSeq: number;
-	messages: ChatViewMessage[];
+	transcriptViewId: string | null;
+	lastOrdinal: number;
+	messages: TranscriptMessage[];
 	isLoading: boolean;
 	isStale: boolean;
 	error: string | null;
@@ -18,15 +21,15 @@ export interface SplitPanePreviewEntry {
 
 export interface SplitPanePreviewCursor {
 	chatId: string;
-	generationId: string;
-	lastSeq: number;
+	transcriptViewId: string;
+	lastOrdinal: number;
 }
 
 function emptyEntry(chatId: string): SplitPanePreviewEntry {
 	return {
 		chatId,
-		generationId: null,
-		lastSeq: 0,
+		transcriptViewId: null,
+		lastOrdinal: 0,
 		messages: [],
 		isLoading: false,
 		isStale: false,
@@ -49,8 +52,8 @@ export class SplitPanePreviewStore {
 
 	cursor(chatId: string): SplitPanePreviewCursor | null {
 		const entry = this.#entries.get(chatId);
-		if (!entry?.generationId || entry.lastSeq <= 0) return null;
-		return { chatId, generationId: entry.generationId, lastSeq: entry.lastSeq };
+		if (!entry?.transcriptViewId || entry.lastOrdinal <= 0) return null;
+		return { chatId, transcriptViewId: entry.transcriptViewId, lastOrdinal: entry.lastOrdinal };
 	}
 
 	restore(chatId: string): void {
@@ -60,8 +63,8 @@ export class SplitPanePreviewStore {
 		const messages = restored.messages.slice(-PREVIEW_LIMIT);
 		this.#entries.set(chatId, {
 			chatId,
-			generationId: restored.generationId,
-			lastSeq: restored.lastSeq,
+			transcriptViewId: restored.transcriptViewId,
+			lastOrdinal: restored.lastOrdinal,
 			messages,
 			isLoading: false,
 			isStale: restored.stale,
@@ -82,18 +85,31 @@ export class SplitPanePreviewStore {
 		this.#loadEpochs.set(chatId, epoch);
 		this.#entries.set(chatId, { ...this.entry(chatId), isLoading: true, error: null });
 		try {
-			const page = await getChatMessages({ chatId, limit: PREVIEW_LIMIT });
-			if (this.#loadEpochs.get(chatId) !== epoch) return;
-			if (isDegradedChatHistoryResponse(page)) {
-				this.#transcriptCache.remove(chatId);
-				this.#entries.set(chatId, {
-					...emptyEntry(chatId),
-					error: m.chat_history_unavailable(),
+			for (let attempt = 0; attempt < 2; attempt += 1) {
+				const demand = await loadTranscriptPageDemand({
+					direction: 'backward',
+					chatId,
+					visibleLimit: PREVIEW_LIMIT,
+					isCurrent: () => this.#loadEpochs.get(chatId) === epoch,
 				});
+				if (demand.kind === 'invalidated') return;
+				if (demand.kind === 'unavailable') {
+					this.#transcriptCache.remove(chatId);
+					this.#entries.set(chatId, {
+						...emptyEntry(chatId),
+						error: m.chat_history_unavailable(),
+					});
+					return;
+				}
+				if (demand.kind === 'view-changed') continue;
+				this.#transcriptCache.replaceFromPage(
+					chatId,
+					collapseBackwardTranscriptDemand(demand),
+				);
+				this.restore(chatId);
 				return;
 			}
-			this.#transcriptCache.replaceFromPage(chatId, page);
-			this.restore(chatId);
+			throw new Error('Chat generation changed while loading preview');
 		} catch (error) {
 			if (this.#loadEpochs.get(chatId) !== epoch) return;
 			this.#entries.set(chatId, {
@@ -106,26 +122,33 @@ export class SplitPanePreviewStore {
 
 	replaceSnapshot(
 		chatId: string,
-		generationId: string,
-		messages: ChatViewMessage[],
-		lastSeq: number,
+		transcriptViewId: string,
+		messages: TranscriptMessage[],
+		lastOrdinal: number,
+		nextBeforeOrdinal: number | null,
 	): void {
 		this.#invalidateSnapshotLoad(chatId);
-		this.#transcriptCache.replace(chatId, generationId, messages, lastSeq);
+		this.#transcriptCache.replace(
+			chatId,
+			transcriptViewId,
+			messages,
+			lastOrdinal,
+			nextBeforeOrdinal,
+		);
 		this.restore(chatId);
 	}
 
 	applyMessages(
 		chatId: string,
-		generationId: string,
-		messages: ChatViewMessage[],
-		serverLastSeq?: number,
+		transcriptViewId: string,
+		messages: TranscriptMessage[],
+		firstOrdinal: number,
+		lastOrdinal: number,
 	): boolean {
-		const result = this.#transcriptCache.applyBackgroundMessages(
+		const result = this.#transcriptCache.applyMessages(
 			chatId,
-			generationId,
-			messages,
-			serverLastSeq,
+			transcriptViewId,
+			{ messages, firstOrdinal, lastOrdinal },
 		);
 		if (result.status !== 'applied') {
 			this.markStale(chatId);

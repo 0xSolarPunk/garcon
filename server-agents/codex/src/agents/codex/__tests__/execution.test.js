@@ -1,22 +1,67 @@
 import { describe, expect, it, mock } from 'bun:test';
 import { AssistantMessage, UserMessage } from '@garcon/common/chat-types';
 import { renderCarriedContext } from '@garcon/common/transcript-seed';
-import { AgentEventEmitterRuntime } from '@garcon/server-agent-common/shared/event-emitter-runtime';
 import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
-import { AgentEventBus } from '../../../../../../server/agents/event-bus.ts';
-import { QueueExecutionAttempt } from '../../../../../../server/chat-execution/execution-attempt.ts';
 import { CodexExecution } from '../execution.ts';
 
-function createRuntime() {
-  const runtime = new AgentEventEmitterRuntime();
+// Stands in for the app-server runtime, which captures the publisher on the operation that issued
+// the call and routes each event by the name Codex gives it. The emit helpers drive those routes,
+// so a test names the operation an event came from rather than the chat it landed in.
+function createRuntime(host = createHost()) {
+  const runtime = {};
+  const routes = new Map();
+  const capture = (request) => {
+    const operation = request.operation;
+    if (operation.runId) routes.set(operation.runId, operation);
+  };
+  const deliver = (chatId, operationId, eventType, build) => {
+    const route = routes.get(operationId);
+    if (!route || route.chatId !== chatId) {
+      host.logger.warn('Dropped a Codex provider event with no owning operation', {
+        chatId,
+        runId: operationId,
+        eventType,
+      });
+      return;
+    }
+    try {
+      route.publish(build(route.runId));
+    } catch (error) {
+      host.logger.warn('Dropped a Codex provider event at an unavailable sink', {
+        chatId,
+        runId: route.runId,
+        eventType,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+  runtime.captureOperation = capture;
+  runtime.emitRows = (chatId, operationId, messages) => deliver(chatId, operationId, 'rows', () => ({
+    type: 'rows',
+    rows: messages.map((message) => ({ message })),
+  }));
+  runtime.emitFinished = (chatId, operationId) => deliver(chatId, operationId, 'run-ended', (runId) => ({
+    type: 'run-ended',
+    runId,
+    outcome: 'finished',
+  }));
+  runtime.emitFailed = (chatId, operationId, message) => deliver(chatId, operationId, 'run-ended', (runId) => ({
+    type: 'run-ended',
+    runId,
+    outcome: 'failed',
+    error: { code: 'PROVIDER_FAILURE', message },
+  }));
   runtime.startSession = mock(async (request) => {
+    capture(request);
     request.executionAdmission?.markStarted();
-    request.onAbortable?.();
     return { agentSessionId: 'thread-1', nativePath: '/tmp/thread-1.jsonl' };
   });
-  runtime.runTurn = mock(async () => undefined);
-  runtime.submitGoalControl = mock(async () => true);
-  runtime.compact = mock(async () => undefined);
+  runtime.runTurn = mock(async (request) => { capture(request); });
+  runtime.submitGoalControl = mock(async (request, beforeDelivery) => {
+    await beforeDelivery({ validate: () => undefined, commit: () => capture(request) });
+    return true;
+  });
+  runtime.compact = mock(async (request) => { capture(request); });
   runtime.abort = mock(async () => false);
   runtime.isRunning = mock(() => false);
   runtime.getRunningSessions = mock(() => []);
@@ -27,6 +72,13 @@ function createRuntime() {
 
 function createHost() {
   return {
+    agentId: 'codex',
+    logger: {
+      debug: mock(() => undefined),
+      info: mock(() => undefined),
+      warn: mock(() => undefined),
+      error: mock(() => undefined),
+    },
     apiProviders: {
       resolveCredential: mock(async () => ({ kind: 'api-key', value: 'secret' })),
     },
@@ -51,16 +103,11 @@ function startRequest(overrides = {}) {
     thinkingMode: 'high',
     settings: { ownerId: 'codex', schemaVersion: 1, values: {} },
     endpoint: null,
-    operation: {
-      commandType: 'chat-start',
-      clientRequestId: 'request-1',
-      clientMessageId: 'message-1',
-      turnId: 'turn-1',
-    },
+    runId: 'run-1',
+    priorContext: [],
     admission: {
       signal: new AbortController().signal,
       markStarted: mock(() => undefined),
-      markAbortable: mock(() => undefined),
     },
     prompt: 'hello',
     attachments: [],
@@ -74,7 +121,7 @@ async function commitHandoff(handoff) {
   handoff.commit();
 }
 
-function goalControlRequest(operation, beforeDelivery = commitHandoff) {
+function goalControlRequest(runId, beforeDelivery = commitHandoff) {
   return startRequest({
     agentSessionId: 'thread-1',
     nativeSession: {
@@ -82,24 +129,23 @@ function goalControlRequest(operation, beforeDelivery = commitHandoff) {
       schemaVersion: 1,
       value: { path: '/tmp/thread-1.jsonl', agentSessionId: 'thread-1' },
     },
-    operation,
+    runId,
     beforeDelivery,
     carriedContext: undefined,
   });
 }
 
 describe('CodexExecution', () => {
-  it('preserves admission, endpoint configuration, session identity, and event identity', async () => {
+  it('preserves admission, endpoint configuration, session identity, and run correlation', async () => {
     const runtime = createRuntime();
-    const host = createHost();
     const execution = new CodexExecution(
-      host,
+      createHost(),
       runtime,
       createPathNativeSessionCodec('codex'),
       createConfig(),
     );
     const events = [];
-    execution.subscribe((event) => events.push(event));
+    const publish = (event) => events.push(event);
     const request = startRequest({
       endpoint: {
         apiProviderId: 'provider-1',
@@ -119,7 +165,7 @@ describe('CodexExecution', () => {
       },
     });
 
-    await expect(execution.start(request)).resolves.toEqual({
+    await expect(execution.start(request, publish)).resolves.toEqual({
       agentSessionId: 'thread-1',
       nativeSession: {
         ownerId: 'codex',
@@ -133,29 +179,30 @@ describe('CodexExecution', () => {
       nativeSeedReceipt: null,
     });
     expect(request.admission.markStarted).toHaveBeenCalledTimes(1);
-    expect(request.admission.markAbortable).toHaveBeenCalledTimes(1);
     expect(runtime.startSession).toHaveBeenCalledWith(expect.objectContaining({
-      clientRequestId: 'request-1',
-      clientMessageId: 'message-1',
-      turnId: 'turn-1',
+      operation: expect.objectContaining({
+        chatId: 'chat-1',
+        runId: 'run-1',
+        publish: expect.any(Function),
+      }),
       envOverrides: { CODEX_HOME: '/tmp/codex-home' },
       codexConfig: expect.objectContaining({
         env: { GARCON_CODEX_PROVIDER_API_KEY_ENDPOINT_1: 'secret' },
       }),
     }));
 
-    runtime.emitMessages('chat-1', [
+    runtime.emitRows('chat-1', 'run-1', [
       new AssistantMessage('2026-07-19T00:00:00.000Z', 'done'),
-    ], { clientRequestId: 'request-1', turnId: 'turn-1' });
+    ]);
     expect(events).toContainEqual(expect.objectContaining({
-      type: 'messages',
-      chatId: 'chat-1',
-      operation: request.operation,
+      type: 'rows',
+      rows: [expect.objectContaining({
+        message: expect.objectContaining({ content: 'done' }),
+      })],
     }));
     expect(events).toContainEqual(expect.objectContaining({
-      type: 'session-created',
-      chatId: 'chat-1',
-      operation: request.operation,
+      type: 'session',
+      session: expect.objectContaining({ agentSessionId: 'thread-1' }),
     }));
   });
 
@@ -171,13 +218,14 @@ describe('CodexExecution', () => {
       createConfig(),
     );
     const events = [];
-    execution.subscribe((event) => events.push(event));
+    const publish = (event) => events.push(event);
 
-    await expect(execution.start(startRequest())).rejects.toThrow('did not materialize');
-    expect(events.some((event) => event.type === 'session-created')).toBe(false);
+    await expect(execution.start(startRequest(), publish)).rejects.toThrow('did not materialize');
+    expect(events.some((event) => event.type === 'session')).toBe(false);
   });
 
   it('keeps carried context separate when starting a Codex goal', async () => {
+    const publish = () => {};
     const runtime = createRuntime();
     const execution = new CodexExecution(
       createHost(),
@@ -192,7 +240,7 @@ describe('CodexExecution', () => {
     const started = await execution.start(startRequest({
       prompt: '/goal ship the migration',
       carriedContext: { prefix },
-    }));
+    }), publish);
 
     expect(runtime.startSession).toHaveBeenCalledWith(expect.objectContaining({
       command: 'ship the migration',
@@ -208,6 +256,7 @@ describe('CodexExecution', () => {
   });
 
   it('rejects goal controls that cannot start a new thread', async () => {
+    const publish = () => {};
     const execution = new CodexExecution(
       createHost(),
       createRuntime(),
@@ -215,12 +264,12 @@ describe('CodexExecution', () => {
       createConfig(),
     );
 
-    await expect(execution.start(startRequest({ prompt: '/goal clear' })))
+    await expect(execution.start(startRequest({ prompt: '/goal clear' }), publish))
       .rejects.toMatchObject({ code: 'INVALID_SETTINGS' });
   });
 
   for (const outcome of ['decline', 'failure']) {
-    it(`keeps the predecessor operation visible when goal control has a pre-boundary ${outcome}`, async () => {
+    it(`keeps the predecessor run active when goal control has a pre-boundary ${outcome}`, async () => {
       const runtime = createRuntime();
       const execution = new CodexExecution(
         createHost(),
@@ -228,35 +277,30 @@ describe('CodexExecution', () => {
         createPathNativeSessionCodec('codex'),
         createConfig(),
       );
-      const predecessor = startRequest().operation;
-      const successor = { ...predecessor, clientRequestId: 'request-2', turnId: 'turn-2' };
-      const next = { ...predecessor, clientRequestId: 'request-3', turnId: 'turn-3' };
       const events = [];
-      execution.subscribe((event) => events.push(event));
-      await execution.start(startRequest());
+      const publish = (event) => events.push(event);
+      await execution.start(startRequest(), publish);
       runtime.submitGoalControl.mockImplementation(async () => {
-        runtime.emitFinished('chat-1', 0, {
-          clientRequestId: predecessor.clientRequestId,
-          turnId: predecessor.turnId,
-        });
+        runtime.emitFinished('chat-1', 'run-1');
         if (outcome === 'failure') throw new Error('failed before delivery boundary');
         return false;
       });
 
-      const activeInput = execution.submitGoalControl(goalControlRequest(successor));
+      const activeInput = execution.submitGoalControl(goalControlRequest('run-2'), publish);
       if (outcome === 'failure') await expect(activeInput).rejects.toThrow('failed before delivery boundary');
       else await expect(activeInput).resolves.toBe(false);
       expect(events).toContainEqual(expect.objectContaining({
-        type: 'finished',
-        operation: predecessor,
+        type: 'run-ended',
+        runId: 'run-1',
+        outcome: 'finished',
       }));
 
-      await execution.resume(goalControlRequest(next));
+      await execution.resume(goalControlRequest('run-3'), publish);
       expect(runtime.runTurn).toHaveBeenCalledOnce();
     });
   }
 
-  it('retains successor ownership after a post-boundary delivery failure', async () => {
+  it('retains successor correlation after a post-boundary delivery failure', async () => {
     const runtime = createRuntime();
     const execution = new CodexExecution(
       createHost(),
@@ -264,33 +308,36 @@ describe('CodexExecution', () => {
       createPathNativeSessionCodec('codex'),
       createConfig(),
     );
-    const predecessor = startRequest().operation;
-    const successor = { ...predecessor, clientRequestId: 'request-2', turnId: 'turn-2' };
     const events = [];
-    execution.subscribe((event) => events.push(event));
-    await execution.start(startRequest());
-    runtime.submitGoalControl.mockImplementation(async (_request, beforeDelivery) => {
+    const publish = (event) => events.push(event);
+    await execution.start(startRequest(), publish);
+    runtime.submitGoalControl.mockImplementation(async (request, beforeDelivery) => {
       await beforeDelivery({
         validate: () => undefined,
-        commit: () => undefined,
+        commit: () => runtime.captureOperation(request),
       });
       throw new Error('delivery outcome unknown');
     });
 
-    await expect(execution.submitGoalControl(goalControlRequest(successor)))
+    await expect(execution.submitGoalControl(goalControlRequest('run-2'), publish))
       .rejects.toThrow('delivery outcome unknown');
-    runtime.emitFailed('chat-1', 'delivery failed', {
-      clientRequestId: successor.clientRequestId,
-      turnId: successor.turnId,
-    });
+    runtime.emitFailed('chat-1', 'run-2', 'delivery failed');
 
     expect(events).toContainEqual(expect.objectContaining({
-      type: 'failed',
-      operation: successor,
+      type: 'run-ended',
+      runId: 'run-2',
+      outcome: 'failed',
     }));
   });
 
-  it('commits retained, routed, tracked, and runtime ownership at one persistence boundary', async () => {
+  it('changes runtime event correlation only when the goal handoff commits', async () => {
+    const predecessorMessages = [];
+    const rejectedMessages = [];
+    const successorMessages = [];
+    const collectRows = (messages) => (event) => {
+      if (event.type !== 'rows') return;
+      messages.push(...event.rows.map((row) => row.message.content));
+    };
     const runtime = createRuntime();
     const execution = new CodexExecution(
       createHost(),
@@ -298,92 +345,141 @@ describe('CodexExecution', () => {
       createPathNativeSessionCodec('codex'),
       createConfig(),
     );
-    const bus = new AgentEventBus({ list: () => [{ execution }] });
-    const predecessor = startRequest().operation;
-    const rejected = { ...predecessor, clientRequestId: 'request-rejected', turnId: 'turn-rejected' };
-    const successor = { ...predecessor, clientRequestId: 'request-b', turnId: 'turn-b' };
-    const attempt = new QueueExecutionAttempt(predecessor);
-    const successorAbortable = mock(() => undefined);
-    let runtimeMetadata = {
-      clientRequestId: predecessor.clientRequestId,
-      turnId: predecessor.turnId,
-    };
-    const trackedMessages = [];
-    const routedMessages = [];
-    execution.subscribe((event) => {
-      if (event.type === 'messages') {
-        trackedMessages.push({ content: event.messages[0].content, turnId: event.operation.turnId });
-      }
-    });
-    bus.onMessages((_chatId, messages, metadata) => {
-      routedMessages.push({ content: messages[0].content, turnId: metadata.turnId });
-    });
-    const emitOutput = (content) => runtime.emitMessages(
+    await execution.start(startRequest(), collectRows(predecessorMessages));
+    const emitOutput = (content, runId) => runtime.emitRows(
       'chat-1',
+      runId,
       [new AssistantMessage('2026-07-24T00:00:00.000Z', content)],
-      runtimeMetadata,
     );
-    const assertOwner = (turnId, content) => {
-      expect(runtimeMetadata.turnId).toBe(turnId);
-      expect(attempt.identity().turnId).toBe(turnId);
-      expect(bus.getActiveTurn('chat-1').turnId).toBe(turnId);
-      expect(trackedMessages.at(-1)).toEqual({ content, turnId });
-      expect(routedMessages.at(-1)).toEqual({ content, turnId });
-    };
-    const composeHandoff = (operationHandoff, next) => attempt.handoffTurn(
-      predecessor,
-      next,
-      bus.handoffTurn('chat-1', predecessor, next, operationHandoff),
-    );
-
-    bus.trackTurn('chat-1', predecessor);
-    bus.markTurnAbortable('chat-1', predecessor);
-    attempt.markAbortable();
-    await execution.start(startRequest());
     runtime.submitGoalControl.mockImplementation(async (request, beforeDelivery) => {
+      emitOutput('before delivery', 'run-1');
       await beforeDelivery({
         validate: () => undefined,
-        commit: () => {
-          runtimeMetadata = {
-            clientRequestId: request.clientRequestId,
-            turnId: request.turnId,
-          };
-          request.onAbortable?.();
-        },
+        commit: () => runtime.captureOperation(request),
       });
+      emitOutput('after delivery', 'run-2');
       return true;
     });
 
-    await expect(execution.submitGoalControl(goalControlRequest(rejected, async (operationHandoff) => {
-      const handoff = composeHandoff(operationHandoff, rejected);
+    await expect(execution.submitGoalControl(goalControlRequest('run-rejected', async (handoff) => {
       handoff.validate();
-      await Promise.resolve();
-      emitOutput('A while persistence fails');
-      assertOwner('turn-1', 'A while persistence fails');
+      emitOutput('while rejected handoff validates', 'run-1');
       throw new Error('persistence failed');
-    }))).rejects.toThrow('persistence failed');
-    emitOutput('A after persistence failed');
-    assertOwner('turn-1', 'A after persistence failed');
+    }), collectRows(rejectedMessages))).rejects.toThrow('persistence failed');
+    emitOutput('after rejected handoff', 'run-1');
 
     await expect(execution.submitGoalControl({
-      ...goalControlRequest(successor, async (operationHandoff) => {
-        const handoff = composeHandoff(operationHandoff, successor);
+      ...goalControlRequest('run-2', async (handoff) => {
         handoff.validate();
-        await Promise.resolve();
-        emitOutput('A before persistence commits');
-        assertOwner('turn-1', 'A before persistence commits');
-        handoff.validate();
+        emitOutput('while accepted handoff validates', 'run-1');
         handoff.commit();
-        emitOutput('B after the atomic commit');
-        assertOwner('turn-b', 'B after the atomic commit');
       }),
       admission: {
         signal: new AbortController().signal,
         markStarted: mock(() => undefined),
-        markAbortable: successorAbortable,
       },
-    })).resolves.toBe(true);
-    expect(successorAbortable).toHaveBeenCalledTimes(1);
-    await expect(bus.waitUntilTurnAbortable('chat-1', successor)).resolves.toBe(true);
+    }, collectRows(successorMessages))).resolves.toBe(true);
+
+    expect(predecessorMessages).toEqual([
+      'before delivery',
+      'while rejected handoff validates',
+      'after rejected handoff',
+      'before delivery',
+      'while accepted handoff validates',
+    ]);
+    expect(rejectedMessages).toEqual([]);
+    expect(successorMessages).toEqual(['after delivery']);
+  });
+
+  it('[TLV5-L07.07-CODEX-UNIT-01] keeps the prior source route when a replacement start fails before activation', async () => {
+    const host = createHost();
+    const runtime = createRuntime(host);
+    const execution = new CodexExecution(
+      host,
+      runtime,
+      createPathNativeSessionCodec('codex'),
+      createConfig(),
+    );
+    const priorEvents = [];
+    const replacementEvents = [];
+    await execution.start(startRequest(), (event) => priorEvents.push(event));
+    runtime.emitFinished('chat-1', 'run-1');
+    host.apiProviders.resolveCredential.mockImplementation(async () => {
+      throw new Error('credential lookup failed before session activation');
+    });
+
+    await expect(execution.start(startRequest({
+      runId: 'run-2',
+      endpoint: {
+        apiProviderId: 'provider-1',
+        endpointId: 'endpoint-1',
+        providerLabel: 'Provider One',
+        protocol: 'openai-compatible',
+        baseUrl: 'https://example.test/v1',
+        model: 'gpt-5.4',
+        isLocal: false,
+        capabilities: { chatCompletions: false, responses: true },
+        headers: {},
+        credential: {
+          kind: 'api-provider-endpoint',
+          apiProviderId: 'provider-1',
+          endpointId: 'endpoint-1',
+        },
+      },
+    }), (event) => replacementEvents.push(event))).rejects.toThrow(
+      'credential lookup failed before session activation',
+    );
+
+    runtime.emitRows('chat-1', 'run-1', [
+      new AssistantMessage('2026-08-15T00:00:00.000Z', 'late prior output'),
+    ]);
+
+    expect(priorEvents).toContainEqual(expect.objectContaining({
+      type: 'rows',
+      rows: [expect.objectContaining({
+        message: expect.objectContaining({ content: 'late prior output' }),
+      })],
+    }));
+    expect(replacementEvents).toEqual([]);
+  });
+
+  it('[TLV5-L07.08-CODEX-UNIT-01] drops a delayed provider event at its closed originating sink after view replacement', async () => {
+    const host = createHost();
+    const runtime = createRuntime(host);
+    const execution = new CodexExecution(
+      host,
+      runtime,
+      createPathNativeSessionCodec('codex'),
+      createConfig(),
+    );
+    const originatingEvents = [];
+    const replacementEvents = [];
+    let originatingSinkClosed = false;
+    const originatingPublisher = (event) => {
+      if (originatingSinkClosed) throw new Error('originating sink closed');
+      originatingEvents.push(event);
+    };
+    await execution.start(startRequest(), originatingPublisher);
+    originatingSinkClosed = true;
+    await execution.resume(goalControlRequest('run-2'), (event) => replacementEvents.push(event));
+    const delayedContent = 'delayed output from the replaced view';
+
+    expect(() => runtime.emitRows(
+      'chat-1',
+      'run-1',
+      [new AssistantMessage('2026-08-15T00:00:00.000Z', delayedContent)],
+    )).not.toThrow();
+
+    expect(originatingEvents.filter((event) => event.type === 'rows')).toEqual([]);
+    expect(replacementEvents).toEqual([]);
+    expect(host.logger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(/drop.*Codex.*event/i),
+      expect.objectContaining({
+        chatId: 'chat-1',
+        runId: 'run-1',
+        eventType: 'rows',
+      }),
+    );
+    expect(JSON.stringify(host.logger.warn.mock.calls)).not.toContain(delayedContent);
   });
 });

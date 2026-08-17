@@ -5,23 +5,24 @@ import type { ExecutionOwnership } from './execution-ownership.ts';
 import { executionTurnIdentity } from './types.ts';
 import type {
   AgentTurnRunnerPort,
-  PendingInputsPort,
-  PendingUserInputRegistrationOptions,
+  UserInputAdmissionOptions,
   QueueDrainOptionsResolver,
 } from './types.ts';
 
 interface GoalControlDeliveryOptions {
   turnRunner: AgentTurnRunnerPort;
-  pendingInputs: PendingInputsPort;
   ownership: ExecutionOwnership;
   getDrainOptions: QueueDrainOptionsResolver;
   readControl(chatId: string): Promise<StoredChatExecutionControlState>;
-  registerPending(
+  admitInput(
     chatId: string,
     content: string,
-    options: PendingUserInputRegistrationOptions,
-  ): Promise<void>;
+    options: UserInputAdmissionOptions,
+  ): Promise<boolean>;
+  discardPreparedInput(chatId: string, clientMessageId: string | null | undefined): void;
 }
+
+export class DuplicateGoalControlInputError extends Error {}
 
 export class GoalControlDelivery {
   constructor(private readonly options: GoalControlDeliveryOptions) {}
@@ -44,8 +45,8 @@ export class GoalControlDelivery {
     const activeAttempt = this.options.ownership.attempt(chatId);
     const predecessor = activeAttempt?.identity();
     const successor = executionTurnIdentity(activeOptions)!;
-    let pendingRegistered = false;
     let deliveryMayHaveStarted = false;
+    let inputInserted = false;
     try {
       const handled = await this.options.turnRunner.submitGoalControl!(
         chatId,
@@ -64,8 +65,8 @@ export class GoalControlDelivery {
             ? activeAttempt.handoffTurn(predecessor, successor, handoff)
             : handoff;
           committedHandoff.validate();
-          await this.options.registerPending(chatId, content, activeOptions);
-          pendingRegistered = true;
+          inputInserted = await this.options.admitInput(chatId, content, activeOptions);
+          if (!inputInserted) throw new DuplicateGoalControlInputError();
           await afterPendingRegistered?.();
           validateOwner();
           committedHandoff.validate();
@@ -78,12 +79,12 @@ export class GoalControlDelivery {
       }
       return handled;
     } catch (error) {
-      if (deliveryMayHaveStarted) {
-        this.options.pendingInputs.markUnconfirmed(chatId, activeOptions.clientRequestId);
-      } else if (pendingRegistered) {
-        this.options.pendingInputs.markFailed(chatId, activeOptions.clientRequestId);
-      }
+      if (error instanceof DuplicateGoalControlInputError) throw error;
       throw new GoalControlDeliveryError(error, deliveryMayHaveStarted);
+    } finally {
+      if (inputInserted) {
+        this.options.discardPreparedInput(chatId, activeOptions.clientMessageId);
+      }
     }
   }
 }

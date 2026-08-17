@@ -2,42 +2,96 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BackgroundTranscriptLoader } from '$lib/chat/transcript/background-transcript-loader.js';
 import { ChatTranscriptCache } from '../chat-transcript-cache.svelte';
 import { UserMessage, type ChatMessage } from '$shared/chat-types';
-import type { ChatViewMessage, CompleteChatHistoryResponse } from '$shared/chat-view';
+import type { TranscriptMessage, CompleteChatHistoryResponse } from '$shared/chat-view';
+import { getChatMessages } from '$lib/api/chats.js';
+
+vi.mock('$lib/api/chats.js', () => ({
+	getChatMessages: vi.fn(),
+}));
 
 const TS = '2024-01-01T00:00:00.000Z';
 
-function entry(seq: number, content: string): ChatViewMessage {
+function entry(ordinal: number, content: string): TranscriptMessage {
 	return {
-		seq,
+		ordinal,
 		message: new UserMessage(TS, content) as ChatMessage,
 	};
 }
 
 function page(
-	generationId: string,
-	messages: ChatViewMessage[],
-	lastSeq = messages.at(-1)?.seq ?? 0,
+	transcriptViewId: string,
+	messages: TranscriptMessage[],
+	lastOrdinal = messages.at(-1)?.ordinal ?? 0,
 ): CompleteChatHistoryResponse {
 	return {
 		historyState: { kind: 'complete' },
 		chatId: 'chat-1',
-		generationId,
+		transcriptViewId,
 		messages,
-		lastSeq,
-		pageOldestSeq: messages[0]?.seq ?? 0,
+		lastOrdinal,
+		pageOldestOrdinal: messages[0]?.ordinal ?? 0,
+		pageNewestOrdinal: lastOrdinal,
+		nextBeforeOrdinal: null,
 		hasMore: false,
-		pendingUserInputs: [],
-		limit: 50,
+		resendCandidates: [],
+		limit: 100,
 	};
 }
 
 function seqs(cache: ChatTranscriptCache, chatId = 'chat-1'): number[] {
-	return cache.get(chatId)?.messages.map((item) => item.seq) ?? [];
+	return cache.get(chatId)?.messages.map((item) => item.ordinal) ?? [];
+}
+
+function boundedNewestPage(
+	messages: TranscriptMessage[],
+	pageNewestOrdinal: number,
+	nextBeforeOrdinal: number | null,
+): CompleteChatHistoryResponse {
+	return {
+		...page('generation-1', messages, 250),
+		pageOldestOrdinal: messages[0]?.ordinal ?? 0,
+		pageNewestOrdinal,
+		nextBeforeOrdinal,
+		hasMore: nextBeforeOrdinal !== null,
+		limit: 100,
+	};
 }
 
 describe('BackgroundTranscriptLoader', () => {
 	beforeEach(() => {
 		localStorage.clear();
+		vi.mocked(getChatMessages).mockReset();
+	});
+
+	it('[TLV5-PAGE.09-WEB-BACKGROUND-01] fills a cached newest snapshot across trailing hidden raw budgets', async () => {
+		vi.mocked(getChatMessages)
+			.mockResolvedValueOnce(boundedNewestPage([], 250, 151))
+			.mockResolvedValueOnce(boundedNewestPage([], 150, 51))
+			.mockResolvedValueOnce(
+				boundedNewestPage(
+					Array.from({ length: 50 }, (_, index) => entry(index + 1, `message-${index + 1}`)),
+					50,
+					null,
+				),
+			);
+		const cache = new ChatTranscriptCache({ limit: 50 });
+		const replaceFromPage = vi.spyOn(cache, 'replaceFromPage');
+		const loader = new BackgroundTranscriptLoader({ cache });
+
+		loader.queueLoad('chat-1');
+		await loader.waitForIdle('chat-1');
+
+		expect(vi.mocked(getChatMessages).mock.calls.map(([request]) => request)).toEqual([
+			{ chatId: 'chat-1', limit: 100 },
+			{ chatId: 'chat-1', limit: 100, beforeOrdinal: 151, transcriptViewId: 'generation-1' },
+			{ chatId: 'chat-1', limit: 100, beforeOrdinal: 51, transcriptViewId: 'generation-1' },
+		]);
+		expect(replaceFromPage).toHaveBeenCalledOnce();
+		expect(seqs(cache)).toEqual(Array.from({ length: 50 }, (_, index) => index + 1));
+		expect(cache.get('chat-1')).toMatchObject({
+			lastOrdinal: 250,
+			nextBeforeOrdinal: null,
+		});
 	});
 
 	it('coalesces repeated loads for the same chat', async () => {
@@ -61,9 +115,10 @@ describe('BackgroundTranscriptLoader', () => {
 		const loader = new BackgroundTranscriptLoader({ cache, loadPage });
 
 		loader.queueLoad('chat-1', {
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			messages: [entry(3, 'three')],
-			lastSeq: 3,
+			firstOrdinal: 3,
+			lastOrdinal: 3,
 		});
 		await loader.waitForIdle('chat-1');
 
@@ -76,27 +131,29 @@ describe('BackgroundTranscriptLoader', () => {
 			.fn()
 			.mockResolvedValue(page('generation-1', [entry(1, 'one'), entry(2, 'two')]));
 		const loader = new BackgroundTranscriptLoader({ cache, loadPage });
-		const applyMessages = cache.applyBackgroundMessages.bind(cache);
+		const applyMessages = cache.applyMessages.bind(cache);
 		let queuedLateBatch = false;
 		const applyMessagesSpy = vi
-			.spyOn(cache, 'applyBackgroundMessages')
-			.mockImplementation((chatId, generationId, messages, lastSeq) => {
-				const result = applyMessages(chatId, generationId, messages, lastSeq);
+			.spyOn(cache, 'applyMessages')
+			.mockImplementation((chatId, transcriptViewId, append) => {
+				const result = applyMessages(chatId, transcriptViewId, append);
 				if (!queuedLateBatch) {
 					queuedLateBatch = true;
 					loader.queueLoad('chat-1', {
-						generationId: 'generation-1',
+						transcriptViewId: 'generation-1',
 						messages: [entry(4, 'four')],
-						lastSeq: 4,
+						firstOrdinal: 4,
+						lastOrdinal: 4,
 					});
 				}
 				return result;
 			});
 
 		loader.queueLoad('chat-1', {
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			messages: [entry(3, 'three')],
-			lastSeq: 3,
+			firstOrdinal: 3,
+			lastOrdinal: 3,
 		});
 		await loader.waitForIdle('chat-1');
 
@@ -118,9 +175,10 @@ describe('BackgroundTranscriptLoader', () => {
 				queuedAfterDrain = true;
 				queueMicrotask(() => {
 					loader.queueLoad('chat-1', {
-						generationId: 'generation-1',
+						transcriptViewId: 'generation-1',
 						messages: [entry(3, 'three')],
-						lastSeq: 3,
+						firstOrdinal: 3,
+						lastOrdinal: 3,
 					});
 				});
 			}
@@ -142,9 +200,10 @@ describe('BackgroundTranscriptLoader', () => {
 		const loader = new BackgroundTranscriptLoader({ cache, loadPage });
 
 		loader.queueLoad('chat-1', {
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			messages: [entry(2, 'two')],
-			lastSeq: 2,
+			firstOrdinal: 2,
+			lastOrdinal: 2,
 		});
 		await loader.waitForIdle('chat-1');
 		await Promise.resolve();
@@ -160,8 +219,10 @@ describe('BackgroundTranscriptLoader', () => {
 		const loader = new BackgroundTranscriptLoader({ cache, loadPage });
 
 		loader.queueLoad('chat-1', {
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			messages: [entry(2, 'old')],
+			firstOrdinal: 2,
+			lastOrdinal: 2,
 		});
 		await loader.waitForIdle('chat-1');
 
@@ -195,9 +256,10 @@ describe('BackgroundTranscriptLoader', () => {
 		const loader = new BackgroundTranscriptLoader({ cache, loadPage });
 
 		loader.queueLoad('chat-1', {
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			messages: [entry(2, 'held')],
-			lastSeq: 2,
+			firstOrdinal: 2,
+			lastOrdinal: 2,
 		});
 		await loader.waitForIdle('chat-1');
 

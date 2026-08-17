@@ -9,6 +9,8 @@
 	import MessageRenderFallback from './MessageRenderFallback.svelte';
 	import PromptComposer from './PromptComposer.svelte';
 	import QueuedInputsDialog from './QueuedInputsDialog.svelte';
+	import HandoffForkDialog from './HandoffForkDialog.svelte';
+	import ReloadChatDialog from './ReloadChatDialog.svelte';
 	import UserMessageNavigatorDialog from './UserMessageNavigatorDialog.svelte';
 	import type { GitQuickBranchSelectorControls } from './git-quick-status-tray-types.js';
 	import QueueControls from './QueueControls.svelte';
@@ -16,7 +18,9 @@
 		ActiveTranscriptState,
 		INITIAL_VISIBLE_MESSAGES,
 	} from '$lib/chat/transcript/active-transcript-state.svelte.js';
-	import type { ChatViewMessage } from '$shared/chat-view';
+	import type { ResendCandidate, TranscriptMessage } from '$shared/chat-view';
+	import type { ChatProcessingPhase } from '$shared/chat-types';
+	import { searchResultNavigation } from '$lib/chat/actions/search-result-navigation.svelte.js';
 	import { ChatTranscriptCache } from '$lib/chat/transcript/chat-transcript-cache.svelte.js';
 	import { BackgroundTranscriptLoader } from '$lib/chat/transcript/background-transcript-loader.js';
 	import type { SplitPanePreviewCursor } from '$lib/chat/split/split-pane-preview-store.svelte.js';
@@ -103,9 +107,10 @@
 		getVisiblePreviewCursor?: (chatId: string) => SplitPanePreviewCursor | null;
 		applyVisiblePreviewMessages?: (
 			chatId: string,
-			generationId: string,
-			messages: ChatViewMessage[],
-			lastSeq?: number,
+			transcriptViewId: string,
+			messages: TranscriptMessage[],
+			firstOrdinal: number,
+			lastOrdinal: number,
 		) => boolean | void;
 		loadVisiblePreviewSnapshot?: (chatId: string) => Promise<void> | void;
 		markVisiblePreviewStale?: (chatId: string) => void;
@@ -113,6 +118,13 @@
 		isVisible?: boolean;
 		isPresented?: boolean;
 	}
+
+	type ReloadRequest = {
+		readonly chatId: string;
+		readonly candidates: readonly ResendCandidate[];
+		readonly complete: () => void;
+		readonly fail: (error: unknown) => void;
+	};
 
 	const fallbackTranscriptCache = new ChatTranscriptCache({ limit: INITIAL_VISIBLE_MESSAGES });
 
@@ -164,14 +176,20 @@
 		get currentChatId() {
 			return lifecycle.currentChatId;
 		},
-		applyProcessingPhase: (chatId, phase) => lifecycle.applyProcessingPhase(chatId, phase),
-		applyProcessingSnapshotPhase: (chatId, phase, sentAt) =>
-			lifecycle.applyProcessingSnapshotPhase(chatId, phase, sentAt),
+		applyProcessingPhase: (chatId, phase) => {
+			lifecycle.applyProcessingPhase(chatId, phase);
+		},
+		applyProcessingSnapshotPhase: (chatId, phase, sentAt) => {
+			lifecycle.applyProcessingSnapshotPhase(chatId, phase, sentAt);
+		},
 		clearTurnPermissionRequests: () => conversationUi.clearTurnPermissionRequests(),
 	});
+
 	let queuedInputsDialogOpen = $state(false);
 	let queuedInputsDialogChatId = $state<string | null>(null);
 	let composerEditorOpenRequestId = $state(0);
+	let reloadRequest = $state.raw<ReloadRequest | null>(null);
+	let reloadInProgress = $state(false);
 	const dialogControl = $derived(conversationUi.getExecutionControl(queuedInputsDialogChatId));
 	const dialogQueue = $derived(dialogControl?.queue ?? null);
 	const queuedInputEditor = new QueuedInputEditorState({
@@ -191,16 +209,21 @@
 		getVisibleChatIds: () => getVisibleChatIds?.() ?? [],
 		getVisibleChatCursor: (chatId) => getVisiblePreviewCursor?.(chatId) ?? null,
 		loadVisibleChatSnapshot: (chatId) => loadVisiblePreviewSnapshot?.(chatId),
-		onVisibleChatMessages: (chatId, generationId, messages, lastSeq) =>
-			applyVisiblePreviewMessages?.(chatId, generationId, messages, lastSeq),
-		markBackgroundStale: (chatId) => transcriptCache.markStale(chatId),
-		onBackgroundMessages: (chatId, generationId, messages, lastSeq) => {
-			const applied = transcriptCache.applyBackgroundMessages(
+		onVisibleChatMessages: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) =>
+			applyVisiblePreviewMessages?.(
 				chatId,
-				generationId,
+				transcriptViewId,
 				messages,
-				lastSeq,
-			);
+				firstOrdinal,
+				lastOrdinal,
+			),
+		markBackgroundStale: (chatId) => transcriptCache.markStale(chatId),
+		onBackgroundMessages: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) => {
+			const applied = transcriptCache.applyMessages(chatId, transcriptViewId, {
+				messages,
+				firstOrdinal,
+				lastOrdinal,
+			});
 			if (applied.status !== 'applied') return false;
 			const preview = selectPreviewFromBatch(messages.map((entry) => entry.message));
 			if (preview) sessions.patchPreview(chatId, preview.content, preview.timestamp);
@@ -307,12 +330,14 @@
 	let conversationViewport: ConversationViewportPort | null = $state(null);
 	let queueControlsContainer: HTMLDivElement | undefined = $state();
 	const conversationSurfaceIdentity = $derived(
-		`${chatState.activeChatId ?? 'none'}:${chatState.generationId}`,
+		`${chatState.activeChatId ?? 'none'}:${chatState.transcriptViewId}`,
 	);
 
 	// WS drain and event router.
 	const drainHandle = createDrainCursor(ws);
 	onDestroy(() => {
+		reloadRequest?.complete();
+		reloadRequest = null;
 		removeProcessingPresentation();
 		drainHandle.cleanup();
 		transcriptCache.flush();
@@ -332,8 +357,14 @@
 		backgroundTranscriptLoader,
 		visiblePreviews: {
 			isVisible: (chatId) => isVisiblePreviewChat?.(chatId) ?? false,
-			applyMessages: (chatId, generationId, messages) =>
-				applyVisiblePreviewMessages?.(chatId, generationId, messages),
+			applyMessages: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) =>
+				applyVisiblePreviewMessages?.(
+					chatId,
+					transcriptViewId,
+					messages,
+					firstOrdinal,
+					lastOrdinal,
+				),
 			loadSnapshot: (chatId) => loadVisiblePreviewSnapshot?.(chatId),
 			markStale: (chatId) => markVisiblePreviewStale?.(chatId),
 		},
@@ -352,7 +383,6 @@
 		chatState,
 		sessions,
 	});
-	onDestroy(() => scroll.destroy());
 	function scrollToBottomAndFill(): void {
 		void scroll.scrollToLatest().then(() => scroll.fillUnderfilledViewport());
 	}
@@ -381,9 +411,8 @@
 					defaults.thinkingMode,
 					modelCatalog.getThinkingModes(agentId),
 				),
-				agentSettings:
-					defaults.agentSettingsById[agentId]
-					?? modelCatalog.getDefaultAgentSettings(agentId),
+					agentSettings: defaults.agentSettingsById[agentId]
+						?? modelCatalog.getDefaultAgentSettings(agentId),
 			};
 		},
 		appShell,
@@ -404,6 +433,22 @@
 	const directAdmissionPending = $derived(
 		controller.isDirectAdmissionPending(sessions.selectedChatId),
 	);
+	// Consumes an epoch-validated search navigation exactly once, after the
+	// selected chat's transcript has the target row loaded.
+	$effect(() => {
+		const chatId = chatState.activeChatId;
+		if (!chatId || chatState.loadStatus !== 'loaded') return;
+		if (!searchResultNavigation.peek(chatId)) return;
+		if (chatState.transcriptViewId === '') return;
+		const ordinal = searchResultNavigation.take(chatId);
+		if (ordinal === null || ordinal > chatState.lastOrdinal) return;
+		void scroll.jumpToMessageRow({
+			chatId,
+			transcriptViewId: chatState.transcriptViewId,
+			rowId: `${chatState.transcriptViewId}:${ordinal}`,
+		});
+	});
+
 	const userMessageNavigator = new UserMessageNavigatorController({
 		transcript: chatState,
 		getSelectedChatId: () => sessions.selectedChatId,
@@ -440,13 +485,14 @@
 		if (queuedInputsDialogOpen && queuedInputsDialogChatId !== chatId) {
 			closeQueuedInputsDialog();
 		}
+		if (reloadRequest && reloadRequest.chatId !== chatId) cancelReload();
 		controller.handleChatSwitchIfChanged(chatId);
 	});
 
 	$effect(() => {
 		const chatId = sessions.selectedChatId;
-		const generationId = chatState.generationId;
-		userMessageNavigator.reconcileActiveTranscript(chatId, generationId);
+		const transcriptViewId = chatState.transcriptViewId;
+		userMessageNavigator.reconcileActiveTranscript(chatId, transcriptViewId);
 	});
 
 	const isPreparingInitialScroll = $derived(
@@ -611,9 +657,40 @@
 		if (!chatId || chatId !== sessions.selectedChatId) {
 			throw new Error(m.sidebar_chats_reload_failed());
 		}
-		await reloadChatFromNative(ws, chatState, chatId);
-		if (chatId === sessions.selectedChatId && scroll.isPinnedToBottom) {
-			scroll.prepareInitialBottomRestore(chatId);
+		if (reloadRequest) throw new Error(m.sidebar_chats_reload_failed());
+		return new Promise<void>((resolve, reject) => {
+			reloadRequest = {
+				chatId,
+				candidates: [...chatState.resendCandidates],
+				complete: resolve,
+				fail: reject,
+			};
+		});
+	}
+
+	function cancelReload(): void {
+		if (reloadInProgress || !reloadRequest) return;
+		const request = reloadRequest;
+		reloadRequest = null;
+		request.complete();
+	}
+
+	async function confirmReload(): Promise<void> {
+		const request = reloadRequest;
+		if (!request || reloadInProgress) return;
+		reloadInProgress = true;
+		try {
+			await reloadChatFromNative(ws, chatState, request.chatId);
+			if (request.chatId === sessions.selectedChatId && scroll.isPinnedToBottom) {
+				scroll.prepareInitialBottomRestore(request.chatId);
+			}
+			reloadRequest = null;
+			request.complete();
+		} catch (error) {
+			reloadRequest = null;
+			request.fail(error);
+		} finally {
+			reloadInProgress = false;
 		}
 	}
 
@@ -653,12 +730,13 @@
 			<ConversationFeed
 				bind:scrollContainer
 				onscroll={() => scroll.handleScroll()}
-				onUserScrollIntent={(direction, source) =>
-					scroll.noteUserScrollIntent(direction, source)}
+				onUserScrollIntent={(direction) => scroll.noteUserScrollIntent(direction)}
 				onLoadEarlier={() => void scroll.requestPage('earlier', 'button')}
 				onLoadLater={() => void scroll.requestPage('later', 'button')}
-				onPermissionDecision={(id, d) => controller.handlePermissionDecision(id, d)}
-				onExitPlanMode={(id, c, p) => controller.handleExitPlanMode(id, c, p)}
+				onPermissionDecision={(permissionOccurrenceId, decision) => (
+					controller.handlePermissionDecision(permissionOccurrenceId, decision))}
+				onExitPlanMode={(permissionOccurrenceId, choice, plan) => (
+					controller.handleExitPlanMode(permissionOccurrenceId, choice, plan))}
 				pendingPermissionRequests={conversationUi.pendingPermissionRequests}
 				onRetry={() => {
 					const chatId = sessions.selectedChatId;
@@ -796,4 +874,17 @@
 			}}
 		/>
 	{/if}
+
+	<ReloadChatDialog
+		open={reloadRequest !== null}
+		candidates={reloadRequest?.candidates ?? []}
+		busy={reloadInProgress}
+		onCancel={cancelReload}
+		onConfirm={() => void confirmReload()}
+	/>
+	<HandoffForkDialog
+		open={controller.handoffForkConfirmation.isOpen}
+		onCancel={() => controller.handoffForkConfirmation.cancel()}
+		onConfirm={() => controller.handoffForkConfirmation.confirm()}
+	/>
 </div>

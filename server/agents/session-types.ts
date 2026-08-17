@@ -12,14 +12,11 @@ import type { NativeSeedReceipt } from '@garcon/common/transcript-seed';
 import type { AgentCommandImage } from '@garcon/common/ws-requests';
 import type { AgentNativeSessionRef } from '@garcon/server-agent-interface';
 import type { CarryOverSegmentRef } from '../chats/store.js';
+import type { TurnCommandType } from '../lib/turn-identity.js';
 
 export type { AgentCommandImage, PermissionMode, ThinkingMode };
 export type AgentName = string;
-export type AgentExecutionCommandType =
-  | 'chat-start'
-  | 'agent-run'
-  | 'fork-run'
-  | 'agent-compact';
+export type AgentExecutionCommandType = TurnCommandType;
 
 export interface PersistedChatExecutionConfig {
   projectPath?: string;
@@ -31,7 +28,7 @@ export interface PersistedChatExecutionConfig {
 
 export interface AgentExecutionAdmission {
   readonly signal: AbortSignal;
-  markStarted(): void;
+  markStarted(): Promise<void>;
 }
 
 export function assertExecutionAdmissionOpen(
@@ -151,6 +148,8 @@ export interface RunAgentTurnRequest {
 export type RunAgentTurnOptions = Omit<RunAgentTurnRequest, 'chatId' | 'command'> & {
   clientRequestId?: string;
   clientMessageId?: string;
+  transcriptViewId?: string;
+  excludedResendOrdinals?: readonly number[];
   turnId?: string;
   commandType?: AgentExecutionCommandType;
   executionAdmission?: AgentExecutionAdmission;
@@ -160,4 +159,5 @@ export type RunAgentTurnOptions = Omit<RunAgentTurnRequest, 'chatId' | 'command'
 export interface AgentSteerOptions {
   readonly clientRequestId: string;
   readonly clientMessageId: string;
+  readonly transcriptViewId: string;
 }

@@ -20,8 +20,8 @@ import {
 import { loadStaticText } from './static.js';
 import { extractFirstLine } from '../lib/text.js';
 import type { RouteMap } from '../lib/http-route-types.js';
-import type { ChatViewPageReader } from '../chats/chat-message-reader.js';
 import type { ChatMetadata } from '../chats/metadata-store.js';
+import { isDomainError } from '../lib/domain-error.js';
 import {
   injectAppTitleIntoShell,
   resolvePublicAppTitle,
@@ -37,7 +37,14 @@ interface MetadataDep {
   getChatMetadata(chatId: string): ChatMetadata | null;
 }
 
-type ChatViewsDep = ChatViewPageReader;
+export interface ShareTranscriptSnapshotPort {
+  renderingSnapshot(chatId: string): Promise<{
+    readonly transcriptViewId: string;
+    readonly lastOrdinal: number;
+    readonly messages: readonly unknown[];
+  }>;
+}
+
 
 function extractLlmTokenFromPath(pathname: string): string | null {
   const match = pathname.match(/^\/shared\/llm\/([^/]+)$/);
@@ -191,7 +198,7 @@ export default function createShareRoutes(
   registry: IChatRegistry,
   settings: SettingsDep,
   metadata: MetadataDep,
-  chatViews: ChatViewsDep,
+  transcripts: ShareTranscriptSnapshotPort,
 ): RouteMap {
   // POST /api/v1/chats/share - Creates or returns existing share.
   async function postShareChat(
@@ -214,8 +221,7 @@ export default function createShareRoutes(
         );
       }
 
-      const page = await chatViews.getOrCreatePage(chatId, 100_000);
-      const messages = page.messages.map((entry) => entry.message);
+      const capture = await transcripts.renderingSnapshot(chatId);
 
       const meta = metadata.getChatMetadata(chatId);
       const overrideTitle = settings.getChatName(chatId);
@@ -230,7 +236,11 @@ export default function createShareRoutes(
         model: session.model as string,
         projectPath: session.projectPath as string,
         sharedAt: new Date().toISOString(),
-        messages,
+        origin: {
+          transcriptViewId: capture.transcriptViewId,
+          lastOrdinal: capture.lastOrdinal,
+        },
+        messages: [...capture.messages],
       };
 
       // Update existing share with latest messages, or create a new one.
@@ -246,6 +256,12 @@ export default function createShareRoutes(
       };
       return Response.json(resp);
     } catch (error: unknown) {
+      if (isDomainError(error)) {
+        return Response.json(
+          { success: false, error: error.message },
+          { status: error.status },
+        );
+      }
       return Response.json(
         { success: false, error: (error as Error).message },
         { status: 500 },

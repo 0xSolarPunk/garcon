@@ -11,6 +11,7 @@ import { isStopSatisfied, type ChatStopOutcome } from '../../common/chat-types.j
 import { prepareAgentHandoffCommand } from '../agents/agent-handoff-command.js';
 import { runOptionsForCommand } from '../agents/agent-run-command-input.js';
 import { runProjectPathUpdateTransaction } from '../agents/project-path-update-transaction.js';
+import type { StartedAgentSession } from '../agents/session-types.js';
 import {
   toClientChatExecutionControlState,
 } from '../chat-execution/control-state.ts';
@@ -29,6 +30,8 @@ import {
   type UpdateProjectPathInput,
 } from './command-support.js';
 import type { CommandLedgerRecord } from './command-ledger.js';
+import { TransientControlActionError } from '../chats/chat-transient-feed.js';
+import { PermissionNotActionableError } from '../ledger/errors.js';
 
 const logger = createLogger('commands:session');
 
@@ -46,13 +49,20 @@ export class SessionCommands {
   }
 
   private async submitRunLocked(input: SubmitRunInput): Promise<CommandAcceptedResponse> {
+    await this.support.assertCurrentTranscriptView(input.chatId, input.transcriptViewId);
     const normalizedInput = {
       chatId: input.chatId,
+      transcriptViewId: input.transcriptViewId,
       command: input.command,
       images: input.images,
       clientRequestId: input.clientRequestId,
       clientMessageId: input.clientMessageId,
-      options: input.handoff ? {} : runOptionsForCommand(input),
+      options: {
+        ...(input.handoff ? {} : runOptionsForCommand(input)),
+        ...(input.excludedResendOrdinals?.length
+          ? { excludedResendOrdinals: input.excludedResendOrdinals }
+          : {}),
+      },
       expectedAgentId: input.expectedAgentId,
       tagsToAdd: input.tagsToAdd,
       permissionFallbackPolicy: input.permissionFallbackPolicy,
@@ -88,7 +98,12 @@ export class SessionCommands {
       await this.support.assertAttachmentsSupported({
         ...handoffCommand.target, attachments: input.images ?? [],
       });
-      normalizedInput.options = handoffCommand.options;
+      normalizedInput.options = {
+        ...handoffCommand.options,
+        ...(input.excludedResendOrdinals?.length
+          ? { excludedResendOrdinals: input.excludedResendOrdinals }
+          : {}),
+      };
       const result = await this.support.submitHttpRun(
         normalizedInput,
         handoffCommand.preparation,
@@ -182,6 +197,14 @@ export class SessionCommands {
   }
 
   async submitPermissionDecision(input: PermissionDecisionInput): Promise<CommandAcceptedResponse> {
+    return this.support.withChatMutationLock(input.chatId, () => (
+      this.submitPermissionDecisionLocked(input)
+    ));
+  }
+
+  private async submitPermissionDecisionLocked(
+    input: PermissionDecisionInput,
+  ): Promise<CommandAcceptedResponse> {
     this.support.requireChat(input.chatId);
     const ledger = await this.deps.ledger.accept({
       commandType: 'permission-decision',
@@ -189,25 +212,38 @@ export class SessionCommands {
       clientRequestId: this.support.requireClientRequestId(input.clientRequestId),
       payload: {
         chatId: input.chatId,
-        permissionRequestId: input.permissionRequestId,
+        permissionOccurrenceId: input.permissionOccurrenceId,
         allow: input.allow,
         alwaysAllow: input.alwaysAllow,
+        control: input.control,
         ...(input.response ? { response: input.response } : {}),
       },
     });
     this.support.throwOnConflict(ledger, 'Conflicting permission decision retry');
     if (ledger.kind !== 'duplicate') {
       try {
-        this.deps.agents.resolvePermission(input.chatId, input.permissionRequestId, {
+        this.deps.transientFeeds.validateAction(input.control);
+        await this.deps.agents.resolvePermission(input.chatId, input.permissionOccurrenceId, {
           allow: input.allow,
           alwaysAllow: input.alwaysAllow,
           response: input.response,
-        });
+        }, input.control);
         await this.deps.ledger.settleTerminal(ledger.record.key, 'finished');
       } catch (error) {
         await this.deps.ledger.settleTerminal(ledger.record.key, 'failed', {
           error: error instanceof Error ? error.message : String(error),
         });
+        if (
+          error instanceof TransientControlActionError
+          || error instanceof PermissionNotActionableError
+        ) {
+          throw new CommandValidationError(
+            'VALIDATION_FAILED',
+            'This permission request is no longer actionable',
+            409,
+            false,
+          );
+        }
         throw error;
       }
     }
@@ -286,8 +322,6 @@ export class SessionCommands {
         error instanceof Error ? error.message : String(error),
       );
     }
-    this.deps.pendingInputs.clearChat(chatId, 'chat-removed');
-
     await Promise.all([
       this.deps.queue.deleteChatQueueFile(chatId).catch(() => {
         // Queue file may not exist.
@@ -432,7 +466,7 @@ export class SessionCommands {
   }
 
   private async updateProjectPathLocked(input: UpdateProjectPathInput): Promise<ProjectPathPatchResponse> {
-    const chat = this.deps.chats.getChat(input.chatId);
+    let chat = this.deps.chats.getChat(input.chatId);
     if (!chat) {
       throw new CommandValidationError('SESSION_NOT_FOUND', 'Session not found', 404);
     }
@@ -459,6 +493,12 @@ export class SessionCommands {
     }
 
     await this.assertChatIdleForProjectPathUpdate(input.chatId, chat);
+    await this.deps.agents.currentTranscriptViewId(input.chatId);
+    const refreshedChat = this.deps.chats.getChat(input.chatId);
+    if (!refreshedChat) {
+      throw new CommandValidationError('SESSION_NOT_FOUND', 'Session not found', 404);
+    }
+    chat = refreshedChat;
     const nativeSession = await this.nativeSessionForProjectPathUpdate(input.chatId, chat);
 
     const event = {
@@ -468,6 +508,7 @@ export class SessionCommands {
       previousProjectPath: chat.projectPath,
       previousEffectiveProjectKey: previousStatus.effectiveProjectKey,
     };
+    let relocatedSession: StartedAgentSession | null = null;
     const updated = await runProjectPathUpdateTransaction({
       chatId: input.chatId,
       agentId: chat.agentId,
@@ -480,22 +521,34 @@ export class SessionCommands {
         nextProjectPath,
         nativeSession,
       }),
-      persist: (nextNativeSession) => this.deps.chats.updateProjectPath(
-        input.chatId,
-        {
-          ...event,
-          ...(nextNativeSession !== undefined
-            ? { nativeSession: nextNativeSession }
-            : {}),
-        },
-        { flush: true },
-      ),
+      persist: async (nextNativeSession) => {
+        const persisted = await this.deps.chats.updateProjectPath(
+          input.chatId,
+          {
+            ...event,
+            ...(nextNativeSession !== undefined
+              ? { nativeSession: nextNativeSession }
+              : {}),
+          },
+          { flush: true },
+        );
+        if (persisted?.agentSessionId && nextNativeSession !== undefined) {
+          relocatedSession = {
+            agentSessionId: persisted.agentSessionId,
+            nativeSession: nextNativeSession,
+            nativeSeedReceipt: persisted.nativeSeedReceipt ?? null,
+          };
+        }
+        return persisted;
+      },
       logger,
     });
     if (!updated) {
       throw new CommandValidationError('SESSION_NOT_FOUND', 'Session not found', 404);
     }
-
+    if (relocatedSession) {
+      this.deps.agents.publishSessionFact(input.chatId, relocatedSession);
+    }
     return {
       success: true,
       chatId: input.chatId,
@@ -559,15 +612,6 @@ export class SessionCommands {
     }
 
     const queue = await this.deps.queue.readChatExecutionControl(chatId);
-    const sendingEntry = queue.entries.find((entry) => entry.status === 'sending');
-    if (sendingEntry) {
-      throw new CommandValidationError(
-        'CHAT_NOT_IDLE',
-        'Cannot update project path while a queued turn is dispatching',
-        409,
-        true,
-      );
-    }
     const steeringEntry = queue.entries.find((entry) => entry.status === 'steering');
     if (steeringEntry) {
       throw new CommandValidationError(
@@ -596,15 +640,6 @@ export class SessionCommands {
       );
     }
 
-    await this.deps.pendingInputs.reconcileRetainedHistory(chatId);
-    if (this.deps.pendingInputs.hasInFlightForChat(chatId)) {
-      throw new CommandValidationError(
-        'CHAT_NOT_IDLE',
-        'Cannot update project path while a submitted message is still pending',
-        409,
-        true,
-      );
-    }
   }
 
   private async nativeSessionForProjectPathUpdate(

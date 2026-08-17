@@ -1,6 +1,14 @@
 import { describe, expect, mock, test } from 'bun:test';
-import type { AgentExecutionContext, AgentHost } from '@garcon/server-agent-interface';
-import { createPathNativeSessionCodec } from '../../native-session/path-native-session.js';
+import {
+  type AgentHost,
+} from '@garcon/server-agent-interface';
+import { UserMessage } from '@garcon/common/chat-types';
+import type {
+  AgentRuntimeEvent,
+  AgentRuntimeOperation,
+  AgentRuntimeResumeRequest,
+  AgentRuntimeStartRequest,
+} from '../../execution/runtime-events.js';
 import { DirectExecution } from '../execution.js';
 
 function endpoint(endpointId: string) {
@@ -32,7 +40,7 @@ function host(): AgentHost {
   };
 }
 
-function request(modelEndpointId: string): AgentExecutionContext {
+function request(modelEndpointId: string): AgentRuntimeResumeRequest {
   return {
     chatId: 'chat-1',
     projectPath: '/tmp',
@@ -41,46 +49,95 @@ function request(modelEndpointId: string): AgentExecutionContext {
     thinkingMode: 'none',
     settings: { ownerId: 'direct-test', schemaVersion: 1, values: {} },
     endpoint: endpoint(modelEndpointId),
-    operation: {
-      commandType: 'agent-run',
-      clientRequestId: 'request-1',
-      clientMessageId: 'message-1',
-      turnId: 'turn-1',
-    },
+    runId: 'run-1',
+    priorContext: [new UserMessage('2026-01-01T00:00:00.000Z', 'earlier')],
+    agentSessionId: 'session-1',
+    nativeSession: null,
     prompt: 'continue',
     attachments: [],
     admission: {
       signal: new AbortController().signal,
-      markStarted() {},
-      markAbortable() {},
+      async markStarted() {},
     },
   };
 }
 
 describe('DirectExecution', () => {
-  test('fails closed when a materialized session requests another endpoint', async () => {
-    const runTurn = mock(async () => {});
-    const subscribe = () => {};
-    const runtime = {
-      runTurn,
-      onMessages: subscribe,
-      onProcessing: subscribe,
-      onFinished: subscribe,
-      onFailed: subscribe,
-    };
-    const nativeSessions = createPathNativeSessionCodec('direct-test');
-    const execution = new DirectExecution(host(), runtime as never, nativeSessions);
-    const resume = request('endpoint-b');
-    resume.nativeSession = nativeSessions.encode({
-      path: '/tmp/endpoint-a/session.jsonl',
+  test('sends frozen history as context and keeps the new prompt separate', async () => {
+    const startSession = mock(async () => ({
       agentSessionId: 'session-1',
-      modelEndpointId: 'endpoint-a',
-    });
-    resume.agentSessionId = 'session-1';
+    }));
+    const runtime = { startSession };
+    const execution = new DirectExecution(host(), runtime as never);
+    const { agentSessionId: _agentSessionId, nativeSession: _nativeSession, ...base } = request('endpoint-a');
+    const start: AgentRuntimeStartRequest = {
+      ...base,
+      carriedContext: { prefix: '<carried>history</carried>\n\n' },
+    };
 
-    await expect(execution.resume(resume)).rejects.toThrow(
-      'Direct sessions cannot change API provider endpoints after they start',
-    );
-    expect(runTurn).not.toHaveBeenCalled();
+    await execution.start(start, () => {});
+
+    expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+      priorContext: start.priorContext,
+      command: 'continue',
+    }));
+  });
+
+  test('forwards core-owned context when rebuilding a stateless request', async () => {
+    const runTurn = mock(async () => {});
+    const runtime = { runTurn };
+    const execution = new DirectExecution(host(), runtime as never);
+    const resume = request('endpoint-b');
+
+    await expect(execution.resume(resume, () => {})).resolves.toBeUndefined();
+    expect(runTurn).toHaveBeenCalledWith(expect.objectContaining({
+      priorContext: resume.priorContext,
+      command: 'continue',
+    }));
+  });
+
+	test('[TLV5-L07.03-DIRECT-UNIT-01] keeps each concrete request bound to the publisher that created it', async () => {
+    const operations: AgentRuntimeOperation[] = [];
+    const runtime = {
+      startSession: mock(async (input: { operation: AgentRuntimeOperation }) => {
+        operations.push(input.operation);
+        if (operations.length === 2) throw new Error('replacement failed');
+        return { agentSessionId: 'session-1' };
+      }),
+    };
+    const execution = new DirectExecution(host(), runtime as never);
+    const { agentSessionId: _agentSessionId, nativeSession: _nativeSession, ...start } = request('endpoint-a');
+    const firstEvents: AgentRuntimeEvent[] = [];
+    const replacementEvents: AgentRuntimeEvent[] = [];
+
+    await execution.start({ ...start, carriedContext: null }, (event) => firstEvents.push(event));
+    await expect(execution.start(
+      { ...start, runId: 'run-2', carriedContext: null },
+      (event) => replacementEvents.push(event),
+    )).rejects.toThrow('replacement failed');
+
+    operations[0].publish({
+      type: 'rows',
+      rows: [],
+    });
+
+    expect(firstEvents.map((event) => event.type)).toEqual(['session', 'rows']);
+    expect(replacementEvents).toEqual([]);
+  });
+
+	test('[TLV5-L07.05-DIRECT-UNIT-01] exposes no unnamed runtime emission surface', async () => {
+    const emitted: AgentRuntimeEvent[] = [];
+    const runtime = {
+      startSession: mock(async () => ({
+        agentSessionId: 'session-1',
+      })),
+    };
+    const execution = new DirectExecution(host(), runtime as never);
+    const { agentSessionId: _agentSessionId, nativeSession: _nativeSession, ...start } = request('endpoint-a');
+
+    await execution.start({ ...start, carriedContext: null }, (event) => emitted.push(event));
+
+    expect(runtime).not.toHaveProperty('emitMessages');
+    expect(emitted.map((event) => event.type)).toEqual(['session']);
   });
 });

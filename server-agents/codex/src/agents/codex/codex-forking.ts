@@ -1,30 +1,38 @@
 import {
   AgentIntegrationError,
-  type AgentForkRequest,
-  type AgentForking,
-  type AgentStartedSession,
+  type AgentNativeFork,
+  type AgentNativeForkRequest,
+  type AgentEstablishedSession,
 } from '@garcon/server-agent-interface';
 import { CodexAppServerRpcError } from './app-server/client.js';
 import type { CodexHistoryProfile } from './history-profile.js';
 
 export interface CodexForkingOptions {
-  readonly legacy: AgentForking;
-  readonly resolveProfile: (request: AgentForkRequest) => Promise<CodexHistoryProfile | null>;
+  readonly journal: AgentNativeFork;
+  readonly resolveProfile: (request: {
+    readonly source: AgentNativeForkRequest['source'];
+    // Presence decides missing-source strictness; whole and point forks pass
+    // their own point shapes.
+    readonly point: object | null;
+    readonly signal: AbortSignal;
+  }) => Promise<CodexHistoryProfile | null>;
   readonly forkPaginatedWhole: (
-    request: AgentForkRequest,
-  ) => Promise<AgentStartedSession | null>;
+    request: AgentNativeForkRequest,
+  ) => Promise<AgentEstablishedSession | null>;
 }
 
-export function createCodexForking(options: CodexForkingOptions): AgentForking {
+export function createCodexForking(options: CodexForkingOptions): AgentNativeFork {
   return {
-    supportsAtMessage: true,
-    supportsWhileRunning: options.legacy.supportsWhileRunning,
     async fork(request) {
       request.admission.signal.throwIfAborted();
-      const profile = await options.resolveProfile(request);
-      if (!profile) return options.legacy.fork(request);
-      if (profile.mode === 'legacy') return options.legacy.fork(request);
-      if (request.point) throw paginatedForkUnsupported('fork-at-message');
+      const profile = await options.resolveProfile({
+        source: request.source,
+        point: request.providerMeta,
+        signal: request.admission.signal,
+      });
+      if (!profile) return options.journal.fork(request);
+      if (profile.mode === 'legacy') return options.journal.fork(request);
+      if (request.providerMeta) throw paginatedForkUnsupported('fork-at-message');
 
       try {
         const forked = await options.forkPaginatedWhole(request);
@@ -36,7 +44,7 @@ export function createCodexForking(options: CodexForkingOptions): AgentForking {
       }
     },
     discard(session, signal) {
-      return options.legacy.discard(session, signal);
+      return options.journal.discard(session, signal);
     },
   };
 }

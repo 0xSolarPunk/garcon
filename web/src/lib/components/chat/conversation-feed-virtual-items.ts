@@ -1,4 +1,7 @@
-import { isToolUseMessage, ToolResultMessage } from '$shared/chat-types';
+import {
+	isToolUseMessage,
+	ToolResultMessage,
+} from '$shared/chat-types';
 import type { PendingPermissionRequest } from '$lib/types/chat';
 import {
 	conversationFeedItemLayout,
@@ -55,7 +58,8 @@ export interface ConversationVirtualFeedInput {
 	reserveComposerTraySpace: boolean;
 	surfaceIdentity: string;
 	transcriptItems: ConversationFeedRenderItem[];
-	floatingPermissions: PendingPermissionRequest[];
+	transcriptViewId: string;
+	pendingPermissions: PendingPermissionRequest[];
 }
 
 function namespacedKey(surfaceIdentity: string, localKey: string): string {
@@ -75,6 +79,17 @@ function toolAnchorIds(item: ConversationFeedRenderItem): string[] {
 
 function transcriptSpacing(item: ConversationFeedRenderItem): ConversationFeedSpacing {
 	return conversationFeedItemLayout(item) === 'hidden' ? 'none' : 'scaled-transcript';
+}
+
+// Consumes the requests anchored to this row so a later row cannot claim them again.
+function takeAnchoredPermissions(
+	permissionsByAnchor: Map<number, PendingPermissionRequest[]>,
+	item: ConversationFeedRenderItem,
+): PendingPermissionRequest[] {
+	if (item.kind !== 'message' || item.ordinal === undefined) return [];
+	const anchored = permissionsByAnchor.get(item.ordinal) ?? [];
+	permissionsByAnchor.delete(item.ordinal);
+	return anchored;
 }
 
 export function buildConversationVirtualFeedModel(
@@ -111,14 +126,42 @@ export function buildConversationVirtualFeedModel(
 	}
 	const transcriptStartIndex = items.length;
 
-	for (const item of input.transcriptItems) {
+	// A permission request renders after the row it was raised against, so it stays put as
+	// the transcript grows. Requests whose anchor belongs to another view, or to a row this
+	// window has not loaded, fall through to the end of the feed.
+	const permissionsByAnchor = new Map<number, PendingPermissionRequest[]>();
+	const detachedPermissions: PendingPermissionRequest[] = [];
+	for (const permission of input.pendingPermissions) {
+		const anchor = permission.transcript;
+		if (!anchor || anchor.transcriptViewId !== input.transcriptViewId) {
+			detachedPermissions.push(permission);
+			continue;
+		}
+		const anchored = permissionsByAnchor.get(anchor.afterOrdinal) ?? [];
+		anchored.push(permission);
+		permissionsByAnchor.set(anchor.afterOrdinal, anchored);
+	}
+
+	for (const [transcriptIndex, item] of input.transcriptItems.entries()) {
+		const anchored = takeAnchoredPermissions(permissionsByAnchor, item);
+		const isLastItem = transcriptIndex === input.transcriptItems.length - 1;
 		items.push({
 			kind: 'transcript',
 			key: key(`transcript:${item.id}`),
 			item,
-			spacingAfter: transcriptSpacing(item),
+			spacingAfter: anchored.length > 0 ? 'none' : transcriptSpacing(item),
 		});
+		for (const [permissionIndex, request] of anchored.entries()) {
+			const isLastAnchored = permissionIndex === anchored.length - 1;
+			items.push(permissionItem(
+				key,
+				request,
+				permissionIndex === 0,
+				!(isLastAnchored && isLastItem),
+			));
+		}
 	}
+	for (const permissions of permissionsByAnchor.values()) detachedPermissions.push(...permissions);
 	const transcriptEndIndex = items.length;
 
 	if (input.showLaterBoundary) {
@@ -128,15 +171,13 @@ export function buildConversationVirtualFeedModel(
 			spacingAfter: 'none',
 		});
 	}
-	for (const [permissionIndex, request] of input.floatingPermissions.entries()) {
-		items.push({
-			kind: 'permission',
-			key: key(`suffix:permission:${request.permissionRequestId}`),
+	for (const [permissionIndex, request] of detachedPermissions.entries()) {
+		items.push(permissionItem(
+			key,
 			request,
-			leadingSpacing: permissionIndex === 0,
-			spacingAfter:
-				permissionIndex < input.floatingPermissions.length - 1 ? 'responsive-feed' : 'none',
-		});
+			permissionIndex === 0,
+			permissionIndex < detachedPermissions.length - 1,
+		));
 	}
 	items.push({
 		kind: 'viewport-end-spacer',
@@ -254,4 +295,19 @@ export function estimateConversationFeedItemSize(
 	if (renderItem.message.type === 'assistant-message') return 180 * scale + spacing;
 	if (renderItem.message.type === 'thinking') return 160 * scale + spacing;
 	return 96 * scale + spacing;
+}
+
+function permissionItem(
+	key: (localKey: string) => string,
+	request: PendingPermissionRequest,
+	leadingSpacing: boolean,
+	trailingSpacing: boolean,
+): ConversationVirtualFeedItem {
+	return {
+		kind: 'permission',
+		key: key(`permission:${request.permissionOccurrenceId}`),
+		request,
+		leadingSpacing,
+		spacingAfter: trailingSpacing ? 'responsive-feed' : 'none',
+	};
 }

@@ -1,52 +1,67 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
 
 mock.module('../utils.js', () => ({
-  sendWebSocketJson: mock(() => undefined),
+  sendWebSocketJson: mock(() => true),
 }));
 
 import { ChatHandler } from '../chat.js';
 import { sendWebSocketJson } from '../utils.js';
 import { ChatRunningError } from '../../chats/errors.js';
+import { StaleTranscriptViewError } from '../../ledger/errors.js';
 
 const chatViewMessage = {
-  seq: 1,
+  ordinal: 1,
   message: { type: 'user-message', content: 'hello', timestamp: '2024-01-01T00:00:00Z' },
 };
 
 const mockProcessing = {
+  phase: mock(() => null),
   snapshot: mock(() => [{ chatId: 'chat-running', phase: 'running' }]),
 };
 
 const mockRegistry = {
-  getChat: mock(() => ({ agentId: 'claude', nativePath: '/tmp/session.jsonl', agentSessionId: 'abc' })),
+  getChat: mock(() => ({
+    agentId: 'claude',
+    nativePath: '/tmp/session.jsonl',
+    agentSessionId: 'abc',
+    agentOwnershipEpoch: 'epoch-1',
+  })),
+};
+
+const mockTransientFeeds = {
+  snapshot: mock(({ chatId, transcriptViewId }) => ({
+    serverInstanceId: 'server-instance-test',
+    chatId,
+    transcriptViewId,
+    transientRevision: 0,
+    rows: [],
+  })),
 };
 
 const mockChatViews = {
   readReplay: mock(() => ({
-    generationId: 'generation-1',
-    mode: 'delta',
+    transcriptViewId: 'view-1',
     messages: [chatViewMessage],
-    lastSeq: 1,
+    firstOrdinal: 2,
+    lastOrdinal: 2,
+    nextAfterOrdinal: 2,
+    throughOrdinal: 2,
+    hasMore: false,
   })),
+  resendCandidates: mock(() => []),
 };
 
-const mockNativeReloader = {
-  reloadFromNative: mock(() => Promise.resolve({
-    generationId: 'generation-2',
-    messages: [chatViewMessage],
-    lastSeq: 1,
-    pageOldestSeq: 1,
-    hasMore: false,
-    mode: 'manual-reload',
-  })),
-};
+const mockTranscriptReload = mock(() => Promise.resolve({
+  transcriptViewId: 'view-2',
+  messages: [chatViewMessage],
+  lastOrdinal: 1,
+  pageOldestOrdinal: 1,
+  pageNewestOrdinal: 1,
+  hasMore: false,
+}));
 
 const mockQueue = {
   readChatExecutionControl: mock(() => Promise.resolve(storedQueue())),
-};
-
-const mockPendingInputs = {
-  listForTransport: mock(() => []),
 };
 
 function storedQueue() {
@@ -63,12 +78,14 @@ function storedQueue() {
 }
 
 const injectedMocks = [
+  mockProcessing.phase,
   mockProcessing.snapshot,
   mockRegistry.getChat,
   mockChatViews.readReplay,
-  mockNativeReloader.reloadFromNative,
+  mockChatViews.resendCandidates,
+  mockTranscriptReload,
   mockQueue.readChatExecutionControl,
-  mockPendingInputs.listForTransport,
+  mockTransientFeeds.snapshot,
 ];
 
 const moduleMocks = [sendWebSocketJson];
@@ -78,9 +95,9 @@ function createHandler() {
     serverInstanceId: 'server-instance-test',
     processing: mockProcessing,
     chatViews: mockChatViews,
-    nativeReloader: mockNativeReloader,
+    transcriptReload: mockTranscriptReload,
     queue: mockQueue,
-    pendingInputs: mockPendingInputs,
+    transientFeeds: mockTransientFeeds,
     registry: mockRegistry,
   });
   return instance.createHandler();
@@ -98,11 +115,6 @@ function lastSentPayload() {
   return calls.length > 0 ? calls[calls.length - 1][1] : null;
 }
 
-function lastPublishedPayload(ws) {
-  const calls = ws.publish.mock.calls;
-  return calls.length > 0 ? JSON.parse(calls[calls.length - 1][1]) : null;
-}
-
 function deferred() {
   let resolve;
   const promise = new Promise((resolvePromise) => {
@@ -118,22 +130,33 @@ describe('chat WebSocket handler', () => {
   beforeEach(() => {
     injectedMocks.forEach((fn) => fn.mockClear());
     moduleMocks.forEach((fn) => fn.mockClear());
+    sendWebSocketJson.mockImplementation(() => true);
     mockProcessing.snapshot.mockReturnValue([{ chatId: 'chat-running', phase: 'running' }]);
-    mockRegistry.getChat.mockReturnValue({ agentId: 'claude', nativePath: '/tmp/session.jsonl', agentSessionId: 'abc' });
+    mockProcessing.phase.mockReturnValue(null);
+    mockRegistry.getChat.mockReturnValue({
+      agentId: 'claude',
+      nativePath: '/tmp/session.jsonl',
+      agentSessionId: 'abc',
+      agentOwnershipEpoch: 'epoch-1',
+    });
     mockQueue.readChatExecutionControl.mockResolvedValue(storedQueue());
     mockChatViews.readReplay.mockReturnValue({
-      generationId: 'generation-1',
-      mode: 'delta',
+      transcriptViewId: 'view-1',
       messages: [chatViewMessage],
-      lastSeq: 1,
-    });
-    mockNativeReloader.reloadFromNative.mockResolvedValue({
-      generationId: 'generation-2',
-      messages: [chatViewMessage],
-      lastSeq: 1,
-      pageOldestSeq: 1,
+      firstOrdinal: 2,
+      lastOrdinal: 2,
+      nextAfterOrdinal: 2,
+      throughOrdinal: 2,
       hasMore: false,
-      mode: 'manual-reload',
+    });
+    mockChatViews.resendCandidates.mockReturnValue([]);
+    mockTranscriptReload.mockResolvedValue({
+      transcriptViewId: 'view-2',
+      messages: [chatViewMessage],
+      lastOrdinal: 1,
+      pageOldestOrdinal: 1,
+      pageNewestOrdinal: 1,
+      hasMore: false,
     });
     ws = createMockWs();
     chatHandler = createHandler();
@@ -384,117 +407,244 @@ describe('chat WebSocket handler', () => {
     expect(lastSentPayload().error).toContain('Missing chatId');
   });
 
-  it('replays same-generation deltas for a subscribe cursor', async () => {
-    const pendingInput = {
+  it('answers a malformed correlated subscribe instead of replaying or staying silent', async () => {
+    await chatHandler.message(ws, {
+      type: 'chat-subscribe',
       chatId: '123',
-      clientRequestId: 'req-unconfirmed',
-      content: 'unconfirmed while disconnected',
-      createdAt: '2024-01-01T00:00:00.000Z',
-      deliveryStatus: 'unconfirmed',
-    };
-    mockPendingInputs.listForTransport.mockReturnValueOnce([pendingInput]);
+      clientRequestId: 'req-sub-invalid-cursor',
+      transcriptViewId: 'view-1',
+      afterOrdinal: 'not-an-ordinal',
+    });
+
+    expect(mockChatViews.readReplay).not.toHaveBeenCalled();
+    expect(lastSentPayload()).toMatchObject({
+      type: 'client-request-error',
+      clientRequestId: 'req-sub-invalid-cursor',
+      requestType: 'chat-subscribe',
+      code: 'REQUEST_VALIDATION_FAILED',
+      retryable: false,
+      chatId: '123',
+    });
+  });
+
+  it('replays view-qualified deltas for a subscribe cursor', async () => {
+    mockChatViews.resendCandidates.mockReturnValueOnce([
+      { ordinal: 1, content: 'hello', attachmentNames: [] },
+    ]);
     await chatHandler.message(ws, {
       type: 'chat-subscribe',
       chatId: '123',
       clientRequestId: 'req-sub-1',
-      generationId: 'generation-1',
-      afterSeq: 1,
+      transcriptViewId: 'view-1',
+      afterOrdinal: 1,
     });
 
-    expect(mockChatViews.readReplay).toHaveBeenCalledWith('123', 'generation-1', 1);
+    expect(mockChatViews.readReplay).toHaveBeenCalledWith('123', 'view-1', 1);
     expect(lastSentPayload()).toMatchObject({
       type: 'chat-subscribed',
       clientRequestId: 'req-sub-1',
       chatId: '123',
-      generationId: 'generation-1',
-      mode: 'delta',
+      transcriptViewId: 'view-1',
       messages: [chatViewMessage],
-      lastSeq: 1,
-      pendingUserInputs: [pendingInput],
-    });
-    expect(mockPendingInputs.listForTransport).toHaveBeenCalledWith('123');
-  });
-
-  it('returns snapshot-required with null generationId when no view is loaded', async () => {
-    mockChatViews.readReplay.mockReturnValueOnce(null);
-
-    await chatHandler.message(ws, {
-      type: 'chat-subscribe',
-      chatId: '123',
-      clientRequestId: 'req-sub-unloaded',
-      generationId: 'generation-1',
-      afterSeq: 1,
-    });
-
-    expect(lastSentPayload()).toMatchObject({
-      type: 'chat-subscribed',
-      clientRequestId: 'req-sub-unloaded',
-      chatId: '123',
-      generationId: null,
-      mode: 'snapshot-required',
-      pendingUserInputs: [],
-      messages: [],
-      lastSeq: 0,
+      firstOrdinal: 2,
+      lastOrdinal: 2,
+      resendCandidates: [{ ordinal: 1, content: 'hello', attachmentNames: [] }],
+      transientFeed: { transcriptViewId: 'view-1', rows: [] },
     });
   });
 
-  it('forwards snapshot-required replay results', async () => {
+  it('captures a bounded replay watermark and returns its continuation fields', async () => {
+    const replayMessage = { ...chatViewMessage, ordinal: 11 };
     mockChatViews.readReplay.mockReturnValueOnce({
-      generationId: 'generation-2',
-      mode: 'snapshot-required',
-      messages: [],
-      lastSeq: 3,
+      transcriptViewId: 'view-1',
+      messages: [replayMessage],
+      firstOrdinal: 11,
+      lastOrdinal: 200,
+      nextAfterOrdinal: 200,
+      throughOrdinal: 600,
+      hasMore: true,
     });
 
     await chatHandler.message(ws, {
       type: 'chat-subscribe',
       chatId: '123',
-      clientRequestId: 'req-sub-ahead',
-      generationId: 'generation-1',
-      afterSeq: 99,
+      clientRequestId: 'req-sub-bounded-first',
+      transcriptViewId: 'view-1',
+      afterOrdinal: 10,
+    });
+
+    expect(mockChatViews.readReplay).toHaveBeenCalledWith('123', 'view-1', 10);
+    expect(lastSentPayload()).toMatchObject({
+      type: 'chat-subscribed',
+      clientRequestId: 'req-sub-bounded-first',
+      chatId: '123',
+      transcriptViewId: 'view-1',
+      nextAfterOrdinal: 200,
+      throughOrdinal: 600,
+      hasMore: true,
+    });
+  });
+
+  it('rejects a replay row that cannot fit in one bounded response frame', async () => {
+    mockChatViews.readReplay.mockReturnValueOnce({
+      transcriptViewId: 'view-1',
+      messages: [{
+        ordinal: 2,
+        message: {
+          type: 'assistant-message',
+          content: 'x'.repeat(1024 * 1024),
+          timestamp: '2024-01-01T00:00:00Z',
+        },
+      }],
+      firstOrdinal: 2,
+      lastOrdinal: 2,
+      nextAfterOrdinal: 2,
+      throughOrdinal: 2,
+      hasMore: false,
+    });
+
+    await chatHandler.message(ws, {
+      type: 'chat-subscribe',
+      chatId: '123',
+      clientRequestId: 'req-sub-oversized-row',
+      transcriptViewId: 'view-1',
+      afterOrdinal: 1,
+    });
+
+    expect(sendWebSocketJson).toHaveBeenCalledTimes(1);
+    expect(lastSentPayload()).toMatchObject({
+      type: 'client-request-error',
+      clientRequestId: 'req-sub-oversized-row',
+      requestType: 'chat-subscribe',
+      code: 'HISTORY_LOAD_FAILED',
+      retryable: false,
+      chatId: '123',
+      message: 'A transcript replay row exceeds the WebSocket response limit',
+    });
+    expect(Buffer.byteLength(JSON.stringify(lastSentPayload()), 'utf8')).toBeLessThan(1024);
+  });
+
+  it('rejects a replay request when its response is dropped by the socket', async () => {
+    sendWebSocketJson.mockImplementation(() => false);
+
+    await expect(chatHandler.message(ws, {
+      type: 'chat-subscribe',
+      chatId: '123',
+      clientRequestId: 'req-sub-dropped',
+      transcriptViewId: 'view-1',
+      afterOrdinal: 10,
+    })).rejects.toThrow();
+
+    expect(mockChatViews.readReplay).toHaveBeenCalledWith('123', 'view-1', 10);
+    expect(sendWebSocketJson).toHaveBeenCalledWith(
+      ws,
+      expect.objectContaining({
+        type: 'chat-subscribed',
+        clientRequestId: 'req-sub-dropped',
+      }),
+    );
+  });
+
+  it('[TLV5-REPLAY.02-CONTRACT-01] repeats the captured replay watermark on continuation requests', async () => {
+    mockChatViews.readReplay.mockReturnValueOnce({
+      transcriptViewId: 'view-1',
+      messages: [],
+      firstOrdinal: 201,
+      lastOrdinal: 400,
+      nextAfterOrdinal: 400,
+      throughOrdinal: 600,
+      hasMore: true,
+    });
+
+    await chatHandler.message(ws, {
+      type: 'chat-subscribe',
+      chatId: '123',
+      clientRequestId: 'req-sub-bounded-next',
+      transcriptViewId: 'view-1',
+      afterOrdinal: 200,
+      throughOrdinal: 600,
+    });
+
+    expect(mockChatViews.readReplay).toHaveBeenCalledWith('123', 'view-1', 200, 600);
+    expect(lastSentPayload()).toMatchObject({
+      type: 'chat-subscribed',
+      clientRequestId: 'req-sub-bounded-next',
+      chatId: '123',
+      transcriptViewId: 'view-1',
+      messages: [],
+      nextAfterOrdinal: 400,
+      throughOrdinal: 600,
+      hasMore: true,
+    });
+  });
+
+  it('suppresses resend candidates while the chat is processing', async () => {
+    mockProcessing.phase.mockReturnValueOnce('running');
+    mockChatViews.resendCandidates.mockReturnValueOnce([
+      { ordinal: 1, content: 'hello', attachmentNames: [] },
+    ]);
+
+    await chatHandler.message(ws, {
+      type: 'chat-subscribe',
+      chatId: '123',
+      clientRequestId: 'req-sub-running',
+      transcriptViewId: 'view-1',
+      afterOrdinal: 1,
     });
 
     expect(lastSentPayload()).toMatchObject({
       type: 'chat-subscribed',
-      clientRequestId: 'req-sub-ahead',
-      generationId: 'generation-2',
-      mode: 'snapshot-required',
-      messages: [],
-      lastSeq: 3,
+      resendCandidates: [],
+    });
+    expect(mockChatViews.resendCandidates).not.toHaveBeenCalled();
+  });
+
+  it('returns a typed stale-view error when replay addresses a replaced view', async () => {
+    mockChatViews.readReplay.mockRejectedValueOnce(
+      new StaleTranscriptViewError('123', 'view-1', 'view-2'),
+    );
+
+    await chatHandler.message(ws, {
+      type: 'chat-subscribe',
+      chatId: '123',
+      clientRequestId: 'req-sub-stale',
+      transcriptViewId: 'view-1',
+      afterOrdinal: 99,
+    });
+
+    expect(lastSentPayload()).toMatchObject({
+      type: 'client-request-error',
+      clientRequestId: 'req-sub-stale',
+      chatId: '123',
+      code: 'STALE_TRANSCRIPT_VIEW',
+      retryable: false,
     });
   });
 
-  it('reloads from native and broadcasts a lightweight generation reset', async () => {
+  it('returns the replacement transcript after a manual native reload', async () => {
     await chatHandler.message(ws, {
       type: 'chat-reload',
       chatId: '123',
       clientRequestId: 'req-reload-1',
     });
 
-    expect(mockNativeReloader.reloadFromNative).toHaveBeenCalledWith('123', 'manual-reload');
+    expect(mockTranscriptReload).toHaveBeenCalledWith('123');
     expect(lastSentPayload()).toMatchObject({
       type: 'chat-reloaded',
       clientRequestId: 'req-reload-1',
       chatId: '123',
-      generationId: 'generation-2',
+      transcriptViewId: 'view-2',
       messages: [chatViewMessage],
-      lastSeq: 1,
-      pageOldestSeq: 1,
+      lastOrdinal: 1,
+      pageOldestOrdinal: 1,
+      pageNewestOrdinal: 1,
       hasMore: false,
     });
-    expect(lastPublishedPayload(ws)).toMatchObject({
-      type: 'chat-generation-reset',
-      chatId: '123',
-      generationId: 'generation-2',
-      reason: 'manual-reload',
-      lastSeq: 1,
-    });
-    expect(ws.publish.mock.calls[0][0]).toBe('chat');
-    expect(ws.publish.mock.calls[0][2]).toBe(true);
+    expect(ws.publish).not.toHaveBeenCalled();
   });
 
   it('returns retryable CHAT_RUNNING for running-chat reload failures', async () => {
-    mockNativeReloader.reloadFromNative.mockRejectedValueOnce(
+    mockTranscriptReload.mockRejectedValueOnce(
       new ChatRunningError('123'),
     );
 

@@ -67,13 +67,15 @@ describe('ConversationWorkspace Escape abort handling', () => {
 		mockGetChatMessages.mockResolvedValue({
 			historyState: { kind: 'complete' },
 			chatId: 'chat-1',
-			generationId: 'gen-1',
+			transcriptViewId: 'gen-1',
 			messages: [],
-			lastSeq: 0,
-			pageOldestSeq: 0,
+			lastOrdinal: 0,
+			pageOldestOrdinal: 0,
+			pageNewestOrdinal: 0,
+			nextBeforeOrdinal: null,
 			hasMore: false,
 			limit: 50,
-			pendingUserInputs: [],
+			resendCandidates: [],
 		});
 		mockGetChatExecutionControl.mockResolvedValue({
 			success: true,
@@ -82,7 +84,6 @@ describe('ConversationWorkspace Escape abort handling', () => {
 				serverInstanceId: 'server-instance-test',
 				queue: {
 					entries: [],
-					dispatchingEntryId: null,
 					steeringEntryId: null,
 					recentlyDispatched: [],
 					pause: null,
@@ -103,7 +104,6 @@ describe('ConversationWorkspace Escape abort handling', () => {
 				serverInstanceId: 'server-instance-test',
 				queue: {
 					entries: [],
-					dispatchingEntryId: null,
 					steeringEntryId: null,
 					recentlyDispatched: [],
 					pause: null,

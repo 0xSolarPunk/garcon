@@ -12,9 +12,14 @@ export async function relocateLegacySessionDirectory(
 
   const claim = await host.storage.claimLegacyWorkspaceDirectory(label);
   if (claim.moved > 0 || claim.skipped > 0) {
-    host.logger.info(
-      `Relocated legacy ${label}: moved ${claim.moved}, skipped ${claim.skipped}`,
-    );
+    host.logger.info('Relocated Direct legacy transcript directory.', {
+      storageNamespace: label,
+      moved: claim.moved,
+      skipped: claim.skipped,
+    });
+  }
+  if (claim.skipped > 0) {
+    throw new Error('Direct legacy transcript relocation was incomplete');
   }
   await store.commit({
     expectedVersion: version,

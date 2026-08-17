@@ -2,85 +2,70 @@ import {
   UserMessage,
   type ChatImage,
 } from '../../common/chat-types.ts';
-import type { ChatViewMessage } from '../../common/chat-view.ts';
 import type { RunAgentTurnOptions } from '../agents/session-types.ts';
-import { createLogger } from '../lib/log.ts';
 import type {
-  ChatMessagesPort,
-  PendingInputsPort,
-  PendingUserInputRegistrationOptions,
+  UserInputAdmissionOptions,
 } from './types.ts';
 
-const logger = createLogger('accepted-input-transcript');
+export interface AcceptedInputTranscriptResult {
+  readonly inserted: boolean;
+}
 
-export interface AcceptedInputTranscriptEvents {
-  appended(
+export interface AcceptedInputTranscriptPort {
+  admitInput(
     chatId: string,
-    generationId: string,
-    messages: ChatViewMessage[],
-    metadata: { clientRequestId?: string; turnId?: string },
-  ): void;
+    message: UserMessage,
+    options: UserInputAdmissionOptions & { readonly clientRequestId: string },
+  ): Promise<AcceptedInputTranscriptResult>;
+  admitQueuedInput(
+    chatId: string,
+    message: UserMessage,
+    options: UserInputAdmissionOptions & { readonly clientRequestId: string },
+  ): AcceptedInputTranscriptResult;
+  discardPreparedInput(chatId: string, clientMessageId: string | null | undefined): void;
 }
 
 export class AcceptedInputTranscript {
-  constructor(
-    private readonly pendingInputs: PendingInputsPort,
-    private readonly chatMessages: ChatMessagesPort,
-    private readonly events: AcceptedInputTranscriptEvents,
-  ) {}
+  constructor(private readonly transcript: AcceptedInputTranscriptPort) {}
 
   async register(
     chatId: string,
     content: string,
-    options: PendingUserInputRegistrationOptions,
-  ): Promise<void> {
-    if (!content && !options.images?.length) return;
-    const deliveryStatus = options.deliveryStatus ?? 'accepted';
+    options: UserInputAdmissionOptions,
+  ): Promise<boolean> {
+    if (!content && !options.images?.length) return true;
+    if (!options.clientRequestId) {
+      throw new TypeError('Accepted input is missing a client request ID');
+    }
     const images = normalizeChatImages(options.images);
-    let clientRequestId: string | undefined;
-    let appended: Awaited<ReturnType<ChatMessagesPort['appendMessages']>>;
-    try {
-      const registered = await this.pendingInputs.register(chatId, content, {
-        clientRequestId: options.clientRequestId,
-        clientMessageId: options.clientMessageId,
-        turnId: options.turnId,
-        images,
-        deliveryStatus,
-      });
-      const record = registered && typeof registered === 'object'
-        ? registered as { clientRequestId?: unknown }
-        : null;
-      clientRequestId = typeof record?.clientRequestId === 'string'
-        ? record.clientRequestId
-        : options.clientRequestId;
-      appended = await this.chatMessages.appendMessages(chatId, [
-        new UserMessage(new Date().toISOString(), content, images, {
-          clientRequestId,
-          upstreamRequestId: options.clientMessageId,
-          turnId: options.turnId,
-          deliveryStatus,
-        }),
-      ]);
-      if (clientRequestId && appended.pendingNativeUserPosition) {
-        this.pendingInputs.bindNativeUserPosition(
-          chatId,
-          clientRequestId,
-          appended.pendingNativeUserPosition,
-        );
-      }
-    } catch (error) {
-      if (clientRequestId) this.pendingInputs.discard(chatId, clientRequestId);
-      throw error;
+    const result = await this.transcript.admitInput(
+      chatId,
+      new UserMessage(options.createdAt ?? new Date().toISOString(), content, images),
+      { ...options, clientRequestId: options.clientRequestId },
+    );
+    return result.inserted !== false;
+  }
+
+  registerQueued(
+    chatId: string,
+    content: string,
+    options: UserInputAdmissionOptions,
+  ): boolean {
+    if (!content && !options.images?.length) return true;
+    if (!options.clientRequestId) {
+      throw new TypeError('Accepted input is missing a client request ID');
     }
-    if (appended.messages.length === 0) return;
-    try {
-      this.events.appended(chatId, appended.generationId, appended.messages, {
-        clientRequestId,
-        turnId: options.turnId,
-      });
-    } catch (error) {
-      logger.warn('chat-messages listener failed after durable append:', (error as Error).message);
-    }
+    const images = normalizeChatImages(options.images);
+    const result = this.transcript.admitQueuedInput(
+      chatId,
+      new UserMessage(options.createdAt ?? new Date().toISOString(), content, images),
+      { ...options, clientRequestId: options.clientRequestId },
+    );
+    return result.inserted !== false;
+  }
+
+  discard(chatId: string, clientMessageId: string | null | undefined): void {
+    this.transcript.discardPreparedInput(chatId, clientMessageId);
   }
 }
 

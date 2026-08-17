@@ -1,5 +1,4 @@
 import type { ChatMessage } from '@garcon/common/chat-types';
-import { getNativeMessageSource } from '@garcon/server-agent-interface';
 import type { ChatSearchSnippetRole } from '@garcon/common/chat-search';
 import type { SearchMessageRowInput } from './rows.js';
 
@@ -10,8 +9,6 @@ const MAX_TOOL_RESULT_TAIL_CHARS = 512;
 const MAX_RECURSIVE_CHARS = 4_000;
 const MAX_RECURSIVE_DEPTH = 8;
 const MAX_RECURSIVE_NODES = 512;
-
-export const TRANSCRIPT_SEARCH_PROJECTOR_VERSION = 1;
 
 interface ExtractionBudget {
   remaining: number;
@@ -262,8 +259,10 @@ function messageText(message: ChatMessage, budget: ExtractionBudget): string {
     case 'todo-read-tool-use':
     case 'enter-plan-mode-tool-use':
     case 'amp-mermaid-tool-use':
+    case 'transcript-notice':
     case 'permission-resolved':
     case 'permission-cancelled':
+    case 'permission-expired':
       return '';
   }
   return assertNever(message);
@@ -299,10 +298,6 @@ function projectOne(message: ChatMessage): {
       role: roleForMessage(message),
       timestamp: typeof message.timestamp === 'string' ? message.timestamp : null,
       body,
-      sourceAnchor: (() => {
-        const source = getNativeMessageSource(message);
-        return source ? JSON.stringify(source) : null;
-      })(),
     } : null,
   };
 }

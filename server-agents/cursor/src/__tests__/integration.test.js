@@ -26,16 +26,12 @@ describe('CursorAgentIntegration', () => {
     const integration = new CursorAgentIntegration(host);
 
     expect(CursorAgentIntegration.integrationId).toBe('cursor');
-    expect(CursorAgentIntegration.apiVersion).toBe(3);
-    expect(CursorAgentIntegration.transcriptIndex.apiVersion).toBe(1);
+    expect(CursorAgentIntegration.apiVersion).toBe(5);
     expect(integration.descriptor.id).toBe('cursor');
     expect(integration.descriptor.supportsProjectPathUpdate).toBe(true);
-    expect(integration.execution.prepareProjectPathUpdate).toBeDefined();
+    expect(integration.projectPathUpdates).toBeDefined();
     expect(integration.transcriptSearch).toBeUndefined();
-    expect(integration.forking).toMatchObject({
-      supportsAtMessage: false,
-      supportsWhileRunning: false,
-    });
+    expect(integration.forking).toBeNull();
     expect(integration.auth).toBeDefined();
     expect(integration.singleQuery).toBeDefined();
     expect(integration.commands).toBeNull();
@@ -52,7 +48,7 @@ describe('CursorAgentIntegration', () => {
       schemaVersion: 1,
       values: {},
     });
-    await expect(integration.transcript.resolveNativeSession({
+    await expect(integration.nativeSessions.resolveNativeSession({
       chat: {
         chatId: 'chat-1',
         agentId: 'cursor',

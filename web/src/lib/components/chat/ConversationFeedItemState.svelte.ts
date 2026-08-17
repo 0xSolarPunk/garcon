@@ -62,20 +62,23 @@ export class ConversationFeedItemState {
 		this.#disclosureOverrides = next;
 	}
 
-	permissionDraft(permissionRequestId: string): PermissionQuestionDraft {
-		return this.#permissionDrafts.get(permissionRequestId) ?? EMPTY_PERMISSION_DRAFT;
+	permissionDraft(permissionOccurrenceId: string): PermissionQuestionDraft {
+		return this.#permissionDrafts.get(permissionOccurrenceId) ?? EMPTY_PERMISSION_DRAFT;
 	}
 
-	setPermissionDraft(permissionRequestId: string, draft: PermissionQuestionDraft): void {
+	setPermissionDraft(
+		permissionOccurrenceId: string,
+		draft: PermissionQuestionDraft,
+	): void {
 		const next = new Map(this.#permissionDrafts);
-		next.set(permissionRequestId, draft);
+		next.set(permissionOccurrenceId, draft);
 		this.#permissionDrafts = next;
 	}
 
 	reconcile(
 		surfaceIdentity: string,
 		validRowIds: ReadonlySet<string>,
-		pendingPermissionIds: ReadonlySet<string>,
+		pendingPermissionOccurrences: ReadonlySet<string>,
 	): void {
 		if (surfaceIdentity !== this.#surfaceIdentity) {
 			this.clear();
@@ -91,7 +94,7 @@ export class ConversationFeedItemState {
 			this.#disclosureOverrides = disclosures;
 		}
 		const drafts = new Map(
-			[...this.#permissionDrafts].filter(([id]) => pendingPermissionIds.has(id)),
+			[...this.#permissionDrafts].filter(([key]) => pendingPermissionOccurrences.has(key)),
 		);
 		if (drafts.size !== this.#permissionDrafts.size) this.#permissionDrafts = drafts;
 	}

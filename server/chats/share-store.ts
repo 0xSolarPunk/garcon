@@ -4,7 +4,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import type { SharedChatSnapshot } from '../../common/share-types.ts';
+import type { SharedChatOrigin, SharedChatSnapshot } from '../../common/share-types.ts';
 import { isRecord } from '../../common/json.js';
 import { writeJsonFileAtomic } from '../lib/json-file-store.js';
 import { createLogger } from '../lib/log.js';
@@ -83,12 +83,25 @@ function normalizeIndexEntry(token: string, value: unknown): ShareIndexEntry | n
   return { shareToken, chatId, title, agentId, model, projectPath, sharedAt };
 }
 
+function normalizeOrigin(value: unknown): SharedChatOrigin | undefined {
+  if (!isRecord(value)) return undefined;
+  const transcriptViewId = typeof value.transcriptViewId === 'string'
+    ? value.transcriptViewId
+    : null;
+  const lastOrdinal = typeof value.lastOrdinal === 'number' && Number.isSafeInteger(value.lastOrdinal)
+    ? value.lastOrdinal
+    : null;
+  if (!transcriptViewId || lastOrdinal === null || lastOrdinal < 0) return undefined;
+  return { transcriptViewId, lastOrdinal };
+}
+
 function normalizeSnapshot(token: string, value: unknown): SharedChatSnapshot | null {
   if (!isRecord(value)) return null;
   const entry = normalizeIndexEntry(token, value);
   if (!entry) return null;
   const messages = Array.isArray(value.messages) ? value.messages : [];
-  return { ...entry, messages };
+  const origin = normalizeOrigin(value.origin);
+  return { ...entry, ...(origin ? { origin } : {}), messages };
 }
 
 export class ShareStore implements IShareStore {

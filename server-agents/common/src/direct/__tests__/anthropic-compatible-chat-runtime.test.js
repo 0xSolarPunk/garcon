@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test';
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
+import { AssistantMessage, UserMessage } from '@garcon/common/chat-types';
 import {
   AnthropicCompatibleChatRuntime,
   anthropicMessagesUrl,
@@ -11,7 +9,6 @@ import {
 } from '../anthropic-compatible-chat-runtime.ts';
 
 const originalFetch = globalThis.fetch;
-const createdDirs = [];
 
 function streamResponse(chunks, options = {}) {
   const encoder = new TextEncoder();
@@ -31,48 +28,46 @@ function streamResponse(chunks, options = {}) {
   });
 }
 
-async function tempDir() {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-anthropic-runtime-'));
-  createdDirs.push(dir);
-  return dir;
-}
-
-function runtimeConfig(dir, overrides = {}) {
+function runtimeConfig(overrides = {}) {
   return {
-    runtimeId: 'direct-anthropic-compatible',
     runtimeLabel: 'Direct (Anthropic)',
     defaultModel: 'acme-sonnet',
-    fallbackModels: [{ value: 'acme-sonnet', label: 'Acme Sonnet' }],
     getApiKey: () => 'sk-ant',
     getBaseUrl: () => 'https://api.example.test',
-    getSessionDir: () => dir,
-    getSessionFilePath: (id) => path.join(dir, `${id}.jsonl`),
     ...overrides,
   };
 }
 
-function makeRuntime(dir, overrides = {}) {
-  return new AnthropicCompatibleChatRuntime(runtimeConfig(dir, overrides));
+function makeRuntime(overrides = {}) {
+  return new AnthropicCompatibleChatRuntime(runtimeConfig(overrides));
 }
 
-function waitForMessages(runtime) {
-  return new Promise((resolve) => {
-    runtime.onMessages((_chatId, messages) => resolve(messages));
-  });
+function captureOperation(runId) {
+  const events = [];
+  let resolveTerminal;
+  const terminal = new Promise((resolve) => { resolveTerminal = resolve; });
+  return {
+    events,
+    terminal,
+    operation: {
+      runId,
+      publish(event) {
+        events.push(event);
+        if (event.type === 'run-ended') resolveTerminal(event);
+      },
+    },
+  };
 }
 
-function waitForFailure(runtime) {
-  return new Promise((resolve) => {
-    runtime.onFailed((_chatId, message) => resolve(message));
-  });
+function capturedMessages(capture) {
+  return capture.events
+    .filter((event) => event.type === 'rows')
+    .flatMap((event) => event.rows.map((row) => row.message));
 }
 
 describe('AnthropicCompatibleChatRuntime', () => {
   afterEach(async () => {
     globalThis.fetch = originalFetch;
-    for (const dir of createdDirs.splice(0)) {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
   });
 
   it('builds Anthropic endpoint URLs from root and v1 base URLs', () => {
@@ -141,7 +136,6 @@ describe('AnthropicCompatibleChatRuntime', () => {
   });
 
   it('streams text deltas and emits the final assistant message', async () => {
-    const dir = await tempDir();
     let requestBody;
     globalThis.fetch = mock(async (_url, init) => {
       requestBody = JSON.parse(init.body);
@@ -152,10 +146,10 @@ describe('AnthropicCompatibleChatRuntime', () => {
       ]);
     });
 
-    const runtime = makeRuntime(dir);
-    const messagesPromise = waitForMessages(runtime);
+    const runtime = makeRuntime();
+    const capture = captureOperation('run-stream');
 
-    const started = await runtime.startSession({
+    await runtime.startSession({
       chatId: 'chat-1',
       command: 'hello?',
       projectPath: '/tmp/project',
@@ -163,9 +157,11 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: capture.operation,
     });
 
-    const messages = await messagesPromise;
+    await capture.terminal;
+    const messages = capturedMessages(capture);
     expect(requestBody).toMatchObject({
       model: 'acme-sonnet',
       max_tokens: 4096,
@@ -175,13 +171,9 @@ describe('AnthropicCompatibleChatRuntime', () => {
     expect(requestBody).not.toHaveProperty('output_config');
     expect(requestBody).not.toHaveProperty('thinking');
     expect(messages[0].content).toBe('hello world');
-    const persisted = await fs.readFile(started.nativePath, 'utf8');
-    expect(persisted).toContain('"content":"hello world"');
-    expect(persisted).not.toContain('private');
   });
 
   it('accepts buffered JSON for an interactive Anthropic session', async () => {
-    const dir = await tempDir();
     let requestBody;
     globalThis.fetch = mock(async (_url, init) => {
       requestBody = JSON.parse(init.body);
@@ -192,8 +184,8 @@ describe('AnthropicCompatibleChatRuntime', () => {
         ],
       });
     });
-    const runtime = makeRuntime(dir);
-    const messages = waitForMessages(runtime);
+    const runtime = makeRuntime();
+    const capture = captureOperation('run-json');
 
     await runtime.startSession({
       chatId: 'chat-json',
@@ -203,14 +195,15 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: capture.operation,
     });
 
     expect(requestBody.stream).toBe(true);
-    await expect(messages).resolves.toMatchObject([{ content: 'session response' }]);
+    await capture.terminal;
+    expect(capturedMessages(capture)).toMatchObject([{ content: 'session response' }]);
   });
 
   it('forwards the current interactive effort and removes it for Default', async () => {
-    const dir = await tempDir();
     const requestBodies = [];
     globalThis.fetch = mock(async (_url, init) => {
       requestBodies.push(JSON.parse(init.body));
@@ -218,8 +211,8 @@ describe('AnthropicCompatibleChatRuntime', () => {
         { type: 'content_block_delta', delta: { type: 'text_delta', text: 'done' } },
       ]);
     });
-    const runtime = makeRuntime(dir);
-    const firstMessages = waitForMessages(runtime);
+    const runtime = makeRuntime();
+    const first = captureOperation('run-first');
 
     const started = await runtime.startSession({
       chatId: 'chat-1',
@@ -229,8 +222,9 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'high',
       claudeThinkingMode: 'auto',
+      operation: first.operation,
     });
-    await firstMessages;
+    await first.terminal;
 
     await runtime.runTurn({
       chatId: 'chat-1',
@@ -241,6 +235,7 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'low',
       claudeThinkingMode: 'auto',
+      operation: captureOperation('run-second').operation,
     });
     await runtime.runTurn({
       chatId: 'chat-1',
@@ -251,6 +246,7 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: captureOperation('run-third').operation,
     });
 
     expect(requestBodies[0].output_config).toEqual({ effort: 'high' });
@@ -259,14 +255,8 @@ describe('AnthropicCompatibleChatRuntime', () => {
     expect(requestBodies.every((body) => !Object.hasOwn(body, 'thinking'))).toBe(true);
   });
 
-  it('hydrates an unknown session from persisted JSONL before resuming', async () => {
-    const dir = await tempDir();
+  it('hydrates an unknown session from the supplied ledger context', async () => {
     const sessionId = 'persisted-session';
-    await fs.writeFile(path.join(dir, `${sessionId}.jsonl`), [
-      JSON.stringify({ role: 'user', content: 'first message' }),
-      JSON.stringify({ role: 'assistant', content: 'first response' }),
-      '',
-    ].join('\n'));
 
     let requestBody;
     globalThis.fetch = mock(async (_url, init) => {
@@ -276,9 +266,8 @@ describe('AnthropicCompatibleChatRuntime', () => {
       ]);
     });
 
-    const runtime = makeRuntime(dir, {
+    const runtime = makeRuntime({
       defaultModel: 'fallback-model',
-      fallbackModels: [{ value: 'fallback-model', label: 'Fallback' }],
     });
 
     await runtime.runTurn({
@@ -290,6 +279,11 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'max',
       claudeThinkingMode: 'auto',
+      priorContext: [
+        new UserMessage('2026-01-01T00:00:00.000Z', 'first message'),
+        new AssistantMessage('2026-01-01T00:00:01.000Z', 'first response'),
+      ],
+      operation: captureOperation('run-hydrated').operation,
     });
 
     expect(requestBody.messages).toEqual([
@@ -482,13 +476,12 @@ describe('AnthropicCompatibleChatRuntime', () => {
   });
 
   it('rejects partial streamed text followed by an Anthropic error event', async () => {
-    const dir = await tempDir();
     globalThis.fetch = mock(async () => streamResponse([
       { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } },
       { type: 'error', error: { message: 'generation failed' } },
     ]));
-    const runtime = makeRuntime(dir);
-    const failure = waitForFailure(runtime);
+    const runtime = makeRuntime();
+    const capture = captureOperation('run-error');
 
     await runtime.startSession({
       chatId: 'chat-error',
@@ -498,20 +491,20 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: capture.operation,
     });
 
-    await expect(failure).resolves.toBe(
+    await expect(capture.terminal.then((event) => event.error?.message)).resolves.toBe(
       'Direct (Anthropic) stream error: generation failed',
     );
   });
 
   it('rejects a valid partial stream that closes before message_stop', async () => {
-    const dir = await tempDir();
     globalThis.fetch = mock(async () => streamResponse([
       { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } },
     ], { complete: false }));
-    const runtime = makeRuntime(dir);
-    const failure = waitForFailure(runtime);
+    const runtime = makeRuntime();
+    const capture = captureOperation('run-truncated');
 
     await runtime.startSession({
       chatId: 'chat-truncated',
@@ -521,9 +514,10 @@ describe('AnthropicCompatibleChatRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: capture.operation,
     });
 
-    await expect(failure).resolves.toBe(
+    await expect(capture.terminal.then((event) => event.error?.message)).resolves.toBe(
       'Direct (Anthropic) stream ended before message_stop.',
     );
   });

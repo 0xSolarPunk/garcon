@@ -15,9 +15,6 @@
   "garconBuild": {
     "apiVersion": 2,
     "integrationId": "claude",
-    "standaloneEntrypoints": {
-      "transcript-index-source": "./src/transcript-index-source.ts"
-    },
     "preMainModules": [],
     "embeddedDependencyMetadata": []
   }

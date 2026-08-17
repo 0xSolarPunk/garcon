@@ -34,13 +34,15 @@ export function handlePlanModeMessages(
 		}
 
 		if (chatMsg.type === 'exit-plan-mode-tool-use') {
-			const permissionRequestId = `plan-exit-${chatMsg.toolId}`;
+			const permissionOccurrenceId = `plan-exit-${chatMsg.toolId}`;
 			ctx.conversationUi.setPendingPermissionRequests((prev) => {
-				if (prev.some((r) => r.permissionRequestId === permissionRequestId)) return prev;
+				if (prev.some((request) => (
+					request.permissionOccurrenceId === permissionOccurrenceId
+				))) return prev;
 				return [
 					...prev,
 					{
-						permissionRequestId,
+						permissionOccurrenceId,
 						requestedTool: chatMsg,
 						chatId: msg.chatId || ctx.getCurrentChatId(),
 						receivedAt: new Date(),

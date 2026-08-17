@@ -3,6 +3,8 @@
 	import ConversationTranscript from '../ConversationTranscript.svelte';
 	import { setAppShell, setChatSessions, setFileSessions, setLocalSettings } from '$lib/context';
 	import type { ChatDisplayRow } from '$lib/chat/transcript/active-transcript-state.svelte.js';
+	import type { PendingPermissionRequest } from '$lib/types/chat';
+	import type { PermissionDecisionPayload } from '$shared/chat-command-contracts';
 	import { FileSessionRegistry } from '$lib/files/sessions/file-session-registry.svelte.js';
 	import { createAppShellStore } from '$lib/stores/app-shell.svelte.js';
 	import { createChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.js';
@@ -10,9 +12,18 @@
 
 	interface Props {
 		rows: ChatDisplayRow[];
+		pendingPermissionRequests?: PendingPermissionRequest[];
+		onPermissionDecision?: (
+			permissionOccurrenceId: string,
+			decision: PermissionDecisionPayload,
+		) => void;
 	}
 
-	let { rows }: Props = $props();
+	let {
+		rows,
+		pendingPermissionRequests = [],
+		onPermissionDecision,
+	}: Props = $props();
 
 	const chatSessions = createChatSessionsStore();
 	chatSessions.createDraft({
@@ -51,8 +62,11 @@
 	localSettings.autoExpandTools = false;
 	setLocalSettings(localSettings);
 	onDestroy(() => localSettings.destroy());
-
-	function ignorePermissionDecision(): void {}
 </script>
 
-<ConversationTranscript {rows} agentId="claude" onPermissionDecision={ignorePermissionDecision} />
+<ConversationTranscript
+	{rows}
+	{pendingPermissionRequests}
+	{onPermissionDecision}
+	agentId="claude"
+/>

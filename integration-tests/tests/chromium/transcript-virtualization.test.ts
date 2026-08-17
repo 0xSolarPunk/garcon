@@ -1,14 +1,20 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import type { Browser, Page } from 'playwright';
-import type { ChatViewMessage } from '../../../common/chat-view.js';
+import { appendFile, chmod, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { Browser, CDPSession, Page } from 'playwright';
 import {
   AssistantMessage,
   BashToolUseMessage,
   CompactionMessage,
   ToolResultMessage,
   UserMessage,
+  WebSearchToolUseMessage,
+  type ChatMessage,
 } from '../../../common/chat-types.js';
-import type { ChatGenerationResetMessage, ChatMessagesMessage } from '../../../common/ws-events.js';
+import type { TranscriptMessage } from '../../../common/chat-view.js';
+import type { LedgerRowDraft } from '../../../server/ledger/contracts.js';
+import { TranscriptLedgerStore } from '../../../server/ledger/store.js';
 import type { IntegrationFixture } from '../../support/integration-fixture.js';
 import {
   closeChromiumBrowser,
@@ -17,77 +23,65 @@ import {
   type ChromiumFixture,
 } from '../../support/chromium-fixture.js';
 import { claudeText, claudeToolUse } from '../../support/fake-claude-model.js';
-import { liveClaudeRunRequest, liveClaudeStartRequest } from '../../support/live-claude.js';
+import {
+  CLAUDE_BINARY,
+  liveClaudeRunRequest,
+  liveClaudeStartRequest,
+} from '../../support/live-claude.js';
 import {
   startScriptedClaudeTestEnvironment,
   type ScriptedClaudeTestEnvironment,
 } from '../../support/scripted-claude.js';
+import { waitForPersistedNativeSession } from '../../support/persisted-chat.js';
 
 const FEED_SELECTOR = '[data-chat-scroll-viewport]';
 const SIZER_SELECTOR = '[data-chat-virtual-sizer]';
 const ITEM_SELECTOR = '[data-chat-virtual-item]';
-const LIVE_HISTORY_PRUNE_IDLE_MS = 3 * 60_000;
+const RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS = 180_000;
+const REUSED_PERMISSION_CLAUDE_PROXY = fileURLToPath(
+  new URL('../../support/reused-permission-claude-proxy.ts', import.meta.url),
+);
+const PERMISSION_OCCURRENCE_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TRANSCRIPT_VIEWPORTS = [
+  { label: 'compact', height: 700, width: 390 },
+  { label: 'wide', height: 900, width: 1280 },
+] as const;
 
 interface ReadingAnchor {
   key: string;
   offset: number;
+  rowId?: string;
+  text?: string;
 }
 
 interface ReadingAnchorFrameSample {
-  frame: number;
-  offset: number | null;
-  scrollTop: number;
-}
-
-interface FollowingRowFrameSample {
-  frame: number;
+  busy: boolean;
   connected: boolean;
-  sameNode: boolean;
-  rowId: string | null;
-  scrollTop: number;
-}
-
-interface FollowingRowSamplerTarget {
-  key: string;
-  rowId: string;
-  initialScrollTop: number;
-}
-
-interface RenderedTranscriptFrame {
-  dataRevision: number;
   frame: number;
-  feedBottom: number;
-  feedTop: number;
-  modelCount: number;
+  mountedKeys: string[];
+  offset: number | null;
+  pinned: boolean;
+  rowId: string | null;
+  sameNode: boolean;
   scrollTop: number;
-  rows: Array<{
-    id: string;
-    virtualKey: string;
-    nodeToken: number;
-    wrapperNodeToken: number;
-    text: string;
-    top: number;
-    bottom: number;
-    type: string;
-  }>;
+  text: string | null;
 }
 
-interface TranscriptThumbDrag {
+interface TranscriptTouchDrag {
+  session: CDPSession;
+  identifier: number;
+  maximumY: number;
   x: number;
-  trackTop: number;
-  travel: number;
-  initialPosition: number;
-  initialScrollTop: number;
+  y: number;
 }
 
-interface ExpectedRenderedTranscriptRow {
-  id: string;
-  index: number;
-  normalizeWhitespace?: boolean;
-  pendingId?: string;
-  seq: number;
-  text: string;
-  type: string;
+interface TouchPrependScenario {
+  caseId: string;
+  clampBeforeRelease: boolean;
+  label: string;
+  liveBehavior: 'completed' | 'expanding' | 'paused-interrupted';
+  viewport: { height: number; width: number };
 }
 
 interface SelectionSnapshot {
@@ -104,6 +98,31 @@ interface TranscriptGeometry {
   modelCount: number;
   overlaps: Array<{ previous: string; next: string; amount: number }>;
   horizontalOverflow: Array<{ key: string; left: number; right: number }>;
+}
+
+interface TranscriptRowObservation {
+  bashCommand: {
+    buttonCount: number;
+    tagName: string;
+    text: string;
+  } | null;
+  itemIndex: number;
+  messageType: string;
+  rowId: string;
+  text: string;
+}
+
+interface ExactTranscriptRow {
+  ordinal: number;
+  type: ChatMessage['type'];
+  text: string;
+}
+
+interface TranscriptViewportScan {
+  duplicateMountedRowIds: string[];
+  indexChanges: Array<{ rowId: string; previous: number; current: number }>;
+  rows: TranscriptRowObservation[];
+  visualOrderViolations: Array<{ previous: string; next: string }>;
 }
 
 interface TranscriptLayoutSnapshot {
@@ -180,97 +199,185 @@ async function seedTranscript(
   return chatId;
 }
 
-function codexTailOrderingTranscript(): ChatViewMessage[] {
-  const timestamp = (seq: number) => new Date(Date.UTC(2026, 7, 12, 5, 0, seq)).toISOString();
-  const messages: ChatViewMessage[] = [];
-  for (let seq = 1; seq <= 210; seq += 1) {
-    const turn = Math.ceil(seq / 2);
-    messages.push({
-      seq,
-      message:
-        seq % 2 === 1
-          ? new UserMessage(timestamp(seq), `codex-tail-user-${turn}`)
-          : new AssistantMessage(timestamp(seq), `codex-tail-assistant-${turn}`),
-    });
+function exactTranscriptText(message: ChatMessage): string {
+  switch (message.type) {
+    case 'user-message':
+    case 'assistant-message':
+      return message.content;
+    case 'bash-tool-use':
+      return `$ ${message.command}`;
+    case 'tool-result':
+      return typeof message.content.raw === 'string'
+        ? message.content.raw
+        : JSON.stringify(message.content);
+    case 'compaction':
+      return message.summary;
+    default:
+      throw new Error(`The exact transcript fixture does not support ${message.type}.`);
   }
-  messages.push({
-    seq: 211,
-    message: new CompactionMessage(timestamp(211), 'auto', '', 124_000, 31_000),
-  });
-  for (let commandIndex = 0; commandIndex < 14; commandIndex += 1) {
-    const seq = 212 + commandIndex * 2;
-    const toolId = `codex-tail-bash-${commandIndex}`;
-    messages.push({
-      seq,
-      message: new BashToolUseMessage(
-        timestamp(seq),
-        toolId,
-        commandIndex === 13
-          ? 'rtk git diff --stat origin/master...HEAD && rtk git diff --name-status origin/master...HEAD'
-          : `printf 'codex-tail-command-${commandIndex}'`,
-      ),
-    });
-    messages.push({
-      seq: seq + 1,
-      message: new ToolResultMessage(
-        timestamp(seq + 1),
-        toolId,
-        { raw: `codex-tail-result-${commandIndex}` },
-        false,
-      ),
-    });
-  }
-  messages.push({
-    seq: 240,
-    message: new AssistantMessage(
-      timestamp(240),
-      'codex-tail-final-assistant-response-after-every-tool',
-    ),
-  });
-  return messages;
 }
 
-async function loadCompleteTranscript(
-  integration: IntegrationFixture,
-  chatId: string,
-): Promise<{
-  generationId: string;
-  lastSeq: number;
-  messages: ChatViewMessage[];
-}> {
-  const newest = await integration.client.getMessages(chatId, { limit: 200 });
-  let page = newest;
-  let messages: ChatViewMessage[] = [...newest.messages];
-  while (page.hasMore) {
-    const earlier = await integration.client.getMessages(chatId, {
-      limit: 200,
-      beforeSeq: page.pageOldestSeq,
-    });
-    expect(earlier.generationId).toBe(newest.generationId);
-    expect(earlier.lastSeq).toBe(newest.lastSeq);
-    expect(earlier.messages.at(-1)?.seq ?? 0).toBeLessThan(page.pageOldestSeq);
-    messages = [...earlier.messages, ...messages];
-    page = earlier;
-  }
-  expect(messages.map((entry) => entry.seq)).toEqual(
-    Array.from({ length: newest.lastSeq }, (_, index) => index + 1),
-  );
+function exactTranscriptRow(entry: TranscriptMessage): ExactTranscriptRow {
   return {
-    generationId: newest.generationId,
-    lastSeq: newest.lastSeq,
-    messages,
+    ordinal: entry.ordinal,
+    type: entry.message.type,
+    text: exactTranscriptText(entry.message),
   };
 }
 
+function mixedOrderingRows(firstOrdinal: number): {
+  drafts: LedgerRowDraft[];
+  expected: ExactTranscriptRow[];
+} {
+  const drafts: LedgerRowDraft[] = [];
+  const expected: ExactTranscriptRow[] = [];
+  let ordinal = firstOrdinal;
+
+  const addMessage = (message: ChatMessage, clientMessageId?: string): void => {
+    const draft: LedgerRowDraft = message instanceof UserMessage
+      ? {
+          kind: 'user-input',
+          at: message.timestamp,
+          detail: {
+            clientMessageId: clientMessageId ?? `mixed-client-${ordinal}`,
+            message,
+            attachments: [],
+            steer: false,
+          },
+          providerMeta: null,
+        }
+      : {
+          kind: 'provider-row',
+          at: message.timestamp,
+          message,
+          providerMeta: null,
+        };
+    drafts.push(draft);
+    expected.push({ ordinal, type: message.type, text: exactTranscriptText(message) });
+    ordinal += 1;
+  };
+  const timestamp = () => new Date(Date.UTC(2026, 7, 15) + ordinal).toISOString();
+
+  for (let turn = 0; turn < 74; turn += 1) {
+    addMessage(new UserMessage(timestamp(), `mixed-user-${turn}`));
+    addMessage(new AssistantMessage(timestamp(), `mixed-assistant-${turn}`));
+  }
+
+  for (let commandIndex = 0; commandIndex < 30; commandIndex += 1) {
+    const toolId = `mixed-bash-${commandIndex}`;
+    addMessage(
+      new BashToolUseMessage(timestamp(), toolId, `printf 'mixed-command-${commandIndex}\\n'`),
+    );
+    addMessage(
+      new ToolResultMessage(timestamp(), toolId, { raw: `mixed-result-${commandIndex}` }, false),
+    );
+    if ((commandIndex + 1) % 5 === 0) {
+      addMessage(
+        new CompactionMessage(
+          timestamp(),
+          'auto',
+          `mixed-compaction-${(commandIndex + 1) / 5}`,
+        ),
+      );
+      addMessage(new AssistantMessage(timestamp(), 'repeated-equal-assistant-content'));
+    }
+  }
+
+  for (let turn = 74; turn < 84; turn += 1) {
+    addMessage(new UserMessage(timestamp(), `mixed-user-${turn}`));
+    addMessage(new AssistantMessage(timestamp(), `mixed-assistant-${turn}`));
+  }
+
+  addMessage(new CompactionMessage(timestamp(), 'manual', 'mixed-tail-compaction'));
+  for (let commandIndex = 30; commandIndex < 42; commandIndex += 1) {
+    const toolId = `mixed-bash-${commandIndex}`;
+    addMessage(
+      new BashToolUseMessage(timestamp(), toolId, `printf 'mixed-command-${commandIndex}\\n'`),
+    );
+    addMessage(
+      new ToolResultMessage(timestamp(), toolId, { raw: `mixed-result-${commandIndex}` }, false),
+    );
+  }
+  addMessage(new AssistantMessage(timestamp(), 'mixed-final-assistant-after-all-tools'));
+
+  return { drafts, expected };
+}
+
+function crossPageToolPairRows(firstOrdinal: number): {
+  drafts: LedgerRowDraft[];
+  toolResultOrdinal: number;
+  toolUseOrdinal: number;
+} {
+  const drafts: LedgerRowDraft[] = [];
+  let ordinal = firstOrdinal;
+  const add = (message: ChatMessage): number => {
+    const messageOrdinal = ordinal;
+    drafts.push({
+      kind: 'provider-row',
+      at: message.timestamp,
+      message,
+      providerMeta: null,
+    });
+    ordinal += 1;
+    return messageOrdinal;
+  };
+  const timestamp = () => new Date(Date.UTC(2026, 7, 15) + ordinal).toISOString();
+
+  for (let index = 0; index < 48; index += 1) {
+    add(new AssistantMessage(timestamp(), `tool-boundary-before-${index}`));
+  }
+  const toolId = 'cross-page-web-search';
+  const toolUseOrdinal = add(
+    new WebSearchToolUseMessage(timestamp(), toolId, 'cross-page transcript stability'),
+  );
+  const toolResultOrdinal = add(
+    new ToolResultMessage(
+      timestamp(),
+      toolId,
+      { raw: 'cross-page-search-result' },
+      false,
+    ),
+  );
+  for (let index = 0; index < 49; index += 1) {
+    add(new AssistantMessage(timestamp(), `tool-boundary-after-${index}`));
+  }
+  return { drafts, toolResultOrdinal, toolUseOrdinal };
+}
+
+async function appendLedgerRows(
+  fixture: ChromiumFixture,
+  chatId: string,
+  transcriptViewId: string,
+  drafts: readonly LedgerRowDraft[],
+): Promise<void> {
+  await fixture.integration.restartGarcon({
+    beforeStart: async () => {
+      const store = new TranscriptLedgerStore(
+        join(fixture.integration.dirs.workspace, 'transcript-ledgers'),
+      );
+      try {
+        const view = store.currentView(chatId);
+        if (view?.viewId !== transcriptViewId) {
+          throw new Error('The mixed transcript fixture opened a different transcript view.');
+        }
+        store.append(chatId, view.viewId, drafts);
+      } finally {
+        store.close();
+      }
+    },
+  });
+}
+
 async function selectSidebarChat(page: Page, chatId: string, marker: string): Promise<void> {
-  await page.evaluate((expected) => {
-    const summary = [
-      ...document.querySelectorAll<HTMLElement>('[data-slot="sidebar-chat-summary"]'),
-    ].find((candidate) => candidate.innerText.includes(expected));
-    const button = summary?.closest('button');
-    if (!button) throw new Error(`Missing sidebar chat containing: ${expected}`);
-    button.click();
-  }, marker);
+  const summary = page
+    .locator('[data-slot="sidebar-chat-summary"]')
+    .filter({ hasText: marker })
+    .first();
+  if (!(await summary.isVisible())) {
+    await page.getByRole('button', { name: 'Menu', exact: true }).click();
+  }
+  await summary.waitFor({ state: 'visible' });
+  await summary.locator('xpath=ancestor::button[1]').click();
   await page.waitForURL((url) => url.pathname === `/chat/${encodeURIComponent(chatId)}`);
   await waitForTranscriptReady(page);
 }
@@ -307,6 +414,109 @@ async function waitForStableModelCount(page: Page, minimum: number): Promise<num
   }, minimum);
 }
 
+async function transcriptEntryCount(page: Page): Promise<number> {
+  return page
+    .locator(SIZER_SELECTOR)
+    .evaluate((sizer) => Number((sizer as HTMLElement).dataset.chatTranscriptEntryCount ?? 0));
+}
+
+async function scanLoadedTranscript(page: Page): Promise<TranscriptViewportScan> {
+  return page.locator(FEED_SELECTOR).evaluate(async (feedElement, itemSelector) => {
+    const feed = feedElement as HTMLElement;
+    const rows = new Map<string, TranscriptRowObservation>();
+    const duplicateMountedRowIds = new Set<string>();
+    const indexChanges: TranscriptViewportScan['indexChanges'] = [];
+    const visualOrderViolations: TranscriptViewportScan['visualOrderViolations'] = [];
+    const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const capture = () => {
+      const mounted = [...feed.querySelectorAll<HTMLElement>(itemSelector)]
+        .flatMap((item) => {
+          const row = item.querySelector<HTMLElement>('[data-chat-row-id]');
+          const itemIndex = Number(item.dataset.index);
+          if (!row?.dataset.chatRowId || !Number.isFinite(itemIndex)) return [];
+          const bashCommand = row.querySelector<HTMLElement>('[data-chat-bash-command]');
+          return [
+            {
+              bashCommand: bashCommand
+                ? {
+                    buttonCount: row.querySelectorAll('button').length,
+                    tagName: bashCommand.tagName,
+                    text: bashCommand.innerText.trim(),
+                  }
+                : null,
+              itemIndex,
+              messageType: row.dataset.chatMessageType ?? '',
+              rect: item.getBoundingClientRect(),
+              rowId: row.dataset.chatRowId,
+              text: row.innerText.trim(),
+            },
+          ];
+        })
+        .sort((left, right) => left.itemIndex - right.itemIndex);
+      const mountedIds = new Set<string>();
+      for (const row of mounted) {
+        if (mountedIds.has(row.rowId)) duplicateMountedRowIds.add(row.rowId);
+        mountedIds.add(row.rowId);
+        const previous = rows.get(row.rowId);
+        if (previous && previous.itemIndex !== row.itemIndex) {
+          indexChanges.push({
+            rowId: row.rowId,
+            previous: previous.itemIndex,
+            current: row.itemIndex,
+          });
+        }
+        rows.set(row.rowId, {
+          bashCommand: row.bashCommand,
+          itemIndex: row.itemIndex,
+          messageType: row.messageType,
+          rowId: row.rowId,
+          text: row.text,
+        });
+      }
+      for (let index = 1; index < mounted.length; index += 1) {
+        const previous = mounted[index - 1];
+        const next = mounted[index];
+        if (previous && next && next.rect.top < previous.rect.top) {
+          visualOrderViolations.push({ previous: previous.rowId, next: next.rowId });
+        }
+      }
+    };
+
+    feed.scrollTop = 0;
+    feed.dispatchEvent(new Event('scroll', { bubbles: true }));
+    for (let settledFrame = 0; settledFrame < 4; settledFrame += 1) await frame();
+    capture();
+
+    for (let attempt = 0; attempt < 512; attempt += 1) {
+      const maximum = Math.max(0, feed.scrollHeight - feed.clientHeight);
+      if (feed.scrollTop >= maximum - 1) break;
+      const previousTop = feed.scrollTop;
+      feed.scrollTop = Math.min(maximum, previousTop + Math.max(1, feed.clientHeight * 0.6));
+      feed.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await frame();
+      await frame();
+      capture();
+      if (feed.scrollTop <= previousTop + 0.5) {
+        throw new Error('The transcript viewport stopped before reaching its loaded later edge.');
+      }
+    }
+
+    const maximum = Math.max(0, feed.scrollHeight - feed.clientHeight);
+    if (feed.scrollTop < maximum - 1) {
+      throw new Error('The transcript viewport scan exceeded its bounded iteration count.');
+    }
+    for (let settledFrame = 0; settledFrame < 4; settledFrame += 1) await frame();
+    capture();
+
+    return {
+      duplicateMountedRowIds: [...duplicateMountedRowIds],
+      indexChanges,
+      rows: [...rows.values()].sort((left, right) => left.itemIndex - right.itemIndex),
+      visualOrderViolations,
+    };
+  }, ITEM_SELECTOR);
+}
+
 async function waitForTranscriptEntryCount(page: Page, minimum: number): Promise<number> {
   await page.waitForFunction(
     ({ selector, minimumCount }) => {
@@ -314,15 +524,8 @@ async function waitForTranscriptEntryCount(page: Page, minimum: number): Promise
       return Number(sizer?.dataset.chatTranscriptEntryCount ?? 0) >= minimumCount;
     },
     { selector: SIZER_SELECTOR, minimumCount: minimum },
-    { timeout: 20_000 },
   );
   return transcriptEntryCount(page);
-}
-
-async function transcriptEntryCount(page: Page): Promise<number> {
-  return page
-    .locator(SIZER_SELECTOR)
-    .evaluate((sizer) => Number((sizer as HTMLElement).dataset.chatTranscriptEntryCount ?? 0));
 }
 
 async function virtualDataRevision(page: Page): Promise<number> {
@@ -354,27 +557,26 @@ async function waitForDistanceFromEnd(page: Page, maximum: number): Promise<void
   );
 }
 
-async function waitForStablePinnedTranscriptLayout(
-  page: Page,
-  scenario = 'unnamed',
-): Promise<void> {
+async function waitForStablePinnedTranscriptLayout(page: Page, scenario = 'unnamed'): Promise<void> {
   await withDiagnosticTimeout(
     `the pinned transcript geometry to settle (${scenario})`,
     page.locator(FEED_SELECTOR).evaluate(
       async (feedElement, input) => {
         const feed = feedElement as HTMLElement;
         const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-        let previous: {
-          dataRevision: number;
-          distanceFromEnd: number;
-          itemCount: number;
-          lastBottom: number;
-          lastHeight: number;
-          lastKey: string;
-          modelCount: number;
-          scrollHeight: number;
-          scrollTop: number;
-        } | null = null;
+        let previous:
+          | {
+              dataRevision: number;
+              distanceFromEnd: number;
+              itemCount: number;
+              lastBottom: number;
+              lastHeight: number;
+              lastKey: string;
+              modelCount: number;
+              scrollHeight: number;
+              scrollTop: number;
+            }
+          | null = null;
         let stableFrames = 0;
         let diagnostic: unknown = null;
 
@@ -389,33 +591,17 @@ async function waitForStablePinnedTranscriptLayout(
             }))
             .filter((item) => Number.isFinite(item.index))
             .sort((left, right) => left.index - right.index);
-          const overlaps: Array<{
-            previous: string;
-            next: string;
-            amount: number;
-          }> = [];
-          const discontinuities: Array<{
-            previous: string;
-            next: string;
-            delta: number;
-          }> = [];
+          const overlaps: Array<{ previous: string; next: string; amount: number }> = [];
+          const discontinuities: Array<{ previous: string; next: string; delta: number }> = [];
           for (let index = 1; index < items.length; index += 1) {
             const prior = items[index - 1];
             const current = items[index];
             if (!prior || !current || current.index !== prior.index + 1) continue;
             const delta = current.rect.top - prior.rect.bottom;
             if (delta < -1) {
-              overlaps.push({
-                previous: prior.key,
-                next: current.key,
-                amount: -delta,
-              });
+              overlaps.push({ previous: prior.key, next: current.key, amount: -delta });
             } else if (delta > 1) {
-              discontinuities.push({
-                previous: prior.key,
-                next: current.key,
-                delta,
-              });
+              discontinuities.push({ previous: prior.key, next: current.key, delta });
             }
           }
           const last = items.at(-1);
@@ -451,13 +637,7 @@ async function waitForStablePinnedTranscriptLayout(
             Math.abs(current.scrollHeight - previous.scrollHeight) <= 0.5 &&
             Math.abs(current.scrollTop - previous.scrollTop) <= 0.5;
           stableFrames = ready && unchanged ? stableFrames + 1 : 0;
-          diagnostic = {
-            current,
-            discontinuities,
-            overlaps,
-            ready,
-            stableFrames,
-          };
+          diagnostic = { current, discontinuities, overlaps, ready, stableFrames };
           previous = current;
           if (stableFrames >= 7) return;
         }
@@ -490,6 +670,7 @@ async function surfaceIdentity(page: Page): Promise<string> {
     });
 }
 
+
 async function waitForSurfaceIdentity(page: Page, expected: string): Promise<void> {
   await page.waitForFunction(
     ({ selector, expectedIdentity }) => {
@@ -514,28 +695,9 @@ async function synchronizeNativeTranscriptGeneration(
   fixture: ChromiumFixture,
   chatId: string,
 ): Promise<void> {
-  // Forces native reconciliation before geometry samples a generation-scoped row key.
-  const liveTranscript = await fixture.integration.client.getMessages(chatId, {
-    limit: 200,
-  });
-  expect(liveTranscript.hasMore).toBe(false);
-  const finalTranscript = await fixture.integration.client.reloadChat(chatId);
-  expect(finalTranscript.hasMore).toBe(false);
-  expect(finalTranscript.lastSeq).toBe(liveTranscript.lastSeq);
-  expect(
-    expectedRenderedTranscriptRows(finalTranscript).map(({ seq, text, type }) => ({
-      seq,
-      text,
-      type,
-    })),
-  ).toEqual(
-    expectedRenderedTranscriptRows(liveTranscript).map(({ seq, text, type }) => ({
-      seq,
-      text,
-      type,
-    })),
-  );
-  await waitForSurfaceIdentity(fixture.page, `${chatId}:${finalTranscript.generationId}`);
+  const transcript = await fixture.integration.client.getMessages(chatId, { limit: 200 });
+  expect(transcript.hasMore).toBe(false);
+  await waitForSurfaceIdentity(fixture.page, `${chatId}:${transcript.transcriptViewId}`);
   await waitForTranscriptReady(fixture.page);
 }
 
@@ -761,8 +923,17 @@ async function readingAnchor(page: Page): Promise<ReadingAnchor> {
       .sort((left, right) => left.rect.top - right.rect.top);
     const anchor = candidates[0];
     const key = anchor?.item.dataset.chatVirtualItem;
-    if (!anchor || !key) throw new Error('No visible transcript item is available as an anchor.');
-    return { key, offset: anchor.rect.top - viewport.top };
+    const row = anchor?.item.querySelector<HTMLElement>('[data-chat-row-id]');
+    const rowId = row?.dataset.chatRowId;
+    if (!anchor || !key || !row || !rowId) {
+      throw new Error('No visible transcript item is available as an anchor.');
+    }
+    return {
+      key,
+      offset: anchor.rect.top - viewport.top,
+      rowId,
+      text: row.textContent?.trim() ?? '',
+    };
   }, ITEM_SELECTOR);
 }
 
@@ -775,13 +946,19 @@ async function startReadingAnchorFrameSampler(page: Page, anchor: ReadingAnchor)
           active: boolean;
           frame: number;
           key: string;
+          node: HTMLElement;
           samples: ReadingAnchorFrameSample[];
         };
       };
+      const node = [...feed.querySelectorAll<HTMLElement>(input.itemSelector)].find(
+        (candidate) => candidate.dataset.chatVirtualItem === input.key,
+      );
+      if (!node) throw new Error('The reading-anchor wrapper is missing.');
       const sampler = {
         active: true,
         frame: 0,
         key: input.key,
+        node,
         samples: [] as ReadingAnchorFrameSample[],
       };
       browserGlobal.__chatReadingAnchorSampler = sampler;
@@ -791,10 +968,20 @@ async function startReadingAnchorFrameSampler(page: Page, anchor: ReadingAnchor)
         const item = [...feed.querySelectorAll<HTMLElement>(input.itemSelector)].find(
           (candidate) => candidate.dataset.chatVirtualItem === sampler.key,
         );
+        const row = item?.querySelector<HTMLElement>('[data-chat-row-id]');
         sampler.samples.push({
+          busy: feed.getAttribute('aria-busy') === 'true',
+          connected: sampler.node.isConnected,
           frame: sampler.frame,
+          mountedKeys: [...feed.querySelectorAll<HTMLElement>(input.itemSelector)].map(
+            (candidate) => candidate.dataset.chatVirtualItem ?? '',
+          ),
           offset: item ? item.getBoundingClientRect().top - viewport.top : null,
+          pinned: feed.dataset.chatPinnedToBottom === 'true',
+          rowId: row?.dataset.chatRowId ?? null,
+          sameNode: item === sampler.node,
           scrollTop: feed.scrollTop,
+          text: row?.textContent?.trim() ?? null,
         });
         sampler.frame += 1;
         requestAnimationFrame(sample);
@@ -804,6 +991,76 @@ async function startReadingAnchorFrameSampler(page: Page, anchor: ReadingAnchor)
     },
     { itemSelector: ITEM_SELECTOR, key: anchor.key },
   );
+}
+
+async function beginTranscriptTouchDrag(page: Page): Promise<TranscriptTouchDrag> {
+  const box = await page.locator(FEED_SELECTOR).boundingBox();
+  if (!box) throw new Error('The transcript viewport has no touch target.');
+  const session = await page.context().newCDPSession(page);
+  await session.send('Emulation.setTouchEmulationEnabled', {
+    enabled: true,
+    maxTouchPoints: 1,
+  });
+  const drag = {
+    session,
+    identifier: 1,
+    maximumY: box.y + box.height - 20,
+    x: box.x + box.width / 2,
+    y: box.y + Math.min(120, box.height / 4),
+  };
+  await session.send('Input.dispatchTouchEvent', {
+    type: 'touchStart',
+    touchPoints: [
+      {
+        id: drag.identifier,
+        x: drag.x,
+        y: drag.y,
+        radiusX: 1,
+        radiusY: 1,
+        force: 1,
+      },
+    ],
+  });
+  return drag;
+}
+
+async function moveTranscriptTouch(
+  page: Page,
+  drag: TranscriptTouchDrag,
+  deltaY: number,
+): Promise<number> {
+  drag.y = Math.min(drag.maximumY, drag.y + deltaY);
+  await drag.session.send('Input.dispatchTouchEvent', {
+    type: 'touchMove',
+    touchPoints: [
+      {
+        id: drag.identifier,
+        x: drag.x,
+        y: drag.y,
+        radiusX: 1,
+        radiusY: 1,
+        force: 1,
+      },
+    ],
+  });
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+  return page
+    .locator(FEED_SELECTOR)
+    .evaluate((feedElement) => (feedElement as HTMLElement).scrollTop);
+}
+
+async function finishTranscriptTouchDrag(drag: TranscriptTouchDrag): Promise<void> {
+  try {
+    await drag.session.send('Input.dispatchTouchEvent', {
+      type: 'touchEnd',
+      touchPoints: [],
+    });
+    await drag.session.send('Emulation.setTouchEmulationEnabled', {
+      enabled: false,
+    });
+  } finally {
+    await drag.session.detach();
+  }
 }
 
 async function finishReadingAnchorFrameSampler(page: Page): Promise<ReadingAnchorFrameSample[]> {
@@ -823,556 +1080,6 @@ async function finishReadingAnchorFrameSampler(page: Page): Promise<ReadingAncho
     delete browserGlobal.__chatReadingAnchorSampler;
     return sampler.samples;
   });
-}
-
-async function startFollowingRowFrameSampler(page: Page): Promise<FollowingRowSamplerTarget> {
-  return page.locator(FEED_SELECTOR).evaluate(async (feedElement, itemSelector) => {
-    const feed = feedElement as HTMLElement;
-    const viewport = feed.getBoundingClientRect();
-    const mounted = [...feed.querySelectorAll<HTMLElement>(itemSelector)]
-      .filter((item) => item.querySelector('[data-chat-row-id]'))
-      .map((item) => ({ item, rect: item.getBoundingClientRect() }))
-      .sort((left, right) => left.rect.top - right.rect.top);
-    const lastVisibleIndex = mounted.findLastIndex(
-      ({ rect }) => rect.bottom > viewport.top + 1 && rect.top < viewport.bottom - 1,
-    );
-    const following = mounted[lastVisibleIndex + 1];
-    const key = following?.item.dataset.chatVirtualItem;
-    const rowId =
-      following?.item.querySelector<HTMLElement>('[data-chat-row-id]')?.dataset.chatRowId;
-    if (!following || !key || !rowId) {
-      throw new Error('No mounted transcript row followed the visible range.');
-    }
-
-    const browserGlobal = globalThis as typeof globalThis & {
-      __chatFollowingRowSampler?: {
-        active: boolean;
-        frame: number;
-        key: string;
-        node: HTMLElement;
-        samples: FollowingRowFrameSample[];
-      };
-    };
-    const sampler = {
-      active: true,
-      frame: 0,
-      key,
-      node: following.item,
-      samples: [] as FollowingRowFrameSample[],
-    };
-    browserGlobal.__chatFollowingRowSampler = sampler;
-    const sample = () => {
-      if (!sampler.active) return;
-      const current = [...feed.querySelectorAll<HTMLElement>(itemSelector)].find(
-        (candidate) => candidate.dataset.chatVirtualItem === sampler.key,
-      );
-      sampler.samples.push({
-        frame: sampler.frame,
-        connected: sampler.node.isConnected,
-        sameNode: current === sampler.node,
-        rowId: current?.querySelector<HTMLElement>('[data-chat-row-id]')?.dataset.chatRowId ?? null,
-        scrollTop: feed.scrollTop,
-      });
-      sampler.frame += 1;
-      requestAnimationFrame(sample);
-    };
-    sample();
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    return { key, rowId, initialScrollTop: feed.scrollTop };
-  }, ITEM_SELECTOR);
-}
-
-async function finishFollowingRowFrameSampler(page: Page): Promise<FollowingRowFrameSample[]> {
-  return page.evaluate(async () => {
-    const browserGlobal = globalThis as typeof globalThis & {
-      __chatFollowingRowSampler?: {
-        active: boolean;
-        samples: FollowingRowFrameSample[];
-      };
-    };
-    const sampler = browserGlobal.__chatFollowingRowSampler;
-    if (!sampler) throw new Error('The following-row frame sampler is missing.');
-    for (let frame = 0; frame < 4; frame += 1) {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    }
-    sampler.active = false;
-    delete browserGlobal.__chatFollowingRowSampler;
-    return sampler.samples;
-  });
-}
-
-async function startRenderedTranscriptFrameSampler(page: Page): Promise<void> {
-  await page.locator(FEED_SELECTOR).evaluate((feedElement, sizerSelector) => {
-    const feed = feedElement as HTMLElement;
-    const browserGlobal = globalThis as typeof globalThis & {
-      __chatRenderedTranscriptSampler?: {
-        active: boolean;
-        frame: number;
-        samples: RenderedTranscriptFrame[];
-      };
-    };
-    const sampler = {
-      active: true,
-      frame: 0,
-      samples: [] as RenderedTranscriptFrame[],
-      nodeTokens: new WeakMap<HTMLElement, number>(),
-      wrapperNodeTokens: new WeakMap<HTMLElement, number>(),
-      nextNodeToken: 1,
-    };
-    browserGlobal.__chatRenderedTranscriptSampler = sampler;
-    const sample = () => {
-      if (!sampler.active) return;
-      const feedRect = feed.getBoundingClientRect();
-      const sizer = feed.querySelector<HTMLElement>(sizerSelector);
-      sampler.samples.push({
-        dataRevision: Number(sizer?.dataset.chatVirtualDataRevision ?? 0),
-        frame: sampler.frame,
-        feedBottom: feedRect.bottom,
-        feedTop: feedRect.top,
-        modelCount: Number(sizer?.dataset.chatVirtualModelCount ?? 0),
-        scrollTop: feed.scrollTop,
-        rows: [...feed.querySelectorAll<HTMLElement>('[data-chat-row-id]')].map((row) => {
-          let nodeToken = sampler.nodeTokens.get(row);
-          if (nodeToken === undefined) {
-            nodeToken = sampler.nextNodeToken;
-            sampler.nextNodeToken += 1;
-            sampler.nodeTokens.set(row, nodeToken);
-          }
-          const wrapper = row.closest<HTMLElement>('[data-chat-virtual-item]');
-          let wrapperNodeToken = wrapper ? sampler.wrapperNodeTokens.get(wrapper) : undefined;
-          if (wrapper && wrapperNodeToken === undefined) {
-            wrapperNodeToken = sampler.nextNodeToken;
-            sampler.nextNodeToken += 1;
-            sampler.wrapperNodeTokens.set(wrapper, wrapperNodeToken);
-          }
-          const rect = row.getBoundingClientRect();
-          return {
-            id: row.dataset.chatRowId ?? '',
-            virtualKey: wrapper?.dataset.chatVirtualItem ?? '',
-            nodeToken,
-            wrapperNodeToken: wrapperNodeToken ?? 0,
-            text: row.textContent?.trim() ?? '',
-            top: rect.top,
-            bottom: rect.bottom,
-            type: row.dataset.chatMessageType ?? '',
-          };
-        }),
-      });
-      sampler.frame += 1;
-      requestAnimationFrame(sample);
-    };
-    sample();
-  }, SIZER_SELECTOR);
-}
-
-async function finishRenderedTranscriptFrameSampler(
-  page: Page,
-): Promise<RenderedTranscriptFrame[]> {
-  return page.evaluate(async () => {
-    const browserGlobal = globalThis as typeof globalThis & {
-      __chatRenderedTranscriptSampler?: {
-        active: boolean;
-        samples: RenderedTranscriptFrame[];
-      };
-    };
-    const sampler = browserGlobal.__chatRenderedTranscriptSampler;
-    if (!sampler) throw new Error('The rendered-transcript frame sampler is missing.');
-    for (let frame = 0; frame < 4; frame += 1) {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    }
-    sampler.active = false;
-    delete browserGlobal.__chatRenderedTranscriptSampler;
-    return sampler.samples;
-  });
-}
-
-async function wheelTranscriptEarlier(page: Page, steps: number): Promise<void> {
-  const feed = page.locator(FEED_SELECTOR);
-  const box = await feed.boundingBox();
-  if (!box) throw new Error('The transcript viewport has no wheel target.');
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  for (let step = 0; step < steps; step += 1) {
-    await page.mouse.wheel(0, -48);
-    await page.evaluate(
-      () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
-    );
-  }
-}
-
-async function beginTranscriptThumbDrag(page: Page): Promise<TranscriptThumbDrag> {
-  const scrollbar = page.locator('[data-chat-feed-scrollbar]').first();
-  await scrollbar.waitFor({ state: 'visible' });
-  await scrollbar.hover();
-  const thumb = scrollbar.locator('[data-slot="scroll-area-thumb"]');
-  await thumb.waitFor({ state: 'visible' });
-  const [trackBox, thumbBox, initialScrollTop] = await Promise.all([
-    scrollbar.boundingBox(),
-    thumb.boundingBox(),
-    page.locator(FEED_SELECTOR).evaluate((feedElement) => (feedElement as HTMLElement).scrollTop),
-  ]);
-  if (!trackBox || !thumbBox) throw new Error('The transcript scrollbar has no drag geometry.');
-  const travel = trackBox.height - thumbBox.height;
-  if (travel <= 4) throw new Error('The transcript scrollbar thumb has no usable travel.');
-  const x = thumbBox.x + thumbBox.width / 2;
-  const initialPosition = Math.max(0, Math.min(1, (thumbBox.y - trackBox.y) / travel));
-  await page.mouse.move(x, thumbBox.y + thumbBox.height / 2);
-  await page.mouse.down();
-  return {
-    x,
-    trackTop: trackBox.y + thumbBox.height / 2,
-    travel,
-    initialPosition,
-    initialScrollTop,
-  };
-}
-
-async function moveTranscriptThumb(
-  page: Page,
-  drag: TranscriptThumbDrag,
-  position: number,
-): Promise<number> {
-  const boundedPosition = Math.max(0, Math.min(1, position));
-  await page.mouse.move(drag.x, drag.trackTop + drag.travel * boundedPosition, {
-    steps: 6,
-  });
-  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
-  return page
-    .locator(FEED_SELECTOR)
-    .evaluate((feedElement) => (feedElement as HTMLElement).scrollTop);
-}
-
-async function finishTranscriptThumbDrag(page: Page): Promise<void> {
-  await page.mouse.up();
-  await page.evaluate(async () => {
-    for (let frame = 0; frame < 4; frame += 1) {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    }
-  });
-}
-
-function expectedRenderedTranscriptRows(transcript: {
-  generationId: string;
-  messages: ReadonlyArray<{ seq: number; message: unknown }>;
-}): ExpectedRenderedTranscriptRow[] {
-  const rows: ExpectedRenderedTranscriptRow[] = [];
-  const pendingBashResultCounts = new Map<string, number>();
-  for (const entry of transcript.messages) {
-    if (typeof entry.message !== 'object' || entry.message === null) {
-      throw new Error(`Transcript seq ${entry.seq} has no renderable message object.`);
-    }
-    const message = entry.message as {
-      type?: unknown;
-      command?: unknown;
-      content?: unknown;
-      metadata?: unknown;
-      postTokens?: unknown;
-      preTokens?: unknown;
-      summary?: unknown;
-      toolId?: unknown;
-      trigger?: unknown;
-    };
-    let text: string;
-    let normalizeWhitespace = false;
-    if (
-      (message.type === 'user-message' ||
-        message.type === 'assistant-message' ||
-        message.type === 'thinking' ||
-        message.type === 'error') &&
-      typeof message.content === 'string'
-    ) {
-      text = message.content;
-    } else if (message.type === 'bash-tool-use' && typeof message.command === 'string') {
-      if (typeof message.toolId !== 'string') {
-        throw new Error(`Transcript seq ${entry.seq} has no Bash tool identity.`);
-      }
-      pendingBashResultCounts.set(
-        message.toolId,
-        (pendingBashResultCounts.get(message.toolId) ?? 0) + 1,
-      );
-      text = `$ ${message.command}`;
-    } else if (message.type === 'compaction') {
-      const tokenLabel =
-        typeof message.preTokens === 'number' && typeof message.postTokens === 'number'
-          ? ` ${message.preTokens.toLocaleString()} → ${message.postTokens.toLocaleString()} tokens`
-          : '';
-      const summaryLabel =
-        typeof message.summary === 'string' && message.summary.trim() ? ' Show summary' : '';
-      text = `Context compacted (${message.trigger === 'auto' ? 'auto' : 'manual'})${tokenLabel}${summaryLabel}`;
-      normalizeWhitespace = true;
-    } else if (message.type === 'tool-result') {
-      if (typeof message.toolId !== 'string') {
-        throw new Error(`Transcript seq ${entry.seq} has no tool-result identity.`);
-      }
-      const pendingCount = pendingBashResultCounts.get(message.toolId) ?? 0;
-      if (pendingCount === 0) {
-        throw new Error(`Missing rendered transcript expectation for tool result ${message.toolId}.`);
-      }
-      if (pendingCount === 1) pendingBashResultCounts.delete(message.toolId);
-      else pendingBashResultCounts.set(message.toolId, pendingCount - 1);
-      continue;
-    } else if (message.type === 'permission-resolved' || message.type === 'permission-cancelled') {
-      continue;
-    } else {
-      throw new Error(`Missing rendered transcript expectation for ${String(message.type)}.`);
-    }
-    rows.push({
-      id: `${transcript.generationId}:${entry.seq}`,
-      index: rows.length,
-      normalizeWhitespace,
-      pendingId:
-        message.type === 'user-message' &&
-        typeof message.metadata === 'object' &&
-        message.metadata !== null &&
-        'clientRequestId' in message.metadata &&
-        typeof message.metadata.clientRequestId === 'string'
-          ? `pending:${message.metadata.clientRequestId}`
-          : undefined,
-      seq: entry.seq,
-      text,
-      type: String(message.type),
-    });
-  }
-  return rows;
-}
-
-function renderedTranscriptText(text: string, expected: ExpectedRenderedTranscriptRow): string {
-  return expected.normalizeWhitespace ? text.replace(/\s+/g, ' ').trim() : text;
-}
-
-function assertRenderedTranscriptFrameIntegrity(
-  frames: RenderedTranscriptFrame[],
-  expectedRows: ExpectedRenderedTranscriptRow[],
-  staticThroughSeq: number,
-): void {
-  const expectedById = new Map(expectedRows.map((row) => [row.id, row] as const));
-  for (const row of expectedRows) {
-    if (row.pendingId) expectedById.set(row.pendingId, row);
-  }
-  const previousById = new Map<
-    string,
-    {
-      frame: number;
-      nodeToken: number;
-      wrapperNodeToken: number;
-      top: number;
-      bottom: number;
-    }
-  >();
-  const violations: Array<Record<string, unknown>> = [];
-  for (const frame of frames) {
-    const ids = frame.rows.map((row) => row.id);
-    const duplicateIds = ids.filter((id, index) => ids.indexOf(id) !== index);
-    const geometryFailures = frame.rows.flatMap((row, index) => {
-      const next = frame.rows[index + 1];
-      return next && (row.top > next.top || row.bottom > next.top + 1)
-        ? [
-            {
-              id: row.id,
-              nextId: next.id,
-              top: row.top,
-              bottom: row.bottom,
-              nextTop: next.top,
-            },
-          ]
-        : [];
-    });
-    const canonicalRows = frame.rows.flatMap((row) => {
-      const expected = expectedById.get(row.id);
-      return expected ? [{ row, expected }] : [];
-    });
-    const unknownRows = frame.rows.filter((row) => !expectedById.has(row.id));
-    const orderFailures = canonicalRows.flatMap(({ row, expected }, index) => {
-      const next = canonicalRows[index + 1];
-      return next && expected.index >= next.expected.index
-        ? [
-            {
-              id: row.id,
-              index: expected.index,
-              nextId: next.row.id,
-              nextIndex: next.expected.index,
-            },
-          ]
-        : [];
-    });
-    const contentFailures = canonicalRows.flatMap(({ row, expected }) =>
-      expected.seq <= staticThroughSeq &&
-      (renderedTranscriptText(row.text, expected) !== expected.text || row.type !== expected.type)
-        ? [{ id: row.id, expected, actual: { text: row.text, type: row.type } }]
-        : [],
-    );
-    const visibleCanonicalRows = canonicalRows.filter(
-      ({ row }) => row.bottom > frame.feedTop + 0.5 && row.top < frame.feedBottom - 0.5,
-    );
-    const visibleSequenceFailures = visibleCanonicalRows.flatMap(({ row, expected }, index) => {
-      const next = visibleCanonicalRows[index + 1];
-      return next && next.expected.index !== expected.index + 1
-        ? [
-            {
-              id: row.id,
-              index: expected.index,
-              nextId: next.row.id,
-              nextIndex: next.expected.index,
-            },
-          ]
-        : [];
-    });
-    const keyFailures = canonicalRows.flatMap(({ row }) => {
-      try {
-        const parsed = JSON.parse(row.virtualKey);
-        return Array.isArray(parsed) && parsed[1] === `transcript:${row.id}`
-          ? []
-          : [{ id: row.id, virtualKey: row.virtualKey }];
-      } catch {
-        return [{ id: row.id, virtualKey: row.virtualKey }];
-      }
-    });
-    const remountFailures = canonicalRows.flatMap(({ row }) => {
-      const previous = previousById.get(row.id);
-      previousById.set(row.id, {
-        frame: frame.frame,
-        nodeToken: row.nodeToken,
-        wrapperNodeToken: row.wrapperNodeToken,
-        top: row.top,
-        bottom: row.bottom,
-      });
-      return previous && previous.frame === frame.frame - 1 && previous.nodeToken !== row.nodeToken
-        ? [
-            {
-              id: row.id,
-              previousNode: previous.nodeToken,
-              nextNode: row.nodeToken,
-              previousWrapper: previous.wrapperNodeToken,
-              nextWrapper: row.wrapperNodeToken,
-              previousTop: previous.top,
-              previousBottom: previous.bottom,
-              nextTop: row.top,
-              nextBottom: row.bottom,
-              visible: row.bottom > frame.feedTop + 0.5 && row.top < frame.feedBottom - 0.5,
-            },
-          ]
-        : [];
-    });
-    if (
-      duplicateIds.length > 0 ||
-      unknownRows.length > 0 ||
-      geometryFailures.length > 0 ||
-      orderFailures.length > 0 ||
-      contentFailures.length > 0 ||
-      visibleSequenceFailures.length > 0 ||
-      keyFailures.length > 0 ||
-      remountFailures.length > 0
-    ) {
-      violations.push({
-        dataRevision: frame.dataRevision,
-        frame: frame.frame,
-        modelCount: frame.modelCount,
-        scrollTop: frame.scrollTop,
-        duplicateIds,
-        unknownRows,
-        geometryFailures,
-        orderFailures,
-        contentFailures,
-        visibleSequenceFailures,
-        keyFailures,
-        remountFailures,
-      });
-    }
-  }
-  expect(frames.length).toBeGreaterThan(3);
-  expect(violations, JSON.stringify(violations.slice(0, 12), null, 2)).toEqual([]);
-}
-
-async function assertMountedTranscriptMatches(
-  page: Page,
-  expectedRows: ExpectedRenderedTranscriptRow[],
-): Promise<void> {
-  const mounted = await page.locator(FEED_SELECTOR).evaluate((feedElement) => {
-    const feed = feedElement as HTMLElement;
-    return [...feed.querySelectorAll<HTMLElement>('[data-chat-row-id]')].map((row) => ({
-      id: row.dataset.chatRowId ?? '',
-      type: row.dataset.chatMessageType ?? '',
-      text: row.textContent?.trim() ?? '',
-      top: row.getBoundingClientRect().top,
-      virtualKey:
-        row.closest<HTMLElement>('[data-chat-virtual-item]')?.dataset.chatVirtualItem ?? '',
-    }));
-  });
-  const expectedById = new Map(expectedRows.map((row) => [row.id, row] as const));
-  const matched = mounted.map((row) => ({
-    row,
-    expected: expectedById.get(row.id) ?? null,
-  }));
-  expect(new Set(mounted.map((row) => row.id)).size).toBe(mounted.length);
-  expect(
-    matched.every(({ expected }) => expected !== null),
-    JSON.stringify(matched, null, 2),
-  ).toBe(true);
-  expect(
-    matched.every(({ row, expected }) =>
-      Boolean(
-        expected &&
-        renderedTranscriptText(row.text, expected) === expected.text &&
-        row.type === expected.type,
-      ),
-    ),
-    JSON.stringify(matched, null, 2),
-  ).toBe(true);
-  expect(
-    matched.every(({ row }, index) => {
-      const next = matched[index + 1];
-      return !next || (expectedById.get(row.id)?.index ?? -1) < (next.expected?.index ?? -1);
-    }),
-    JSON.stringify(matched, null, 2),
-  ).toBe(true);
-  expect(
-    matched.every(({ row }) => {
-      try {
-        const parsed = JSON.parse(row.virtualKey);
-        return Array.isArray(parsed) && parsed[1] === `transcript:${row.id}`;
-      } catch {
-        return false;
-      }
-    }),
-    JSON.stringify(matched, null, 2),
-  ).toBe(true);
-}
-
-async function assertCodexTailAssistantIsLast(
-  page: Page,
-  expectedRows: ExpectedRenderedTranscriptRow[],
-  finalRowId: string,
-  lastBashRowId: string,
-): Promise<void> {
-  await scrollToPosition(page, 'end');
-  await page.locator(`[data-chat-row-id="${finalRowId}"]`).waitFor({ state: 'visible' });
-  await assertMountedTranscriptMatches(page, expectedRows);
-  const tail = await page.locator(FEED_SELECTOR).evaluate(
-    (feedElement, expected) => {
-      const feed = feedElement as HTMLElement;
-      const rows = [...feed.querySelectorAll<HTMLElement>('[data-chat-row-id]')];
-      const finalRows = rows.filter((row) => row.dataset.chatRowId === expected.finalRowId);
-      const finalRow = finalRows[0];
-      const lastBashRow = rows.find((row) => row.dataset.chatRowId === expected.lastBashRowId);
-      return {
-        finalCount: finalRows.length,
-        finalText: finalRow?.textContent?.trim() ?? null,
-        finalTop: finalRow?.getBoundingClientRect().top ?? null,
-        lastBashText: lastBashRow?.textContent?.trim() ?? null,
-        lastBashTop: lastBashRow?.getBoundingClientRect().top ?? null,
-        lastMountedRowId: rows.at(-1)?.dataset.chatRowId ?? null,
-      };
-    },
-    { finalRowId, lastBashRowId },
-  );
-  expect(tail.finalCount, JSON.stringify(tail, null, 2)).toBe(1);
-  expect(tail.lastMountedRowId, JSON.stringify(tail, null, 2)).toBe(finalRowId);
-  expect(tail.finalText).toBe('codex-tail-final-assistant-response-after-every-tool');
-  expect(tail.lastBashText).toBe(
-    '$ rtk git diff --stat origin/master...HEAD && rtk git diff --name-status origin/master...HEAD',
-  );
-  expect(tail.finalTop).not.toBeNull();
-  expect(tail.lastBashTop).not.toBeNull();
-  expect(tail.finalTop!).toBeGreaterThan(tail.lastBashTop!);
 }
 
 async function anchorByKey(
@@ -1400,40 +1107,37 @@ async function anchorByKey(
     })();
     const current = await page
       .locator(FEED_SELECTOR)
-      .evaluate(
-        (feedElement, input) => {
-          const feed = feedElement as HTMLElement;
-          const mountedKeys = [...feed.querySelectorAll<HTMLElement>(input.itemSelector)].flatMap(
-            (item) => item.dataset.chatVirtualItem ?? [],
-          );
-          const mountedIdentities = [
-            ...new Set(
-              mountedKeys.flatMap((mountedKey) => {
-                try {
-                  const parsed = JSON.parse(mountedKey);
-                  return Array.isArray(parsed) && typeof parsed[0] === 'string' ? [parsed[0]] : [];
-                } catch {
-                  return [];
-                }
-              }),
-            ),
-          ];
-          const sizer = feed.querySelector<HTMLElement>(input.sizerSelector);
-          return {
-            mountedIdentities,
-            mountedKeys,
-            scrollTop: feed.scrollTop,
-            maximumScrollTop: Math.max(0, feed.scrollHeight - feed.clientHeight),
-            distanceFromEnd: feed.scrollHeight - feed.clientHeight - feed.scrollTop,
-            pinned: feed.dataset.chatPinnedToBottom === 'true',
-            userScrolledUp: feed.dataset.chatUserScrolledUp === 'true',
-            modelCount: Number(sizer?.dataset.chatVirtualModelCount ?? 0),
-            dataRevision: Number(sizer?.dataset.chatVirtualDataRevision ?? 0),
-            scale: sizer?.dataset.chatTranscriptScale,
-          };
-        },
-        { itemSelector: ITEM_SELECTOR, sizerSelector: SIZER_SELECTOR },
-      )
+      .evaluate((feedElement, input) => {
+        const feed = feedElement as HTMLElement;
+        const mountedKeys = [...feed.querySelectorAll<HTMLElement>(input.itemSelector)].flatMap(
+          (item) => item.dataset.chatVirtualItem ?? [],
+        );
+        const mountedIdentities = [
+          ...new Set(
+            mountedKeys.flatMap((mountedKey) => {
+              try {
+                const parsed = JSON.parse(mountedKey);
+                return Array.isArray(parsed) && typeof parsed[0] === 'string' ? [parsed[0]] : [];
+              } catch {
+                return [];
+              }
+            }),
+          ),
+        ];
+        const sizer = feed.querySelector<HTMLElement>(input.sizerSelector);
+        return {
+          mountedIdentities,
+          mountedKeys,
+          scrollTop: feed.scrollTop,
+          maximumScrollTop: Math.max(0, feed.scrollHeight - feed.clientHeight),
+          distanceFromEnd: feed.scrollHeight - feed.clientHeight - feed.scrollTop,
+          pinned: feed.dataset.chatPinnedToBottom === 'true',
+          userScrolledUp: feed.dataset.chatUserScrolledUp === 'true',
+          modelCount: Number(sizer?.dataset.chatVirtualModelCount ?? 0),
+          dataRevision: Number(sizer?.dataset.chatVirtualDataRevision ?? 0),
+          scale: sizer?.dataset.chatTranscriptScale,
+        };
+      }, { itemSelector: ITEM_SELECTOR, sizerSelector: SIZER_SELECTOR })
       .catch(() => null);
     throw new Error(
       `Timed out waiting for the strict reading anchor:\n${JSON.stringify(
@@ -2107,11 +1811,7 @@ async function mountedConversationDiscontinuities(
       }))
       .filter((item) => Number.isFinite(item.index))
       .sort((left, right) => left.index - right.index);
-    const discontinuities: Array<{
-      previous: string;
-      next: string;
-      delta: number;
-    }> = [];
+    const discontinuities: Array<{ previous: string; next: string; delta: number }> = [];
     for (let index = 1; index < items.length; index += 1) {
       const previous = items[index - 1];
       const next = items[index];
@@ -2146,12 +1846,14 @@ async function createTranscript(fixture: ChromiumFixture): Promise<string> {
   if (!response?.ok()) throw new Error(`SPA navigation failed with ${response?.status()}.`);
 
   await waitForTranscriptReady(fixture.page);
+  // Appending never rotates the transcript view, so the surface identity is expected to
+  // hold here; the appended turn rendering is what proves the feed caught up.
   await appendTurn(fixture.integration, chatId, 'chromium-generation-prime');
   await fixture.page
     .locator(FEED_SELECTOR)
     .getByText('echo:chromium-generation-prime', { exact: true })
     .waitFor();
-  await synchronizeNativeTranscriptGeneration(fixture, chatId);
+  await waitForTranscriptReady(fixture.page);
   return chatId;
 }
 
@@ -2159,30 +1861,15 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
   const chatId = await seedTranscript(fixture.integration, 90, 'chromium-processing-prefetch');
   await prepareTranscript(fixture, chatId);
   const prompt = 'chromium-processing-prefetch-held';
-  const heldCompletion = fixture.integration.fakeProviders.openAi.holdNext({
-    lastUserText: prompt,
-  });
+  const heldCompletion = fixture.integration.fakeProviders.openAi.holdNext({ lastUserText: prompt });
   let releaseFirstPage!: () => void;
   const firstPageGate = new Promise<void>((resolve) => (releaseFirstPage = resolve));
-  let resolveFirstPageRequest!: () => void;
-  const firstPageRequest = new Promise<void>((resolve) => (resolveFirstPageRequest = resolve));
-  let resolveSecondPageRequest!: () => void;
-  const secondPageRequest = new Promise<void>((resolve) => (resolveSecondPageRequest = resolve));
   let earlierRequestCount = 0;
+  let firstDemandRequestBaseline = 0;
   let turnId: string | null = null;
-
-  await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
-    const url = new URL(route.request().url());
-    if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeSeq')) {
-      earlierRequestCount += 1;
-      if (earlierRequestCount === 1) {
-        resolveFirstPageRequest();
-        await firstPageGate;
-      } else if (earlierRequestCount === 2) {
-        resolveSecondPageRequest();
-      }
-    }
-    await route.continue();
+  const waitForEarlierRequest = () => fixture.page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeOrdinal');
   });
 
   try {
@@ -2193,10 +1880,18 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
     });
     turnId = accepted.turnId ?? null;
     await withDiagnosticTimeout('the held processing turn', heldCompletion.received);
-    await fixture.page
-      .locator('[data-slot="chat-processing-status"]')
-      .waitFor({ state: 'visible' });
+    await fixture.page.locator('[data-slot="chat-processing-status"]').waitFor({ state: 'visible' });
     const modelCountBeforePrefetch = await waitForStableModelCount(fixture.page, 50);
+    firstDemandRequestBaseline = earlierRequestCount;
+    await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeOrdinal')) {
+        earlierRequestCount += 1;
+        if (earlierRequestCount === firstDemandRequestBaseline + 1) await firstPageGate;
+      }
+      await route.continue();
+    });
+    const firstPageRequest = waitForEarlierRequest();
 
     const loadAheadDistance = await fixture.page.locator(FEED_SELECTOR).evaluate((feedElement) => {
       const feed = feedElement as HTMLElement;
@@ -2221,13 +1916,15 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
     await withDiagnosticTimeout('the first held earlier-page request', firstPageRequest);
     expect(loadAheadDistance).toBeGreaterThan(0);
     expect(await transcriptBoundaryIntersectsViewport(fixture.page, 'earlier')).toBe(false);
-    const earlierLoadingIndicator = fixture.page.locator('[data-chat-earlier-loading-indicator]');
+    const earlierLoadingIndicator = fixture.page.locator(
+      '[data-chat-earlier-loading-indicator]',
+    );
     await earlierLoadingIndicator.waitFor({ state: 'visible' });
 
-    expect(await fixture.page.locator('[data-transcript-page-boundary="earlier"]').count()).toBe(0);
-    const boundarySweep = await fixture.page
-      .locator(FEED_SELECTOR)
-      .evaluate(async (feedElement) => {
+    expect(
+      await fixture.page.locator('[data-transcript-page-boundary="earlier"]').count(),
+    ).toBe(0);
+    const boundarySweep = await fixture.page.locator(FEED_SELECTOR).evaluate(async (feedElement) => {
         const feed = feedElement as HTMLElement;
         const offsets: number[] = [];
         const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -2241,10 +1938,11 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
         return { offsets, scrollTop: feed.scrollTop };
       });
     expect(boundarySweep.scrollTop, JSON.stringify(boundarySweep, null, 2)).toBe(0);
-    expect(await fixture.page.locator('[data-transcript-page-boundary="earlier"]').count()).toBe(0);
+    expect(
+      await fixture.page.locator('[data-transcript-page-boundary="earlier"]').count(),
+    ).toBe(0);
     const prependAnchor = await readingAnchor(fixture.page);
     await startReadingAnchorFrameSampler(fixture.page, prependAnchor);
-    const followingTarget = await startFollowingRowFrameSampler(fixture.page);
     await fixture.page.locator(FEED_SELECTOR).evaluate(
       (feedElement, input) => {
         const feed = feedElement as HTMLElement;
@@ -2267,7 +1965,9 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
           feed.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -80 }));
           pumpState.frames += 1;
           const sizer = feed.querySelector<HTMLElement>(input.sizerSelector);
-          pumpState.observedModelCount = Number(sizer?.dataset.chatVirtualModelCount ?? Number.NaN);
+          pumpState.observedModelCount = Number(
+            sizer?.dataset.chatVirtualModelCount ?? Number.NaN,
+          );
           if (pumpState.observedModelCount > input.initialModelCount) {
             pumpState.growthFrame = pumpState.frames;
             pumpState.complete = true;
@@ -2279,10 +1979,7 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
         };
         requestAnimationFrame(pump);
       },
-      {
-        initialModelCount: modelCountBeforePrefetch,
-        sizerSelector: SIZER_SELECTOR,
-      },
+      { initialModelCount: modelCountBeforePrefetch, sizerSelector: SIZER_SELECTOR },
     );
 
     releaseFirstPage();
@@ -2317,7 +2014,6 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
     );
     await earlierLoadingIndicator.waitFor({ state: 'detached' });
     const prependFrames = await finishReadingAnchorFrameSampler(fixture.page);
-    const followingFrames = await finishFollowingRowFrameSampler(fixture.page);
     expect(
       Math.max(
         ...prependFrames.map((sample) =>
@@ -2328,13 +2024,8 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
       ),
       JSON.stringify({ prependAnchor, prependFrames }, null, 2),
     ).toBeLessThanOrEqual(1);
-    expect(
-      followingFrames.filter(
-        (sample) => !sample.connected || !sample.sameNode || sample.rowId !== followingTarget.rowId,
-      ),
-      JSON.stringify({ followingTarget, followingFrames }, null, 2),
-    ).toEqual([]);
-    expect(earlierRequestCount).toBe(1);
+    const firstDemandRequestCount = earlierRequestCount;
+    expect(firstDemandRequestCount).toBeGreaterThan(firstDemandRequestBaseline);
     expect(modelCountAfterFirstPage).toBe(modelCountBeforePrefetch + 50);
 
     await fixture.page.locator(FEED_SELECTOR).evaluate((feedElement) => {
@@ -2343,13 +2034,15 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
       feed.dispatchEvent(new Event('scroll', { bubbles: true }));
     });
     // A clamped viewport emits no scroll event for the subsequent upward gesture.
+    const secondDemandRequestBaseline = earlierRequestCount;
+    const secondPageRequest = waitForEarlierRequest();
     await signalScrollIntent(fixture.page, 'earlier');
     await withDiagnosticTimeout('the clamped-gesture earlier-page request', secondPageRequest);
     const modelCountAfterPrefetch = await waitForModelCount(
       fixture.page,
       modelCountBeforePrefetch + 100,
     );
-    expect(earlierRequestCount).toBe(2);
+    expect(earlierRequestCount).toBeGreaterThan(secondDemandRequestBaseline);
     expect(modelCountAfterPrefetch).toBe(modelCountBeforePrefetch + 100);
   } finally {
     releaseFirstPage();
@@ -2362,6 +2055,396 @@ async function verifyEarlierPrefetchDuringProcessing(fixture: ChromiumFixture): 
     'agent-run-finished',
   );
   fixture.assertNoBrowserErrors();
+}
+
+async function verifyTouchDragPrepend(
+  fixture: ChromiumFixture,
+  scenario: TouchPrependScenario,
+): Promise<void> {
+  await fixture.page.setViewportSize(scenario.viewport);
+  const chatId = await seedTranscript(
+    fixture.integration,
+    90,
+    `chromium-touch-${scenario.label}`,
+  );
+  let releaseEarlierPage!: () => void;
+  const earlierPageGate = new Promise<void>((resolve) => (releaseEarlierPage = resolve));
+  let resolveEarlierRequest!: () => void;
+  const earlierRequest = new Promise<void>((resolve) => (resolveEarlierRequest = resolve));
+  let earlierRequestCount = 0;
+  let gestureRequestBaseline = 0;
+  let drag: TranscriptTouchDrag | null = null;
+  let liveHold: ReturnType<typeof fixture.integration.fakeProviders.openAi.holdNext> | null = null;
+  let liveTurnId: string | null = null;
+  let liveAbort: Promise<unknown> | null = null;
+  let stopLiveTurn: ReturnType<typeof fixture.integration.client.stopChat> | null = null;
+  let queuedPrompt: string | null = null;
+  let queuePauseId: string | null = null;
+
+  try {
+    await prepareTranscript(fixture, chatId);
+    let initialEntryCount = await transcriptEntryCount(fixture.page);
+    expect(initialEntryCount).toBe(50);
+    gestureRequestBaseline = earlierRequestCount;
+    await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeOrdinal')) {
+        earlierRequestCount += 1;
+        if (earlierRequestCount === gestureRequestBaseline + 1) {
+          resolveEarlierRequest();
+          await earlierPageGate;
+        }
+      }
+      await route.continue();
+    });
+    if (scenario.liveBehavior !== 'completed') {
+      const prompt = `chromium-touch-live-${scenario.label}`;
+      liveHold = fixture.integration.fakeProviders.openAi.holdNext({
+        lastUserText: prompt,
+      });
+      const accepted = await fixture.integration.client.runDirectChat({
+        chatId,
+        content: prompt,
+        agent: fixture.integration.directAgents.openAi,
+      });
+      if (!accepted.turnId) throw new Error('The held mobile touch turn has no turn ID.');
+      liveTurnId = accepted.turnId;
+      await withDiagnosticTimeout('the held touch-drag turn', liveHold.received);
+      initialEntryCount = await waitForTranscriptEntryCount(fixture.page, initialEntryCount + 1);
+      await waitForStablePinnedTranscriptLayout(fixture.page, `${scenario.label}-held-live`);
+      if (scenario.liveBehavior === 'paused-interrupted') {
+        queuedPrompt = `chromium-touch-queued-${scenario.label}`;
+        const queued = await fixture.integration.client.enqueueNew(chatId, queuedPrompt);
+        expect(queued.control.queue.entries.map((entry) => entry.content)).toContain(queuedPrompt);
+        const paused = await fixture.integration.client.pauseQueue(chatId);
+        expect(paused.control.queue.pause?.kind).toBe('manual');
+        queuePauseId = paused.control.queue.pause?.id ?? null;
+        expect(queuePauseId).not.toBeNull();
+      }
+      await scrollToPosition(fixture.page, 'middle');
+    }
+    await fixture.page.locator(FEED_SELECTOR).evaluate(async (feedElement, clampBeforeRelease) => {
+      const feed = feedElement as HTMLElement;
+      const requested = clampBeforeRelease ? 260 : feed.clientHeight * 2.5;
+      feed.scrollTop = Math.min(requested, Math.max(0, feed.scrollHeight - feed.clientHeight));
+      feed.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }, scenario.clampBeforeRelease);
+
+    drag = await beginTranscriptTouchDrag(fixture.page);
+    for (let step = 0; step < 24; step += 1) {
+      await moveTranscriptTouch(fixture.page, drag, scenario.clampBeforeRelease ? 80 : 24);
+      if (earlierRequestCount > gestureRequestBaseline) break;
+    }
+    await withDiagnosticTimeout('the held touch-drag earlier-page request', earlierRequest);
+    if (scenario.clampBeforeRelease) {
+      for (let step = 0; step < 20; step += 1) {
+        if ((await moveTranscriptTouch(fixture.page, drag, 24)) <= 1) break;
+      }
+      expect(
+        await fixture.page
+          .locator(FEED_SELECTOR)
+          .evaluate((feedElement) => (feedElement as HTMLElement).scrollTop),
+      ).toBeLessThanOrEqual(1);
+    }
+
+    const anchor = await readingAnchor(fixture.page);
+    if (!anchor.rowId || anchor.text === undefined) {
+      throw new Error('The touch-drag reading anchor has no rendered row identity.');
+    }
+    await startReadingAnchorFrameSampler(fixture.page, anchor);
+    let expectedEntryCount = initialEntryCount + 50;
+    if (scenario.liveBehavior === 'expanding' && liveHold) {
+      expect(
+        liveHold.releaseText(`Live response expands during the ${scenario.label} prepend.`),
+      ).toBe(true);
+      expect(await waitForTranscriptEntryCount(fixture.page, initialEntryCount + 1)).toBe(
+        initialEntryCount + 1,
+      );
+      expectedEntryCount += 1;
+    } else if (scenario.liveBehavior === 'paused-interrupted' && liveHold) {
+      liveAbort = liveHold.expectAbort();
+      stopLiveTurn = fixture.integration.client.stopChat({
+        agentId: fixture.integration.directAgents.openAi.agentId,
+        chatId,
+        clientRequestId: crypto.randomUUID(),
+      });
+    }
+    releaseEarlierPage();
+
+    let growthFrame: number | null = null;
+    for (let frame = 0; frame < 40; frame += 1) {
+      if (drag.y < drag.maximumY) await moveTranscriptTouch(fixture.page, drag, 6);
+      if ((await transcriptEntryCount(fixture.page)) >= expectedEntryCount) {
+        growthFrame ??= frame;
+        if (frame >= growthFrame + 6) break;
+      }
+    }
+    expect(growthFrame).not.toBeNull();
+    await waitForStableModelCount(fixture.page, expectedEntryCount);
+    await finishTranscriptTouchDrag(drag);
+    drag = null;
+    if (stopLiveTurn) {
+      expect((await stopLiveTurn).outcome).toBe('interrupt-requested');
+      await liveAbort;
+    }
+    if (liveTurnId) {
+      expect((await fixture.integration.client.waitForTurnTerminal(chatId, liveTurnId)).type).toBe(
+        'agent-run-finished',
+      );
+    }
+    if (queuedPrompt) {
+      const expectedQueuedPrompt = queuedPrompt;
+      if (!queuePauseId) throw new Error('The paused queue lost its pause identity.');
+      const control = await fixture.integration.client.getExecutionControl(chatId);
+      expect(control.queue.pause?.id).toBe(queuePauseId);
+      expect(control.queue.entries.map((entry) => entry.content)).toEqual([expectedQueuedPrompt]);
+      expect(
+        await fixture.page
+          .locator(FEED_SELECTOR)
+          .locator('[data-chat-row-id]')
+          .filter({ hasText: expectedQueuedPrompt })
+          .count(),
+      ).toBe(0);
+    }
+
+    const frames = await finishReadingAnchorFrameSampler(fixture.page);
+    if (queuedPrompt) {
+      await fixture.integration.client.clearQueue(chatId);
+      queuedPrompt = null;
+    }
+    const identityFailures = frames.filter(
+      (frame) =>
+        !frame.connected ||
+        !frame.sameNode ||
+        frame.offset === null ||
+        frame.rowId !== anchor.rowId ||
+        frame.text !== anchor.text,
+    );
+    const reverseMovement = frames.flatMap((frame, index) => {
+      const previous = frames[index - 1];
+      return previous &&
+        previous.offset !== null &&
+        frame.offset !== null &&
+        frame.offset < previous.offset - 1
+        ? [{ previous, frame }]
+        : [];
+    });
+    expect(identityFailures, JSON.stringify({ anchor, frames }, null, 2)).toEqual([]);
+    expect(reverseMovement, JSON.stringify({ anchor, frames }, null, 2)).toEqual([]);
+    const firstOffset = frames.find((frame) => frame.offset !== null)?.offset;
+    const finalOffset = frames.findLast((frame) => frame.offset !== null)?.offset;
+    expect(
+      firstOffset != null && finalOffset != null ? finalOffset - firstOffset : 0,
+      JSON.stringify({ anchor, frames }, null, 2),
+    ).toBeGreaterThan(12);
+    expect(earlierRequestCount).toBeGreaterThan(gestureRequestBaseline);
+    fixture.assertNoBrowserErrors();
+  } finally {
+    releaseEarlierPage();
+    if (drag) await finishTranscriptTouchDrag(drag);
+    if (stopLiveTurn) await stopLiveTurn.catch(() => undefined);
+    if (liveAbort) await liveAbort.catch(() => undefined);
+    if (queuedPrompt) await fixture.integration.client.clearQueue(chatId).catch(() => undefined);
+    liveHold?.releaseEcho();
+    await fixture.page.unroute('**/api/v1/chats/messages?**');
+  }
+}
+
+async function verifyScrollbarDragPrepend(
+  fixture: ChromiumFixture,
+  viewport: { height: number; width: number },
+): Promise<void> {
+  await fixture.page.setViewportSize(viewport);
+  const chatId = await seedTranscript(
+    fixture.integration,
+    90,
+    `chromium-scrollbar-${viewport.width}`,
+  );
+  let releaseEarlierPage!: () => void;
+  const earlierPageGate = new Promise<void>((resolve) => (releaseEarlierPage = resolve));
+  let resolveEarlierRequest!: () => void;
+  const earlierRequest = new Promise<void>((resolve) => (resolveEarlierRequest = resolve));
+  let earlierRequestCount = 0;
+  let dragRequestBaseline = 0;
+  let mouseDown = false;
+
+  try {
+    const { initialModelCount } = await prepareTranscript(fixture, chatId);
+    dragRequestBaseline = earlierRequestCount;
+    await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeOrdinal')) {
+        earlierRequestCount += 1;
+        if (earlierRequestCount === dragRequestBaseline + 1) {
+          resolveEarlierRequest();
+          await earlierPageGate;
+        }
+      }
+      await route.continue();
+    });
+    await scrollToPosition(fixture.page, 'middle');
+    const scrollbar = fixture.page.locator('[data-chat-feed-scrollbar]');
+    const thumb = scrollbar.locator('[data-slot="scroll-area-thumb"]');
+    const trackBox = await scrollbar.boundingBox();
+    const thumbBox = await thumb.boundingBox();
+    if (!trackBox || !thumbBox) throw new Error('The transcript scrollbar is not measurable.');
+
+    const x = thumbBox.x + thumbBox.width / 2;
+    let y = thumbBox.y + thumbBox.height / 2;
+    await fixture.page.mouse.move(x, y);
+    await fixture.page.mouse.down();
+    mouseDown = true;
+    for (let step = 0; step < 24; step += 1) {
+      y = Math.max(trackBox.y + 4, y - Math.max(4, trackBox.height / 24));
+      await fixture.page.mouse.move(x, y);
+      if (earlierRequestCount > dragRequestBaseline) break;
+    }
+    await withDiagnosticTimeout('the held scrollbar-drag earlier page', earlierRequest);
+    const upwardScrollTop = await fixture.page
+      .locator(FEED_SELECTOR)
+      .evaluate((feedElement) => (feedElement as HTMLElement).scrollTop);
+
+    const reversalY = Math.min(trackBox.y + trackBox.height - 4, y + trackBox.height / 8);
+    await fixture.page.mouse.move(x, reversalY, { steps: 6 });
+    const reversedScrollTop = await fixture.page
+      .locator(FEED_SELECTOR)
+      .evaluate((feedElement) => (feedElement as HTMLElement).scrollTop);
+    expect(reversedScrollTop).toBeGreaterThan(upwardScrollTop);
+
+    const anchor = await readingAnchor(fixture.page);
+    await startReadingAnchorFrameSampler(fixture.page, anchor);
+    releaseEarlierPage();
+    await waitForStableModelCount(fixture.page, initialModelCount + 50);
+    const frames = await finishReadingAnchorFrameSampler(fixture.page);
+    expect(
+      frames.filter(
+        (frame) =>
+          !frame.connected ||
+          !frame.sameNode ||
+          frame.offset === null ||
+          frame.rowId !== anchor.rowId ||
+          frame.text !== anchor.text,
+      ),
+      JSON.stringify({ anchor, frames, upwardScrollTop, reversedScrollTop }, null, 2),
+    ).toEqual([]);
+    expect(
+      Math.max(
+        ...frames.map((frame) =>
+          frame.offset === null
+            ? Number.POSITIVE_INFINITY
+            : Math.abs(frame.offset - anchor.offset),
+        ),
+      ),
+      JSON.stringify({ anchor, frames, upwardScrollTop, reversedScrollTop }, null, 2),
+    ).toBeLessThanOrEqual(1);
+    expect(earlierRequestCount).toBeGreaterThan(dragRequestBaseline);
+    fixture.assertNoBrowserErrors();
+  } finally {
+    releaseEarlierPage();
+    if (mouseDown) await fixture.page.mouse.up().catch(() => undefined);
+    await fixture.page.unroute('**/api/v1/chats/messages?**');
+  }
+}
+
+async function verifyKeyboardPrepend(
+  fixture: ChromiumFixture,
+  viewport: { height: number; width: number },
+): Promise<void> {
+  await fixture.page.setViewportSize(viewport);
+  const chatId = await seedTranscript(
+    fixture.integration,
+    90,
+    `chromium-keyboard-${viewport.width}`,
+  );
+  let releaseEarlierPage!: () => void;
+  const earlierPageGate = new Promise<void>((resolve) => (releaseEarlierPage = resolve));
+  let resolveEarlierRequest!: () => void;
+  const earlierRequest = new Promise<void>((resolve) => (resolveEarlierRequest = resolve));
+  let earlierRequestCount = 0;
+  let keyboardRequestBaseline = 0;
+
+  try {
+    const { initialModelCount } = await prepareTranscript(fixture, chatId);
+    keyboardRequestBaseline = earlierRequestCount;
+    await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeOrdinal')) {
+        earlierRequestCount += 1;
+        if (earlierRequestCount === keyboardRequestBaseline + 1) {
+          resolveEarlierRequest();
+          await earlierPageGate;
+        }
+      }
+      await route.continue();
+    });
+    await fixture.page.locator(FEED_SELECTOR).evaluate(async (feedElement) => {
+      const feed = feedElement as HTMLElement;
+      const maximum = Math.max(0, feed.scrollHeight - feed.clientHeight);
+      feed.scrollTop = Math.min(maximum, feed.clientHeight * 2.5);
+      feed.dispatchEvent(new Event('scroll', { bubbles: true }));
+      feed.focus({ preventScroll: true });
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    });
+
+    for (let press = 0; press < 24; press += 1) {
+      await fixture.page.keyboard.press('PageUp');
+      await fixture.page.evaluate(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      });
+      if (earlierRequestCount > keyboardRequestBaseline) break;
+    }
+    await withDiagnosticTimeout('the held keyboard earlier page', earlierRequest);
+    await fixture.page.locator(FEED_SELECTOR).evaluate(async (feedElement) => {
+      const feed = feedElement as HTMLElement;
+      const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      let previous = feed.scrollTop;
+      let stableFrames = 0;
+      for (let attempt = 0; attempt < 90; attempt += 1) {
+        await frame();
+        const current = feed.scrollTop;
+        stableFrames = Math.abs(current - previous) <= 0.5 ? stableFrames + 1 : 0;
+        previous = current;
+        if (stableFrames >= 7) return;
+      }
+      throw new Error('Keyboard transcript paging did not settle before publication.');
+    });
+    expect(
+      await fixture.page.locator('[data-transcript-page-boundary="earlier"]').count(),
+    ).toBe(0);
+
+    const anchor = await readingAnchor(fixture.page);
+    await startReadingAnchorFrameSampler(fixture.page, anchor);
+    releaseEarlierPage();
+    await waitForStableModelCount(fixture.page, initialModelCount + 50);
+    const frames = await finishReadingAnchorFrameSampler(fixture.page);
+    expect(
+      frames.filter(
+        (frame) =>
+          !frame.connected ||
+          !frame.sameNode ||
+          frame.offset === null ||
+          frame.rowId !== anchor.rowId ||
+          frame.text !== anchor.text,
+      ),
+      JSON.stringify({ anchor, frames }, null, 2),
+    ).toEqual([]);
+    expect(
+      Math.max(
+        ...frames.map((frame) =>
+          frame.offset === null
+            ? Number.POSITIVE_INFINITY
+            : Math.abs(frame.offset - anchor.offset),
+        ),
+      ),
+      JSON.stringify({ anchor, frames }, null, 2),
+    ).toBeLessThanOrEqual(1);
+    expect(earlierRequestCount).toBeGreaterThan(keyboardRequestBaseline);
+    fixture.assertNoBrowserErrors();
+  } finally {
+    releaseEarlierPage();
+    await fixture.page.unroute('**/api/v1/chats/messages?**');
+  }
 }
 
 async function prepareTranscript(
@@ -2403,11 +2486,7 @@ async function revealEarlierTranscript(
       const prefetchPosition = await page.locator(FEED_SELECTOR).evaluate(async (feedElement) => {
         const feed = feedElement as HTMLElement;
         const settle = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-        const attempts: Array<{
-          maximum: number;
-          target: number;
-          scrollTop: number;
-        }> = [];
+        const attempts: Array<{ maximum: number; target: number; scrollTop: number }> = [];
         for (let attempt = 0; attempt < 8; attempt += 1) {
           const maximum = Math.max(0, feed.scrollHeight - feed.clientHeight);
           const target = Math.min(maximum, Math.max(101, feed.clientHeight * 0.75));
@@ -2418,16 +2497,10 @@ async function revealEarlierTranscript(
           attempts.push({ maximum, target, scrollTop: feed.scrollTop });
           // First measurements may correct the offset; the anchor sampler starts after they settle.
           if (feed.scrollTop > 100 && feed.scrollTop <= feed.clientHeight) {
-            return {
-              attempts,
-              scrollTop: feed.scrollTop,
-              viewportHeight: feed.clientHeight,
-            };
+            return { attempts, scrollTop: feed.scrollTop, viewportHeight: feed.clientHeight };
           }
         }
-        throw new Error(
-          `The earlier prefetch position did not settle: ${JSON.stringify(attempts)}`,
-        );
+        throw new Error(`The earlier prefetch position did not settle: ${JSON.stringify(attempts)}`);
       });
       expect(prefetchPosition.scrollTop, JSON.stringify(prefetchPosition)).toBeGreaterThan(100);
       expect(prefetchPosition.scrollTop).toBeLessThanOrEqual(prefetchPosition.viewportHeight);
@@ -2854,32 +2927,18 @@ async function expectNoSwitchPaintFlicker(
           settledGeometry = currentGeometry;
         }
       } else if (settledGeometry) {
-        recordViolation({
-          attempt,
-          kind: 'settled-feed-became-unsettled',
-          busy,
-          contentVisible,
-        });
+        recordViolation({ attempt, kind: 'settled-feed-became-unsettled', busy, contentVisible });
       }
       settledFrames = settled ? settledFrames + 1 : 0;
     }
     delete browserGlobal.__chatSwitchPaintSamplerReady;
-    return {
-      settledFrames,
-      switchObserved,
-      transition,
-      violationCount,
-      violations,
-    };
+    return { settledFrames, switchObserved, transition, violationCount, violations };
   });
   await fixture.page.waitForFunction(
     () =>
       Boolean(
-        (
-          globalThis as typeof globalThis & {
-            __chatSwitchPaintSamplerReady?: boolean;
-          }
-        ).__chatSwitchPaintSamplerReady,
+        (globalThis as typeof globalThis & { __chatSwitchPaintSamplerReady?: boolean })
+          .__chatSwitchPaintSamplerReady,
       ),
     undefined,
     { timeout: 5_000 },
@@ -2949,7 +3008,7 @@ async function verifyChatSwitchBottomRestore(
   fixture: ChromiumFixture,
   primaryChatId: string,
   environment: ScriptedClaudeTestEnvironment,
-): Promise<string> {
+): Promise<void> {
   const secondaryMarker = 'chromium-heterogeneous-switch-0';
   const secondaryChatId = await seedHeterogeneousTranscript(fixture, environment);
   // The scripted start can select its newly created chat. Re-establishes the primary
@@ -2962,11 +3021,9 @@ async function verifyChatSwitchBottomRestore(
     selectSidebarChat(fixture.page, secondaryChatId, secondaryMarker),
   );
   await waitForStablePinnedTranscriptLayout(fixture.page, 'switch-to-secondary');
-  const visibleHeights = await fixture.page
-    .locator(ITEM_SELECTOR)
-    .evaluateAll((items) =>
-      items.map((item) => Math.round((item as HTMLElement).getBoundingClientRect().height)),
-    );
+  const visibleHeights = await fixture.page.locator(ITEM_SELECTOR).evaluateAll((items) =>
+    items.map((item) => Math.round((item as HTMLElement).getBoundingClientRect().height)),
+  );
   expect(new Set(visibleHeights).size, JSON.stringify(visibleHeights)).toBeGreaterThanOrEqual(3);
 
   await expectNoSwitchPaintFlicker(fixture, () =>
@@ -2978,311 +3035,431 @@ async function verifyChatSwitchBottomRestore(
     userScrolledUp: false,
   });
   fixture.assertNoBrowserErrors();
-  return secondaryChatId;
 }
 
-async function verifyStreamedRowOrderAndFollowingBuffer(
+async function verifyHeldEarlierPageChatSwitch(
+  fixture: ChromiumFixture,
+  viewport: { height: number; width: number },
+): Promise<void> {
+  await fixture.page.setViewportSize(viewport);
+  const sourceChatId = await seedTranscript(
+    fixture.integration,
+    90,
+    `held-page-switch-source-${viewport.width}`,
+  );
+  const targetChatId = await seedTranscript(
+    fixture.integration,
+    8,
+    `held-page-switch-target-${viewport.width}`,
+  );
+  const targetPage = await fixture.integration.client.getMessages(targetChatId, { limit: 200 });
+  let releaseEarlierPage!: () => void;
+  const earlierPageGate = new Promise<void>((resolve) => (releaseEarlierPage = resolve));
+  let resolveEarlierRequest!: () => void;
+  const earlierRequest = new Promise<void>((resolve) => (resolveEarlierRequest = resolve));
+  let earlierRequestCount = 0;
+
+  try {
+    await prepareTranscript(fixture, sourceChatId);
+    await fixture.page.evaluate((heldChatId) => {
+      const browserGlobal = globalThis as typeof globalThis & {
+        __restoreHeldEarlierPageFetch?: () => void;
+      };
+      const originalFetch = globalThis.fetch;
+      browserGlobal.__restoreHeldEarlierPageFetch = () => {
+        globalThis.fetch = originalFetch;
+        delete browserGlobal.__restoreHeldEarlierPageFetch;
+      };
+      globalThis.fetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(
+          typeof input === 'string' || input instanceof URL ? input : input.url,
+          location.href,
+        );
+        if (
+          url.pathname === '/api/v1/chats/messages' &&
+          url.searchParams.get('chatId') === heldChatId &&
+          url.searchParams.has('beforeOrdinal')
+        ) {
+          return originalFetch(input, { ...init, signal: undefined });
+        }
+        return originalFetch(input, init);
+      }, originalFetch);
+    }, sourceChatId);
+    await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
+      const url = new URL(route.request().url());
+      if (
+        url.searchParams.get('chatId') === sourceChatId &&
+        url.searchParams.has('beforeOrdinal')
+      ) {
+        const response = await route.fetch();
+        earlierRequestCount += 1;
+        if (earlierRequestCount === 1) {
+          resolveEarlierRequest();
+          await earlierPageGate;
+        }
+        await route.fulfill({ response });
+        return;
+      }
+      await route.continue();
+    });
+    await fixture.page.locator(FEED_SELECTOR).evaluate(async (feedElement) => {
+      const feed = feedElement as HTMLElement;
+      const target = Math.min(
+        Math.max(0, feed.scrollHeight - feed.clientHeight),
+        feed.clientHeight * 0.75,
+      );
+      feed.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -80 }));
+      feed.scrollTop = target;
+      feed.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    });
+    await withDiagnosticTimeout('the held source-chat earlier page', earlierRequest);
+    await fixture.page.locator(`${FEED_SELECTOR}[aria-busy="true"]`).waitFor({ state: 'visible' });
+
+    await selectSidebarChat(
+      fixture.page,
+      targetChatId,
+      `held-page-switch-target-${viewport.width}-0`,
+    );
+    await waitForSurfaceIdentity(
+      fixture.page,
+      `${targetChatId}:${targetPage.transcriptViewId}`,
+    );
+    const targetRevision = await virtualDataRevision(fixture.page);
+    const targetEntryCount = await transcriptEntryCount(fixture.page);
+    releaseEarlierPage();
+    await fixture.page.evaluate(async () => {
+      for (let frame = 0; frame < 12; frame += 1) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      }
+    });
+
+    expect(fixture.page.url()).toContain(`/chat/${targetChatId}`);
+    expect(await transcriptEntryCount(fixture.page)).toBe(targetEntryCount);
+    expect(await virtualDataRevision(fixture.page)).toBe(targetRevision);
+    expect(await surfaceIdentity(fixture.page)).toBe(
+      `${targetChatId}:${targetPage.transcriptViewId}`,
+    );
+    const targetScan = await scanLoadedTranscript(fixture.page);
+    expect(targetScan.rows.map((row) => row.rowId)).toEqual(
+      targetPage.messages.map(
+        (entry) => `${targetPage.transcriptViewId}:${entry.ordinal}`,
+      ),
+    );
+    expect(targetScan.rows.map((row) => row.messageType)).toEqual(
+      targetPage.messages.map((entry) => entry.message.type),
+    );
+    expect(targetScan.rows.map((row) => row.text)).toEqual(
+      targetPage.messages.map((entry) => exactTranscriptText(entry.message)),
+    );
+    expect(
+      await fixture.page
+        .locator(FEED_SELECTOR)
+        .getByText(`held-page-switch-source-${viewport.width}-0`, { exact: true })
+        .count(),
+    ).toBe(0);
+    expect(earlierRequestCount).toBe(1);
+    fixture.assertNoBrowserErrors();
+  } finally {
+    releaseEarlierPage();
+    await fixture.page
+      .evaluate(() => {
+        (
+          globalThis as typeof globalThis & {
+            __restoreHeldEarlierPageFetch?: () => void;
+          }
+        ).__restoreHeldEarlierPageFetch?.();
+      })
+      .catch(() => undefined);
+    await fixture.page.unroute('**/api/v1/chats/messages?**');
+  }
+}
+
+async function claudeNativeTranscript(
+  fixture: ChromiumFixture,
+  chatId: string,
+): Promise<{ agentSessionId: string; path: string }> {
+  const chat = await waitForPersistedNativeSession({
+    directories: fixture.integration.dirs,
+    chatId,
+    agentId: 'claude',
+  });
+  const agentSessionId = typeof chat.agentSessionId === 'string' ? chat.agentSessionId : '';
+  const nativeSession =
+    chat.nativeSession && typeof chat.nativeSession === 'object'
+      ? (chat.nativeSession as Record<string, unknown>)
+      : null;
+  const value =
+    nativeSession?.value && typeof nativeSession.value === 'object'
+      ? (nativeSession.value as Record<string, unknown>)
+      : null;
+  const path = typeof value?.path === 'string' ? value.path : '';
+  if (!agentSessionId || !path) {
+    throw new Error(`Claude chat ${chatId} has no persisted native transcript.`);
+  }
+  return { agentSessionId, path };
+}
+
+async function verifyDetachedNativeReload(
   fixture: ChromiumFixture,
   environment: ScriptedClaudeTestEnvironment,
-  chatId: string,
+  viewport: { height: number; width: number },
 ): Promise<void> {
-  const prompt = 'chromium-streamed-row-order';
-  const beforeTool =
-    'I am inspecting the transcript before running the command. This response is deliberately long enough to wrap across several visual lines while preserving one exact assistant row identity.';
-  const command = "printf '%s\\n' 'ordered-tool-output'";
-  const afterTool =
-    'The command completed before this final response. This second long response verifies that the Bash row remains ahead of the assistant row after every staged live publication.';
-
-  await selectSidebarChat(fixture.page, chatId, 'chromium-heterogeneous-switch-0');
-  await scrollToPosition(fixture.page, 'end');
-  await waitForStablePinnedTranscriptLayout(fixture.page, 'streamed-row-order-baseline');
-  const baseline = await fixture.integration.client.getMessages(chatId, {
-    limit: 200,
-  });
-  const baselineModelCount = await fixture.page
-    .locator(SIZER_SELECTOR)
-    .evaluate((sizer) => Number((sizer as HTMLElement).dataset.chatVirtualModelCount ?? 0));
-  await startRenderedTranscriptFrameSampler(fixture.page);
-
-  environment.model.scriptTurn([
-    claudeText(beforeTool),
-    claudeToolUse('toolu_chromium_streamed_order', 'Bash', { command }),
-  ]);
-  const heldFinal = environment.model.scriptHeldTurn([claudeText(afterTool)]);
-  const accepted = await fixture.integration.client.runChat(
-    liveClaudeRunRequest({
-      chatId,
-      command: prompt,
-      permissionMode: 'bypassPermissions',
-    }),
-  );
-  await withDiagnosticTimeout('the streamed Bash result to reach Claude', heldFinal.requested);
-  await waitForModelCount(fixture.page, baselineModelCount + 3);
-  heldFinal.release();
-  expect((await fixture.integration.client.waitForTurnTerminal(chatId, accepted.turnId)).type).toBe(
-    'agent-run-finished',
-  );
-  await waitForStablePinnedTranscriptLayout(fixture.page, 'streamed-row-order');
-  const renderedFrames = await finishRenderedTranscriptFrameSampler(fixture.page);
-
-  const transcript = await fixture.integration.client.getMessages(chatId, {
-    limit: 200,
-  });
-  const appended = transcript.messages.filter((entry) => entry.seq > baseline.lastSeq);
-  expect(appended.map((entry) => entry.message.type)).toEqual([
-    'user-message',
-    'assistant-message',
-    'bash-tool-use',
-    'tool-result',
-    'assistant-message',
-  ]);
-  const expectedRows = expectedRenderedTranscriptRows({
-    generationId: transcript.generationId,
-    messages: appended,
-  });
-  expect(expectedRows.map((row) => row.type)).toEqual([
-    'user-message',
-    'assistant-message',
-    'bash-tool-use',
-    'assistant-message',
-  ]);
-  const hiddenToolResult = appended.find((entry) => entry.message.type === 'tool-result');
-  if (!hiddenToolResult) throw new Error('The streamed transcript has no Bash result.');
-  const hiddenToolResultId = `${transcript.generationId}:${hiddenToolResult.seq}`;
-  const expectedRowIds = expectedRows.map((row) => row.id);
-  const expectedById = new Map(expectedRows.map((row) => [row.id, row] as const));
-  const firstFrameById = new Map<string, number>();
-  const frameViolations = renderedFrames.flatMap((frame) => {
-    const ids = frame.rows.map((row) => row.id);
-    const duplicateIds = ids.filter((id, index) => ids.indexOf(id) !== index);
-    const renderedExpectedRows = frame.rows.filter((row) => expectedById.has(row.id));
-    for (const row of renderedExpectedRows) {
-      if (!firstFrameById.has(row.id)) firstFrameById.set(row.id, frame.frame);
-    }
-    const wrongText = renderedExpectedRows.filter(
-      (row) => row.text !== expectedById.get(row.id)?.text,
-    );
-    const wrongOrder = renderedExpectedRows.some((row, index) => {
-      const next = renderedExpectedRows[index + 1];
-      if (!next) return false;
-      return expectedById.get(row.id)!.index >= expectedById.get(next.id)!.index || row.top > next.top;
-    });
-    return duplicateIds.length > 0 || wrongText.length > 0 || wrongOrder
-      ? [
-          {
-            frame: frame.frame,
-            duplicateIds,
-            expectedRows: renderedExpectedRows,
-            wrongText,
-            wrongOrder,
-          },
-        ]
-      : [];
-  });
-  expect(renderedFrames.length).toBeGreaterThan(3);
-  expect(frameViolations, JSON.stringify(frameViolations, null, 2)).toEqual([]);
-  const observedExpectedIds = expectedRowIds.filter((id) => firstFrameById.has(id));
-  expect(observedExpectedIds).toContain(expectedRowIds[1]);
-  expect(observedExpectedIds).toContain(expectedRowIds[2]);
-  expect(observedExpectedIds).toContain(expectedRowIds[3]);
-  expect(firstFrameById.get(expectedRowIds[2])!).toBeLessThanOrEqual(
-    firstFrameById.get(expectedRowIds[3])!,
-  );
-  expect(
-    renderedFrames.some((frame) => frame.rows.some((row) => row.id === hiddenToolResultId)),
-  ).toBe(false);
-
-  await scrollToPosition(fixture.page, 'end');
-  const rendered = await fixture.page
-    .locator(FEED_SELECTOR)
-    .evaluate((feedElement, expectedIds) => {
-      const feed = feedElement as HTMLElement;
-      const allRows = [...feed.querySelectorAll<HTMLElement>('[data-chat-row-id]')].map((row) => {
-        const wrapper = row.closest<HTMLElement>('[data-chat-virtual-item]');
-        return {
-          id: row.dataset.chatRowId ?? '',
-          type: row.dataset.chatMessageType ?? '',
-          text: row.textContent?.trim() ?? '',
-          top: row.getBoundingClientRect().top,
-          virtualKey: wrapper?.dataset.chatVirtualItem ?? '',
-        };
-      });
-      const rows = expectedIds.map((id) => {
-        const matches = allRows.filter((row) => row.id === id);
-        return { id, count: matches.length, row: matches[0] ?? null };
-      });
-      const bashRow = rows.find((entry) => entry.row?.type === 'bash-tool-use');
-      const bashCode = bashRow
-        ? [...feed.querySelectorAll<HTMLElement>('[data-chat-row-id]')]
-            .find((row) => row.dataset.chatRowId === bashRow.id)
-            ?.querySelector<HTMLElement>('[data-chat-bash-command]')
-        : null;
-      return {
-        rows,
-        allRowIds: allRows.map((row) => row.id),
-        bash: {
-          text: bashCode?.textContent?.trim() ?? null,
-          childDivCount: bashCode?.querySelectorAll('div').length ?? null,
-          buttonCount: bashCode?.querySelectorAll('button').length ?? null,
-        },
-      };
-    }, expectedRowIds);
-  expect(rendered.rows.map((entry) => entry.count)).toEqual([1, 1, 1, 1]);
-  expect(rendered.rows.map((entry) => entry.row?.text)).toEqual(
-    expectedRows.map((row) => row.text),
-  );
-  expect(rendered.rows.map((entry) => entry.row?.type)).toEqual(
-    expectedRows.map((row) => row.type),
-  );
-  expect(
-    rendered.rows.every((entry, index) => {
-      const next = rendered.rows[index + 1];
-      return !next || (entry.row?.top ?? Number.POSITIVE_INFINITY) <= (next.row?.top ?? 0);
-    }),
-    JSON.stringify(rendered.rows, null, 2),
-  ).toBe(true);
-  expect(
-    rendered.rows.map((entry) => {
-      const parsed = JSON.parse(entry.row?.virtualKey ?? 'null');
-      return Array.isArray(parsed) ? parsed[1] : null;
-    }),
-  ).toEqual(expectedRowIds.map((id) => `transcript:${id}`));
-  expect(new Set(rendered.allRowIds).size).toBe(rendered.allRowIds.length);
-  expect(rendered.allRowIds.filter((id) => expectedRowIds.includes(id))).toHaveLength(4);
-  expect(rendered.allRowIds).not.toContain(hiddenToolResultId);
-  expect(rendered.bash).toEqual({
-    text: `$ ${command}`,
-    childDivCount: 0,
-    buttonCount: 0,
-  });
-
+  const chatId = await seedHeterogeneousTranscript(fixture, environment);
+  const beforeReload = await fixture.integration.client.getMessages(chatId, { limit: 200 });
+  await fixture.page.setViewportSize(viewport);
+  await prepareTranscript(fixture, chatId, 1);
   await scrollToPosition(fixture.page, 'middle');
-  const followingTarget = await startFollowingRowFrameSampler(fixture.page);
-  const scrollingPrompt = 'chromium-streamed-while-scrolling';
-  const scrollingResponse =
-    'Live output continues while the reader scrolls upward, without remounting the following transcript row.';
-  const heldScrollingResponse = environment.model.scriptHeldTurn([claudeText(scrollingResponse)]);
-  const scrollingTurn = await fixture.integration.client.runChat(
-    liveClaudeRunRequest({
-      chatId,
-      command: scrollingPrompt,
-      permissionMode: 'bypassPermissions',
-    }),
-  );
-  await withDiagnosticTimeout(
-    'the scrolling turn to reach Claude',
-    heldScrollingResponse.requested,
-  );
-  await wheelTranscriptEarlier(fixture.page, 3);
-  heldScrollingResponse.release();
-  const scrollingTerminal = fixture.integration.client.waitForTurnTerminal(
-    chatId,
-    scrollingTurn.turnId,
-  );
-  await wheelTranscriptEarlier(fixture.page, 5);
-  expect((await scrollingTerminal).type).toBe('agent-run-finished');
-  const followingSamples = await finishFollowingRowFrameSampler(fixture.page);
-  const followingViolations = followingSamples.filter(
-    (sample) => !sample.connected || !sample.sameNode || sample.rowId !== followingTarget.rowId,
-  );
-  const reverseMovement = followingSamples.flatMap((sample, index) => {
-    const previous = followingSamples[index - 1];
-    return previous && sample.scrollTop > previous.scrollTop + 1
-      ? [
-          {
-            previous: previous.scrollTop,
-            current: sample.scrollTop,
-            frame: sample.frame,
-          },
-        ]
-      : [];
+  expect(await viewportPolicy(fixture.page)).toEqual({
+    pinned: false,
+    userScrolledUp: true,
   });
-  expect(followingSamples.length).toBeGreaterThan(3);
-  expect(followingViolations, JSON.stringify(followingSamples, null, 2)).toEqual([]);
-  expect(reverseMovement, JSON.stringify(followingSamples, null, 2)).toEqual([]);
-  expect(followingSamples.at(-1)?.scrollTop ?? followingTarget.initialScrollTop).toBeLessThan(
-    followingTarget.initialScrollTop - 40,
+  const oldSurfaceIdentity = await surfaceIdentity(fixture.page);
+  expect(oldSurfaceIdentity).toBe(`${chatId}:${beforeReload.transcriptViewId}`);
+
+  const native = await claudeNativeTranscript(fixture, chatId);
+  const externalContent = `detached-native-reload-final-assistant-${viewport.width}`;
+  await appendFile(
+    native.path,
+    `${JSON.stringify({
+      sessionId: native.agentSessionId,
+      type: 'assistant',
+      uuid: crypto.randomUUID(),
+      timestamp: new Date(Date.now() + 1_000).toISOString(),
+      cwd: fixture.integration.dirs.project,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: externalContent }],
+      },
+    })}\n`,
+    'utf8',
   );
-  environment.model.assertSettled();
+
+  const reloaded = await fixture.integration.client.reloadChat(chatId);
+  expect(reloaded.transcriptViewId).not.toBe(beforeReload.transcriptViewId);
+  await waitForSurfaceIdentity(fixture.page, `${chatId}:${reloaded.transcriptViewId}`);
+  await waitForTranscriptReady(fixture.page);
+  expect(await surfaceIdentity(fixture.page)).not.toBe(oldSurfaceIdentity);
+
+  const canonical = await fixture.integration.client.getMessages(chatId, { limit: 200 });
+  expect(canonical.transcriptViewId).toBe(reloaded.transcriptViewId);
+  expect(canonical.messages.at(-1)).toMatchObject({
+    message: { type: 'assistant-message', content: externalContent },
+  });
+  await loadCompleteTranscript(fixture.page, canonical.messages.length);
+  const renderedExpected = canonical.messages.filter(
+    (entry) => entry.message.type !== 'tool-result',
+  );
+  const scan = await scanLoadedTranscript(fixture.page);
+  expect(scan.rows.map((row) => row.rowId)).toEqual(
+    renderedExpected.map(
+      (entry) => `${canonical.transcriptViewId}:${entry.ordinal}`,
+    ),
+  );
+  expect(scan.rows.map((row) => row.messageType)).toEqual(
+    renderedExpected.map((entry) => entry.message.type),
+  );
+  expect(scan.rows.at(-1)).toMatchObject({
+    messageType: 'assistant-message',
+    rowId: `${canonical.transcriptViewId}:${canonical.messages.at(-1)?.ordinal}`,
+    text: externalContent,
+  });
+  expect(
+    await fixture.page.locator(FEED_SELECTOR).getByText(externalContent, { exact: true }).isVisible(),
+  ).toBe(true);
   fixture.assertNoBrowserErrors();
 }
 
-async function verifyNativeHistoryReloadAfterStreaming(fixture: ChromiumFixture): Promise<void> {
-  const chatId = await seedTranscript(fixture.integration, 15, 'chromium-native-reload-base');
-  await prepareTranscript(fixture, chatId, 20);
-  await scrollToPosition(fixture.page, 'end');
-  await waitForStablePinnedTranscriptLayout(fixture.page, 'native-reload-baseline');
-
-  const prompt = 'chromium-native-reload-stream';
-  const accepted = await fixture.integration.client.runDirectChat({
-    chatId,
-    content: prompt,
-    agent: fixture.integration.directAgents.openAi,
-  });
-  expect((await fixture.integration.client.waitForTurnTerminal(chatId, accepted.turnId)).type).toBe(
+async function verifyHeldEarlierPageNativeReload(
+  fixture: ChromiumFixture,
+  environment: ScriptedClaudeTestEnvironment,
+): Promise<void> {
+  const viewport = TRANSCRIPT_VIEWPORTS[0]!;
+  const chatId = fixture.integration.newChatId();
+  const baseUserContent = 'held-page-native-reload-base-user';
+  const baseAssistantContent = 'held-page-native-reload-base-assistant';
+  environment.model.scriptTurn([claudeText(baseAssistantContent)]);
+  const started = await fixture.integration.client.startChat(
+    liveClaudeStartRequest({
+      chatId,
+      projectPath: fixture.integration.dirs.project,
+      command: baseUserContent,
+      permissionMode: 'bypassPermissions',
+    }),
+  );
+  expect((await fixture.integration.client.waitForTurnTerminal(chatId, started.turnId)).type).toBe(
     'agent-run-finished',
   );
-  await fixture.page.locator(FEED_SELECTOR).getByText(`echo:${prompt}`, { exact: true }).waitFor();
-  await waitForStablePinnedTranscriptLayout(fixture.page, 'native-reload-streamed');
+  environment.model.assertSettled();
+  const seeded = await fixture.integration.client.getMessages(chatId, {
+    limit: 200,
+  });
+  const injected = mixedOrderingRows(seeded.lastOrdinal + 1);
+  await appendLedgerRows(fixture, chatId, seeded.transcriptViewId, injected.drafts);
+  const beforeReload = await fixture.integration.client.getMessages(chatId, {
+    limit: 200,
+  });
+  expect(beforeReload.transcriptViewId).toBe(seeded.transcriptViewId);
+  expect(beforeReload.hasMore).toBe(true);
 
-  const beforeReload = await fixture.integration.client.getMessages(chatId);
-  const eventCursor = fixture.integration.client.markEvents();
-  await openMainWorkspaceActions(fixture.page);
-  await clickMenuItem(fixture.page, 'Reload from native history');
-  const reset = await fixture.integration.client.waitForEvent(
-    (event): event is ChatGenerationResetMessage =>
-      event.type === 'chat-generation-reset' &&
-      event.chatId === chatId &&
-      event.reason === 'manual-reload',
-    'the native-history generation reset',
-    { afterIndex: eventCursor },
-  );
+  let releaseEarlierPage!: () => void;
+  const earlierPageGate = new Promise<void>((resolve) => (releaseEarlierPage = resolve));
+  let resolveEarlierRequest!: () => void;
+  const earlierRequest = new Promise<void>((resolve) => (resolveEarlierRequest = resolve));
+  let earlierRequestCount = 0;
+  let heldRequestView = '';
+  await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeOrdinal')) {
+      const response = await route.fetch();
+      earlierRequestCount += 1;
+      if (earlierRequestCount === 1) {
+        heldRequestView = url.searchParams.get('transcriptViewId') ?? '';
+        resolveEarlierRequest();
+        await earlierPageGate;
+      }
+      await route.fulfill({ response });
+      return;
+    }
+    await route.continue();
+  });
 
-  // Includes the two viewport spacers and the desktop floating-toolbar spacer.
-  const expectedModelCount = beforeReload.messages.length + 3;
-  await waitForStableModelCount(fixture.page, expectedModelCount);
-  const replacement = await fixture.page.locator(FEED_SELECTOR).evaluate(
-    (feedElement, { oldGenerationId, nextGenerationId }) => {
-      const feed = feedElement as HTMLElement;
-      const rows = [...feed.querySelectorAll<HTMLElement>('[data-chat-row-id]')];
-      const rowIds = rows.flatMap((row) => row.dataset.chatRowId ?? []);
-      const sizer = feed.querySelector<HTMLElement>('[data-chat-virtual-sizer]');
-      return {
-        modelCount: Number(sizer?.dataset.chatVirtualModelCount ?? 0),
-        mountedRowCount: rowIds.length,
-        onlyNextGeneration: rowIds.every((rowId) => rowId.startsWith(`${nextGenerationId}:`)),
-        oldGenerationMounted: rowIds.some((rowId) => rowId.startsWith(`${oldGenerationId}:`)),
+  try {
+    await fixture.page.setViewportSize(viewport);
+    await prepareTranscript(fixture, chatId, 1);
+    await fixture.page.evaluate((heldChatId) => {
+      const browserGlobal = globalThis as typeof globalThis & {
+        __restoreHeldEarlierReloadFetch?: () => void;
       };
-    },
-    {
-      oldGenerationId: beforeReload.generationId,
-      nextGenerationId: reset.generationId,
-    },
-  );
-  expect(replacement).toEqual({
-    modelCount: expectedModelCount,
-    mountedRowCount: expect.any(Number),
-    onlyNextGeneration: true,
-    oldGenerationMounted: false,
-  });
-  expect(replacement.mountedRowCount).toBeGreaterThan(0);
-  expect(replacement.mountedRowCount).toBeLessThan(beforeReload.messages.length);
-  expect(await surfaceIdentity(fixture.page)).toBe(`${chatId}:${reset.generationId}`);
-  const exactTextCounts = await fixture.page.locator(FEED_SELECTOR).evaluate(
-    (feed, expected) => {
-      const leafTexts = [...feed.querySelectorAll<HTMLElement>('*')].flatMap((element) =>
-        element.children.length === 0 ? [element.textContent?.trim() ?? ''] : [],
+      const originalFetch = globalThis.fetch;
+      browserGlobal.__restoreHeldEarlierReloadFetch = () => {
+        globalThis.fetch = originalFetch;
+        delete browserGlobal.__restoreHeldEarlierReloadFetch;
+      };
+      globalThis.fetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(
+          typeof input === 'string' || input instanceof URL ? input : input.url,
+          location.href,
+        );
+        if (
+          url.pathname === '/api/v1/chats/messages' &&
+          url.searchParams.get('chatId') === heldChatId &&
+          url.searchParams.has('beforeOrdinal')
+        ) {
+          return originalFetch(input, { ...init, signal: undefined });
+        }
+        return originalFetch(input, init);
+      }, originalFetch);
+    }, chatId);
+    await fixture.page.locator(FEED_SELECTOR).evaluate(async (feedElement) => {
+      const feed = feedElement as HTMLElement;
+      feed.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -80 }));
+      feed.scrollTop = Math.min(
+        Math.max(0, feed.scrollHeight - feed.clientHeight),
+        feed.clientHeight * 0.75,
       );
-      return expected.map((text) => leafTexts.filter((candidate) => candidate === text).length);
-    },
-    [prompt, `echo:${prompt}`],
-  );
-  expect(exactTextCounts).toEqual([1, 1]);
-  await waitForStablePinnedTranscriptLayout(fixture.page, 'native-reload-applied');
-  expect(await viewportPolicy(fixture.page)).toEqual({
-    pinned: true,
-    userScrolledUp: false,
-  });
+      feed.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    });
+    await withDiagnosticTimeout('the held pre-reload earlier page', earlierRequest);
+    await fixture.page.locator(`${FEED_SELECTOR}[aria-busy="true"]`).waitFor({ state: 'visible' });
+    expect(heldRequestView).toBe(beforeReload.transcriptViewId);
+
+    const native = await claudeNativeTranscript(fixture, chatId);
+    const externalContent = 'held-page-native-reload-final-assistant';
+    await appendFile(
+      native.path,
+      `${JSON.stringify({
+        sessionId: native.agentSessionId,
+        type: 'assistant',
+        uuid: crypto.randomUUID(),
+        timestamp: new Date(Date.now() + 1_000).toISOString(),
+        cwd: fixture.integration.dirs.project,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: externalContent }],
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const reloaded = await fixture.integration.client.reloadChat(chatId);
+    expect(reloaded.transcriptViewId).not.toBe(beforeReload.transcriptViewId);
+    await waitForSurfaceIdentity(fixture.page, `${chatId}:${reloaded.transcriptViewId}`);
+    await waitForTranscriptReady(fixture.page);
+    const replacementRevision = await virtualDataRevision(fixture.page);
+    const replacementEntryCount = await transcriptEntryCount(fixture.page);
+
+    releaseEarlierPage();
+    await fixture.page.evaluate(async () => {
+      for (let frame = 0; frame < 12; frame += 1) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      }
+    });
+
+    expect(earlierRequestCount).toBe(1);
+    expect(await surfaceIdentity(fixture.page)).toBe(`${chatId}:${reloaded.transcriptViewId}`);
+    expect(await virtualDataRevision(fixture.page)).toBe(replacementRevision);
+    expect(await transcriptEntryCount(fixture.page)).toBe(replacementEntryCount);
+    const canonical = await fixture.integration.client.getMessages(chatId, {
+      limit: 200,
+    });
+    expect(canonical.transcriptViewId).toBe(reloaded.transcriptViewId);
+    expect(canonical.messages.at(-1)).toMatchObject({
+      message: { type: 'assistant-message', content: externalContent },
+    });
+    expect(canonical.messages.map(exactTranscriptRow)).toEqual([
+      expect.objectContaining({ type: 'user-message', text: baseUserContent }),
+      expect.objectContaining({ type: 'assistant-message', text: baseAssistantContent }),
+      expect.objectContaining({ type: 'assistant-message', text: externalContent }),
+    ]);
+    expect(JSON.stringify(canonical.messages)).not.toContain(
+      'mixed-final-assistant-after-all-tools',
+    );
+    await loadCompleteTranscript(fixture.page, canonical.messages.length);
+    const renderedExpected = canonical.messages.filter(
+      (entry) => entry.message.type !== 'tool-result',
+    );
+    const scan = await scanLoadedTranscript(fixture.page);
+    expect(scan.rows.map((row) => row.rowId)).toEqual(
+      renderedExpected.map((entry) => `${canonical.transcriptViewId}:${entry.ordinal}`),
+    );
+    expect(scan.rows.map((row) => row.messageType)).toEqual(
+      renderedExpected.map((entry) => entry.message.type),
+    );
+    expect(scan.rows.map((row) => row.text)).toEqual(
+      renderedExpected.map((entry) => exactTranscriptText(entry.message)),
+    );
+    expect(scan.rows.at(-1)).toMatchObject({
+      messageType: 'assistant-message',
+      rowId: `${canonical.transcriptViewId}:${canonical.messages.at(-1)?.ordinal}`,
+      text: externalContent,
+    });
+    fixture.assertNoBrowserErrors();
+  } finally {
+    releaseEarlierPage();
+    await fixture.page
+      .evaluate(() => {
+        (
+          globalThis as typeof globalThis & {
+            __restoreHeldEarlierReloadFetch?: () => void;
+          }
+        ).__restoreHeldEarlierReloadFetch?.();
+      })
+      .catch(() => undefined);
+    await fixture.page.unroute('**/api/v1/chats/messages?**');
+  }
+}
+
+async function verifyDirectChatHidesNativeReload(fixture: ChromiumFixture): Promise<void> {
+  const chatId = await seedTranscript(fixture.integration, 15, 'chromium-no-native-reload-base');
+  await prepareTranscript(fixture, chatId, 20);
+  await scrollToPosition(fixture.page, 'end');
+  await waitForStablePinnedTranscriptLayout(fixture.page, 'no-native-reload-baseline');
+  await openMainWorkspaceActions(fixture.page);
+  expect(await fixture.page.getByRole('menuitem', { name: 'Reload from native history' }).count())
+    .toBe(0);
+  await fixture.page.keyboard.press('Escape');
   fixture.assertNoBrowserErrors();
 }
 
@@ -3354,9 +3531,8 @@ async function verifyHiddenPortalCleanup(fixture: ChromiumFixture, chatId: strin
 }
 
 async function verifyTextScaleTransitions(fixture: ChromiumFixture, chatId: string): Promise<void> {
-  await prepareTranscript(fixture, chatId);
   await synchronizeNativeTranscriptGeneration(fixture, chatId);
-  const initialModelCount = await waitForStableModelCount(fixture.page, 50);
+  const { initialModelCount } = await prepareTranscript(fixture, chatId);
   await revealEarlierTranscript(fixture.page, initialModelCount);
   await scrollToPosition(fixture.page, 'middle');
   await seedTranscript(fixture.integration, 1);
@@ -3471,564 +3647,389 @@ async function verifyTextScaleTransitions(fixture: ChromiumFixture, chatId: stri
   fixture.assertNoBrowserErrors();
 }
 
-async function verifyCodexTailOrderingAcrossPaging(fixture: ChromiumFixture): Promise<void> {
-  const chatId = await seedTranscript(fixture.integration, 1, 'chromium-codex-tail-ordering');
-  const nativePage = await fixture.integration.client.getMessages(chatId, {
-    limit: 50,
-  });
-  const messages = codexTailOrderingTranscript();
-  const completeTranscript = {
-    generationId: nativePage.generationId,
-    lastSeq: messages.length,
-    messages,
-  };
-  const expectedRows = expectedRenderedTranscriptRows(completeTranscript);
-  const finalRowId = `${nativePage.generationId}:240`;
-  const lastBashRowId = `${nativePage.generationId}:238`;
-  const requestedBeforeSeqs: number[] = [];
-
-  await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
-    const url = new URL(route.request().url());
-    if (url.searchParams.get('chatId') !== chatId) {
-      await route.continue();
-      return;
-    }
-    const limit = Number(url.searchParams.get('limit') ?? 50);
-    const beforeSeqValue = url.searchParams.get('beforeSeq');
-    const beforeSeq = beforeSeqValue === null ? messages.length + 1 : Number(beforeSeqValue);
-    if (beforeSeqValue !== null) requestedBeforeSeqs.push(beforeSeq);
-    const end = Math.max(0, Math.min(messages.length, beforeSeq - 1));
-    const start = Math.max(0, end - limit);
-    const pageMessages = messages.slice(start, end);
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        historyState: { kind: 'complete' },
-        chatId,
-        generationId: nativePage.generationId,
-        messages: pageMessages,
-        lastSeq: messages.length,
-        pageOldestSeq: pageMessages[0]?.seq ?? 0,
-        hasMore: (pageMessages[0]?.seq ?? 1) > 1,
-        pendingUserInputs: [],
-        limit,
-      }),
-    });
-  });
-
-  try {
-    await prepareTranscript(fixture, chatId, 35);
-    await waitForTranscriptEntryCount(fixture.page, 50);
-    await startRenderedTranscriptFrameSampler(fixture.page);
-    let entryCount = await transcriptEntryCount(fixture.page);
-    const counts = [entryCount];
-    await assertCodexTailAssistantIsLast(fixture.page, expectedRows, finalRowId, lastBashRowId);
-
-    for (let pageIndex = 0; pageIndex < 4 && entryCount < messages.length; pageIndex += 1) {
-      const previousRevision = await virtualDataRevision(fixture.page);
-      await scrollToPosition(fixture.page, 'start');
-      await waitForVirtualDataRevisionAfter(fixture.page, previousRevision);
-      entryCount = await transcriptEntryCount(fixture.page);
-      counts.push(entryCount);
-      await assertMountedTranscriptMatches(fixture.page, expectedRows);
-      await scrollToPosition(fixture.page, 'middle');
-      await assertMountedTranscriptMatches(fixture.page, expectedRows);
-      await assertCodexTailAssistantIsLast(fixture.page, expectedRows, finalRowId, lastBashRowId);
-    }
-
-    await scrollToPosition(fixture.page, 'start');
-    const firstRows = await fixture.page.locator(FEED_SELECTOR).evaluate((feedElement) =>
-      [...(feedElement as HTMLElement).querySelectorAll<HTMLElement>('[data-chat-row-id]')]
-        .slice(0, 10)
-        .map((row) => ({
-          id: row.dataset.chatRowId,
-          text: row.textContent?.trim(),
-          type: row.dataset.chatMessageType,
-        })),
+async function loadCompleteTranscript(page: Page, expectedEntryCount: number): Promise<void> {
+  let entryCount = await transcriptEntryCount(page);
+  const attempts: Array<{ before: number; after: number }> = [];
+  const maximumPageCount = Math.ceil(expectedEntryCount / 50) + 2;
+  for (
+    let pageIndex = 0;
+    pageIndex < maximumPageCount && entryCount < expectedEntryCount;
+    pageIndex += 1
+  ) {
+    const previousEntryCount = entryCount;
+    const previousRevision = await virtualDataRevision(page);
+    await scrollToPosition(page, 'start');
+    await waitForVirtualDataRevisionAfter(page, previousRevision);
+    entryCount = await transcriptEntryCount(page);
+    attempts.push({ before: previousEntryCount, after: entryCount });
+    expect(entryCount, JSON.stringify({ expectedEntryCount, attempts })).toBeGreaterThan(
+      previousEntryCount,
     );
-    expect(firstRows).toEqual(
-      Array.from({ length: 10 }, (_, index) => {
-        const seq = index + 1;
-        const turn = Math.ceil(seq / 2);
-        return {
-          id: `${nativePage.generationId}:${seq}`,
-          text: `codex-tail-${seq % 2 === 1 ? 'user' : 'assistant'}-${turn}`,
-          type: seq % 2 === 1 ? 'user-message' : 'assistant-message',
-        };
-      }),
-    );
-
-    const frames = await finishRenderedTranscriptFrameSampler(fixture.page);
-    assertRenderedTranscriptFrameIntegrity(frames, expectedRows, messages.length);
-    expect(counts, JSON.stringify({ counts, requestedBeforeSeqs }, null, 2)).toEqual([
-      50, 100, 150, 200, 240,
-    ]);
-    expect(requestedBeforeSeqs).toEqual([191, 141, 91, 41]);
-    expect(await mountedConversationDiscontinuities(fixture.page)).toEqual([]);
-    fixture.assertNoBrowserErrors();
-  } finally {
-    await fixture.page.unroute('**/api/v1/chats/messages?**');
   }
+  expect(entryCount, JSON.stringify({ expectedEntryCount, attempts })).toBe(expectedEntryCount);
 }
 
-async function verifyContinuousHistoryPaging(fixture: ChromiumFixture): Promise<void> {
-  const switchTargetChatId = await seedTranscript(
+async function readCompleteCanonicalTranscript(
+  fixture: ChromiumFixture,
+  chatId: string,
+): Promise<{ messages: TranscriptMessage[]; transcriptViewId: string }> {
+  let response = await fixture.integration.client.getMessages(chatId, { limit: 200 });
+  const transcriptViewId = response.transcriptViewId;
+  let messages = [...response.messages];
+  for (let pageCount = 1; response.hasMore; pageCount += 1) {
+    if (pageCount > 10) throw new Error('Canonical transcript pagination did not converge.');
+    const nextBeforeOrdinal = response.nextBeforeOrdinal;
+    if (nextBeforeOrdinal === null) {
+      throw new Error('A canonical transcript page is missing its raw continuation cursor.');
+    }
+    response = await fixture.integration.client.getMessages(chatId, {
+      beforeOrdinal: nextBeforeOrdinal,
+      limit: 200,
+      transcriptViewId,
+    });
+    expect(response.transcriptViewId).toBe(transcriptViewId);
+    messages = [...response.messages, ...messages];
+  }
+  return { messages, transcriptViewId };
+}
+
+async function dispatchClockedTranscriptPosition(
+  page: Page,
+  position: 'away' | 'end',
+): Promise<void> {
+  const geometry = await page.locator(FEED_SELECTOR).evaluate((feedElement, target) => {
+    const feed = feedElement as HTMLElement;
+    const maximum = Math.max(0, feed.scrollHeight - feed.clientHeight);
+    const scrollTop = target === 'end' ? maximum : maximum / 2;
+    feed.dispatchEvent(
+      new WheelEvent('wheel', {
+        bubbles: true,
+        deltaY: scrollTop < feed.scrollTop ? -600 : 600,
+      }),
+    );
+    feed.scrollTop = scrollTop;
+    feed.dispatchEvent(new Event('scroll', { bubbles: true }));
+    return { clientHeight: feed.clientHeight, maximum };
+  }, position);
+  expect(geometry.maximum).toBeGreaterThan(geometry.clientHeight * 2);
+}
+
+async function verifyLiveEdgeRetention(
+  fixture: ChromiumFixture,
+  viewport: { height: number; width: number },
+): Promise<void> {
+  const promptPrefix = `chromium-live-edge-retention-${viewport.width}`;
+  const turnCount = 110;
+  const expectedEntryCount = turnCount * 2;
+  const chatId = await seedTranscript(fixture.integration, turnCount, promptPrefix);
+  await fixture.page.setViewportSize(viewport);
+  await prepareTranscript(fixture, chatId);
+  await loadCompleteTranscript(fixture.page, expectedEntryCount);
+  const canonicalBeforeIdle = await readCompleteCanonicalTranscript(fixture, chatId);
+  expect(canonicalBeforeIdle.messages).toHaveLength(expectedEntryCount);
+
+  const clockStart = Date.now();
+  await fixture.page.clock.install({ time: clockStart });
+  await fixture.page.clock.pauseAt(clockStart + 1_000);
+
+  await dispatchClockedTranscriptPosition(fixture.page, 'end');
+  await fixture.page.clock.runFor(100);
+  expect(await transcriptEntryCount(fixture.page)).toBe(expectedEntryCount);
+
+  await dispatchClockedTranscriptPosition(fixture.page, 'away');
+  await fixture.page.clock.runFor(100);
+  expect(await viewportPolicy(fixture.page)).toEqual({ pinned: false, userScrolledUp: true });
+
+  await dispatchClockedTranscriptPosition(fixture.page, 'end');
+  await fixture.page.clock.runFor(100);
+  expect(await viewportPolicy(fixture.page)).toEqual({ pinned: true, userScrolledUp: false });
+  await fixture.page.clock.runFor(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
+  expect(await transcriptEntryCount(fixture.page)).toBe(expectedEntryCount);
+  expect(await viewportPolicy(fixture.page)).toEqual({ pinned: true, userScrolledUp: false });
+
+  const canonicalAfterIdle = await readCompleteCanonicalTranscript(fixture, chatId);
+  expect(canonicalAfterIdle.transcriptViewId).toBe(canonicalBeforeIdle.transcriptViewId);
+  expect(canonicalAfterIdle.messages.map(exactTranscriptRow)).toEqual(
+    canonicalBeforeIdle.messages.map(exactTranscriptRow),
+  );
+  const finalEntry = canonicalAfterIdle.messages.at(-1);
+  expect(finalEntry).toMatchObject({
+    message: {
+      content: `echo:${promptPrefix}-${turnCount - 1}`,
+      type: 'assistant-message',
+    },
+  });
+  const finalRow = fixture.page.locator(
+    `[data-chat-row-id="${canonicalAfterIdle.transcriptViewId}:${finalEntry?.ordinal}"]`,
+  );
+  await finalRow.waitFor({ state: 'visible' });
+  expect((await finalRow.innerText()).trim()).toBe(`echo:${promptPrefix}-${turnCount - 1}`);
+
+  const laterPrompts = Array.from(
+    { length: 3 },
+    (_, index) => `${promptPrefix}-after-idle-${index}`,
+  );
+  for (const prompt of laterPrompts) {
+    await appendTurn(fixture.integration, chatId, prompt);
+  }
+  await fixture.page.clock.runFor(100);
+  expect(await viewportPolicy(fixture.page)).toEqual({ pinned: true, userScrolledUp: false });
+  const expectedAfterGrowth = expectedEntryCount + laterPrompts.length * 2;
+  expect(await transcriptEntryCount(fixture.page)).toBe(expectedAfterGrowth);
+
+  await fixture.page.clock.runFor(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
+  expect(await transcriptEntryCount(fixture.page)).toBe(expectedAfterGrowth);
+
+  const canonicalAfterGrowth = await readCompleteCanonicalTranscript(fixture, chatId);
+  expect(canonicalAfterGrowth.transcriptViewId).toBe(canonicalBeforeIdle.transcriptViewId);
+  expect(canonicalAfterGrowth.messages.slice(0, canonicalBeforeIdle.messages.length).map(
+    exactTranscriptRow,
+  )).toEqual(canonicalBeforeIdle.messages.map(exactTranscriptRow));
+  expect(canonicalAfterGrowth.messages.slice(-laterPrompts.length * 2).map(exactTranscriptRow))
+    .toEqual(laterPrompts.flatMap((prompt) => [
+      expect.objectContaining({ type: 'user-message', text: prompt }),
+      expect.objectContaining({ type: 'assistant-message', text: `echo:${prompt}` }),
+    ]));
+  const finalLiveEntry = canonicalAfterGrowth.messages.at(-1);
+  expect(finalLiveEntry).toMatchObject({
+    message: {
+      type: 'assistant-message',
+      content: `echo:${laterPrompts.at(-1)}`,
+    },
+  });
+  await fixture.page.locator(
+    `[data-chat-row-id="${canonicalAfterGrowth.transcriptViewId}:${finalLiveEntry?.ordinal}"]`,
+  ).waitFor({ state: 'visible' });
+  fixture.assertNoBrowserErrors();
+}
+
+async function verifyDetachedWindowRetention(fixture: ChromiumFixture): Promise<void> {
+  const promptPrefix = 'chromium-retained-window';
+  const turnCount = 110;
+  const expectedEntryCount = turnCount * 2;
+  const chatId = await seedTranscript(fixture.integration, turnCount, promptPrefix);
+  await prepareTranscript(fixture, chatId);
+  await loadCompleteTranscript(fixture.page, expectedEntryCount);
+
+  const scan = await scanLoadedTranscript(fixture.page);
+  expect(scan.duplicateMountedRowIds).toEqual([]);
+  expect(scan.indexChanges).toEqual([]);
+  expect(scan.visualOrderViolations).toEqual([]);
+  expect(scan.rows).toHaveLength(expectedEntryCount);
+  const ordinals = scan.rows.map((row) => Number(row.rowId.slice(row.rowId.lastIndexOf(':') + 1)));
+  expect(ordinals.every(Number.isFinite)).toBe(true);
+  expect(ordinals).toEqual([...ordinals].sort((left, right) => left - right));
+  for (let turnIndex = 0; turnIndex < turnCount; turnIndex += 1) {
+    const user = scan.rows[turnIndex * 2];
+    const assistant = scan.rows[turnIndex * 2 + 1];
+    const prompt = `${promptPrefix}-${turnIndex}`;
+    expect(user).toMatchObject({ messageType: 'user-message', text: prompt });
+    expect(assistant).toMatchObject({ messageType: 'assistant-message', text: `echo:${prompt}` });
+    expect(user?.itemIndex).toBeLessThan(assistant?.itemIndex ?? -1);
+    if (turnIndex + 1 < turnCount) {
+      expect(assistant?.itemIndex).toBeLessThan(scan.rows[(turnIndex + 1) * 2]?.itemIndex ?? -1);
+    }
+  }
+
+  await scrollToPosition(fixture.page, 'end');
+  await fixture.page.evaluate(async () => {
+    for (let frame = 0; frame < 8; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+  });
+  expect(await transcriptEntryCount(fixture.page)).toBe(expectedEntryCount);
+
+  const livePrompt = `${promptPrefix}-live`;
+  await appendTurn(fixture.integration, chatId, livePrompt);
+  await fixture.page
+    .locator(FEED_SELECTOR)
+    .getByText(`echo:${livePrompt}`, { exact: true })
+    .waitFor();
+  expect(await transcriptEntryCount(fixture.page)).toBe(expectedEntryCount + 2);
+  const tail = await fixture.page.locator(FEED_SELECTOR).evaluate((feedElement, input) =>
+    [...feedElement.querySelectorAll<HTMLElement>('[data-chat-row-id]')]
+      .flatMap((row) => {
+        const text = row.innerText.trim();
+        if (text !== input.user && text !== input.assistant) return [];
+        return [
+          {
+            itemIndex: Number(row.closest<HTMLElement>('[data-chat-virtual-item]')?.dataset.index),
+            messageType: row.dataset.chatMessageType ?? '',
+            rowId: row.dataset.chatRowId ?? '',
+            text,
+          },
+        ];
+      })
+      .sort((left, right) => left.itemIndex - right.itemIndex),
+    { user: livePrompt, assistant: `echo:${livePrompt}` },
+  );
+  expect(tail).toHaveLength(2);
+  expect(tail[0]).toMatchObject({ messageType: 'user-message', text: livePrompt });
+  expect(tail[1]).toMatchObject({ messageType: 'assistant-message', text: `echo:${livePrompt}` });
+  expect(tail[0]?.itemIndex).toBeLessThan(tail[1]?.itemIndex ?? -1);
+
+  const retainedGeometry = await transcriptGeometry(fixture.page);
+  expect(retainedGeometry.itemCount).toBeGreaterThan(2);
+  expect(retainedGeometry.transcriptItemCount).toBeGreaterThan(1);
+  expect(retainedGeometry.overlaps).toEqual([]);
+  expect(await mountedConversationDiscontinuities(fixture.page)).toEqual([]);
+  fixture.assertNoBrowserErrors();
+}
+
+async function verifyMixedTranscriptOrdering(fixture: ChromiumFixture): Promise<void> {
+  const chatId = await seedTranscript(
     fixture.integration,
     1,
-    'chromium-continuity-switch-target',
+    'mixed-ordering-ledger-baseline',
   );
-  const chatId = await seedTranscript(fixture.integration, 110, 'chromium-bounded-window');
-  const completeTranscript = await loadCompleteTranscript(fixture.integration, chatId);
-  const completeRows = expectedRenderedTranscriptRows(completeTranscript);
-  expect(completeRows).toHaveLength(220);
-  await prepareTranscript(fixture, chatId);
-  const initialPage = await fixture.integration.client.getMessages(chatId, {
-    limit: 50,
+  const initial = await fixture.integration.client.getMessages(chatId, { limit: 200 });
+  const generated = mixedOrderingRows(initial.lastOrdinal + 1);
+  const expected = [...initial.messages.map(exactTranscriptRow), ...generated.expected];
+  expect(expected).toHaveLength(268);
+  await appendLedgerRows(
+    fixture,
+    chatId,
+    initial.transcriptViewId,
+    generated.drafts,
+  );
+
+  const canonical = await readCompleteCanonicalTranscript(fixture, chatId);
+  expect(canonical.transcriptViewId).toBe(initial.transcriptViewId);
+  expect(canonical.messages.map(exactTranscriptRow)).toEqual(expected);
+  expect(canonical.messages.at(-1)).toMatchObject({
+    ordinal: expected.at(-1)?.ordinal,
+    message: {
+      type: 'assistant-message',
+      content: 'mixed-final-assistant-after-all-tools',
+    },
   });
-  const newestEntry = initialPage.messages.at(-1);
-  if (!newestEntry) throw new Error('The continuous history fixture has no newest row.');
-  const newestRowId = `${initialPage.generationId}:${newestEntry.seq}`;
-  const newestText = 'echo:chromium-bounded-window-109';
-  const requestedBeforeSeqs: number[] = [];
-  await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
-    const url = new URL(route.request().url());
-    if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeSeq')) {
-      requestedBeforeSeqs.push(Number(url.searchParams.get('beforeSeq')));
-    }
-    await route.continue();
-  });
+  const renderedExpected = expected.filter((row) => row.type !== 'tool-result');
 
-  try {
-    await startRenderedTranscriptFrameSampler(fixture.page);
-    let entryCount = await transcriptEntryCount(fixture.page);
-    const counts = [entryCount];
-    await assertMountedTranscriptMatches(fixture.page, completeRows);
-    for (let pageIndex = 0; pageIndex < 4 && entryCount < initialPage.lastSeq; pageIndex += 1) {
-      const previousRevision = await virtualDataRevision(fixture.page);
-      await scrollToPosition(fixture.page, 'start');
-      await waitForVirtualDataRevisionAfter(fixture.page, previousRevision);
-      entryCount = await transcriptEntryCount(fixture.page);
-      counts.push(entryCount);
-      await assertMountedTranscriptMatches(fixture.page, completeRows);
-      await scrollToPosition(fixture.page, 'middle');
-      await assertMountedTranscriptMatches(fixture.page, completeRows);
-    }
-    const pagingFrames = await finishRenderedTranscriptFrameSampler(fixture.page);
-    assertRenderedTranscriptFrameIntegrity(pagingFrames, completeRows, completeTranscript.lastSeq);
-
-    expect(counts, JSON.stringify({ counts, requestedBeforeSeqs }, null, 2)).toEqual([
-      50, 100, 150, 200, 220,
-    ]);
-    expect(requestedBeforeSeqs).toEqual([171, 121, 71, 21]);
-    expect(requestedBeforeSeqs).not.toContain(initialPage.lastSeq + 1);
-    const requestCountAfterEarlierPages = requestedBeforeSeqs.length;
-
-    await fixture.page.clock.install();
-    await fixture.page.clock.fastForward(1);
-    await scrollToPosition(fixture.page, 'end');
-    await fixture.page.locator(`[data-chat-row-id="${newestRowId}"]`).waitFor({ state: 'visible' });
-    expect(
-      await fixture.page.locator(FEED_SELECTOR).getAttribute('data-chat-pinned-to-bottom'),
-    ).toBe('true');
-    expect(
-      await fixture.page.locator(`[data-chat-row-id="${newestRowId}"]`).textContent(),
-    ).toContain(newestText);
-    expect(requestedBeforeSeqs).toHaveLength(requestCountAfterEarlierPages);
-    await assertMountedTranscriptMatches(fixture.page, completeRows);
-    await fixture.page.clock.fastForward(LIVE_HISTORY_PRUNE_IDLE_MS - 30_000);
-    expect(await transcriptEntryCount(fixture.page)).toBe(completeTranscript.lastSeq);
-    expect(
-      await fixture.page.locator(`[data-chat-row-id="${newestRowId}"]`).textContent(),
-    ).toContain(newestText);
-
-    await fixture.page.clock.runFor(31_000);
-    await fixture.page.clock.resume();
-    await fixture.page.waitForFunction(
-      ({ selector, expectedCount }) =>
-        Number(
-          document.querySelector<HTMLElement>(selector)?.dataset.chatTranscriptEntryCount ?? 0,
-        ) === expectedCount,
-      { selector: SIZER_SELECTOR, expectedCount: 100 },
+  for (const viewport of TRANSCRIPT_VIEWPORTS) {
+    await fixture.page.setViewportSize(viewport);
+    await prepareTranscript(fixture, chatId, 1);
+    await loadCompleteTranscript(fixture.page, expected.length);
+    const scan = await scanLoadedTranscript(fixture.page);
+    const diagnostic = JSON.stringify({ viewport, scan }, null, 2);
+    expect(scan.duplicateMountedRowIds, diagnostic).toEqual([]);
+    expect(scan.indexChanges, diagnostic).toEqual([]);
+    expect(scan.visualOrderViolations, diagnostic).toEqual([]);
+    expect(scan.rows, diagnostic).toHaveLength(renderedExpected.length);
+    expect(scan.rows.map((row) => row.rowId), diagnostic).toEqual(
+      renderedExpected.map((row) => `${initial.transcriptViewId}:${row.ordinal}`),
     );
-    expect(await transcriptEntryCount(fixture.page)).toBe(100);
-    await fixture.page.locator(`[data-chat-row-id="${newestRowId}"]`).waitFor({ state: 'visible' });
-    expect(
-      await fixture.page.locator(`[data-chat-row-id="${newestRowId}"]`).textContent(),
-    ).toContain(newestText);
-    await waitForDistanceFromEnd(fixture.page, 1);
-    expect(requestedBeforeSeqs).toHaveLength(requestCountAfterEarlierPages);
-    await assertMountedTranscriptMatches(fixture.page, completeRows);
-
-    await selectSidebarChat(
-      fixture.page,
-      switchTargetChatId,
-      'chromium-continuity-switch-target-0',
+    expect(scan.rows.map((row) => row.messageType), diagnostic).toEqual(
+      renderedExpected.map((row) => row.type),
     );
-    await selectSidebarChat(fixture.page, chatId, 'chromium-bounded-window-109');
-    const restoredEntryCounts = await fixture.page
-      .locator(SIZER_SELECTOR)
-      .evaluate(async (sizer) => {
-        const counts: number[] = [];
-        for (let frame = 0; frame < 24; frame += 1) {
-          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-          counts.push(Number((sizer as HTMLElement).dataset.chatTranscriptEntryCount ?? 0));
-        }
-        return counts;
-      });
-    expect(new Set(restoredEntryCounts), JSON.stringify(restoredEntryCounts)).toEqual(
-      new Set([100]),
-    );
-    await assertMountedTranscriptMatches(fixture.page, completeRows);
 
-    const continuousGeometry = await transcriptGeometry(fixture.page);
-    expect(continuousGeometry.itemCount).toBeGreaterThan(2);
-    expect(continuousGeometry.transcriptItemCount).toBeGreaterThan(1);
-    expect(continuousGeometry.modelCount).toBe(103);
-    expect(continuousGeometry.overlaps).toEqual([]);
-    expect(await mountedConversationDiscontinuities(fixture.page)).toEqual([]);
-    fixture.assertNoBrowserErrors();
-  } finally {
-    await fixture.page.unroute('**/api/v1/chats/messages?**');
-  }
-}
-
-async function verifyTranscriptDragLifecycle(
-  fixture: ChromiumFixture,
-  viewport: { width: number; height: number; label: string },
-): Promise<void> {
-  await fixture.page.setViewportSize({
-    width: viewport.width,
-    height: viewport.height,
-  });
-  const promptPrefix = `chromium-drag-${viewport.label}`;
-  const chatId = await seedTranscript(fixture.integration, 180, promptPrefix);
-  await prepareTranscript(fixture, chatId);
-  const initialPage = await fixture.integration.client.getMessages(chatId, {
-    limit: 50,
-  });
-  expect(initialPage.messages).toHaveLength(50);
-  expect(initialPage.hasMore).toBe(true);
-
-  const completeInitialTranscript = await loadCompleteTranscript(fixture.integration, chatId);
-  const completeInitialRows = expectedRenderedTranscriptRows(completeInitialTranscript);
-  expect(completeInitialRows).toHaveLength(360);
-  for (let pageIndex = 0; pageIndex < 4; pageIndex += 1) {
-    const previousCount = await transcriptEntryCount(fixture.page);
-    const previousRevision = await virtualDataRevision(fixture.page);
-    await scrollToPosition(fixture.page, 'start');
-    await waitForVirtualDataRevisionAfter(fixture.page, previousRevision);
-    expect(await transcriptEntryCount(fixture.page)).toBe(previousCount + 50);
-  }
-  const loadedEntryCount = await transcriptEntryCount(fixture.page);
-  expect(loadedEntryCount).toBe(250);
-  const loadedOldestSeq = initialPage.lastSeq - loadedEntryCount + 1;
-
-  const requestedBeforeSeqs: number[] = [];
-  let holdNextEarlierRequest = false;
-  let resolveEarlierRequest!: () => void;
-  const earlierRequestReceived = new Promise<void>((resolve) => (resolveEarlierRequest = resolve));
-  let releaseEarlierPage!: () => void;
-  const earlierPageGate = new Promise<void>((resolve) => (releaseEarlierPage = resolve));
-  let liveHold: ReturnType<typeof fixture.integration.fakeProviders.openAi.holdNext> | null = null;
-  let interruptedHold: ReturnType<typeof fixture.integration.fakeProviders.openAi.holdNext> | null =
-    null;
-
-  await fixture.page.route('**/api/v1/chats/messages?**', async (route) => {
-    const url = new URL(route.request().url());
-    if (url.searchParams.get('chatId') === chatId && url.searchParams.has('beforeSeq')) {
-      requestedBeforeSeqs.push(Number(url.searchParams.get('beforeSeq')));
-      if (holdNextEarlierRequest) {
-        holdNextEarlierRequest = false;
-        resolveEarlierRequest();
-        await earlierPageGate;
+    for (const [index, expectedRow] of renderedExpected.entries()) {
+      const rendered = scan.rows[index];
+      expect(rendered, diagnostic).toBeDefined();
+      if (!rendered) continue;
+      if (
+        expectedRow.type === 'user-message' ||
+        expectedRow.type === 'assistant-message' ||
+        expectedRow.type === 'bash-tool-use'
+      ) {
+        expect(rendered.text, diagnostic).toBe(expectedRow.text);
+      } else if (expectedRow.type === 'compaction') {
+        expect(rendered.text, diagnostic).toContain('Context compacted');
       }
     }
-    await route.continue();
-  });
 
-  try {
-    await scrollToPosition(fixture.page, 'end');
-    await waitForStablePinnedTranscriptLayout(fixture.page, `${viewport.label}-completed-drag`);
-    await startRenderedTranscriptFrameSampler(fixture.page);
-    const completedDrag = await beginTranscriptThumbDrag(fixture.page);
-    const completedFirstScrollTop = await moveTranscriptThumb(
-      fixture.page,
-      completedDrag,
-      completedDrag.initialPosition - 0.04,
-    );
-    const completedScrollTop = await moveTranscriptThumb(
-      fixture.page,
-      completedDrag,
-      completedDrag.initialPosition - 0.08,
-    );
-    await finishTranscriptThumbDrag(fixture.page);
-    const completedFrames = await finishRenderedTranscriptFrameSampler(fixture.page);
-    assertRenderedTranscriptFrameIntegrity(
-      completedFrames,
-      completeInitialRows,
-      initialPage.lastSeq,
-    );
-    expect(completedDrag.initialPosition).toBeGreaterThan(0.8);
-    expect(completedFirstScrollTop).toBeLessThan(completedDrag.initialScrollTop - 20);
-    expect(completedScrollTop).toBeLessThan(completedFirstScrollTop - 20);
-    expect(requestedBeforeSeqs).toEqual([]);
-
-    await scrollToPosition(fixture.page, 'end');
-    await waitForStablePinnedTranscriptLayout(fixture.page, `${viewport.label}-held-drag`);
-    const liveTurns = Array.from({ length: 5 }, (_, segment) => ({
-      prompt: `${promptPrefix}-${segment === 0 ? 'held-live' : `expanding-${segment + 1}`}`,
-      response: `Live response ${segment + 1} expands while the ${viewport.label} transcript thumb remains held and keeps every identity, line of text, and vertical position ordered.`,
-    }));
-    const firstLiveTurn = liveTurns[0];
-    if (!firstLiveTurn) throw new Error('The expanding transcript fixture has no first turn.');
-    liveHold = fixture.integration.fakeProviders.openAi.holdNext({
-      lastUserText: firstLiveTurn.prompt,
-    });
-    await startRenderedTranscriptFrameSampler(fixture.page);
-    const acceptedFirstLiveTurn = await fixture.integration.client.runDirectChat({
-      chatId,
-      content: firstLiveTurn.prompt,
-      agent: fixture.integration.directAgents.openAi,
-    });
-    await withDiagnosticTimeout('the held live drag turn', liveHold.received);
-    await fixture.page
-      .locator('[data-slot="chat-processing-status"]')
-      .waitFor({ state: 'visible' });
-    await waitForTranscriptEntryCount(fixture.page, 51);
-    const liveDrag = await beginTranscriptThumbDrag(fixture.page);
-    for (const index of [0, 1]) {
-      await moveTranscriptThumb(
-        fixture.page,
-        liveDrag,
-        liveDrag.initialPosition - (index + 1) * 0.0025,
-      );
-    }
-    const heldScrollTop = await fixture.page
-      .locator(FEED_SELECTOR)
-      .evaluate((feedElement) => (feedElement as HTMLElement).scrollTop);
-    await fixture.page.locator(FEED_SELECTOR).evaluate(
-      () =>
-        new Promise<void>((resolve) => {
-          let frames = 0;
-          const sample = () => {
-            frames += 1;
-            if (frames >= 4) resolve();
-            else requestAnimationFrame(sample);
-          };
-          requestAnimationFrame(sample);
-        }),
-    );
-    const pausedHeldScrollTop = await fixture.page
-      .locator(FEED_SELECTOR)
-      .evaluate((feedElement) => (feedElement as HTMLElement).scrollTop);
-    expect(Math.abs(pausedHeldScrollTop - heldScrollTop)).toBeLessThanOrEqual(1);
-    expect(liveHold.releaseText(firstLiveTurn.response)).toBe(true);
-    expect(
-      (
-        await fixture.integration.client.waitForTurnTerminal(
-          chatId,
-          acceptedFirstLiveTurn.turnId,
-        )
-      ).type,
-    ).toBe('agent-run-finished');
-
-    for (const [index, liveTurn] of liveTurns.slice(1).entries()) {
-      liveHold = fixture.integration.fakeProviders.openAi.holdNext({
-        lastUserText: liveTurn.prompt,
+    const bashRows = scan.rows.filter((row) => row.messageType === 'bash-tool-use');
+    expect(bashRows, diagnostic).toHaveLength(42);
+    for (const row of bashRows) {
+      expect(row.bashCommand, diagnostic).toEqual({
+        buttonCount: 0,
+        tagName: 'CODE',
+        text: row.text,
       });
-      const acceptedLiveTurn = await fixture.integration.client.runDirectChat({
-        chatId,
-        content: liveTurn.prompt,
-        agent: fixture.integration.directAgents.openAi,
-      });
-      await withDiagnosticTimeout(`the expanding live drag turn ${index + 2}`, liveHold.received);
-      await moveTranscriptThumb(
-        fixture.page,
-        liveDrag,
-        liveDrag.initialPosition - (index * 2 + 3) * 0.0025,
-      );
-      expect(liveHold.releaseText(liveTurn.response)).toBe(true);
-      await moveTranscriptThumb(
-        fixture.page,
-        liveDrag,
-        liveDrag.initialPosition - (index * 2 + 4) * 0.0025,
-      );
-      expect(
-        (
-          await fixture.integration.client.waitForTurnTerminal(chatId, acceptedLiveTurn.turnId)
-        ).type,
-      ).toBe('agent-run-finished');
     }
-    await finishTranscriptThumbDrag(fixture.page);
-    const liveFrames = await finishRenderedTranscriptFrameSampler(fixture.page);
-
-    const afterLive = await loadCompleteTranscript(fixture.integration, chatId);
-    const liveEntries = afterLive.messages.filter((entry) => entry.seq > initialPage.lastSeq);
-    expect(liveEntries.map((entry) => entry.message.type)).toEqual(
-      liveTurns.flatMap(() => ['user-message', 'assistant-message']),
-    );
     expect(
-      liveEntries.map((entry) =>
-        'content' in entry.message && typeof entry.message.content === 'string'
-          ? entry.message.content
-          : null,
+      scan.rows.filter(
+        (row) =>
+          row.messageType === 'assistant-message' &&
+          row.text === 'repeated-equal-assistant-content',
       ),
-    ).toEqual(liveTurns.flatMap((turn) => [turn.prompt, turn.response]));
-    const afterLiveRows = expectedRenderedTranscriptRows(afterLive);
-    assertRenderedTranscriptFrameIntegrity(liveFrames, afterLiveRows, afterLive.lastSeq);
-    const expandedRows = afterLiveRows.filter((row) => row.seq > initialPage.lastSeq);
-    expect(new Set(liveFrames.map((frame) => frame.modelCount)).size).toBeGreaterThan(2);
-    for (const expectedRow of expandedRows) {
-      const rowFrames = liveFrames.flatMap((frame) =>
-        frame.rows.filter((row) => row.id === expectedRow.id),
-      );
-      expect(rowFrames.length, expectedRow.id).toBeGreaterThan(0);
-      expect(new Set(rowFrames.map((row) => row.text))).toEqual(new Set([expectedRow.text]));
-      expect(new Set(rowFrames.map((row) => row.nodeToken)).size, expectedRow.id).toBe(1);
-    }
-    expect(requestedBeforeSeqs).toEqual([]);
-
-    await scrollToPosition(fixture.page, 'end');
-    await fixture.page
-      .locator(FEED_SELECTOR)
-      .getByText(liveTurns.at(-1)?.response ?? '', { exact: true })
-      .waitFor();
-    await waitForStablePinnedTranscriptLayout(fixture.page, `${viewport.label}-prepend-drag`);
-    await assertMountedTranscriptMatches(fixture.page, afterLiveRows);
-    const countBeforeEarlierPage = await transcriptEntryCount(fixture.page);
-    holdNextEarlierRequest = true;
-    await startRenderedTranscriptFrameSampler(fixture.page);
-    const prependDrag = await beginTranscriptThumbDrag(fixture.page);
-    await moveTranscriptThumb(fixture.page, prependDrag, prependDrag.initialPosition * 0.35);
-    const clampedScrollTop = await moveTranscriptThumb(fixture.page, prependDrag, 0);
-    expect(clampedScrollTop).toBeLessThanOrEqual(1);
-    await withDiagnosticTimeout('the thumb-drag earlier-page request', earlierRequestReceived);
-    const prependAnchor = await readingAnchor(fixture.page);
-    await startReadingAnchorFrameSampler(fixture.page, prependAnchor);
-    const followingTarget = await startFollowingRowFrameSampler(fixture.page);
-    releaseEarlierPage();
-    for (let movement = 0; movement < 8; movement += 1) {
-      await moveTranscriptThumb(fixture.page, prependDrag, 0);
-    }
-    await waitForTranscriptEntryCount(fixture.page, countBeforeEarlierPage + 50);
-    const settledPrependAnchor = await anchorByKey(fixture.page, prependAnchor.key);
-    await finishTranscriptThumbDrag(fixture.page);
-    const prependRenderedFrames = await finishRenderedTranscriptFrameSampler(fixture.page);
-    const prependFrames = await finishReadingAnchorFrameSampler(fixture.page);
-    const followingFrames = await finishFollowingRowFrameSampler(fixture.page);
+      diagnostic,
+    ).toHaveLength(6);
+    expect(scan.rows.at(-1), diagnostic).toMatchObject({
+      messageType: 'assistant-message',
+      rowId: `${initial.transcriptViewId}:${expected.at(-1)?.ordinal}`,
+      text: 'mixed-final-assistant-after-all-tools',
+    });
     expect(
-      Math.max(
-        ...prependFrames.map((sample) =>
-          sample.offset === null
-            ? Number.POSITIVE_INFINITY
-            : Math.abs(sample.offset - prependAnchor.offset),
-        ),
-      ),
-      JSON.stringify({ prependAnchor, prependFrames }, null, 2),
-    ).toBeLessThanOrEqual(1);
-    expect(
-      Math.abs(settledPrependAnchor.offset - prependAnchor.offset),
-      JSON.stringify({ prependAnchor, settledPrependAnchor }, null, 2),
-    ).toBeLessThanOrEqual(1);
-    const followingViolations = followingFrames.filter(
-      (sample) => !sample.connected || !sample.sameNode || sample.rowId !== followingTarget.rowId,
-    );
-    expect(
-      followingViolations,
-      JSON.stringify({ followingTarget, followingFrames }, null, 2),
-    ).toEqual([]);
-    assertRenderedTranscriptFrameIntegrity(
-      prependRenderedFrames,
-      afterLiveRows,
-      afterLive.lastSeq,
-    );
-    expect(requestedBeforeSeqs[0]).toBe(loadedOldestSeq);
-    expect(new Set(requestedBeforeSeqs).size).toBe(requestedBeforeSeqs.length);
-    expect(
-      requestedBeforeSeqs.every(
-        (cursor, index) => index === 0 || cursor < requestedBeforeSeqs[index - 1],
-      ),
-      JSON.stringify(requestedBeforeSeqs),
+      await fixture.page
+        .locator(FEED_SELECTOR)
+        .getByText('mixed-final-assistant-after-all-tools', { exact: true })
+        .isVisible(),
     ).toBe(true);
-
-    await scrollToPosition(fixture.page, 'end');
-    await waitForStablePinnedTranscriptLayout(fixture.page, `${viewport.label}-interrupted-drag`);
-    await assertMountedTranscriptMatches(fixture.page, afterLiveRows);
-
-    const interruptedPrompt = `${promptPrefix}-interrupted`;
-    interruptedHold = fixture.integration.fakeProviders.openAi.holdNext({
-      lastUserText: interruptedPrompt,
-    });
-    await startRenderedTranscriptFrameSampler(fixture.page);
-    const interruptedTurn = await fixture.integration.client.runDirectChat({
-      chatId,
-      content: interruptedPrompt,
-      agent: fixture.integration.directAgents.openAi,
-    });
-    await withDiagnosticTimeout('the interruptible drag turn', interruptedHold.received);
-    await fixture.page
-      .locator('[data-slot="chat-processing-status"]')
-      .waitFor({ state: 'visible' });
-    const interruptedDrag = await beginTranscriptThumbDrag(fixture.page);
-    const preInterruptScrollTop = await moveTranscriptThumb(
-      fixture.page,
-      interruptedDrag,
-      interruptedDrag.initialPosition - 0.05,
-    );
-    const stopCursor = fixture.integration.client.markEvents();
-    const terminal = fixture.integration.client.waitForTurnTerminal(chatId, interruptedTurn.turnId);
-    const providerAbort = interruptedHold.expectAbort();
-    const stop = await fixture.integration.client.stopChat({
-      chatId,
-      clientRequestId: crypto.randomUUID(),
-    });
-    expect(stop.outcome).toBe('interrupt-requested');
-    await providerAbort;
-    await fixture.integration.client.waitForProcessing(chatId, false, {
-      afterIndex: stopCursor,
-      timeoutMs: 20_000,
-    });
-    expect((await terminal).type).toBe('agent-run-finished');
-    const interruptedScrollTop = await moveTranscriptThumb(
-      fixture.page,
-      interruptedDrag,
-      interruptedDrag.initialPosition - 0.1,
-    );
-    await finishTranscriptThumbDrag(fixture.page);
-    const interruptedFrames = await finishRenderedTranscriptFrameSampler(fixture.page);
-    expect(preInterruptScrollTop).toBeLessThan(interruptedDrag.initialScrollTop - 20);
-    expect(interruptedScrollTop).toBeLessThan(preInterruptScrollTop - 20);
-
-    const finalTranscript = await fixture.integration.client.getMessages(chatId, { limit: 200 });
-    const interruptedEntries = finalTranscript.messages.filter(
-      (entry) => entry.seq > afterLive.lastSeq,
-    );
-    expect(interruptedEntries.map((entry) => entry.message.type)).toEqual(['user-message']);
-    expect(
-      interruptedEntries.map((entry) =>
-        'content' in entry.message && typeof entry.message.content === 'string'
-          ? entry.message.content
-          : null,
-      ),
-    ).toEqual([interruptedPrompt]);
-    const finalRows = expectedRenderedTranscriptRows(finalTranscript);
-    assertRenderedTranscriptFrameIntegrity(interruptedFrames, finalRows, afterLive.lastSeq);
-    await scrollToPosition(fixture.page, 'end');
-    await assertMountedTranscriptMatches(fixture.page, finalRows);
-    expect(await fixture.page.locator('[data-slot="chat-processing-status"]').count()).toBe(0);
-    const geometry = await transcriptGeometry(fixture.page);
-    expect(geometry.overlaps).toEqual([]);
-    expect(geometry.horizontalOverflow).toEqual([]);
-    expect(await mountedConversationDiscontinuities(fixture.page)).toEqual([]);
-    fixture.assertNoBrowserErrors();
-  } finally {
-    releaseEarlierPage();
-    liveHold?.releaseEcho();
-    interruptedHold?.releaseEcho();
-    await fixture.page.mouse.up().catch(() => undefined);
-    await fixture.page.unroute('**/api/v1/chats/messages?**');
   }
+  fixture.assertNoBrowserErrors();
+}
+
+async function verifyCrossPageToolPairPrepend(
+  fixture: ChromiumFixture,
+  viewport: { height: number; width: number },
+): Promise<void> {
+  const chatId = await seedTranscript(fixture.integration, 1, 'tool-boundary-baseline');
+  const initial = await fixture.integration.client.getMessages(chatId, { limit: 200 });
+  const generated = crossPageToolPairRows(initial.lastOrdinal + 1);
+  await appendLedgerRows(
+    fixture,
+    chatId,
+    initial.transcriptViewId,
+    generated.drafts,
+  );
+
+  await fixture.page.setViewportSize(viewport);
+  const prepared = await prepareTranscript(fixture, chatId);
+  expect(await transcriptEntryCount(fixture.page)).toBe(50);
+  const toolUseRowId = `${initial.transcriptViewId}:${generated.toolUseOrdinal}`;
+  const toolResultRowId = `${initial.transcriptViewId}:${generated.toolResultOrdinal}`;
+  expect(await fixture.page.locator(`[data-chat-row-id="${toolUseRowId}"]`).count()).toBe(0);
+  expect(await fixture.page.locator(`[data-chat-row-id="${toolResultRowId}"]`).count()).toBe(0);
+
+  const { anchor, frames } = await revealEarlierTranscript(
+    fixture.page,
+    prepared.initialModelCount,
+  );
+  expect(frames.length).toBeGreaterThan(2);
+  expect(
+    frames.filter(
+      (frame) =>
+        !frame.connected
+        || !frame.sameNode
+        || frame.offset === null
+        || frame.rowId !== anchor.rowId
+        || frame.text !== anchor.text,
+    ),
+    JSON.stringify({ anchor, frames }, null, 2),
+  ).toEqual([]);
+  expect(
+    Math.max(
+      ...frames.map((frame) =>
+        frame.offset === null
+          ? Number.POSITIVE_INFINITY
+          : Math.abs(frame.offset - anchor.offset),
+      ),
+    ),
+    JSON.stringify({ anchor, frames }, null, 2),
+  ).toBeLessThanOrEqual(1);
+
+  const scan = await scanLoadedTranscript(fixture.page);
+  const toolUse = scan.rows.filter((row) => row.rowId === toolUseRowId);
+  const toolResult = scan.rows.filter((row) => row.rowId === toolResultRowId);
+  expect(toolUse).toHaveLength(1);
+  expect(toolResult).toHaveLength(1);
+  expect(toolUse[0]).toMatchObject({ messageType: 'web-search-tool-use' });
+  expect(toolResult[0]).toMatchObject({ messageType: 'tool-result' });
+  expect(toolUse[0]?.itemIndex).toBeLessThan(toolResult[0]?.itemIndex ?? -1);
+  expect(scan.duplicateMountedRowIds).toEqual([]);
+  expect(scan.indexChanges).toEqual([]);
+  expect(scan.visualOrderViolations).toEqual([]);
+  fixture.assertNoBrowserErrors();
 }
 
 async function seedPermissionTranscript(
@@ -4081,15 +4082,12 @@ async function seedPermissionTranscript(
       permissionMode: 'bypassPermissions',
     }),
   );
-  const event = await fixture.integration.client.waitForEvent(
-    (candidate): candidate is ChatMessagesMessage =>
-      candidate.type === 'chat-messages' &&
-      candidate.chatId === chatId &&
-      candidate.messages.some((entry) => entry.message.type === 'permission-request'),
-    'the Chromium permission request',
+  const permission = await fixture.integration.client.waitForTransientPermission(
+    chatId,
+    () => true,
     { afterIndex: cursor, timeoutMs: 30_000 },
   );
-  expect(event.messages.some((entry) => entry.message.type === 'permission-request')).toBe(true);
+  expect(permission.message.type).toBe('permission-request');
   return chatId;
 }
 
@@ -4135,6 +4133,409 @@ async function verifyPermissionDraftPersistence(
   fixture.assertNoBrowserErrors();
 }
 
+async function verifyHistoricalPermissionIsInertAfterRestart(
+  fixture: ChromiumFixture,
+  environment: ScriptedClaudeTestEnvironment,
+): Promise<void> {
+  environment.model.scriptTurn([
+    claudeToolUse('toolu_chromium_historical_ask', 'AskUserQuestion', {
+      questions: [
+        {
+          question: 'Which durable store?',
+          header: 'Database',
+          multiSelect: false,
+          options: [
+            { label: 'Postgres', description: 'Use the durable database.' },
+            { label: 'SQLite', description: 'Use the embedded database.' },
+          ],
+        },
+      ],
+    }),
+  ]);
+  const chatId = fixture.integration.newChatId();
+  const cursor = fixture.integration.client.markEvents();
+  await fixture.integration.client.startChat(
+    liveClaudeStartRequest({
+      chatId,
+      projectPath: fixture.integration.dirs.project,
+      command: 'ask a permission that survives restart',
+      permissionMode: 'bypassPermissions',
+    }),
+  );
+  const permission = await fixture.integration.client.waitForTransientPermission(
+    chatId,
+    () => true,
+    { afterIndex: cursor, timeoutMs: 30_000 },
+  );
+  if (permission.message.type !== 'permission-request') {
+    throw new Error('The scripted historical permission request was not published.');
+  }
+  const permissionOccurrenceId = permission.message.permissionOccurrenceId;
+
+  await fixture.integration.restartGarcon();
+  const response = await fixture.page.goto(
+    `${fixture.integration.garcon.baseUrl}/chat/${encodeURIComponent(chatId)}`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  if (!response?.ok()) throw new Error(`SPA navigation failed with ${response?.status()}.`);
+  await waitForTranscriptReady(fixture.page);
+
+  const snapshot = await fixture.integration.client.getChatSnapshot(chatId, 50);
+  expect(snapshot.transientFeed.rows).toEqual([]);
+  expect(snapshot.transcript.availability).toBe('available');
+  if (snapshot.transcript.availability !== 'available') {
+    throw new Error('The restarted permission transcript is unavailable.');
+  }
+  expect(snapshot.transcript.messages.some((entry) => (
+    entry.message.type === 'permission-request'
+    && entry.message.permissionOccurrenceId === permissionOccurrenceId
+  ))).toBe(true);
+
+  const postgres = fixture.page.getByRole('radio', { name: /Postgres/ });
+  await postgres.waitFor({ state: 'visible' });
+  expect(await postgres.isDisabled()).toBe(true);
+  expect(await fixture.page.getByRole('button', { name: /Submit answer/ }).count()).toBe(0);
+  expect(await fixture.page.getByRole('button', { name: /^Skip$/ }).count()).toBe(0);
+  environment.model.assertSettled();
+  fixture.assertNoBrowserErrors();
+}
+
+interface ReusedPermissionFixturePaths {
+  callbackLog: string;
+  cancelRelease: string;
+  requestLog: string;
+}
+
+interface ReusedPermissionScenario {
+  finalReply: string;
+  firstCommand: string;
+  firstToolUseId: string;
+  prompt: string;
+  secondCommand: string;
+  secondToolUseId: string;
+}
+
+type PermissionLifecycleMessage = Extract<
+  ChatMessage,
+  {
+    type:
+      | 'permission-request'
+      | 'permission-cancelled'
+      | 'permission-resolved'
+      | 'permission-expired';
+  }
+>;
+
+function isPermissionLifecycleMessage(message: ChatMessage): message is PermissionLifecycleMessage {
+  return message.type === 'permission-request'
+    || message.type === 'permission-cancelled'
+    || message.type === 'permission-resolved'
+    || message.type === 'permission-expired';
+}
+
+async function readJsonLineLog(path: string): Promise<Record<string, unknown>[]> {
+  let contents: string;
+  try {
+    contents = await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  return contents
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const value = JSON.parse(line) as unknown;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`Invalid reused-permission log line: ${line}`);
+      }
+      return value as Record<string, unknown>;
+    });
+}
+
+async function waitForJsonLineLog(
+  path: string,
+  description: string,
+  predicate: (records: readonly Record<string, unknown>[]) => boolean,
+): Promise<Record<string, unknown>[]> {
+  return await withDiagnosticTimeout(description, (async () => {
+    for (;;) {
+      const records = await readJsonLineLog(path);
+      if (predicate(records)) return records;
+      await Bun.sleep(20);
+    }
+  })(), 30_000);
+}
+
+function permissionRequestForCommand(
+  messages: readonly TranscriptMessage[],
+  command: string,
+): TranscriptMessage {
+  const request = messages.find((entry) => (
+    entry.message.type === 'permission-request'
+    && entry.message.requestedTool.type === 'bash-tool-use'
+    && entry.message.requestedTool.command === command
+  ));
+  if (!request) throw new Error(`Permission request was not committed for ${command}.`);
+  return request;
+}
+
+async function waitForPermissionTranscript(
+  fixture: ChromiumFixture,
+  chatId: string,
+  predicate: (messages: readonly TranscriptMessage[]) => boolean,
+  description: string,
+): Promise<Awaited<ReturnType<IntegrationFixture['client']['getMessages']>>> {
+  return await withDiagnosticTimeout(description, (async () => {
+    for (;;) {
+      const page = await fixture.integration.client.getMessages(chatId, { limit: 100 });
+      if (predicate(page.messages)) return page;
+      await Bun.sleep(20);
+    }
+  })(), 30_000);
+}
+
+async function verifyReusedPermissionOccurrence(
+  fixture: ChromiumFixture,
+  environment: ScriptedClaudeTestEnvironment,
+  paths: ReusedPermissionFixturePaths,
+  scenario: ReusedPermissionScenario,
+): Promise<void> {
+  environment.model.scriptTurn([
+    claudeToolUse(scenario.firstToolUseId, 'Bash', { command: scenario.firstCommand }),
+  ]);
+  environment.model.scriptTurn([claudeText(scenario.finalReply)]);
+
+  const chatId = fixture.integration.newChatId();
+  const eventCursor = fixture.integration.client.markEvents();
+  const turn = await fixture.integration.client.startChat(liveClaudeStartRequest({
+    chatId,
+    projectPath: fixture.integration.dirs.project,
+    command: scenario.prompt,
+  }));
+  const firstTransient = await fixture.integration.client.waitForTransientPermission(
+    chatId,
+    (row) => JSON.stringify(row.message).includes(scenario.firstCommand),
+    { afterIndex: eventCursor, timeoutMs: 30_000 },
+  );
+  const secondTransient = await fixture.integration.client.waitForTransientPermission(
+    chatId,
+    (row) => JSON.stringify(row.message).includes(scenario.secondCommand),
+    { afterIndex: eventCursor, timeoutMs: 30_000 },
+  );
+  if (
+    firstTransient.message.type !== 'permission-request'
+    || secondTransient.message.type !== 'permission-request'
+  ) {
+    throw new Error('The reused Claude permission requests were not published.');
+  }
+
+  const requestLog = await waitForJsonLineLog(
+    paths.requestLog,
+    'the duplicated provider permission requests',
+    (records) => records.filter((record) => record.command !== undefined).length === 2,
+  );
+  const providerRequests = requestLog.filter((record) => record.command !== undefined);
+  expect(providerRequests).toHaveLength(2);
+  expect(providerRequests[0]).toEqual({
+    occurrence: 'first',
+    requestId: expect.any(String),
+    command: scenario.firstCommand,
+    toolUseId: scenario.firstToolUseId,
+  });
+  expect(providerRequests[1]).toEqual({
+    occurrence: 'second',
+    requestId: providerRequests[0]?.requestId,
+    command: scenario.secondCommand,
+    toolUseId: scenario.secondToolUseId,
+  });
+  const reusedNativeRequestId = providerRequests[0]?.requestId;
+  if (typeof reusedNativeRequestId !== 'string' || reusedNativeRequestId.length === 0) {
+    throw new Error('The provider permission request ID was not recorded.');
+  }
+
+  const beforeTerminal = await fixture.integration.client.getChatSnapshot(chatId, 100);
+  if (beforeTerminal.transcript.availability !== 'available') {
+    throw new Error('The reused permission transcript is unavailable.');
+  }
+  const firstRequest = permissionRequestForCommand(
+    beforeTerminal.transcript.messages,
+    scenario.firstCommand,
+  );
+  const secondRequest = permissionRequestForCommand(
+    beforeTerminal.transcript.messages,
+    scenario.secondCommand,
+  );
+  if (
+    firstRequest.message.type !== 'permission-request'
+    || secondRequest.message.type !== 'permission-request'
+  ) {
+    throw new Error('The committed reused permission rows changed type.');
+  }
+  const firstOccurrenceId = firstRequest.message.permissionOccurrenceId;
+  const secondOccurrenceId = secondRequest.message.permissionOccurrenceId;
+  expect(firstOccurrenceId).toMatch(PERMISSION_OCCURRENCE_UUID);
+  expect(secondOccurrenceId).toMatch(PERMISSION_OCCURRENCE_UUID);
+  expect(secondOccurrenceId).not.toBe(firstOccurrenceId);
+  expect(firstTransient.permissionOccurrenceId).toBe(firstOccurrenceId);
+  expect(secondTransient.permissionOccurrenceId).toBe(secondOccurrenceId);
+  expect(beforeTerminal.transientFeed.rows.map((row) => row.permissionOccurrenceId).sort())
+    .toEqual([firstOccurrenceId, secondOccurrenceId].sort());
+
+  const transcriptViewId = beforeTerminal.transcript.transcriptViewId;
+  const firstRowId = `${transcriptViewId}:${firstRequest.ordinal}`;
+  const secondRowId = `${transcriptViewId}:${secondRequest.ordinal}`;
+  expect(firstRowId).not.toBe(secondRowId);
+  expect(firstTransient.transcript.transcriptViewId).toBe(transcriptViewId);
+  expect(secondTransient.transcript.transcriptViewId).toBe(transcriptViewId);
+
+  const response = await fixture.page.goto(
+    `${fixture.integration.garcon.baseUrl}/chat/${encodeURIComponent(chatId)}`,
+    { waitUntil: 'domcontentloaded' },
+  );
+  if (!response?.ok()) throw new Error(`SPA navigation failed with ${response?.status()}.`);
+  await waitForTranscriptReady(fixture.page);
+
+  const firstRow = fixture.page.locator(`[data-chat-row-id="${firstRowId}"]`);
+  const secondRow = fixture.page.locator(`[data-chat-row-id="${secondRowId}"]`);
+  await firstRow.waitFor({ state: 'visible' });
+  await secondRow.waitFor({ state: 'visible' });
+  await firstRow.locator('summary').click();
+  await secondRow.locator('summary').click();
+  expect(JSON.parse(await firstRow.locator('pre').innerText())).toEqual({
+    command: scenario.firstCommand,
+  });
+  expect(JSON.parse(await secondRow.locator('pre').innerText())).toEqual({
+    command: scenario.secondCommand,
+  });
+  const firstAllow = firstRow.getByRole('button', { name: /Allow once/ });
+  const secondAllow = secondRow.getByRole('button', { name: /Allow once/ });
+  await firstAllow.waitFor({ state: 'visible' });
+  await secondAllow.waitFor({ state: 'visible' });
+  expect(await firstAllow.isEnabled()).toBe(true);
+  expect(await secondAllow.isEnabled()).toBe(true);
+
+  await writeFile(paths.cancelRelease, 'cancel first occurrence');
+  await waitForJsonLineLog(
+    paths.requestLog,
+    'the delayed provider cancellation',
+    (records) => records.some((record) => record.terminal === 'cancelled'),
+  );
+  const afterCancellation = await waitForPermissionTranscript(
+    fixture,
+    chatId,
+    (messages) => messages.some((entry) => (
+      entry.message.type === 'permission-cancelled'
+      && entry.message.permissionOccurrenceId === firstOccurrenceId
+    )),
+    'the first permission occurrence cancellation',
+  );
+  const terminalRows = afterCancellation.messages.filter(
+    (entry): entry is TranscriptMessage & { message: PermissionLifecycleMessage } => (
+      entry.message.type === 'permission-cancelled'
+      || entry.message.type === 'permission-resolved'
+      || entry.message.type === 'permission-expired'
+    ),
+  );
+  expect(terminalRows.map((entry) => ({
+    type: entry.message.type,
+    permissionOccurrenceId: entry.message.permissionOccurrenceId,
+  }))).toEqual([{
+    type: 'permission-cancelled',
+    permissionOccurrenceId: firstOccurrenceId,
+  }]);
+  await firstAllow.waitFor({ state: 'hidden' });
+  await secondAllow.waitFor({ state: 'visible' });
+  expect(await secondAllow.isEnabled()).toBe(true);
+
+  const firstControl = {
+    serverInstanceId: beforeTerminal.transientFeed.serverInstanceId,
+    chatId,
+    runId: firstTransient.runId,
+    permissionOccurrenceId: firstOccurrenceId,
+  };
+  fixture.assertNoBrowserErrors();
+  const staleResponse = await fixture.page.evaluate(async (input) => {
+    const stale = await fetch('/api/v1/chats/permissions/decision', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    return { status: stale.status, body: await stale.json() as unknown };
+  }, {
+    clientRequestId: crypto.randomUUID(),
+    chatId,
+    permissionOccurrenceId: firstOccurrenceId,
+    allow: true,
+    alwaysAllow: false,
+    control: firstControl,
+  });
+  expect(staleResponse).toMatchObject({
+    status: 409,
+    body: { errorCode: 'VALIDATION_FAILED', retryable: false },
+  });
+  await fixture.page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+  expect(fixture.browserErrors.splice(0)).toEqual([
+    'console.error: Failed to load resource: the server responded with a status of 409 (Conflict)',
+  ]);
+  expect(await readJsonLineLog(paths.callbackLog)).toEqual([]);
+  await secondAllow.waitFor({ state: 'visible' });
+  expect(await secondAllow.isEnabled()).toBe(true);
+
+  await secondAllow.click();
+  const callbacks = await waitForJsonLineLog(
+    paths.callbackLog,
+    'the second permission provider callback',
+    (records) => records.length === 1,
+  );
+  expect(callbacks).toEqual([{
+    requestId: reusedNativeRequestId,
+    subtype: 'success',
+    response: {
+      behavior: 'allow',
+      updatedInput: { command: scenario.secondCommand },
+    },
+  }]);
+
+  const terminal = await fixture.integration.client.waitForTurnTerminal(
+    chatId,
+    turn.turnId,
+    { afterIndex: eventCursor, timeoutMs: 30_000 },
+  );
+  expect(terminal.type).toBe('agent-run-finished');
+  const completed = await fixture.integration.client.getMessages(chatId, { limit: 100 });
+  const permissionRows = completed.messages.filter(
+    (entry): entry is TranscriptMessage & { message: PermissionLifecycleMessage } => (
+      isPermissionLifecycleMessage(entry.message)
+    ),
+  );
+  expect(permissionRows.map((entry) => ({
+    ordinal: entry.ordinal,
+    type: entry.message.type,
+    permissionOccurrenceId: entry.message.permissionOccurrenceId,
+  }))).toEqual([
+    { ordinal: firstRequest.ordinal, type: 'permission-request', permissionOccurrenceId: firstOccurrenceId },
+    { ordinal: secondRequest.ordinal, type: 'permission-request', permissionOccurrenceId: secondOccurrenceId },
+    {
+      ordinal: expect.any(Number),
+      type: 'permission-cancelled',
+      permissionOccurrenceId: firstOccurrenceId,
+    },
+    {
+      ordinal: expect.any(Number),
+      type: 'permission-resolved',
+      permissionOccurrenceId: secondOccurrenceId,
+    },
+  ]);
+  expect(completed.messages.some((entry) => (
+    entry.message.type === 'assistant-message' && entry.message.content === scenario.finalReply
+  ))).toBe(true);
+  expect(await readJsonLineLog(paths.callbackLog)).toEqual(callbacks);
+  await secondAllow.waitFor({ state: 'hidden' });
+  environment.model.assertSettled();
+  fixture.assertNoBrowserErrors();
+}
+
 describe('Chromium transcript virtualization', () => {
   let environment: ScriptedClaudeTestEnvironment | undefined;
   let browser: Browser | undefined;
@@ -4158,7 +4559,7 @@ describe('Chromium transcript virtualization', () => {
     }
   });
 
-  test('preserves virtual transcript geometry across paging, appends, and scale', async () => {
+  test('[TLV5-UX.01-CHROMIUM-01] preserves virtual transcript geometry across paging, appends, and scale', async () => {
     if (!environment) throw new Error('Scripted Claude environment was not initialized.');
     const testEnvironment = environment;
     await withChromiumFixture(
@@ -4173,13 +4574,7 @@ describe('Chromium transcript virtualization', () => {
         markPhase('verifying detached, hidden, and pinned append geometry');
         await verifyAppendGeometry(fixture, chatId);
         markPhase('verifying chat-switch end restoration');
-        const streamedChatId = await verifyChatSwitchBottomRestore(
-          fixture,
-          chatId,
-          testEnvironment,
-        );
-        markPhase('verifying streamed row order and the following-row buffer');
-        await verifyStreamedRowOrderAndFollowingBuffer(fixture, testEnvironment, streamedChatId);
+        await verifyChatSwitchBottomRestore(fixture, chatId, testEnvironment);
         markPhase('verifying detached and pinned text-scale transitions');
         await verifyTextScaleTransitions(fixture, chatId);
       },
@@ -4202,6 +4597,117 @@ describe('Chromium transcript virtualization', () => {
       browser,
     );
   }, 180_000);
+
+  for (const scenario of [
+    {
+      caseId: '[TLV5-UX.06-COMPACT-TOUCH-COMPLETED-01]',
+      clampBeforeRelease: false,
+      label: 'compact-completed',
+      liveBehavior: 'completed',
+      viewport: { height: 700, width: 390 },
+    },
+    {
+      caseId: '[TLV5-UX.06-COMPACT-TOUCH-LIVE-01]',
+      clampBeforeRelease: true,
+      label: 'compact-live-expanding',
+      liveBehavior: 'expanding',
+      viewport: { height: 700, width: 390 },
+    },
+    {
+      caseId: '[TLV5-UX.06-COMPACT-TOUCH-INTERRUPTED-01]',
+      clampBeforeRelease: false,
+      label: 'compact-paused-interrupted',
+      liveBehavior: 'paused-interrupted',
+      viewport: { height: 700, width: 390 },
+    },
+    {
+      caseId: '[TLV5-UX.06-WIDE-TOUCH-COMPLETED-01]',
+      clampBeforeRelease: false,
+      label: 'wide-completed',
+      liveBehavior: 'completed',
+      viewport: { height: 900, width: 1280 },
+    },
+    {
+      caseId: '[TLV5-UX.06-WIDE-TOUCH-LIVE-01]',
+      clampBeforeRelease: true,
+      label: 'wide-live-expanding',
+      liveBehavior: 'expanding',
+      viewport: { height: 900, width: 1280 },
+    },
+    {
+      caseId: '[TLV5-UX.06-WIDE-TOUCH-INTERRUPTED-01]',
+      clampBeforeRelease: false,
+      label: 'wide-paused-interrupted',
+      liveBehavior: 'paused-interrupted',
+      viewport: { height: 900, width: 1280 },
+    },
+  ] satisfies TouchPrependScenario[]) {
+    test(`${scenario.caseId} keeps touch scrolling stable through a ${scenario.label} earlier-page prepend`, async () => {
+      if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+      await withChromiumFixture(
+        `transcript-touch-prepend-${scenario.label}`,
+        async (fixture, markPhase) => {
+          markPhase(`continuing a touch drag through the ${scenario.label} prepend`);
+          await verifyTouchDragPrepend(fixture, scenario);
+        },
+        diagnostics,
+        { serverEnvironment: environment.serverEnvironment },
+        browser,
+      );
+    }, 180_000);
+  }
+
+  for (const scenario of [
+    {
+      caseId: '[TLV5-UX.06-COMPACT-SCROLLBAR-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[0],
+    },
+    {
+      caseId: '[TLV5-UX.06-WIDE-SCROLLBAR-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[1],
+    },
+  ] as const) {
+    const { viewport } = scenario;
+    test(`${scenario.caseId} keeps a ${viewport.label} scrollbar reversal stable through an earlier-page prepend`, async () => {
+      if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+      await withChromiumFixture(
+        `transcript-scrollbar-prepend-${viewport.label}`,
+        async (fixture, markPhase) => {
+          markPhase(`reversing a ${viewport.label} scrollbar drag during a held prepend`);
+          await verifyScrollbarDragPrepend(fixture, viewport);
+        },
+        diagnostics,
+        { serverEnvironment: environment.serverEnvironment },
+        browser,
+      );
+    }, 180_000);
+  }
+
+  for (const scenario of [
+    {
+      caseId: '[TLV5-UX.06-COMPACT-KEYBOARD-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[0],
+    },
+    {
+      caseId: '[TLV5-UX.06-WIDE-KEYBOARD-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[1],
+    },
+  ] as const) {
+    const { viewport } = scenario;
+    test(`${scenario.caseId} keeps a ${viewport.label} keyboard page stable through an earlier-page prepend`, async () => {
+      if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+      await withChromiumFixture(
+        `transcript-keyboard-prepend-${viewport.label}`,
+        async (fixture, markPhase) => {
+          markPhase(`paging a ${viewport.label} feed by keyboard during a held prepend`);
+          await verifyKeyboardPrepend(fixture, viewport);
+        },
+        diagnostics,
+        { serverEnvironment: environment.serverEnvironment },
+        browser,
+      );
+    }, 180_000);
+  }
 
   test('navigates unmounted transcript rows and respects user cancellation', async () => {
     if (!environment) throw new Error('Scripted Claude environment was not initialized.');
@@ -4247,13 +4753,85 @@ describe('Chromium transcript virtualization', () => {
     );
   }, 180_000);
 
-  test('rebuilds a completed streamed turn from native history', async () => {
+  test('[TLV5-PERM.08-BROWSER-CHROMIUM-01] keeps reused permission occurrences independently actionable', async () => {
+    if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+    const testEnvironment = environment;
+    const firstMarker = crypto.randomUUID().replaceAll('-', '');
+    const secondMarker = crypto.randomUUID().replaceAll('-', '');
+    const scenario: ReusedPermissionScenario = {
+      finalReply: `reused permission complete ${crypto.randomUUID()}`,
+      firstCommand: `rm -f ./reused-permission-first-${firstMarker}`,
+      firstToolUseId: `toolu_reused_first_${firstMarker}`,
+      prompt: `request two reused permissions ${crypto.randomUUID()}`,
+      secondCommand: `rm -f ./reused-permission-second-${secondMarker}`,
+      secondToolUseId: `toolu_reused_second_${secondMarker}`,
+    };
+    let wrapperPath = '';
+    let paths: ReusedPermissionFixturePaths = {
+      callbackLog: '',
+      cancelRelease: '',
+      requestLog: '',
+    };
+    await withChromiumFixture(
+      'transcript-reused-permission-occurrences',
+      async (fixture, markPhase) => {
+        markPhase('routing reused provider permissions to distinct browser occurrences');
+        await verifyReusedPermissionOccurrence(fixture, testEnvironment, paths, scenario);
+      },
+      diagnostics,
+      {
+        serverEnvironment: testEnvironment.serverEnvironment,
+        resolveServerEnvironment(directories) {
+          wrapperPath = join(directories.root, 'reused-permission-claude');
+          paths = {
+            callbackLog: join(directories.root, 'reused-permission-callbacks.jsonl'),
+            cancelRelease: join(directories.root, 'reused-permission-cancel-release'),
+            requestLog: join(directories.root, 'reused-permission-requests.jsonl'),
+          };
+          return {
+            CLAUDE_BINARY: wrapperPath,
+            GARCON_REUSED_PERMISSION_CALLBACK_LOG: paths.callbackLog,
+            GARCON_REUSED_PERMISSION_CANCEL_RELEASE: paths.cancelRelease,
+            GARCON_REUSED_PERMISSION_CLAUDE_BINARY: CLAUDE_BINARY,
+            GARCON_REUSED_PERMISSION_REQUEST_LOG: paths.requestLog,
+            GARCON_REUSED_PERMISSION_SECOND_COMMAND: scenario.secondCommand,
+            GARCON_REUSED_PERMISSION_SECOND_TOOL_USE_ID: scenario.secondToolUseId,
+          };
+        },
+        async prepareWorkspace() {
+          await writeFile(
+            wrapperPath,
+            `#!/usr/bin/env bash\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(REUSED_PERMISSION_CLAUDE_PROXY)} "$@"\n`,
+          );
+          await chmod(wrapperPath, 0o755);
+        },
+      },
+      browser,
+    );
+  }, 180_000);
+
+  test('[TLV5-PERM.07-CHROMIUM-RESTART-01] keeps historical permission rows inert after a server restart', async () => {
+    if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+    const testEnvironment = environment;
+    await withChromiumFixture(
+      'transcript-historical-permission-restart',
+      async (fixture, markPhase) => {
+        markPhase('restarting with a durable permission and no transient capability');
+        await verifyHistoricalPermissionIsInertAfterRestart(fixture, testEnvironment);
+      },
+      diagnostics,
+      { serverEnvironment: testEnvironment.serverEnvironment },
+      browser,
+    );
+  }, 180_000);
+
+  test('[TLV5-L10.03-CHROMIUM-01] hides native-history reload for a direct chat', async () => {
     if (!environment) throw new Error('Scripted Claude environment was not initialized.');
     await withChromiumFixture(
       'transcript-native-history-reload',
       async (fixture, markPhase) => {
-        markPhase('streaming and reloading the native transcript');
-        await verifyNativeHistoryReloadAfterStreaming(fixture);
+        markPhase('checking the direct-chat native reload capability');
+        await verifyDirectChatHidesNativeReload(fixture);
       },
       diagnostics,
       { serverEnvironment: environment.serverEnvironment },
@@ -4261,47 +4839,137 @@ describe('Chromium transcript virtualization', () => {
     );
   }, 120_000);
 
-  test('keeps loaded history continuous across automatic earlier paging', async () => {
-    if (!environment) throw new Error('Scripted Claude environment was not initialized.');
-    await withChromiumFixture(
-      'transcript-continuous-history-paging',
-      async (fixture, markPhase) => {
-        markPhase('paging earlier without evicting the loaded tail');
-        await verifyContinuousHistoryPaging(fixture);
-      },
-      diagnostics,
-      { serverEnvironment: environment.serverEnvironment },
-      browser,
-    );
-  }, 180_000);
-
-  test('keeps the final Codex assistant response after every preceding tool across paging', async () => {
-    if (!environment) throw new Error('Scripted Claude environment was not initialized.');
-    await withChromiumFixture(
-      'transcript-codex-tail-ordering',
-      async (fixture, markPhase) => {
-        markPhase('paging a Codex-style compaction and Bash-heavy tail without reordering');
-        await verifyCodexTailOrderingAcrossPaging(fixture);
-      },
-      diagnostics,
-      { serverEnvironment: environment.serverEnvironment },
-      browser,
-    );
-  }, 180_000);
-
-  for (const viewport of [
-    { label: 'compact', width: 390, height: 700 },
-    { label: 'desktop', width: 1440, height: 900 },
-  ]) {
-    test(`keeps ${viewport.label} transcript drag scrolling stable across live and interrupted turns`, async () => {
+  for (const scenario of [
+    {
+      caseId: '[TLV5-UX.11-COMPACT-SWITCH-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[0],
+    },
+    {
+      caseId: '[TLV5-UX.11-WIDE-SWITCH-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[1],
+    },
+  ] as const) {
+    const { viewport } = scenario;
+    test(`${scenario.caseId} isolates a held earlier page across a ${viewport.label} chat switch`, async () => {
       if (!environment) throw new Error('Scripted Claude environment was not initialized.');
       await withChromiumFixture(
-        `transcript-drag-${viewport.label}`,
+        `transcript-held-page-switch-${viewport.label}`,
         async (fixture, markPhase) => {
-          markPhase(
-            `dragging completed, held, expanding, and interrupted ${viewport.label} history`,
-          );
-          await verifyTranscriptDragLifecycle(fixture, viewport);
+          markPhase(`switching a ${viewport.label} feed while its earlier page is held`);
+          await verifyHeldEarlierPageChatSwitch(fixture, viewport);
+        },
+        diagnostics,
+        { serverEnvironment: environment.serverEnvironment },
+        browser,
+      );
+    }, 180_000);
+
+    const reloadCaseId = viewport.label === 'compact'
+      ? '[TLV5-UX.11-COMPACT-RELOAD-01]'
+      : '[TLV5-UX.11-WIDE-RELOAD-01]';
+    test(`${reloadCaseId} replaces an idle detached ${viewport.label} transcript from native history`, async () => {
+      if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+      const testEnvironment = environment;
+      await withChromiumFixture(
+        `transcript-detached-native-reload-${viewport.label}`,
+        async (fixture, markPhase) => {
+          markPhase(`reloading a detached ${viewport.label} native transcript`);
+          await verifyDetachedNativeReload(fixture, testEnvironment, viewport);
+        },
+        diagnostics,
+        { serverEnvironment: testEnvironment.serverEnvironment },
+        browser,
+      );
+    }, 180_000);
+  }
+
+  test('[TLV5-PAGE.05-CHROMIUM-01] ignores a held old-view page after native history replaces the transcript', async () => {
+    if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+    const testEnvironment = environment;
+    await withChromiumFixture(
+      'transcript-held-page-native-reload',
+      async (fixture, markPhase) => {
+        markPhase('releasing an old-view page after native transcript replacement');
+        await verifyHeldEarlierPageNativeReload(fixture, testEnvironment);
+      },
+      diagnostics,
+      { serverEnvironment: testEnvironment.serverEnvironment },
+      browser,
+    );
+  }, 180_000);
+
+  test('[TLV5-UX.09-CHROMIUM-01] renders mixed paged transcripts in exact ledger order on compact and wide layouts', async () => {
+    if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+    await withChromiumFixture(
+      'transcript-mixed-ordering',
+      async (fixture, markPhase) => {
+        markPhase('verifying exact mixed-row and final-assistant order');
+        await verifyMixedTranscriptOrdering(fixture);
+      },
+      diagnostics,
+      { serverEnvironment: environment.serverEnvironment },
+      browser,
+    );
+  }, 180_000);
+
+  for (const scenario of [
+    {
+      caseId: '[TLV5-UX.06-COMPACT-TOOL-PAIR-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[0],
+    },
+    {
+      caseId: '[TLV5-UX.06-WIDE-TOOL-PAIR-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[1],
+    },
+  ] as const) {
+    const { viewport } = scenario;
+    test(`${scenario.caseId} keeps a ${viewport.label} reading row stable when paging completes a tool pair`, async () => {
+      if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+      await withChromiumFixture(
+        `transcript-cross-page-tool-pair-${viewport.label}`,
+        async (fixture, markPhase) => {
+          markPhase(`completing a ${viewport.label} tool pair across an earlier-page boundary`);
+          await verifyCrossPageToolPairPrepend(fixture, viewport);
+        },
+        diagnostics,
+        { serverEnvironment: environment.serverEnvironment },
+        browser,
+      );
+    }, 180_000);
+  }
+
+  test('[TLV5-UX.04-CHROMIUM-01] retains the complete detached transcript through paging and live following', async () => {
+    if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+    await withChromiumFixture(
+      'transcript-detached-window-retention',
+      async (fixture, markPhase) => {
+        markPhase('paging and scanning the complete retained transcript');
+        await verifyDetachedWindowRetention(fixture);
+      },
+      diagnostics,
+      { serverEnvironment: environment.serverEnvironment },
+      browser,
+    );
+  }, 180_000);
+
+  for (const scenario of [
+    {
+      caseId: '[TLV5-UX.17-COMPACT-CHROMIUM-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[0],
+    },
+    {
+      caseId: '[TLV5-UX.17-WIDE-CHROMIUM-01]',
+      viewport: TRANSCRIPT_VIEWPORTS[1],
+    },
+  ] as const) {
+    const { viewport } = scenario;
+    test(`${scenario.caseId} retains a ${viewport.label} expanded transcript beyond the retired live-edge delay`, async () => {
+      if (!environment) throw new Error('Scripted Claude environment was not initialized.');
+      await withChromiumFixture(
+        `transcript-live-edge-retention-${viewport.label}`,
+        async (fixture, markPhase) => {
+          markPhase(`verifying durable ${viewport.label} live-edge retention`);
+          await verifyLiveEdgeRetention(fixture, viewport);
         },
         diagnostics,
         { serverEnvironment: environment.serverEnvironment },

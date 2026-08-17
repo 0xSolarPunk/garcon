@@ -128,6 +128,7 @@
 				})
 			: false,
 	);
+	const canReloadSelectedChat = $derived(selectedChat?.canReloadFromNativeHistory ?? false);
 	const splitDropZones = SPLIT_DROP_ZONES;
 	const visibleSplitChatIds = $derived(
 		splitLayout.isEnabled ? splitLayout.panes.map((pane) => pane.chatId) : [],
@@ -326,7 +327,7 @@
 		<CurrentChatMenu
 			{selectedChat}
 			{isMobileLayout}
-			canReload
+			canReload={canReloadSelectedChat}
 			canUpdateProjectPath={canUpdateSelectedProjectPath}
 			canFork={canForkSelectedChat}
 			canForkNow={canForkSelectedChatNow}
@@ -433,8 +434,19 @@
 					getVisibleChatIds={getVisibleSplitChatIds}
 					isVisiblePreviewChat={isVisibleSplitChat}
 					getVisiblePreviewCursor={(chatId) => splitPanePreviews.cursor(chatId)}
-					applyVisiblePreviewMessages={(chatId, generationId, messages, lastSeq) =>
-						splitPanePreviews.applyMessages(chatId, generationId, messages, lastSeq)}
+				applyVisiblePreviewMessages={(
+					chatId,
+					transcriptViewId,
+					messages,
+					firstOrdinal,
+					lastOrdinal,
+				) => splitPanePreviews.applyMessages(
+					chatId,
+					transcriptViewId,
+					messages,
+					firstOrdinal,
+					lastOrdinal,
+				)}
 					loadVisiblePreviewSnapshot={(chatId) => splitPanePreviews.loadSnapshot(chatId)}
 					markVisiblePreviewStale={(chatId) => splitPanePreviews.markStale(chatId)}
 				/>

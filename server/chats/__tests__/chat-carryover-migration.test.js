@@ -67,7 +67,7 @@ describe('legacy carryover migration', () => {
     ]);
   });
 
-  it('promotes a committed staged transfer and retains its source cleanup', async () => {
+  it('promotes a committed staged transfer without obsolete source cleanup', async () => {
     const stable = segment('codex', 'gpt', [new UserMessage(TIMESTAMP, 'first')], {
       target: { agentId: 'claude', model: 'opus' },
     });
@@ -84,7 +84,7 @@ describe('legacy carryover migration', () => {
       sessions: { [CHAT_ID]: target },
     }));
     await fs.writeFile(path.join(workspaceDir, 'chat-carryover.json'), JSON.stringify({
-      version: 4,
+      version: 3,
       chats: {
         [CHAT_ID]: {
           revision: 1,
@@ -142,19 +142,8 @@ describe('legacy carryover migration', () => {
       }),
     ]);
     expect(await readJson('agent-ownership-journal.json')).toEqual({
-      version: 3,
+      version: 5,
       ownershipIntents: [],
-      transferCleanup: [expect.objectContaining({
-        operationId: 'legacy-transfer',
-        chatId: CHAT_ID,
-        status: 'pending',
-        attempts: 0,
-        source: expect.objectContaining({
-          agentId: 'claude',
-          agentSessionId: 'claude-session',
-          nativeSeedReceipt: null,
-        }),
-      })],
     });
   });
 
@@ -191,9 +180,8 @@ describe('legacy carryover migration', () => {
     await migrateLegacyCarryOverWorkspace(workspaceDir);
 
     expect(await readJson('agent-ownership-journal.json')).toEqual({
-      version: 3,
+      version: 5,
       ownershipIntents: [],
-      transferCleanup: [],
     });
     expect((await readJson('carryover-transcripts/migration-v2.json')).phase).toBe('complete');
     await expect(fs.stat(path.join(workspaceDir, 'chat-carryover.json')))
@@ -377,7 +365,7 @@ describe('legacy carryover migration', () => {
 
     const registry = await readJson('chats.json');
     expect(registry.version).toBe(5);
-    expect((await readJson('agent-ownership-journal.json')).version).toBe(3);
+    expect((await readJson('agent-ownership-journal.json')).version).toBe(5);
     expect((await readJson('carryover-transcripts/migration-v2.json')).phase).toBe('complete');
     const store = new CarryOverTranscriptStore({ workspaceDir });
     await store.initialize();
@@ -475,7 +463,7 @@ describe('legacy carryover migration', () => {
       .rejects.toThrow('unsafe after new-format history was created');
   });
 
-  it('releases a transfer whose chat was deleted instead of aborting the boot', async () => {
+  it('drops obsolete transfer cleanup whose chat was deleted', async () => {
     await writeLegacyWorkspace({
       segments: [segment('codex', 'gpt', [new UserMessage(TIMESTAMP, 'first')])],
       currentAgentId: 'codex',
@@ -510,16 +498,7 @@ describe('legacy carryover migration', () => {
     await migrateLegacyCarryOverWorkspace(workspaceDir);
 
     const journal = await readJson('agent-ownership-journal.json');
-    expect(journal.version).toBe(3);
-    // Converted to a delete intent so the orphaned provider session is still
-    // releasable, matching how the delete branch already handled this state.
-    expect(journal.ownershipIntents).toHaveLength(1);
-    expect(journal.ownershipIntents[0]).toMatchObject({
-      kind: 'delete',
-      chatId: '1786077000009999',
-      phase: 'registry-removed',
-    });
-    expect(journal.ownershipIntents[0].releaseReferences).toHaveLength(1);
+    expect(journal).toEqual({ version: 5, ownershipIntents: [] });
   });
 
   it('rejects transcripts that differ from the committed segments', async () => {

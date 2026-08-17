@@ -1,6 +1,7 @@
 import { describe, expect, it, mock } from 'bun:test';
 
 import { AgentRuntimeRouter } from '../runtime-router.ts';
+import { createRuntimeTranscriptFixture } from './runtime-router-test-fixture.js';
 
 const storedNativeSession = {
   ownerId: 'claude',
@@ -14,6 +15,7 @@ const resolvedNativeSession = {
 };
 
 function makeRouter(overrides = {}) {
+  const transcript = createRuntimeTranscriptFixture();
   const preparation = {
     nativeSession: resolvedNativeSession,
     commit: mock(() => Promise.resolve()),
@@ -22,6 +24,7 @@ function makeRouter(overrides = {}) {
   const prepareProjectPathUpdate = mock(() => Promise.resolve(preparation));
   const entry = {
     agentId: 'claude',
+    agentOwnershipEpoch: 'epoch-1',
     agentSessionId: 'session-1',
     nativeSession: storedNativeSession,
     projectPath: '/old',
@@ -39,7 +42,7 @@ function makeRouter(overrides = {}) {
       })),
       parse: mock((settings) => settings),
     },
-    execution: { prepareProjectPathUpdate },
+    projectPathUpdates: { prepare: prepareProjectPathUpdate },
   };
   const router = new AgentRuntimeRouter({
     registry: {
@@ -50,7 +53,13 @@ function makeRouter(overrides = {}) {
     },
     endpointResolver: {},
     events: {},
+    projection: {},
     getCarryOverRevision: () => 'carry-1',
+createCarriedContext: async () => null,
+    getCarryOverMessageCount: async () => 0,
+    ledger: transcript.ledger,
+    hasPendingOwnershipTransfer: () => false,
+    adoption: transcript.adoption,
   });
 
   return { entry, preparation, prepareProjectPathUpdate, router };

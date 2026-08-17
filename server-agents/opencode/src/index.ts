@@ -1,14 +1,12 @@
 import { PERMISSION_MODE_VALUES, THINKING_MODE_VALUES } from '@garcon/common/chat-modes';
-import { retargetNativeSeedReceipt } from '@garcon/common/transcript-seed';
 import {
   AgentIntegrationError,
-  computeAgentTranscriptRevision,
+  type AgentChatReference,
   type AgentHost,
   type AgentIntegration,
-  type AgentTranscript,
 } from '@garcon/server-agent-interface';
+import type { AgentNativeEvidenceSource } from '@garcon/server-agent-common/native-session/evidence-source';
 import { createModelCatalog } from '@garcon/server-agent-common/catalog/model-catalog';
-import { resolveAgentStandaloneEntrypoint } from '@garcon/server-agent-common/build/standalone-entrypoint';
 import {
   createArtificialNativePath,
   getArtificialAgentSessionId,
@@ -19,14 +17,20 @@ import { createVersion1RecordMigration } from '@garcon/server-agent-common/migra
 import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
 import { createVersionedSettings } from '@garcon/server-agent-common/settings/versioned-settings';
 import { singleQueryRuntimeOptions } from '@garcon/server-agent-common/shared/single-query-control';
+import { createAgentProducerAdapter } from '@garcon/server-agent-common/execution/producer-adapter';
+import {
+  createHistoryImport,
+  createNativeHistoryImport,
+} from '@garcon/server-agent-common/native-session/native-history-import';
 import { createOpenCodeConfig } from './config.js';
 import { OpenCodeExecution } from './agents/opencode/execution.js';
 import {
-  getOpenCodePreviewFromSessionId,
-  loadOpenCodeChatMessages,
+  loadLegacyOpenCodeChatMessages,
+  loadRequiredOpenCodeChatMessages,
 } from './agents/opencode/history-loader.js';
 import { getOpenCodeAuthStatus } from './agents/opencode/opencode-auth.js';
 import { OpenCodeRuntime } from './agents/opencode/opencode.js';
+import { createOpenCodeNativeActivityProbe } from './agents/opencode/native-activity.js';
 
 const OPENCODE_DESCRIPTOR = {
   id: 'opencode',
@@ -47,20 +51,16 @@ const OPENCODE_DESCRIPTOR = {
 
 export default class OpenCodeAgentIntegration implements AgentIntegration {
   static readonly integrationId = 'opencode';
-  static readonly apiVersion = 3 as const;
-  static readonly transcriptIndex = {
-    apiVersion: 1,
-    moduleUrl: resolveAgentStandaloneEntrypoint({
-      integrationId: 'opencode',
-      name: 'transcript-index-source',
-      sourceUrl: new URL('./transcript-index-source.ts', import.meta.url),
-    }),
-  } as const;
-
+  static readonly apiVersion = 5 as const;
   readonly descriptor = OPENCODE_DESCRIPTOR;
   readonly attachments = null;
   readonly execution;
-  readonly transcript: AgentTranscript;
+  readonly legacyHistoryImport;
+  readonly nativeHistoryImport;
+  readonly nativeActivity;
+  readonly nativeSessions;
+  readonly sessionConfiguration: NonNullable<AgentIntegration['sessionConfiguration']>;
+  readonly projectPathUpdates = null;
   readonly catalog;
   readonly settings;
   readonly lifecycle;
@@ -68,7 +68,7 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
   readonly auth: NonNullable<AgentIntegration['auth']>;
   readonly commands = null;
   readonly compaction = null;
-  readonly forking: NonNullable<AgentIntegration['forking']>;
+  readonly forking = null;
   readonly steering: NonNullable<AgentIntegration['steering']>;
   readonly goals = null;
   readonly endpoints = null;
@@ -87,12 +87,26 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
       defaults: {},
       descriptors: [],
     });
-    this.execution = new OpenCodeExecution(runtime, nativeSessions);
+    const providerExecution = new OpenCodeExecution(runtime, nativeSessions);
+    this.sessionConfiguration = {
+      apply: (agentSessionId, configuration) => (
+        providerExecution.applySessionConfiguration(agentSessionId, configuration)
+      ),
+    };
+    const nativeEvidence = createOpenCodeNativeEvidence(runtime, nativeSessions, sessionId);
+    this.nativeSessions = nativeEvidence;
+    this.execution = createAgentProducerAdapter(providerExecution, logger).execution;
+    this.legacyHistoryImport = createHistoryImport({ load: nativeEvidence.loadLegacy });
+    this.nativeHistoryImport = createNativeHistoryImport(nativeEvidence);
+    this.nativeActivity = createOpenCodeNativeActivityProbe({
+      nativeSessions,
+      logger,
+      withClient: (operation) => runtime.withClientLease((client) => operation(async () => client)),
+    });
     this.steering = {
       captureTarget: (request) => runtime.steering.captureTarget(request.agentSessionId),
       steer: (request) => runtime.steering.steer(request),
     };
-    this.transcript = createOpenCodeTranscript(runtime, nativeSessions, sessionId, logger);
     this.catalog = createModelCatalog({
       logger: host.logger,
       defaultModel: '',
@@ -106,50 +120,6 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
       async status(signal) {
         signal.throwIfAborted();
         return getOpenCodeAuthStatus(runtime);
-      },
-    };
-    this.forking = {
-      supportsAtMessage: false,
-      supportsWhileRunning: false,
-      async fork(request) {
-        request.admission.signal.throwIfAborted();
-        if (request.point) {
-          throw new AgentIntegrationError(
-            'OPERATION_UNSUPPORTED',
-            'OpenCode does not support message-point forks',
-            false,
-          );
-        }
-        const sourceSessionId = sessionId(request.source)?.trim();
-        if (!sourceSessionId) {
-          throw new AgentIntegrationError(
-            'TRANSCRIPT_UNAVAILABLE',
-            'Cannot fork OpenCode session without a source session ID',
-            false,
-          );
-        }
-        const agentSessionId = await runtime.forkSession(sourceSessionId, {
-          projectPath: request.source.projectPath,
-        });
-        return {
-          kind: 'materialized',
-          session: {
-            agentSessionId,
-            nativeSession: nativeSessions.encode({
-              path: createArtificialNativePath('opencode', agentSessionId),
-              agentSessionId,
-              modelEndpointId: null,
-            }),
-            nativeSeedReceipt: retargetNativeSeedReceipt(
-              request.source.nativeSeedReceipt,
-              agentSessionId,
-            ),
-          },
-        };
-      },
-      // OpenCode exposes no safe API for deleting an uncommitted fork.
-      async discard(_session, signal) {
-        signal.throwIfAborted();
       },
     };
     this.singleQuery = {
@@ -181,8 +151,7 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
 }
 
 type NativeSessionCodec = ReturnType<typeof createPathNativeSessionCodec>;
-type ChatReference = Parameters<AgentTranscript['load']>[0]['chat'];
-type SessionReference = Pick<ChatReference, 'nativeSession'> & {
+type SessionReference = Pick<AgentChatReference, 'nativeSession'> & {
   readonly agentSessionId?: string | null;
 };
 
@@ -195,32 +164,23 @@ function createSessionIdResolver(nativeSessions: NativeSessionCodec) {
   };
 }
 
-function createOpenCodeTranscript(
+function createOpenCodeNativeEvidence(
   runtime: OpenCodeRuntime,
   nativeSessions: NativeSessionCodec,
   sessionId: (chat: SessionReference) => string | null,
-  logger: AgentHost['logger'],
-): AgentTranscript {
-  const loadMessages = async (chat: ChatReference, signal: AbortSignal) => {
+): AgentNativeEvidenceSource & {
+  readonly loadLegacy: AgentNativeEvidenceSource['load'];
+} {
+  const load = async (
+    chat: AgentChatReference,
+    signal: AbortSignal,
+    loadMessages: typeof loadLegacyOpenCodeChatMessages,
+  ) => {
     const id = sessionId(chat);
-    if (!id) return [];
-    return runtime.withClientLease((client) => (
-      loadOpenCodeChatMessages(id, async () => client, {
-        directory: chat.projectPath,
-        signal,
-        logger,
-      })
-    ));
-  };
-  const resolveIndexSource = async (chat: ChatReference, signal: AbortSignal) => {
-    const id = sessionId(chat);
-    if (!id) return null;
-    const baseUrl = await runtime.getTranscriptIndexEndpoint(signal);
-    return {
-      ownerId: 'opencode',
-      schemaVersion: 1,
-      value: { baseUrl, sessionId: id, directory: chat.projectPath },
-    } as const;
+    return runtime.withClientLease((client) => loadMessages(id, async () => client, {
+      directory: chat.projectPath,
+      signal,
+    }));
   };
   return {
     async resolveNativeSession({ chat, signal }) {
@@ -235,40 +195,11 @@ function createOpenCodeTranscript(
     },
     async load({ chat, signal }) {
       signal.throwIfAborted();
-      const messages = await loadMessages(chat, signal);
-      return { messages, revision: computeAgentTranscriptRevision(messages) };
+      return { messages: await load(chat, signal, loadRequiredOpenCodeChatMessages) };
     },
-    async preview({ chat, signal }) {
+    async loadLegacy({ chat, signal }) {
       signal.throwIfAborted();
-      const id = sessionId(chat);
-      if (!id) return null;
-      return runtime.withClientLease((client) => (
-        getOpenCodePreviewFromSessionId(id, async () => client, {
-          directory: chat.projectPath,
-          signal,
-          logger,
-        })
-      ));
-    },
-    async revision({ chat, signal }) {
-      signal.throwIfAborted();
-      return computeAgentTranscriptRevision(await loadMessages(chat, signal));
-    },
-    async resolveIndexSource({ chat, signal }) {
-      return resolveIndexSource(chat, signal);
-    },
-    async refreshIndexSource({ chat, failedSource, signal }) {
-      signal.throwIfAborted();
-      const failedBaseUrl = failedSource.value.baseUrl;
-      if (typeof failedBaseUrl !== 'string') return resolveIndexSource(chat, signal);
-      const id = sessionId(chat);
-      if (!id) return null;
-      const baseUrl = await runtime.refreshTranscriptIndexEndpoint(failedBaseUrl, signal);
-      return {
-        ownerId: 'opencode',
-        schemaVersion: 1,
-        value: { baseUrl, sessionId: id, directory: chat.projectPath },
-      };
+      return { messages: await load(chat, signal, loadLegacyOpenCodeChatMessages) };
     },
     async describeSource({ chat, signal }) {
       signal.throwIfAborted();

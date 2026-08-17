@@ -1,33 +1,21 @@
 // OpenAI-compatible chat-completions protocol adapter for direct runtimes.
 
-import type { SharedModelOption } from '@garcon/common/models';
 import type { AgentAttachment } from '@garcon/common/agent-execution';
-import type { AgentLogger } from '@garcon/server-agent-interface';
 import { readSseDataEvents } from '@garcon/server-agent-common/shared/sse';
 import {
   DirectChatRuntimeBase,
   type DirectRuntimeSession,
-  type DirectUserTurn,
 } from "./direct-chat-runtime-base.js";
-import type { DirectConversationMessage } from "./session-store.js";
 import { appendTextAttachmentContext, imageAttachments } from '@garcon/server-agent-common/shared/attachments';
 import {
-  DEFAULT_DIRECT_SINGLE_QUERY_TIMEOUT_MS,
   directSingleQuerySignal,
   directSingleQueryTimeoutMs,
 } from './single-query-options.js';
 import { resolveDirectExplicitEffort } from './reasoning-effort.js';
 import { isJsonResponse } from './response-media-type.js';
 import { stripThinkBlocks } from './strip-think-blocks.js';
+import type { ChatMessage } from '@garcon/common/chat-types';
 
-const SILENT_LOGGER: AgentLogger = Object.freeze({
-  debug() {},
-  info() {},
-  warn() {},
-  error() {},
-});
-
-const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const STREAM_TIMEOUT_MS = 5 * 60_000;
 
 interface OpenAiCompatibleContentPart {
@@ -41,25 +29,12 @@ interface ConversationMessage {
   content: string | OpenAiCompatibleContentPart[];
 }
 
-interface ModelFetchContext {
-  apiKey: string;
-  baseUrl: string;
-  requestTimeoutMs: number;
-  fallbackModels: SharedModelOption[];
-}
-
 export interface OpenAiCompatibleChatRuntimeConfig {
-  runtimeId: string;
   runtimeLabel: string;
   defaultModel: string;
-  fallbackModels: SharedModelOption[];
   getApiKey: () => string;
   getBaseUrl: () => string;
-  getSessionDir: () => string;
-  getSessionFilePath: (sessionId: string) => string;
-  logger?: AgentLogger;
   buildHeaders?: (apiKey: string) => Record<string, string>;
-  fetchModels?: (ctx: ModelFetchContext) => Promise<SharedModelOption[]>;
 }
 
 function buildHeaders(config: OpenAiCompatibleChatRuntimeConfig, apiKey: string): Record<string, string> {
@@ -99,22 +74,6 @@ export function buildOpenAiCompatibleUserContent(
     parts.push({ type: 'image_url', image_url: { url: image.data } });
   }
   return parts;
-}
-
-export function extractOpenAiCompatibleTextContent(content: ConversationMessage['content']): string {
-  if (typeof content === 'string') return content;
-
-  return content
-    .filter((part) => part.type === 'text' && typeof part.text === 'string')
-    .map((part) => part.text!)
-    .join('\n');
-}
-
-function persistedToOpenAiMessage(message: DirectConversationMessage): ConversationMessage {
-  return {
-    role: message.role,
-    content: message.content,
-  };
 }
 
 async function readOpenAiCompatibleTextStream(
@@ -223,31 +182,34 @@ export class OpenAiCompatibleChatRuntime extends DirectChatRuntimeBase<
   ConversationMessage,
   OpenAiCompatibleChatRuntimeConfig
 > {
-  #modelCache: SharedModelOption[] | null = null;
-  #modelCacheTime = 0;
-  #modelFetchPromise: Promise<SharedModelOption[]> | null = null;
-
   constructor(config: OpenAiCompatibleChatRuntimeConfig) {
     super(config);
   }
 
-  protected buildUserTurn(
+  protected buildUserMessage(
     command: string,
     images?: readonly AgentAttachment[],
-  ): DirectUserTurn<ConversationMessage> {
+  ): ConversationMessage {
     const content = buildOpenAiCompatibleUserContent(command, images);
-    return {
-      message: { role: 'user', content },
-      persistedContent: extractOpenAiCompatibleTextContent(content),
-    };
+    return { role: 'user', content };
   }
 
   protected buildAssistantMessage(content: string): ConversationMessage {
     return { role: 'assistant', content };
   }
 
-  protected persistedToMessage(message: DirectConversationMessage): ConversationMessage {
-    return persistedToOpenAiMessage(message);
+  protected contextMessage(message: ChatMessage): ConversationMessage | null {
+    if (message.type === 'user-message') {
+      return {
+        role: 'user',
+        content: buildOpenAiCompatibleUserContent(message.content, message.images?.map((image) => ({
+          kind: 'image', data: image.data, name: image.name || null,
+          mimeType: image.mimeType ?? 'application/octet-stream',
+        }))),
+      };
+    }
+    if (message.type === 'assistant-message') return { role: 'assistant', content: message.content };
+    return { role: 'assistant', content: JSON.stringify(message) };
   }
 
   protected async streamSession(session: DirectRuntimeSession<ConversationMessage>): Promise<string> {
@@ -282,52 +244,4 @@ export class OpenAiCompatibleChatRuntime extends DirectChatRuntimeBase<
     }
   }
 
-  override async getModels(): Promise<SharedModelOption[]> {
-    if (!this.config.fetchModels) {
-      return this.config.fallbackModels;
-    }
-
-    if (this.#modelCache && Date.now() - this.#modelCacheTime < MODEL_CACHE_TTL_MS) {
-      return this.#modelCache;
-    }
-
-    if (this.#modelFetchPromise) {
-      return this.#modelFetchPromise;
-    }
-
-    this.#modelFetchPromise = this.#fetchModels();
-    try {
-      return await this.#modelFetchPromise;
-    } finally {
-      this.#modelFetchPromise = null;
-    }
-  }
-
-  async #fetchModels(): Promise<SharedModelOption[]> {
-    const apiKey = this.config.getApiKey();
-    if (!apiKey) {
-      return this.config.fallbackModels;
-    }
-
-    try {
-      const models = await this.config.fetchModels!({
-        apiKey,
-        baseUrl: this.config.getBaseUrl(),
-        requestTimeoutMs: DEFAULT_DIRECT_SINGLE_QUERY_TIMEOUT_MS,
-        fallbackModels: this.config.fallbackModels,
-      });
-      if (models.length > 0) {
-        this.#modelCache = models;
-        this.#modelCacheTime = Date.now();
-        return models;
-      }
-    } catch (error) {
-      (this.config.logger ?? SILENT_LOGGER).warn('Direct model fetch failed', {
-        runtimeId: this.config.runtimeId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-
-    return this.config.fallbackModels;
-  }
 }

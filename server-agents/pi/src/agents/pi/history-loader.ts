@@ -7,12 +7,12 @@ import {
   type SessionEntry,
   type SessionHeader,
 } from '@earendil-works/pi-coding-agent';
+import { attachNativeMessageSource } from '@garcon/server-agent-common/shared/native-message-source';
 import {
   type ChatMessage,
 } from '@garcon/common/chat-types';
 import { findPiSessionFileBySessionId } from './pi-session-paths.js';
 import { convertPiMessage } from './message-converter.js';
-import { attachNativeMessageSource } from '@garcon/server-agent-common/shared/native-message-source';
 import type { PiConfig } from '../../config.js';
 
 export interface PiPreview {
@@ -46,21 +46,26 @@ function assertAcyclicActivePath(entries: SessionEntry[]): void {
   }
 }
 
-async function readPiSessionFile(sessionPath: string): Promise<{
+async function readPiSessionFile(sessionPath: string, strict = false): Promise<{
   entries: FileEntry[];
   header: SessionHeader | null;
   messages: ChatMessage[];
 }> {
   const raw = await fs.readFile(sessionPath, 'utf8');
-  const entries = parseSessionEntries(raw);
+  const entries = strict ? parseStrictPiSessionEntries(raw) : parseSessionEntries(raw);
   const header = findHeader(entries);
   const sessionEntries = entries.filter(isSessionEntry);
   assertAcyclicActivePath(sessionEntries);
+  // buildContextEntries plus sessionEntryToContextMessages is exactly the
+  // decomposition buildSessionContext performs, kept explicit here so each
+  // rendered row retains its session entry identity through to providerMeta.
   const messages = buildContextEntries(sessionEntries).flatMap((entry) => {
+    const entryId = typeof entry.id === 'string' && entry.id.length > 0 ? entry.id : null;
     const converted = sessionEntryToContextMessages(entry)
       .flatMap((message) => convertPiMessage(message));
+    if (entryId === null) return converted;
     return converted.map((message, withinSourceOrdinal) => attachNativeMessageSource(message, {
-      entryId: entry.id,
+      entryId,
       withinSourceOrdinal,
     }));
   });
@@ -68,7 +73,28 @@ async function readPiSessionFile(sessionPath: string): Promise<{
 }
 
 export async function loadPiChatMessages(sessionPath: string): Promise<ChatMessage[]> {
-  return (await readPiSessionFile(sessionPath)).messages;
+  return (await readPiSessionFile(sessionPath, true)).messages;
+}
+
+function parseStrictPiSessionEntries(raw: string): FileEntry[] {
+  return raw.split('\n').flatMap((line, index) => {
+    if (!line.trim()) return [];
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      throw new Error(`Pi transcript record ${index + 1} is invalid`);
+    }
+    if (
+      !value
+      || typeof value !== 'object'
+      || Array.isArray(value)
+      || typeof (value as Record<string, unknown>).type !== 'string'
+    ) {
+      throw new Error(`Pi transcript record ${index + 1} is invalid`);
+    }
+    return [value as FileEntry];
+  });
 }
 
 export async function loadPiChatMessagesBySessionId(

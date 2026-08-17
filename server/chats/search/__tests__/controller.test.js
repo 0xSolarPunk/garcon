@@ -1,185 +1,471 @@
 import { describe, expect, it, mock } from 'bun:test';
+import { fileURLToPath } from 'node:url';
+import { UserMessage, AssistantMessage } from '../../../../common/chat-types.js';
+import { LedgerFencedError } from '../../../ledger/errors.js';
 import { TranscriptSearchController } from '../controller.js';
 
-const emptyStatus = {
-  indexedChatCount: 0,
-  pendingChatCount: 0,
-  failedChatCount: 0,
-  unsupportedChatCount: 0,
-};
-
-function registration(agentId, chatId) {
+function userRow(viewId, ordinal, content) {
+  const message = new UserMessage('2026-08-10T10:00:00.000Z', content);
   return {
-    agentId,
-    reference: {
-      chatId,
-      projectPath: '/repo',
-      model: 'model',
-      nativeSession: null,
-      carryOverRevision: 'carry-v1:0',
-    },
-    updatedAt: '2026-01-01T00:00:00.000Z',
+    kind: 'user-input',
+    viewId,
+    ordinal,
+    at: message.timestamp,
+    detail: { clientMessageId: `message-${ordinal}`, message, attachments: [], steer: false },
+    providerMeta: null,
   };
 }
 
-function integration(agentId, source = null) {
+function providerRow(viewId, ordinal, content) {
+  const message = new AssistantMessage('2026-08-10T10:00:01.000Z', content);
   return {
-    descriptor: { id: agentId },
-    transcript: {
-      resolveIndexSource: mock(async () => source),
-      refreshIndexSource: mock(async () => source),
-    },
+    kind: 'provider-row',
+    viewId,
+    ordinal,
+    at: message.timestamp,
+    message,
+    providerMeta: null,
   };
 }
 
-function createService(overrides = {}) {
-  return {
-    operationEpoch: () => 'operation-epoch',
-    setSourceRefreshHandler: mock(() => {}),
-    setCatalogRefreshHandler: mock(() => {}),
-    enable: mock(async () => {}),
-    reconcile: mock(async () => {}),
-    sourceMayHaveChanged: mock(() => {}),
-    deleteChat: mock(() => {}),
-    search: mock(async () => ({ results: [], index: emptyStatus })),
-    disableAndDelete: mock(async () => {}),
-    close: mock(async () => {}),
-    ...overrides,
-  };
-}
-
-function controllerFixture(integrations, registrations, service = createService()) {
-  const byId = new Map(integrations.map((entry) => [entry.descriptor.id, entry]));
-  const classes = integrations.map((entry) => ({
-    integrationId: entry.descriptor.id,
-    apiVersion: 3,
-    transcriptIndex: { apiVersion: 1, moduleUrl: import.meta.url },
-  }));
-  return {
-    controller: new TranscriptSearchController({
-      integrations: {
-        classes: () => classes,
-        get: (agentId) => byId.get(agentId) ?? null,
+function harness() {
+  const views = new Map([['chat-1', { viewId: 'view-1', contentStartOrdinal: 1 }]]);
+  const rows = new Map([['chat-1', [
+    userRow('view-1', 1, 'hello'),
+    providerRow('view-1', 2, 'world'),
+  ]] ]);
+  let listener = null;
+  const service = {
+    setResyncHandler: mock(() => undefined),
+    enable: mock(async () => undefined),
+    replaceChat: mock(async () => undefined),
+    appendRows: mock(async () => undefined),
+    deleteChat: mock(async () => undefined),
+    pruneChats: mock(async () => undefined),
+    search: mock(async ({ allowedChats }) => ({
+      results: allowedChats.map(({ chatId, transcriptViewId }) => ({
+        chatId,
+        transcriptViewId,
+        score: 1,
+        matchedMessageCount: 1,
+        snippets: [],
+      })),
+      index: {
+        indexedChatCount: allowedChats.length,
+        pendingChatCount: 0,
+        failedChatCount: 0,
+        unsupportedChatCount: 0,
       },
-      listChats: () => registrations,
-      service,
-    }),
-    service,
+    })),
+    disableAndDelete: mock(async () => undefined),
+    close: mock(async () => undefined),
   };
+  const ledger = {
+    currentView: mock((chatId) => views.get(chatId) ?? null),
+    currentRows: mock((chatId) => rows.get(chatId) ?? []),
+    subscribe: mock((candidate) => {
+      listener = candidate;
+      return () => { listener = null; };
+    }),
+  };
+  const logger = { warn: mock(() => undefined) };
+  const controller = new TranscriptSearchController({
+    listChatIds: () => [...views.keys()],
+    ledger,
+    service,
+    logger,
+  });
+  return { controller, ledger, listener: () => listener, logger, rows, service, views };
+}
+
+async function settle() {
+  await Bun.sleep(0);
+  await Bun.sleep(0);
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 describe('TranscriptSearchController', () => {
-  it('cleans shared search storage while disabled', async () => {
-    const { controller, service } = controllerFixture([], []);
+  it('indexes each current ledger view when enabled', async () => {
+    const test = harness();
 
-    await controller.initialize(false);
+    await test.controller.initialize(true);
 
-    expect(service.disableAndDelete).toHaveBeenCalledWith(expect.any(AbortSignal));
-  });
-
-  it('awaits Worker admission but resolves sources in a background catalog build', async () => {
-    let release;
-    const blockedSource = new Promise((resolve) => { release = resolve; });
-    const provider = integration('claude');
-    provider.transcript.resolveIndexSource = mock(() => blockedSource);
-    const { controller, service } = controllerFixture([provider], [registration('claude', 'chat-1')]);
-
-    await controller.start();
-
-    expect(service.enable).toHaveBeenCalledWith({
-      modules: [{
-        agentId: 'claude',
-        reference: { apiVersion: 1, moduleUrl: import.meta.url },
-      }],
-      signal: expect.any(AbortSignal),
-    });
-    expect(service.reconcile).not.toHaveBeenCalled();
-    release({ ownerId: 'claude', schemaVersion: 1, value: { nativePath: '/tmp/chat.jsonl' } });
-    await Bun.sleep(10);
-    expect(service.reconcile).toHaveBeenCalledWith({
-      generation: { epoch: 'operation-epoch', sequence: 1 },
-      chats: [expect.objectContaining({
-        chatId: 'chat-1',
-        source: { state: 'ready', reference: expect.objectContaining({ ownerId: 'claude' }) },
-      })],
-    });
-    await controller.close();
-  });
-
-  it('sends only a targeted payload-free dirty hint', async () => {
-    const { controller, service } = controllerFixture(
-      [integration('claude')],
-      [registration('claude', 'chat-1')],
-    );
-    await controller.start();
-
-    controller.sourceMayHaveChanged('chat-1');
-    controller.sourceMayHaveChanged('missing');
-
-    expect(service.sourceMayHaveChanged).toHaveBeenCalledTimes(1);
-    expect(service.sourceMayHaveChanged).toHaveBeenCalledWith({
+    expect(test.service.replaceChat).toHaveBeenCalledWith({
       chatId: 'chat-1',
-      generation: { epoch: 'operation-epoch', sequence: 1 },
+      transcriptViewId: 'view-1',
+      throughOrdinal: 2,
+      rows: [
+        expect.objectContaining({ ordinal: 1, role: 'user', body: 'hello' }),
+        expect.objectContaining({ ordinal: 2, role: 'assistant', body: 'world' }),
+      ],
     });
-    await controller.close();
+    expect(test.service.pruneChats).toHaveBeenCalledWith(['chat-1']);
   });
 
-  it('forwards one global search and defensively filters its result', async () => {
-    const service = createService({
-      search: mock(async () => ({
-        results: [
-          { chatId: 'allowed', score: 2, matchedMessageCount: 1, snippets: [] },
-          { chatId: 'outside', score: 1, matchedMessageCount: 1, snippets: [] },
-        ],
-        index: { ...emptyStatus, indexedChatCount: 1 },
-      })),
+  it('indexes only the committed suffix during normal appends', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.service.appendRows.mockClear();
+    const row = providerRow('view-1', 3, 'later');
+    test.rows.get('chat-1').push(row);
+
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [row] });
+    await settle();
+
+    expect(test.service.appendRows).toHaveBeenCalledWith({
+      chatId: 'chat-1',
+      transcriptViewId: 'view-1',
+      expectedAfterOrdinal: 2,
+      throughOrdinal: 3,
+      rows: [expect.objectContaining({ ordinal: 3, body: 'later' })],
     });
-    const { controller } = controllerFixture([], [], service);
-    await controller.start();
+  });
 
-    const response = await controller.search({ query: 'needle', allowedChatIds: ['allowed'] });
+  it('[TLV5-SEARCH.01-CORE-UNIT-01] indexes repeated ordinary commits only as ordered suffixes', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.service.appendRows.mockClear();
+    test.service.replaceChat.mockClear();
 
-    expect(response.results.map((result) => result.chatId)).toEqual(['allowed']);
-    expect(service.search).toHaveBeenCalledWith(expect.objectContaining({
-      allowedChatIds: ['allowed'],
-      limit: 20,
-      query: expect.objectContaining({ version: 1 }),
+    for (let ordinal = 3; ordinal <= 5; ordinal += 1) {
+      const row = providerRow('view-1', ordinal, `suffix-${ordinal}`);
+      test.rows.get('chat-1').push(row);
+      test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [row] });
+    }
+    await settle();
+
+    expect(test.service.appendRows.mock.calls.map(([input]) => ({
+      expectedAfterOrdinal: input.expectedAfterOrdinal,
+      throughOrdinal: input.throughOrdinal,
+      body: input.rows[0]?.body,
+    }))).toEqual([
+      { expectedAfterOrdinal: 2, throughOrdinal: 3, body: 'suffix-3' },
+      { expectedAfterOrdinal: 3, throughOrdinal: 4, body: 'suffix-4' },
+      { expectedAfterOrdinal: 4, throughOrdinal: 5, body: 'suffix-5' },
+    ]);
+    expect(test.service.replaceChat).not.toHaveBeenCalled();
+  });
+
+  it('advances the search watermark across non-searchable ledger rows', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.service.appendRows.mockClear();
+    const session = {
+      kind: 'session',
+      viewId: 'view-1',
+      ordinal: 3,
+      at: '2026-08-10T10:00:02.000Z',
+      detail: {
+        agentSessionId: 'session-1',
+        nativeSession: null,
+        nativeSeedReceipt: null,
+      },
+      providerMeta: null,
+    };
+    const terminal = {
+      kind: 'run-ended',
+      viewId: 'view-1',
+      ordinal: 4,
+      at: '2026-08-10T10:00:03.000Z',
+      outcome: 'finished',
+      origin: 'provider',
+      providerMeta: null,
+    };
+    const visible = providerRow('view-1', 5, 'after hidden rows');
+
+    test.listener()({
+      type: 'session',
+      chatId: 'chat-1',
+      viewId: 'view-1',
+      row: session,
+    });
+    test.listener()({
+      type: 'run-ended',
+      chatId: 'chat-1',
+      viewId: 'view-1',
+      runId: 'run-1',
+      row: terminal,
+    });
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [visible] });
+    await settle();
+
+    expect(test.service.appendRows.mock.calls.map(([input]) => ({
+      expectedAfterOrdinal: input.expectedAfterOrdinal,
+      throughOrdinal: input.throughOrdinal,
+      rows: input.rows,
+    }))).toEqual([
+      { expectedAfterOrdinal: 2, throughOrdinal: 3, rows: [] },
+      { expectedAfterOrdinal: 3, throughOrdinal: 4, rows: [] },
+      {
+        expectedAfterOrdinal: 4,
+        throughOrdinal: 5,
+        rows: [expect.objectContaining({ ordinal: 5, body: 'after hidden rows' })],
+      },
+    ]);
+  });
+
+  it('[TLV5-SEARCH.04-CORE-PERF-01] keeps long append series linear without rereading the transcript', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.ledger.currentRows.mockClear();
+    test.service.appendRows.mockClear();
+    test.service.replaceChat.mockClear();
+    const appendCount = 2_000;
+
+    for (let ordinal = 3; ordinal < 3 + appendCount; ordinal += 1) {
+      const row = providerRow('view-1', ordinal, `linear-suffix-${ordinal}`);
+      test.rows.get('chat-1').push(row);
+      test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [row] });
+    }
+    await settle();
+
+    expect(test.ledger.currentRows).not.toHaveBeenCalled();
+    expect(test.service.replaceChat).not.toHaveBeenCalled();
+    expect(test.service.appendRows).toHaveBeenCalledTimes(appendCount);
+    expect(test.service.appendRows.mock.calls.every(([input]) => input.rows.length === 1)).toBe(true);
+    expect(test.service.appendRows.mock.calls.at(-1)?.[0]).toMatchObject({
+      expectedAfterOrdinal: appendCount + 1,
+      throughOrdinal: appendCount + 2,
+      rows: [expect.objectContaining({ body: `linear-suffix-${appendCount + 2}` })],
+    });
+  });
+
+  it('resyncs a watermark gap without converting ordinary worker failures into replacements', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.service.appendRows.mockClear();
+    test.service.replaceChat.mockClear();
+
+    const gapRow = providerRow('view-1', 3, 'gap');
+    test.rows.get('chat-1').push(gapRow);
+    test.service.appendRows.mockRejectedValueOnce(new Error('SEARCH_INDEX_GAP'));
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [gapRow] });
+    await settle();
+
+    expect(test.service.replaceChat).toHaveBeenCalledTimes(1);
+    test.service.replaceChat.mockClear();
+
+    const failedRow = providerRow('view-1', 4, 'worker-failure');
+    const continuedRow = providerRow('view-1', 5, 'continued');
+    test.rows.get('chat-1').push(failedRow, continuedRow);
+    test.service.appendRows.mockRejectedValueOnce(new Error('disk unavailable'));
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [failedRow] });
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [continuedRow] });
+    await settle();
+
+    expect(test.service.replaceChat).not.toHaveBeenCalled();
+    expect(test.service.appendRows).toHaveBeenCalledWith(expect.objectContaining({
+      expectedAfterOrdinal: 4,
+      throughOrdinal: 5,
     }));
-    await controller.close();
-  });
-
-  it('deletes immediately and follows with a complete catalog', async () => {
-    const { controller, service } = controllerFixture(
-      [integration('claude')],
-      [registration('claude', 'chat-1')],
-    );
-    await controller.start();
-
-    controller.deleteChat('chat-1');
-
-    expect(service.deleteChat).toHaveBeenCalledWith({
+    expect(test.logger.warn).toHaveBeenCalledWith('Transcript search indexing job failed', {
       chatId: 'chat-1',
-      generation: { epoch: 'operation-epoch', sequence: 1 },
+      operation: 'append',
+      code: 'SEARCH_INDEX_UNAVAILABLE',
     });
-    await controller.close();
+    expect(JSON.stringify(test.logger.warn.mock.calls)).not.toContain('disk unavailable');
   });
 
-  it('reports failed admission as retryable and permits a later retry', async () => {
-    const service = createService();
-    service.enable.mockImplementationOnce(async () => {
-      throw new Error('reader unavailable');
+  it('does not rebuild a whole chat after its committed suffix is already queued', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.service.appendRows.mockClear();
+    test.service.replaceChat.mockClear();
+    const row = providerRow('view-1', 3, 'later');
+    test.rows.get('chat-1').push(row);
+
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [row] });
+    test.controller.catalogMayHaveChanged('chat-1');
+    await settle();
+
+    expect(test.service.appendRows).toHaveBeenCalledTimes(1);
+    expect(test.service.replaceChat).not.toHaveBeenCalled();
+  });
+
+  it('[TLV5-SEARCH.02-CORE-UNIT-01] absorbs a rejected indexing job and continues same-chat and cross-chat queues', async () => {
+    const fixture = fileURLToPath(new URL('./fixtures/rejected-index-job.ts', import.meta.url));
+    const child = Bun.spawn([process.execPath, fixture], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdout: 'pipe',
+      stderr: 'pipe',
     });
-    const { controller } = controllerFixture([], [], service);
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
 
-    await expect(controller.start()).rejects.toThrow('reader unavailable');
-    await expect(controller.search({ query: 'needle', allowedChatIds: [] }))
-      .rejects.toMatchObject({
-        code: 'SEARCH_INDEX_UNAVAILABLE',
-        retryable: true,
-      });
-    await controller.start();
+    expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: '', stderr: '' });
+  });
 
-    expect(service.enable).toHaveBeenCalledTimes(2);
-    await controller.close();
+  it('isolates a stalled chat while preserving that chat\'s append order', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.service.appendRows.mockClear();
+    const stalled = deferred();
+    const started = [];
+    test.service.appendRows.mockImplementation(async (input) => {
+      started.push(`${input.chatId}:${input.throughOrdinal}`);
+      if (input.chatId === 'chat-1' && input.throughOrdinal === 3) {
+        await stalled.promise;
+      }
+    });
+
+    const first = providerRow('view-1', 3, 'stalled-first');
+    const second = providerRow('view-1', 4, 'ordered-second');
+    const other = providerRow('view-2', 1, 'independent-chat');
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [first] });
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [second] });
+    test.listener()({ type: 'rows', chatId: 'chat-2', viewId: 'view-2', rows: [other] });
+    await settle();
+
+    expect(started).toEqual(['chat-1:3', 'chat-2:1']);
+
+    stalled.resolve();
+    await settle();
+    expect(started).toEqual(['chat-1:3', 'chat-2:1', 'chat-1:4']);
+  });
+
+  it('[TLV5-SEARCH.03-CORE-UNIT-01] replaces old-view entries before accepting new-view navigation', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    test.service.replaceChat.mockClear();
+    test.views.set('chat-1', { viewId: 'view-2', contentStartOrdinal: 1 });
+    test.rows.set('chat-1', [userRow('view-2', 1, 'reloaded')]);
+
+    test.listener()({
+      type: 'view-replaced',
+      chatId: 'chat-1',
+      previousViewId: 'view-1',
+      view: test.views.get('chat-1'),
+    });
+    await settle();
+
+    expect(test.controller.validateResultView('chat-1', 'view-1')).toBe(false);
+    expect(test.controller.validateResultView('chat-1', 'view-2')).toBe(true);
+    expect(test.service.replaceChat).toHaveBeenCalledWith(expect.objectContaining({
+      chatId: 'chat-1',
+      transcriptViewId: 'view-2',
+    }));
+  });
+
+  it('orders replacement after every already-queued old-view append', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    const append = deferred();
+    const order = [];
+    test.service.appendRows.mockImplementation(async () => {
+      order.push('append-start');
+      await append.promise;
+      order.push('append-end');
+    });
+    test.service.replaceChat.mockImplementation(async () => {
+      order.push('replace');
+    });
+    test.service.replaceChat.mockClear();
+    const oldRow = providerRow('view-1', 3, 'old tail');
+
+    test.listener()({ type: 'rows', chatId: 'chat-1', viewId: 'view-1', rows: [oldRow] });
+    await settle();
+    test.views.set('chat-1', { viewId: 'view-2', contentStartOrdinal: 1 });
+    test.rows.set('chat-1', [userRow('view-2', 1, 'reloaded')]);
+    test.listener()({
+      type: 'view-replaced',
+      chatId: 'chat-1',
+      previousViewId: 'view-1',
+      view: test.views.get('chat-1'),
+    });
+
+    expect(order).toEqual(['append-start']);
+    append.resolve();
+    await settle();
+    expect(order).toEqual(['append-start', 'append-end', 'replace']);
+  });
+
+  it('qualifies searches by each current transcript view', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+
+    const result = await test.controller.search({
+      query: 'hello',
+      allowedChatIds: ['chat-1', 'missing'],
+    });
+
+    expect(test.service.search).toHaveBeenCalledWith(expect.objectContaining({
+      allowedChats: [{ chatId: 'chat-1', transcriptViewId: 'view-1' }],
+    }));
+    expect(result.results).toEqual([
+      expect.objectContaining({ chatId: 'chat-1', transcriptViewId: 'view-1' }),
+    ]);
+  });
+
+  it('does not admit an old-view result when the transcript is replaced during the query', async () => {
+    const test = harness();
+    await test.controller.initialize(true);
+    const pending = deferred();
+    test.service.search.mockImplementation(() => pending.promise);
+
+    const result = test.controller.search({
+      query: 'hello',
+      allowedChatIds: ['chat-1'],
+    });
+    await settle();
+    test.views.set('chat-1', { viewId: 'view-2', contentStartOrdinal: 1 });
+    pending.resolve({
+      results: [{
+        chatId: 'chat-1',
+        transcriptViewId: 'view-1',
+        score: 1,
+        matchedMessageCount: 1,
+        snippets: [],
+      }],
+      index: {
+        indexedChatCount: 1,
+        pendingChatCount: 0,
+        failedChatCount: 0,
+        unsupportedChatCount: 0,
+      },
+    });
+
+    expect((await result).results).toEqual([]);
+  });
+
+  it('keeps healthy chats searchable when another ledger is fenced', async () => {
+    const test = harness();
+    test.views.set('chat-fenced', { viewId: 'view-fenced', contentStartOrdinal: 1 });
+    test.rows.set('chat-fenced', [userRow('view-fenced', 1, 'unavailable')]);
+    test.ledger.currentView.mockImplementation((chatId) => {
+      if (chatId === 'chat-fenced') throw new LedgerFencedError(chatId);
+      return test.views.get(chatId) ?? null;
+    });
+
+    await test.controller.initialize(true);
+    const result = await test.controller.search({
+      query: 'hello',
+      allowedChatIds: ['chat-1', 'chat-fenced'],
+    });
+
+    expect(test.service.replaceChat).toHaveBeenCalledTimes(1);
+    expect(test.service.deleteChat).toHaveBeenCalledWith('chat-fenced');
+    expect(test.service.pruneChats).toHaveBeenCalledWith(['chat-1', 'chat-fenced']);
+    expect(test.service.search).toHaveBeenCalledWith(expect.objectContaining({
+      allowedChats: [{ chatId: 'chat-1', transcriptViewId: 'view-1' }],
+    }));
+    expect(result.results).toEqual([
+      expect.objectContaining({ chatId: 'chat-1', transcriptViewId: 'view-1' }),
+    ]);
+    expect(result.index).toEqual({
+      indexedChatCount: 1,
+      pendingChatCount: 0,
+      failedChatCount: 1,
+      unsupportedChatCount: 0,
+    });
+    expect(test.controller.validateResultView('chat-fenced', 'view-fenced')).toBe(false);
   });
 });

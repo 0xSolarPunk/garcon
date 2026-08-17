@@ -36,10 +36,7 @@
 	import { ConversationFeedProjectionState } from './ConversationFeedProjectionState.svelte.js';
 	import { ConversationFeedRetentionState } from './ConversationFeedRetentionState.svelte.js';
 	import { ConversationFeedVirtualController } from './ConversationFeedVirtualController.svelte.js';
-	import type {
-		ConversationViewportIntentSource,
-		ConversationViewportPort,
-	} from '$lib/chat/transcript/conversation-viewport-port.js';
+	import type { ConversationViewportPort } from '$lib/chat/transcript/conversation-viewport-port.js';
 	import { ConversationFeedItemState } from './ConversationFeedItemState.svelte.js';
 	import {
 		ConversationFeedAnnouncementBatcher,
@@ -51,15 +48,16 @@
 	interface Props {
 		scrollContainer?: HTMLDivElement | null;
 		onscroll?: () => void;
-		onUserScrollIntent?: (
-			direction: 'earlier' | 'later' | null,
-			source?: ConversationViewportIntentSource,
-		) => boolean | void;
+		onUserScrollIntent?: (direction: 'earlier' | 'later' | null) => void;
 		onPermissionDecision?: (
-			permissionRequestId: string,
+			permissionOccurrenceId: string,
 			decision: PermissionDecisionPayload & { message?: string },
 		) => void;
-		onExitPlanMode?: (permissionRequestId: string, choice: string, plan: string) => void;
+		onExitPlanMode?: (
+			permissionOccurrenceId: string,
+			choice: string,
+			plan: string,
+		) => void;
 		pendingPermissionRequests?: PendingPermissionRequest[];
 		onRetry?: () => void;
 		onLoadEarlier?: () => void;
@@ -152,10 +150,7 @@
 		if (scrollbarPointerY === null || (event.buttons & 1) === 0) return;
 		const direction = conversationScrollbarScrollDirection(scrollbarPointerY, event.clientY);
 		scrollbarPointerY = event.clientY;
-		if (onUserScrollIntent?.(direction, 'scrollbar-drag') === true) {
-			event.preventDefault();
-			event.stopPropagation();
-		}
+		if (direction) onUserScrollIntent?.(direction);
 	}
 
 	function handleScrollbarWheel(event: WheelEvent): void {
@@ -165,7 +160,6 @@
 
 	function finishScrollbarPointerIntent(): void {
 		scrollbarPointerY = null;
-		virtualController.finishScrollbarDrag();
 	}
 
 	const feedScrollAreaClass = 'h-full overflow-hidden relative';
@@ -195,7 +189,7 @@
 			(request) => !request.chatId || request.chatId === chatState.activeChatId,
 		),
 	);
-	const floatingPendingPermissionRequests = $derived(
+	const projectedPendingPermissionRequests = $derived(
 		visiblePendingPermissionRequests(chatState.visibleRows, activePendingPermissionRequests),
 	);
 	const projectionState = new ConversationFeedProjectionState();
@@ -220,11 +214,12 @@
 			chatState.pageStates.earlier.status === 'error' ||
 			(chatState.pageStates.earlier.status === 'loading' &&
 				chatState.pageStates.earlier.error !== null),
-		showLaterBoundary: chatState.canLoadLater || chatState.pageStates.later.status !== 'idle',
+		showLaterBoundary: chatState.hasLaterMessages || chatState.pageStates.later.status !== 'idle',
 		reserveComposerTraySpace,
-		floatingPermissions:
-			floatingPendingPermissionRequests.length > 0 && onPermissionDecision
-				? floatingPendingPermissionRequests
+		transcriptViewId: chatState.getCursor().transcriptViewId,
+		pendingPermissions:
+			projectedPendingPermissionRequests.length > 0 && onPermissionDecision
+				? projectedPendingPermissionRequests
 				: EMPTY_PENDING_PERMISSIONS,
 	});
 	let projection = $state.raw(projectionState.reconcile(untrack(() => projectionInput)));
@@ -240,8 +235,8 @@
 			isLiveWindow: !chatState.hasLaterMessages,
 			detachedStatus: m.chat_feed_new_response_available(),
 			hiddenToolTypes: localSettings.hiddenToolTypes,
-			floatingPermissionIds: projectionInput.floatingPermissions.map(
-				(request) => request.permissionRequestId,
+			floatingPermissionOccurrences: projectionInput.pendingPermissions.map(
+				(request) => request.permissionOccurrenceId,
 			),
 		};
 		untrack(() => {
@@ -283,8 +278,8 @@
 
 	$effect.pre(() => {
 		const input = projectionInput;
-		const pendingPermissionIds = new Set(
-			activePendingPermissionRequests.map((request) => request.permissionRequestId),
+		const pendingPermissionOccurrences = new Set(
+			activePendingPermissionRequests.map((request) => request.permissionOccurrenceId),
 		);
 		untrack(() => {
 			const nextProjection = projectionState.reconcile(input);
@@ -298,7 +293,7 @@
 			itemState.reconcile(
 				input.surfaceIdentity,
 				new Set(input.rows.map((row) => row.id)),
-				pendingPermissionIds,
+				pendingPermissionOccurrences,
 			);
 		});
 	});
@@ -477,7 +472,7 @@
 		data-chat-feed-scrollbar
 		onpointerdowncapture={handleScrollbarPointerDownCapture}
 		onwheel={handleScrollbarWheel}
-		onpointermovecapture={handleScrollbarPointerMove}
+		onpointermove={handleScrollbarPointerMove}
 		onpointerup={finishScrollbarPointerIntent}
 		onpointercancel={finishScrollbarPointerIntent}
 		onlostpointercapture={finishScrollbarPointerIntent}

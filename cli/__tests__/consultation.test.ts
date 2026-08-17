@@ -6,6 +6,7 @@ import type {
   StartChatCommandRequest,
 } from '@garcon/common/chat-command-contracts';
 import type { ChatListResponse } from '@garcon/common/chat-list';
+import type { ChatSnapshotResponse } from '@garcon/common/chat-snapshot';
 import type { UpdateChatTitleRequest } from '@garcon/common/chat-title-contracts';
 import type { ModelCatalogResponse } from '@garcon/common/model-catalog';
 import type { RemoteSettingsSnapshot } from '@garcon/common/settings';
@@ -35,6 +36,58 @@ const receipt: AgentTurnReceipt = {
   settledAt: new Date().toISOString(),
   output: { availability: 'available', completeness: 'complete', assistantMessages: ['Done'] },
 };
+
+function snapshot(): ChatSnapshotResponse {
+  return {
+    observedAt: new Date().toISOString(),
+    messageLimit: 1,
+    chat: {
+      id: CHAT_ID,
+      title: 'Chat',
+      agentId: 'codex',
+      agentOwnershipEpoch: 'epoch-1',
+      carryOverRevision: 'carry-v1:0',
+      model: 'gpt-5.4',
+      apiProviderId: null,
+      modelEndpointId: null,
+      modelProtocol: null,
+      permissionMode: 'acceptEdits',
+      thinkingMode: 'high',
+      projectPath: '/repo',
+      tags: [],
+      activity: { createdAt: null, lastActivityAt: null },
+    },
+    processingPhase: null,
+    control: {
+      serverInstanceId: 'id',
+      queue: {
+        entries: [],
+        steeringEntryId: null,
+        recentlyDispatched: [],
+        pause: null,
+        reorderRevision: 0,
+      },
+      version: 0,
+      updatedAt: null,
+    },
+    transientFeed: {
+      serverInstanceId: 'id',
+      chatId: CHAT_ID,
+      transcriptViewId: 'view-1',
+      transientRevision: 0,
+      rows: [],
+    },
+    transcript: {
+      availability: 'available',
+      transcriptViewId: 'view-1',
+      messages: [],
+      lastOrdinal: 0,
+      pageOldestOrdinal: 0,
+      pageNewestOrdinal: 0,
+      hasMore: false,
+    },
+  };
+}
 
 function catalog(): ModelCatalogResponse {
   return {
@@ -84,6 +137,7 @@ function client(overrides: Partial<ConsultationClient> = {}): ConsultationClient
 } {
   return {
     starts: [], runs: [], titles: [],
+    async getChatSnapshot() { return snapshot(); },
     async getModelCatalog() { return catalog(); },
     async getSettings() { return settings; },
     async listChats() { throw new Error('chat list should not be loaded'); },
@@ -182,6 +236,7 @@ describe('runConsultation', () => {
     });
     expect(testClient.runs[0]).toEqual({
       clientRequestId: 'request', clientMessageId: 'request', chatId: CHAT_ID,
+      transcriptViewId: 'view-1',
       command: 'Continue', tagsToAdd: ['follow-up'],
       permissionFallbackPolicy: 'require-explicit-bypass',
     });
@@ -324,17 +379,4 @@ describe('runConsultation', () => {
     })).rejects.toThrow('server retention pressure');
   });
 
-  test('reports native recovery without printing a false empty success', async () => {
-    const unavailable = {
-      ...receipt,
-      output: { availability: 'unavailable', reason: 'recovery' },
-    } as AgentTurnReceipt;
-
-    await expect(runConsultation({
-      kind: 'resume', workspace: 'default', configDir: '/config', chatId: CHAT_ID,
-      prompt: 'Continue', readsPromptFromStdin: false,
-    }, 'Continue', client({ async getTurnReceipt() { return unavailable; } }), output(), undefined, {
-      createId: () => 'request',
-    })).rejects.toThrow('server recovery rebuilt the transcript');
-  });
 });

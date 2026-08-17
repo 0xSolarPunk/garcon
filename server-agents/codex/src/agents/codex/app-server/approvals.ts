@@ -2,13 +2,16 @@ import crypto from 'crypto';
 import {
   BashToolUseMessage,
   EditToolUseMessage,
+  PermissionCancelledMessage,
   PermissionRequestMessage,
   RequestPermissionsToolUseMessage,
 } from '@garcon/common/chat-types';
+import type { AgentLogger } from '@garcon/server-agent-interface';
+import { publishPermissionCancelled, type CodexOperation } from './operation-routes.js';
 import type { JsonRpcServerRequest } from './protocol.js';
 
 export interface CodexPendingApproval {
-  permissionRequestId: string;
+  permissionOccurrenceId: string;
   requestId: number;
   chatId: string;
   method: string;
@@ -27,7 +30,7 @@ export function isApprovalRequest(request: JsonRpcServerRequest): boolean {
 
 export function createPendingApproval(chatId: string, request: JsonRpcServerRequest): CodexPendingApproval {
   return {
-    permissionRequestId: `codex-${crypto.randomBytes(8).toString('hex')}`,
+    permissionOccurrenceId: crypto.randomUUID(),
     requestId: request.id,
     chatId,
     method: request.method,
@@ -37,30 +40,44 @@ export function createPendingApproval(chatId: string, request: JsonRpcServerRequ
 
 export function buildApprovalMessage(pending: CodexPendingApproval): PermissionRequestMessage {
   const now = new Date().toISOString();
-  const toolId = stringField(pending.params.itemId) || stringField(pending.params.callId) || pending.permissionRequestId;
+  const toolId = stringField(pending.params.itemId)
+    || stringField(pending.params.callId)
+    || pending.permissionOccurrenceId;
 
   if (pending.method === 'item/commandExecution/requestApproval') {
     const command = stringField(pending.params.command)
       || networkApprovalLabel(pending.params.networkApprovalContext)
       || stringField(pending.params.reason)
       || 'Command approval requested';
-    return new PermissionRequestMessage(now, pending.permissionRequestId, new BashToolUseMessage(now, toolId, command));
+    return new PermissionRequestMessage(
+      now,
+      pending.permissionOccurrenceId,
+      new BashToolUseMessage(now, toolId, command),
+    );
   }
 
   if (pending.method === 'execCommandApproval') {
     const command = Array.isArray(pending.params.command)
       ? pending.params.command.map(String).join(' ')
       : stringField(pending.params.reason) || 'Command approval requested';
-    return new PermissionRequestMessage(now, pending.permissionRequestId, new BashToolUseMessage(now, toolId, command));
+    return new PermissionRequestMessage(
+      now,
+      pending.permissionOccurrenceId,
+      new BashToolUseMessage(now, toolId, command),
+    );
   }
 
   if (pending.method === 'item/fileChange/requestApproval' || pending.method === 'applyPatchApproval') {
-    return new PermissionRequestMessage(now, pending.permissionRequestId, new EditToolUseMessage(now, toolId));
+    return new PermissionRequestMessage(
+      now,
+      pending.permissionOccurrenceId,
+      new EditToolUseMessage(now, toolId),
+    );
   }
 
   return new PermissionRequestMessage(
     now,
-    pending.permissionRequestId,
+    pending.permissionOccurrenceId,
     new RequestPermissionsToolUseMessage(
       now,
       toolId,
@@ -133,4 +150,28 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function stringField(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+// Each approval belongs to the operation that provoked it, so its cancellation is published
+// through that operation rather than batched behind whichever one happens to be current.
+export function cancelPendingApprovals(
+  logger: AgentLogger,
+  pending: Set<CodexPendingApproval & { client: object; operation: CodexOperation }>,
+  client: object,
+  reason: 'cancelled' | 'session-complete' | 'aborted',
+): void {
+  for (const approval of [...pending]) {
+    if (approval.client !== client) continue;
+    pending.delete(approval);
+    publishPermissionCancelled(
+      logger,
+      approval.chatId,
+      new PermissionCancelledMessage(
+        new Date().toISOString(),
+        approval.permissionOccurrenceId,
+        reason,
+      ),
+      approval.operation,
+    );
+  }
 }

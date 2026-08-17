@@ -37,11 +37,12 @@ import type { AgentHandoffService } from '../agents/agent-handoff-service.js';
 import type { ChatIdAllocator } from '../chats/chat-id-allocator.js';
 import type { ChatListProjector } from '../chats/chat-list-projector.js';
 import type { ForkChatFileCopyResult } from '../chats/fork-chat.js';
-import type { CarryOverTranscriptStore } from '../chats/carryover-transcript-store.js';
 import type { PathCache } from '../chats/path-cache.js';
-import type { PendingUserInputServiceContract } from '../chats/pending-user-input-service.js';
 import type { RecentTitleIconSource } from '../chats/recent-title-icons.js';
 import type { ChatRegistryEntry, IChatRegistry } from '../chats/store.js';
+import type { ChatTransientFeedStore } from '../chats/chat-transient-feed.js';
+import type { LedgerRowDraft } from '../ledger/contracts.js';
+import type { TranscriptLedgerService } from '../ledger/service.js';
 import {
   CommandExecutionControlError,
   withCurrentExecutionControl,
@@ -73,21 +74,6 @@ export interface MetadataDep {
   getChatMetadata(chatId: string): { firstMessage?: string | null } | null;
 }
 
-export type CarryOverDep = Pick<
-  CarryOverTranscriptStore,
-  'assertAvailable' | 'logicalMessageCount' | 'resolveCutoff'
->;
-
-export type PendingInputsDep = Pick<
-  PendingUserInputServiceContract,
-  | 'clearChat'
-  | 'hasInFlightForChat'
-  | 'markFailed'
-  | 'markUnconfirmed'
-  | 'reconcileNativeHistory'
-  | 'reconcileRetainedHistory'
->;
-
 export type AgentRegistryDep = Pick<
   AgentRegistryServiceContract,
   | 'hasAgent'
@@ -107,6 +93,8 @@ export type AgentRegistryDep = Pick<
   | 'supportsUpdateProjectPath'
   | 'requiresNativePathForProjectPathUpdate'
   | 'isAgentSessionRunning'
+  | 'currentTranscriptViewId'
+  | 'publishSessionFact'
   | 'forkAgentSession'
   | 'discardForkedAgentSession'
   | 'compactSession'
@@ -118,26 +106,32 @@ export type ForkChatFileCopyDep = (args: {
   sourceSession: ChatRegistryEntry;
   sourceChatId: string;
   targetChatId: string;
-  upToSequence?: number;
+  upToOrdinal?: number;
+  allowHandoffFork?: boolean;
   registry: IChatRegistry;
   settings: SettingsDep;
   metadata: MetadataDep;
-  carryOver: CarryOverDep;
+  ledger: TranscriptLedgerService;
   ownership: Pick<AgentOwnershipJournal, 'delete'>;
-  getViewCursor(chatId: string): { lastSeq: number } | null;
   forkAgentSession: (args: {
     sourceSession: ChatRegistryEntry;
     sourceChatId: string;
     targetChatId: string;
-    messageSequence?: number;
+    messageOrdinal?: number;
   }) => Promise<ForkedAgentSessionOutcome | null>;
   discardForkedAgentSession: (agentId: string, session: StartedAgentSession) => Promise<void>;
+  readForkedNativeHistory: (args: {
+    targetChatId: string;
+    sourceSession: ChatRegistryEntry;
+    fork: StartedAgentSession;
+  }) => Promise<LedgerRowDraft[] | null>;
 }) => Promise<ForkChatFileCopyResult>;
 
-export interface ChatViewSeqDep {
-  getNativeHistoryLastSeq(chatId: string): number | null;
-  getCursor(chatId: string): { generationId: string; lastSeq: number } | null;
-}
+export type ForkedNativeHistoryReaderDep = (args: {
+  targetChatId: string;
+  sourceSession: ChatRegistryEntry;
+  fork: StartedAgentSession;
+}) => Promise<LedgerRowDraft[] | null>;
 
 export interface FileMentionResolverDep {
   resolve(command: string, projectPath: string): Promise<string>;
@@ -146,28 +140,27 @@ export interface FileMentionResolverDep {
 export interface ChatCommandServiceDeps {
   chats: IChatRegistry;
   queue: ChatExecutionCommands;
-  chatViews: ChatViewSeqDep;
-  idleReconciler: { ensureReconciled(chatId: string): Promise<void> };
   ledger: CommandLedger;
   settings: SettingsDep;
   recentTitleIcons: RecentTitleIconSource;
   metadata: MetadataDep;
   agents: AgentRegistryDep;
-  pendingInputs: PendingInputsDep;
   fileMentions: FileMentionResolverDep;
   forkChatFileCopy: ForkChatFileCopyDep;
-  carryOver: CarryOverDep;
+  readForkedNativeHistory: ForkedNativeHistoryReaderDep;
+  transcripts: TranscriptLedgerService;
   chatIds: Pick<ChatIdAllocator, 'allocate'>;
   chatListProjector: Pick<ChatListProjector, 'buildOne'>;
   pathCache: Pick<PathCache, 'resolveProjectPath'>;
-  ownership: Pick<
-    AgentOwnershipJournal,
-    'delete' | 'abandonedTransferCleanups' | 'retryRetainedTransferCleanups'
-  >;
+  ownership: Pick<AgentOwnershipJournal, 'delete'>;
   handoffs: Pick<
     AgentHandoffService,
-    'resolveTarget' | 'createPreparation' | 'captureContinuationSegments'
+    | 'resolveTarget'
+    | 'createPreparation'
+    | 'seedContinuationLedger'
+    | 'deleteContinuationLedger'
   >;
+  transientFeeds: Pick<ChatTransientFeedStore, 'validateAction'>;
   chatMutationLock?: KeyedPromiseLock;
 }
 
@@ -176,6 +169,7 @@ export type SubmitForkRunInput = ForkRunCommandRequest;
 
 export interface NormalizedSubmitRunInput {
   chatId: string;
+  transcriptViewId?: string;
   command: string;
   images?: RunAgentTurnOptions['images'];
   clientRequestId: string;
@@ -189,6 +183,7 @@ export interface NormalizedSubmitRunInput {
 
 export interface NormalizedSubmitForkRunInput extends NormalizedSubmitRunInput {
   sourceChatId: string;
+  allowHandoffFork?: boolean;
 }
 
 export type ChatStartInput = StartChatCommandRequest;
@@ -230,6 +225,7 @@ export interface NormalizedChatStart {
 
 export interface ScheduledExistingChatInput {
   chatId: string;
+  transcriptViewId?: string;
   command: string;
   busyBehavior: 'queue' | 'skip';
   clientRequestId: string;
@@ -394,6 +390,17 @@ export class CommandSupport {
     );
   }
 
+  async assertCurrentTranscriptView(chatId: string, transcriptViewId: string): Promise<void> {
+    const currentTranscriptViewId = await this.deps.agents.currentTranscriptViewId(chatId);
+    if (currentTranscriptViewId === transcriptViewId) return;
+    throw new CommandValidationError(
+      'STALE_TRANSCRIPT_VIEW',
+      `Transcript view ${transcriptViewId} was replaced by ${currentTranscriptViewId}`,
+      409,
+      false,
+    );
+  }
+
   async projectCommandChat(chatId: string): Promise<import('../../common/chat-list.js').ChatListEntry> {
     const chat = await this.projectCommandChatIfPresent(chatId);
     if (chat) return chat;
@@ -509,6 +516,7 @@ export class CommandSupport {
       ...this.optionsWithoutAttachments(input.options),
       clientRequestId: ids.clientRequestId,
       clientMessageId: ids.clientMessageId,
+      ...(input.transcriptViewId ? { transcriptViewId: input.transcriptViewId } : {}),
       turnId: ledger.record.turnId ?? ids.turnId,
     };
     options.commandType = commandType;

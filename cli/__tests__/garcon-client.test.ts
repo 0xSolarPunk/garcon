@@ -62,6 +62,7 @@ function validSnapshot(overrides: Record<string, unknown> = {}): Record<string, 
       thinkingMode: 'high',
       projectPath: '/project',
       tags: ['cli'],
+      canReloadFromNativeHistory: false,
       activity: { createdAt: null, lastActivityAt: null },
     },
     processingPhase: null,
@@ -69,7 +70,6 @@ function validSnapshot(overrides: Record<string, unknown> = {}): Record<string, 
       serverInstanceId: connection.instanceId,
       queue: {
         entries: [],
-        dispatchingEntryId: null,
         steeringEntryId: null,
         recentlyDispatched: [],
         pause: null,
@@ -78,14 +78,22 @@ function validSnapshot(overrides: Record<string, unknown> = {}): Record<string, 
       version: 0,
       updatedAt: null,
     },
-    pendingUserInputs: [],
     transcript: {
       availability: 'available',
-      generationId: 'generation-1',
+      transcriptViewId: 'view-1',
       messages: [],
-      lastSeq: 0,
-      pageOldestSeq: 0,
+      lastOrdinal: 0,
+      pageOldestOrdinal: 0,
+      pageNewestOrdinal: 0,
+      nextBeforeOrdinal: null,
       hasMore: false,
+    },
+    transientFeed: {
+      serverInstanceId: connection.instanceId,
+      chatId: runRequest.chatId,
+      transcriptViewId: 'view-1',
+      transientRevision: 0,
+      rows: [],
     },
     ...overrides,
   };
@@ -120,6 +128,10 @@ describe('GarconClient', () => {
   test.each([
     ['chat ID', () => validSnapshot({
       chat: { ...validSnapshot().chat as object, id: '1785337200123457' },
+      transientFeed: {
+        ...validSnapshot().transientFeed as object,
+        chatId: '1785337200123457',
+      },
     })],
     ['message limit', () => validSnapshot({ messageLimit: 9 })],
     ['server instance', () => validSnapshot({
@@ -180,100 +192,6 @@ describe('GarconClient', () => {
     expect((await client.runChat(runRequest)).turnId).toBe('turn-1');
     expect(authorization).toBe('Bearer garcon_local_secret');
     expect(redirect).toBe('error');
-  });
-
-  test('submits a fenced native-history repair to the maintenance endpoint', async () => {
-    let observed: { url: string; method: string | undefined; body: unknown } | undefined;
-    const client = new GarconClient({
-      ...connection,
-      fetch: async (input, init) => {
-        observed = {
-          url: String(input),
-          method: init?.method,
-          body: JSON.parse(String(init?.body)),
-        };
-        return Response.json({
-          success: true,
-          action: 'accept-native',
-          chatId: runRequest.chatId,
-          receiptCleared: true,
-        });
-      },
-    });
-
-    await expect(client.repairHistory({
-      action: 'accept-native',
-      chatId: runRequest.chatId,
-      expectedCarryOverRevision: 'carry-v5:abc123',
-      expectedAgentOwnershipEpoch: 'epoch-1',
-    })).resolves.toMatchObject({ receiptCleared: true });
-
-    expect(observed).toEqual({
-      url: `${connection.baseUrl}/api/v1/chats/repair-history`,
-      method: 'POST',
-      body: {
-        action: 'accept-native',
-        chatId: runRequest.chatId,
-        expectedCarryOverRevision: 'carry-v5:abc123',
-        expectedAgentOwnershipEpoch: 'epoch-1',
-      },
-    });
-  });
-
-  test('submits an abandoned-release retry to the maintenance endpoint', async () => {
-    let observed: {
-      url: string;
-      method: string | undefined;
-      body: unknown;
-      hasDeadline: boolean;
-    } | undefined;
-    const client = new GarconClient({
-      ...connection,
-      fetch: async (input, init) => {
-        observed = {
-          url: String(input),
-          method: init?.method,
-          body: JSON.parse(String(init?.body)),
-          hasDeadline: init?.signal !== undefined,
-        };
-        return Response.json({
-          success: true,
-          action: 'retry-abandoned-release',
-          retried: [{ chatId: 'chat-a', agentId: 'claude', lastErrorCode: null }],
-          unresolved: [{ chatId: 'chat-b', agentId: 'codex', lastErrorCode: 'SOURCE_UNAVAILABLE' }],
-        });
-      },
-    });
-
-    await expect(client.repairHistory({ action: 'retry-abandoned-release' })).resolves.toEqual({
-      success: true,
-      action: 'retry-abandoned-release',
-      retried: [{ chatId: 'chat-a', agentId: 'claude', lastErrorCode: null }],
-      unresolved: [{ chatId: 'chat-b', agentId: 'codex', lastErrorCode: 'SOURCE_UNAVAILABLE' }],
-    });
-    expect(observed).toEqual({
-      url: `${connection.baseUrl}/api/v1/chats/repair-history`,
-      method: 'POST',
-      body: { action: 'retry-abandoned-release' },
-      // The route drains every retained record serially, so no fixed client
-      // deadline fits; only the caller's own signal may cancel.
-      hasDeadline: false,
-    });
-  });
-
-  test('rejects a malformed abandoned-release retry response', async () => {
-    const client = new GarconClient({
-      ...connection,
-      fetch: async () => Response.json({
-        success: true,
-        action: 'retry-abandoned-release',
-        retried: [{ chatId: 'chat-a' }],
-        unresolved: 'no',
-      }),
-    });
-
-    await expect(client.repairHistory({ action: 'retry-abandoned-release' }))
-      .rejects.toThrow('invalid history repair response');
   });
 
   test('updates a chat title through the existing workspace API', async () => {
@@ -641,7 +559,6 @@ describe('GarconClient', () => {
     serverInstanceId: 'instance',
     queue: {
       entries: [],
-      dispatchingEntryId: null,
       steeringEntryId: null,
       recentlyDispatched: [],
       pause: null,

@@ -33,11 +33,11 @@ import type {
   AcceptedQueueEntrySteerOutcome,
   CapturedSteerTarget,
   DirectTurnReservation,
-  PendingInputsPort,
-  PendingUserInputRegistrationOptions,
+  UserInputAdmissionOptions,
   QueueCommandMutationResult,
 } from './types.ts';
 import type { StoredChatExecutionControlState } from './control-state.ts';
+import { DuplicateGoalControlInputError } from './goal-control-delivery.ts';
 
 const logger = createLogger('accepted-input');
 
@@ -46,11 +46,12 @@ export interface AcceptedInputCoordinator {
   requestDrain(chatId: string, context: string): void;
   reserveDirect(chatId: string, turn: TurnIdentity): DirectTurnReservation;
   checkpoint(reservation: DirectTurnReservation): void;
-  registerPending(
+  admitInput(
     chatId: string,
     content: string,
-    options: PendingUserInputRegistrationOptions,
-  ): Promise<void>;
+    options: UserInputAdmissionOptions,
+  ): Promise<boolean>;
+  discardPreparedInput(chatId: string, clientMessageId: string | null | undefined): void;
   releaseDirect(reservation: DirectTurnReservation): Promise<void>;
   runDirect(
     reservation: DirectTurnReservation,
@@ -73,25 +74,20 @@ export interface AcceptedInputCoordinator {
     options: AgentSteerOptions,
     target: CapturedSteerTarget,
     afterPendingRegistered: (turnId: string) => Promise<void>,
-    notSentDisposition?: 'mark-failed' | 'queue-handler-settles',
   ): Promise<AcceptedSteerOutcome>;
-  hasAppliedCreate(chatId: string, commandKey: string, entryId: string): Promise<boolean>;
 }
 
 export interface AcceptedInputDeps {
   controls: ChatExecutionControlOperations;
-  pendingInputs: PendingInputsPort;
   coordinator: AcceptedInputCoordinator;
 }
 
 export class AcceptedInputHandler {
   readonly #controls: ChatExecutionControlOperations;
-  readonly #pendingInputs: PendingInputsPort;
   readonly #coordinator: AcceptedInputCoordinator;
 
   constructor(deps: AcceptedInputDeps) {
     this.#controls = deps.controls;
-    this.#pendingInputs = deps.pendingInputs;
     this.#coordinator = deps.coordinator;
   }
 
@@ -101,6 +97,13 @@ export class AcceptedInputHandler {
         input.command.chatId,
         input.content,
         { key: input.command.key, entryId: input.command.entryId },
+        {
+          clientMessageId: input.clientMessageId,
+          transcriptViewId: input.transcriptViewId,
+          ...(input.excludedResendOrdinals?.length
+            ? { excludedResendOrdinals: [...input.excludedResendOrdinals] }
+            : {}),
+        },
       );
       await input.settlement.settleQueueMutation(input.command, result.entryId);
       this.#coordinator.requestDrain(input.command.chatId, 'accepted enqueue');
@@ -167,6 +170,7 @@ export class AcceptedInputHandler {
 
   async schedule(input: AcceptedDirectInput): Promise<void> {
     const reservation = await this.#prepareDirect(input);
+    if (!reservation) return;
     this.#coordinator.trackDispatch(
       this.#coordinator.runDirect(reservation, input.content, input.options, input.dispatch).catch((error) => {
         logger.error('commands: run failed:', error instanceof Error ? error.message : String(error));
@@ -176,6 +180,7 @@ export class AcceptedInputHandler {
 
   async runInitial(input: AcceptedDirectInput): Promise<void> {
     const reservation = await this.#prepareDirect(input);
+    if (!reservation) return;
     await this.#coordinator.runDirect(
       reservation,
       input.content,
@@ -246,7 +251,8 @@ export class AcceptedInputHandler {
     }
     const delivery = {
       clientRequestId: input.command.clientRequestId,
-      clientMessageId: input.command.entryId,
+      clientMessageId: input.clientMessageId,
+      transcriptViewId: input.transcriptViewId,
       turnId,
     };
     let deliveryAccepted = false;
@@ -255,28 +261,21 @@ export class AcceptedInputHandler {
         input.command.chatId,
         input.content,
         delivery,
-        async () => {
-          await this.#controls.stageGoalControlFallback(
-            input.command.chatId,
-            input.content,
-            { key: input.command.key, entryId: input.command.entryId },
-            delivery,
-          );
-          try {
-            await input.settlement.markScheduled(input.command, turnId);
-          } catch (error) {
-            await this.#controls.removeSent(input.command.chatId, input.command.entryId);
-            throw error;
-          }
-        },
+        () => input.settlement.markScheduled(input.command, turnId),
       );
       if (delivered) {
         deliveryAccepted = true;
-        await this.#controls.removeSent(input.command.chatId, input.command.entryId);
         await input.settlement.settleGoalControl(input.command);
         return { delivery: 'active', control: await this.#controls.read(input.command.chatId) };
       }
     } catch (error) {
+      if (error instanceof DuplicateGoalControlInputError) {
+        await input.settlement.settleDuplicateInput(input.command);
+        return {
+          delivery: 'active',
+          control: await this.#controls.read(input.command.chatId),
+        };
+      }
       deliveryAccepted ||= error instanceof GoalControlDeliveryError && error.deliveryAccepted;
       await input.settlement.settleGoalControlFailure(input.command, error, deliveryAccepted);
       throw error;
@@ -284,6 +283,8 @@ export class AcceptedInputHandler {
     const queued = await this.enqueue({
       command: input.command,
       content: input.content,
+      clientMessageId: input.clientMessageId,
+      transcriptViewId: input.transcriptViewId,
       settlement: input.settlement,
     });
     return { delivery: 'queued', entryId: queued.entryId, control: queued.control };
@@ -298,11 +299,16 @@ export class AcceptedInputHandler {
         {
           clientRequestId: input.command.clientRequestId,
           clientMessageId: input.clientMessageId,
+          transcriptViewId: input.transcriptViewId,
         },
         input.target,
         (turnId) => input.settlement.markScheduled(input.command, turnId),
       );
-      await input.settlement.settleSteerSuccess(input.command, outcome.turnId);
+      if (outcome.duplicate) {
+        await input.settlement.settleDuplicateInput(input.command);
+      } else {
+        await input.settlement.settleSteerSuccess(input.command, outcome.turnId);
+      }
       return outcome;
     } catch (error) {
       await input.settlement.settleSteerFailure(input.command, error);
@@ -333,10 +339,10 @@ export class AcceptedInputHandler {
         {
           clientRequestId: input.command.clientRequestId,
           clientMessageId: input.clientMessageId,
+          transcriptViewId: input.transcriptViewId,
         },
         input.target,
         (turnId) => input.settlement.markScheduled(input.command, turnId),
-        'queue-handler-settles',
       );
     } catch (error) {
       const deliveryOutcome = error instanceof SteerDeliveryError ? error.outcome : 'not-sent';
@@ -354,7 +360,11 @@ export class AcceptedInputHandler {
     }
     this.#coordinator.requestDrain(input.command.chatId, 'queued steer consumed');
     try {
-      await input.settlement.settleSteerSuccess(input.command, outcome.turnId);
+      if (outcome.duplicate) {
+        await input.settlement.settleDuplicateInput(input.command);
+      } else {
+        await input.settlement.settleSteerSuccess(input.command, outcome.turnId);
+      }
     } catch (error) {
       logger.error('queued steer ledger settlement failed', {
         chatId: input.command.chatId,
@@ -417,7 +427,6 @@ export class AcceptedInputHandler {
   ): Promise<QueueEntrySteerError> {
     try {
       const control = await this.#controls.releaseSteer(input.command.chatId, input.command.entryId);
-      this.#pendingInputs.markFailed(input.command.chatId, input.command.clientRequestId);
       this.#coordinator.requestDrain(input.command.chatId, 'rejected queued steer released');
       const wrapped = this.#queueSteerError(error, 'not-sent', control);
       await this.#settleQueueSteerFailure(input, wrapped, 'not-sent');
@@ -434,12 +443,10 @@ export class AcceptedInputHandler {
           input.command.entryId,
           'completion-uncertain',
         );
-        this.#pendingInputs.markFailed(input.command.chatId, input.command.clientRequestId);
         const wrapped = this.#queueSteerError(error, 'not-sent', control);
         await this.#settleQueueSteerFailure(input, wrapped, 'not-sent');
         return wrapped;
       } catch (recoveryError) {
-        this.#pendingInputs.markFailed(input.command.chatId, input.command.clientRequestId);
         const wrapped = new QueueEntrySteerError(
           'QUEUE_STEER_RECOVERY_FAILED',
           QUEUE_STEER_RECOVERY_FAILED_MESSAGE,
@@ -538,33 +545,7 @@ export class AcceptedInputHandler {
     return error instanceof DomainError && error.code === 'SESSION_NOT_FOUND';
   }
 
-  async recoverGoalControl(input: AcceptedGoalControl): Promise<AcceptedGoalControlOutcome> {
-    const applied = await this.#coordinator.hasAppliedCreate(
-      input.command.chatId,
-      input.command.key,
-      input.command.entryId,
-    );
-    if (!applied) {
-      throw new DomainError(
-        'INTERNAL_ERROR',
-        'The previous goal-control delivery did not reach a recorded outcome',
-        409,
-      );
-    }
-    const control = await this.#controls.returnUnsent(
-      input.command.chatId,
-      input.command.entryId,
-    );
-    await input.settlement.settleQueueMutation(input.command, input.command.entryId);
-    this.#coordinator.requestDrain(input.command.chatId, 'recovered goal-control fallback');
-    return {
-      delivery: 'queued',
-      entryId: input.command.entryId,
-      control,
-    };
-  }
-
-  async #prepareDirect(input: AcceptedDirectInput): Promise<DirectTurnReservation> {
+  async #prepareDirect(input: AcceptedDirectInput): Promise<DirectTurnReservation | null> {
     let reservation: DirectTurnReservation;
     try {
       reservation = this.#coordinator.reserveDirect(input.command.chatId, input.options);
@@ -576,24 +557,25 @@ export class AcceptedInputHandler {
       this.#checkpoint(reservation);
       const control = await this.#checkpointAfter(reservation, this.#controls.read(input.command.chatId));
       assertDirectControlAvailable(control);
-        await this.#checkpointAfter(reservation, Promise.resolve(input.preparation?.prepare({
+      await this.#checkpointAfter(reservation, Promise.resolve(input.preparation?.prepare({
           signal: reservation.executionAdmission.signal,
           assertAdmissionActive: () => this.#checkpoint(reservation),
         })));
-      await this.#checkpointAfter(
+      const inserted = await this.#checkpointAfter(
         reservation,
-        this.#coordinator.registerPending(input.command.chatId, input.content, input.options),
+        this.#coordinator.admitInput(input.command.chatId, input.content, input.options),
       );
+      if (inserted === false) {
+        await input.settlement.settleDuplicateInput(input.command);
+        await this.#coordinator.releaseDirect(reservation);
+        return null;
+      }
       await this.#checkpointAfter(
         reservation,
         input.settlement.markScheduled(input.command, input.options.turnId!),
       );
       return reservation;
     } catch (error) {
-      this.#pendingInputs.markFailed(
-        input.command.chatId,
-        input.options.clientRequestId!,
-      );
       let failure: unknown = error;
       let retryable = true;
       let preserveForkPreparation = false;
@@ -611,6 +593,10 @@ export class AcceptedInputHandler {
         }
       }
       try {
+        this.#coordinator.discardPreparedInput(
+          input.command.chatId,
+          input.options.clientMessageId,
+        );
         await this.#coordinator.releaseDirect(reservation);
       } catch (releaseError) {
         failure = aggregateFailure(

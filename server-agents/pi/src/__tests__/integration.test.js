@@ -26,17 +26,13 @@ describe('PiAgentIntegration', () => {
     const integration = new PiAgentIntegration(host);
 
     expect(PiAgentIntegration.integrationId).toBe('pi');
-    expect(PiAgentIntegration.apiVersion).toBe(3);
-    expect(PiAgentIntegration.transcriptIndex.apiVersion).toBe(1);
+    expect(PiAgentIntegration.apiVersion).toBe(5);
     expect(integration.descriptor.id).toBe('pi');
     expect(integration.descriptor.supportsProjectPathUpdate).toBe(true);
     expect(integration.descriptor.requiresNativePathForProjectPathUpdate).toBe(true);
-    expect(integration.execution.prepareProjectPathUpdate).toBeDefined();
+    expect(integration.projectPathUpdates).toBeDefined();
     expect(integration.transcriptSearch).toBeUndefined();
-    expect(integration.forking).toMatchObject({
-      supportsAtMessage: false,
-      supportsWhileRunning: false,
-    });
+    expect(integration.forking).toBeNull();
     expect(integration.auth).toBeDefined();
     expect(integration.singleQuery).toBeDefined();
     expect(integration.steering).toMatchObject({
@@ -65,7 +61,7 @@ describe('PiAgentIntegration', () => {
       schemaVersion: 1,
       values: {},
     });
-    await expect(integration.transcript.resolveNativeSession({
+    await expect(integration.nativeSessions.resolveNativeSession({
       chat: {
         chatId: 'chat-1',
         agentId: 'pi',

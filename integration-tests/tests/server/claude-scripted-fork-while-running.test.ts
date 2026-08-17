@@ -4,7 +4,9 @@ import {
   claudeText,
   claudeToolUse,
 } from '../../support/fake-claude-model.js';
-import { GarconApiError } from '../../support/garcon-client.js';
+import {
+  forkAtMessageWhenPersisted,
+} from '../../support/fork-test-support.js';
 import {
   type IntegrationFixture,
   withIntegrationFixture,
@@ -32,7 +34,7 @@ describe('scripted Claude fork while running', () => {
     environment?.dispose();
   });
 
-  test('forks the native prefix, refuses a streamed point, then accepts it after settle', async () => {
+  test('forks streamed ledger points before and after native settlement', async () => {
     if (!environment) throw new Error('Scripted Claude environment was not initialized.');
     const testEnvironment = environment;
     const prompt = `SCRIPTED_CLAUDE_FORK_PROMPT_${crypto.randomUUID().replaceAll('-', '')}`;
@@ -66,11 +68,22 @@ describe('scripted Claude fork while running', () => {
       expect(messagesOfType(wholeFork.messages, 'assistant-message')
         .some((message) => message.content.includes(reply))).toBe(false);
 
-      await expectNativeHistoryRefusal(fixture.client.forkChat({
+      // A provider-native position is optional. The frozen ledger prefix is
+      // immediately forkable while the provider is still settling the turn.
+      const streamedForkId = fixture.newChatId();
+      await fixture.client.forkChat({
         sourceChatId,
-        chatId: fixture.newChatId(),
-        upToSeq: streamedBash.seq,
-      }));
+        chatId: streamedForkId,
+        transcriptViewId: (await fixture.client.getMessages(sourceChatId, { limit: 1 }))
+          .transcriptViewId,
+        upToOrdinal: streamedBash.ordinal,
+      });
+      const streamedFork = await fixture.client.getMessages(streamedForkId);
+      expect(userContents(streamedFork.messages)).toEqual([prompt]);
+      expect(messagesOfType(streamedFork.messages, 'bash-tool-use')
+        .some((message) => message.command === command)).toBe(true);
+      expect(messagesOfType(streamedFork.messages, 'assistant-message')
+        .some((message) => message.content.includes(reply))).toBe(false);
 
       await waitForVisibleResponse({
         fixture,
@@ -85,11 +98,7 @@ describe('scripted Claude fork while running', () => {
       if (!persistedBash) throw new Error('Claude did not persist the scripted command.');
 
       const recoveredForkId = fixture.newChatId();
-      await fixture.client.forkChat({
-        sourceChatId,
-        chatId: recoveredForkId,
-        upToSeq: persistedBash.seq,
-      });
+      await forkAtMessageWhenPersisted(fixture, sourceChatId, recoveredForkId, persistedBash.ordinal);
       const recovered = await fixture.client.getMessages(recoveredForkId);
       expect(userContents(recovered.messages)).toEqual([prompt]);
       expect(messagesOfType(recovered.messages, 'bash-tool-use')
@@ -107,7 +116,7 @@ async function waitForBash(
   fixture: IntegrationFixture,
   chatId: string,
   command: string,
-): Promise<{ seq: number }> {
+): Promise<{ ordinal: number }> {
   const deadline = Date.now() + LIVE_TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const page = await fixture.client.getMessages(chatId);
@@ -117,21 +126,4 @@ async function waitForBash(
     await Bun.sleep(POLL_INTERVAL_MS);
   }
   throw new Error(`Claude never rendered ${command}.`);
-}
-
-async function expectNativeHistoryRefusal(promise: Promise<unknown>): Promise<void> {
-  let failure: unknown;
-  try {
-    await promise;
-  } catch (error) {
-    failure = error;
-  }
-  expect(failure).toBeInstanceOf(GarconApiError);
-  expect(failure).toMatchObject({
-    status: 409,
-    body: {
-      errorCode: 'MESSAGE_NOT_IN_NATIVE_HISTORY',
-      retryable: true,
-    },
-  });
 }

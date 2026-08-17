@@ -1,14 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock } from 'bun:test';
 import crypto from 'node:crypto';
-import { promises as fs } from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { UserMessage } from '../../../common/chat-types.js';
 import { AgentHandoffService } from '../agent-handoff-service.ts';
-import { CarryOverTranscriptStore } from '../../chats/carryover-transcript-store.ts';
-import { carryOverRevision } from '../../chats/carryover-segments.ts';
-
-const timestamp = '2026-01-01T00:00:00.000Z';
 
 function envelope(ownerId) {
   return { ownerId, schemaVersion: 1, values: {} };
@@ -61,16 +53,6 @@ function handoff(agentId = 'target-agent') {
   };
 }
 
-function integration(agentId) {
-  return {
-    descriptor: { id: agentId },
-    settings: {
-      defaults: () => envelope(agentId),
-      parse: (value) => value,
-    },
-  };
-}
-
 function context() {
   return {
     signal: new AbortController().signal,
@@ -79,86 +61,360 @@ function context() {
 }
 
 describe('AgentHandoffService', () => {
-  let workspaceDir;
-  let carryOver;
-
-  beforeEach(async () => {
-    workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-handoff-service-'));
-    carryOver = new CarryOverTranscriptStore({ workspaceDir });
-    await carryOver.initialize();
-  });
-
-  afterEach(async () => {
-    await fs.rm(workspaceDir, { recursive: true, force: true });
-  });
-
-  it('preserves a committed segment when the journal fails after mutating the live registry entry', async () => {
-    const current = sourceChat();
-    const registry = { getChat: () => current };
-    let targetSegments;
-    const ownership = {
-      findHandoff: () => null,
-      beginHandoff: mock(async (input) => {
-        targetSegments = input.targetCarryOverSegments;
-        return handoffIntent(input, 'target-epoch');
-      }),
-      commitHandoff: mock(async () => {
-        Object.assign(current, {
-          agentId: 'target-agent',
-          agentOwnershipEpoch: 'target-epoch',
-          agentSessionId: null,
-          carryOverSegments: targetSegments,
-        });
-        throw new Error('journal follow-up write failed');
-      }),
-      compensateHandoff: mock(async () => {}),
+  it('copies a frozen conversational prefix into a target ledger', () => {
+    const ledger = {
+      currentView: mock(() => null),
+      highWatermark: mock(() => ({ viewId: 'view-1', ordinal: 3 })),
+      rowsThrough: mock(() => [
+        { kind: 'user-input', at: 't1', detail: { message: { type: 'user-message' } } },
+        { kind: 'notice', at: 't2', message: 'ignored', detail: {} },
+        { kind: 'provider-row', at: 't3', message: { type: 'assistant-message' }, providerMeta: {} },
+      ]),
+      initializeChat: mock(() => ({})),
+      deleteChat: mock(() => {}),
     };
-    const service = createService({ registry, ownership, carryOver });
-    const preparation = service.createPreparation({
+    const service = createService({ ledger });
+
+    const watermark = service.seedContinuationLedger({
+      sourceChatId: 'source',
+      targetChatId: 'target',
+    });
+
+    expect(watermark).toEqual({ viewId: 'view-1', ordinal: 3 });
+    expect(ledger.initializeChat).toHaveBeenCalledWith('target', [
+      expect.objectContaining({ kind: 'user-input', providerMeta: null }),
+      expect.objectContaining({ kind: 'provider-row', providerMeta: null }),
+    ], 3);
+  });
+
+  it('[TLV5-HANDOFF.01-CORE-UNIT-01] closes, checkpoints, decides, and rolls ownership forward in order', async () => {
+    const current = sourceChat();
+    const calls = [];
+    const state = handoffState(current, calls);
+    const ledger = ledgerState(calls);
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger,
+      reopenProducer: () => calls.push('reopen'),
+      onCommitted: mock(async () => calls.push('notify')),
+    });
+    const admission = context();
+
+    await service.createPreparation({
       chatId: 'chat',
       clientRequestId: 'request-1',
       handoff: handoff(),
       source: current,
       target: target(),
-    });
+    }).prepare(admission);
 
-    await expect(preparation.prepare(context())).rejects.toThrow('journal follow-up write failed');
-    await preparation.compensate();
-
+    expect(calls).toEqual([
+      'close',
+      'watermark',
+      'checkpoint',
+      'decision',
+      'close',
+      'marker',
+      'boundary',
+      'registry',
+      'complete',
+      'reopen',
+      'notify',
+    ]);
+    expect(admission.assertAdmissionActive).toHaveBeenCalledTimes(2);
+    expect(state.decided.watermark).toEqual({ viewId: 'view-1', ordinal: 7 });
     expect(current).toMatchObject({
       agentId: 'target-agent',
-      agentOwnershipEpoch: 'target-epoch',
-      carryOverSegments: targetSegments,
-    });
-    await expect(carryOver.readIndex(targetSegments[0].id)).resolves.toMatchObject({
-      id: targetSegments[0].id,
+      agentOwnershipEpoch: state.decided.target.agentOwnershipEpoch,
+      agentSessionId: null,
     });
   });
 
-  it('detects source ownership changes after native capture with a stable snapshot fence', async () => {
+  it('leaves the source authoritative when checkpoint verification fails', async () => {
     const current = sourceChat();
-    const registry = { getChat: () => current };
-    const beginHandoff = mock(async (input) => handoffIntent(input, 'target-epoch'));
-    const settledCapture = {
-      loadStable: mock(async () => {
-        current.agentOwnershipEpoch = 'new-owner-epoch';
-        return {
-          messages: [new UserMessage(timestamp, 'captured')],
-          revision: 'native-r1',
-        };
+    const calls = [];
+    const state = handoffState(current, calls);
+    const ledger = ledgerState(calls);
+    ledger.checkpointForHandoff = mock(() => { throw new Error('checkpoint busy'); });
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger,
+      reopenProducer: () => calls.push('reopen'),
+    });
+
+    await expect(service.createPreparation({
+      chatId: 'chat',
+      clientRequestId: 'request-1',
+      handoff: handoff(),
+      source: current,
+      target: target(),
+    }).prepare(context())).rejects.toThrow('checkpoint busy');
+
+    expect(state.ownership.decideHandoff).not.toHaveBeenCalled();
+    expect(calls).toEqual(['close', 'watermark', 'reopen']);
+    expect(current).toMatchObject({ agentId: 'source-agent', agentOwnershipEpoch: 'source-epoch' });
+  });
+
+  it('[TLV5-HANDOFF.03-CORE-UNIT-01] rolls a persisted decision forward without recapturing or checkpointing', async () => {
+    const current = sourceChat();
+    const calls = [];
+    const state = handoffState(current, calls);
+    state.setIntent(persistedIntent());
+    const ledger = ledgerState(calls);
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger,
+      reopenProducer: () => calls.push('reopen'),
+    });
+
+    await service.createPreparation({
+      chatId: 'chat',
+      clientRequestId: 'request-1',
+      handoff: handoff(),
+      source: current,
+      target: target(),
+    }).prepare(context());
+
+    expect(calls).toEqual(['close', 'marker', 'boundary', 'registry', 'complete', 'reopen']);
+    expect(ledger.highWatermark).not.toHaveBeenCalled();
+    expect(ledger.checkpointForHandoff).not.toHaveBeenCalled();
+  });
+
+  it('recovers every durable handoff through the ledger boundary', async () => {
+    const current = sourceChat();
+    const calls = [];
+    const state = handoffState(current, calls);
+    state.setIntent(persistedIntent());
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger: ledgerState(calls),
+      reopenProducer: () => calls.push('reopen'),
+    });
+
+    await service.recoverPendingHandoffs();
+
+    expect(calls).toEqual(['close', 'marker', 'boundary', 'registry', 'complete', 'reopen']);
+    expect(current.agentId).toBe('target-agent');
+  });
+
+  it('recovers later chats while an earlier handoff remains blocked', async () => {
+    const first = { ...persistedIntent(), chatId: 'chat-a', operationId: 'handoff-a' };
+    const second = { ...persistedIntent(), chatId: 'chat-b', operationId: 'handoff-b' };
+    let markSecondStarted;
+    const secondStarted = new Promise((resolve) => {
+      markSecondStarted = resolve;
+    });
+    let markSecondRecovered;
+    const secondRecovered = new Promise((resolve) => {
+      markSecondRecovered = resolve;
+    });
+    const ownership = {
+      pendingHandoffs: () => [first, second],
+      applyHandoffDecision: mock(async (operationId) => {
+        if (operationId === first.operationId) await secondStarted;
+        if (operationId === second.operationId) markSecondStarted();
       }),
-      assertRevision: mock(async () => {}),
+      completeHandoff: mock(async (operationId) => {
+        if (operationId === second.operationId) markSecondRecovered();
+      }),
     };
     const service = createService({
-      registry,
-      carryOver,
-      settledCapture,
-      ownership: {
-        findHandoff: () => null,
-        beginHandoff,
-        commitHandoff: mock(async () => {}),
-        compensateHandoff: mock(async () => {}),
-      },
+      ownership,
+      ledger: ledgerState([]),
+    });
+
+    const recovery = service.recoverPendingHandoffs();
+    await secondRecovered;
+    await recovery;
+
+    expect(ownership.completeHandoff).toHaveBeenCalledWith(second.operationId);
+  });
+
+  it('returns after one failed recovery attempt and retries that operation independently', async () => {
+    const first = { ...persistedIntent(), chatId: 'chat-a', operationId: 'handoff-a' };
+    const second = { ...persistedIntent(), chatId: 'chat-b', operationId: 'handoff-b' };
+    let firstAttempts = 0;
+    const completed = [];
+    const ownership = {
+      pendingHandoffs: () => [first, second],
+      applyHandoffDecision: mock(async (operationId) => {
+        if (operationId !== first.operationId) return;
+        firstAttempts += 1;
+        if (firstAttempts === 1) throw new Error('injected first recovery failure');
+      }),
+      completeHandoff: mock(async (operationId) => {
+        completed.push(operationId);
+      }),
+    };
+    const service = createService({
+      ownership,
+      ledger: ledgerState([]),
+    });
+
+    await service.recoverPendingHandoffs();
+
+    expect(firstAttempts).toBe(1);
+    expect(completed).toEqual([second.operationId]);
+
+    for (let attempt = 0; attempt < 100 && !completed.includes(first.operationId); attempt += 1) {
+      await Bun.sleep(5);
+    }
+    expect(firstAttempts).toBe(2);
+    expect(completed).toEqual([second.operationId, first.operationId]);
+  });
+
+  it('unrefs the timer for an independently retried handoff recovery', async () => {
+    const intent = persistedIntent();
+    let attempts = 0;
+    const ownership = {
+      pendingHandoffs: () => [intent],
+      applyHandoffDecision: mock(async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('injected recovery failure');
+      }),
+      completeHandoff: mock(async () => {}),
+    };
+    const timer = { unref: mock(() => undefined) };
+    const originalSetTimeout = globalThis.setTimeout;
+    let fireRetry = null;
+    globalThis.setTimeout = mock((callback) => {
+      fireRetry = callback;
+      return timer;
+    });
+    const service = createService({ ownership, ledger: ledgerState([]) });
+    const recovery = service.recoverPendingHandoffs();
+
+    try {
+      for (let tick = 0; tick < 20 && fireRetry === null; tick += 1) {
+        await Promise.resolve();
+      }
+      expect(fireRetry).toBeFunction();
+      expect(timer.unref).toHaveBeenCalledTimes(1);
+
+      fireRetry();
+      await recovery;
+      for (let tick = 0; tick < 20 && attempts < 2; tick += 1) {
+        await Promise.resolve();
+      }
+      expect(attempts).toBe(2);
+    } finally {
+      if (attempts < 2) fireRetry?.();
+      await recovery.catch(() => undefined);
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
+  it('cancels scheduled recovery retries during shutdown', async () => {
+    const intent = persistedIntent();
+    let attempts = 0;
+    const ownership = {
+      pendingHandoffs: () => [intent],
+      applyHandoffDecision: mock(async () => {
+        attempts += 1;
+        throw new Error('injected recovery failure');
+      }),
+      completeHandoff: mock(async () => {}),
+    };
+    const timer = { unref: mock(() => undefined) };
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let fireRetry = null;
+    globalThis.setTimeout = mock((callback) => {
+      fireRetry = callback;
+      return timer;
+    });
+    globalThis.clearTimeout = mock(() => undefined);
+    const service = createService({ ownership, ledger: ledgerState([]) });
+
+    try {
+      await service.recoverPendingHandoffs();
+      expect(fireRetry).toBeFunction();
+      expect(timer.unref).toHaveBeenCalledTimes(1);
+
+      service.shutdown();
+
+      expect(globalThis.clearTimeout).toHaveBeenCalledWith(timer);
+      fireRetry();
+      for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+      expect(attempts).toBe(1);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+  });
+
+  it('does not schedule a retry when an active recovery fails after shutdown', async () => {
+    const intent = persistedIntent();
+    let attempts = 0;
+    let markAttemptStarted;
+    const attemptStarted = new Promise((resolve) => {
+      markAttemptStarted = resolve;
+    });
+    let rejectAttempt;
+    const heldAttempt = new Promise((_, reject) => {
+      rejectAttempt = reject;
+    });
+    const ownership = {
+      pendingHandoffs: () => [intent],
+      applyHandoffDecision: mock(async () => {
+        attempts += 1;
+        markAttemptStarted();
+        await heldAttempt;
+      }),
+      completeHandoff: mock(async () => {}),
+    };
+    const timer = { unref: mock(() => undefined) };
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = mock(() => timer);
+    const service = createService({ ownership, ledger: ledgerState([]) });
+    const recovery = service.recoverPendingHandoffs();
+    let attemptReleased = false;
+
+    try {
+      await attemptStarted;
+      service.shutdown();
+      rejectAttempt(new Error('injected post-shutdown recovery failure'));
+      attemptReleased = true;
+      await recovery;
+
+      expect(globalThis.setTimeout).not.toHaveBeenCalled();
+      expect(attempts).toBe(1);
+    } finally {
+      if (!attemptReleased) {
+        rejectAttempt(new Error('test cleanup'));
+      }
+      await recovery.catch(() => undefined);
+      globalThis.setTimeout = originalSetTimeout;
+    }
+  });
+
+  it('stops decided handoff roll-forward retries during shutdown', async () => {
+    const current = sourceChat();
+    const calls = [];
+    const state = handoffState(current, calls);
+    let registryAttempts = 0;
+    let allowRecovery = false;
+    state.ownership.applyHandoffDecision = mock(async () => {
+      registryAttempts += 1;
+      if (!allowRecovery) throw new Error('injected decided handoff failure');
+    });
+    const timer = { unref: mock(() => undefined) };
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let fireRetry = null;
+    globalThis.setTimeout = mock((callback) => {
+      fireRetry = callback;
+      return timer;
+    });
+    globalThis.clearTimeout = mock(() => undefined);
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger: ledgerState(calls),
     });
     const preparation = service.createPreparation({
       chatId: 'chat',
@@ -166,109 +422,145 @@ describe('AgentHandoffService', () => {
       handoff: handoff(),
       source: current,
       target: target(),
-    });
+    }).prepare(context());
+    let outcome = null;
+    void preparation.then(
+      () => { outcome = 'resolved'; },
+      () => { outcome = 'rejected'; },
+    );
 
-    await expect(preparation.prepare(context())).rejects.toMatchObject({
-      code: 'STALE_CHAT_OWNERSHIP',
-      status: 409,
-    });
-    await preparation.compensate();
-    expect(beginHandoff).toHaveBeenCalledTimes(1);
-    expect(await segmentDirectories(workspaceDir)).toEqual([]);
+    try {
+      for (let tick = 0; tick < 20 && fireRetry === null; tick += 1) {
+        await Promise.resolve();
+      }
+      expect(fireRetry).toBeFunction();
+
+      service.shutdown();
+
+      for (let tick = 0; tick < 20 && outcome === null; tick += 1) {
+        await Promise.resolve();
+      }
+      expect(globalThis.clearTimeout).toHaveBeenCalledWith(timer);
+      expect(outcome).toBe('rejected');
+      fireRetry();
+      for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+      expect(registryAttempts).toBe(1);
+    } finally {
+      allowRecovery = true;
+      fireRetry?.();
+      await preparation.catch(() => undefined);
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
   });
 
-  it('resumes an existing prepared intent without recapturing or writing another segment', async () => {
+  it('[TLV5-HANDOFF.06-CORE-UNIT-01] adopts an existing switch marker after unrelated post-watermark rows', async () => {
     const current = sourceChat();
-    const registry = { getChat: () => current };
-    const segmentId = '7f1bb17c-0cc5-4a0d-b762-2c14b04c5f2e';
-    const prepared = await carryOver.prepareSegment({
-      operationId: 'existing-operation',
-      id: segmentId,
-      seedSanitation: 'not-applicable',
-      messages: [new UserMessage(timestamp, 'captured')],
+    const calls = [];
+    const state = handoffState(current, calls);
+    state.setIntent(persistedIntent());
+    const ledger = ledgerState(calls);
+    ledger.rowsAfter.mockReturnValue([
+      { kind: 'notice', ordinal: 8 },
+      {
+        kind: 'agent-switch',
+        ordinal: 9,
+        detail: {
+          fromAgentId: 'source-agent',
+          toAgentId: 'target-agent',
+          toModel: 'target-model',
+        },
+      },
+    ]);
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger,
     });
-    await prepared.commit();
-    prepared.releaseRoot();
-    const targetSegments = [{
-      id: segmentId,
+
+    await service.recoverPendingHandoffs();
+
+    expect(ledger.appendAgentSwitch).not.toHaveBeenCalled();
+    expect(ledger.advanceContentStart).toHaveBeenCalledWith('chat', 'view-1', 10);
+  });
+
+  it('fences a persisted switch marker that conflicts with the handoff decision', async () => {
+    const current = sourceChat();
+    const calls = [];
+    const state = handoffState(current, calls);
+    state.setIntent(persistedIntent());
+    const ledger = ledgerState(calls);
+    ledger.rowsAfter.mockReturnValue([{
+      kind: 'agent-switch',
+      ordinal: 8,
+      detail: {
+        fromAgentId: 'source-agent',
+        toAgentId: 'target-agent',
+        toModel: 'different-target-model',
+      },
+    }]);
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger,
+    });
+
+    await service.recoverPendingHandoffs();
+
+    expect(ledger.appendAgentSwitch).not.toHaveBeenCalled();
+    expect(ledger.advanceContentStart).not.toHaveBeenCalled();
+    expect(state.ownership.applyHandoffDecision).not.toHaveBeenCalled();
+    expect(state.ownership.completeHandoff).not.toHaveBeenCalled();
+    expect(current).toMatchObject({
       agentId: 'source-agent',
-      model: 'source-model',
-      capturedAt: timestamp,
-      storedMessageCount: 1,
-      visibleMessageCount: 1,
-      trailingHandoff: { agentId: 'target-agent', model: 'target-model' },
-    }];
-    const existing = handoffIntent({
-      operationId: 'existing-operation',
-      clientRequestId: 'request-1',
-      submittedTargetHash: hashTarget(handoff()),
-      chatId: 'chat',
-      source: current,
-      target: target(),
-      targetCarryOverSegments: targetSegments,
-    }, 'target-epoch');
-    const settledCapture = {
-      loadStable: mock(async () => { throw new Error('unexpected capture'); }),
-      assertRevision: mock(async () => {}),
-    };
-    const commitHandoff = mock(async () => {
-      Object.assign(current, {
-        agentId: 'target-agent',
-        agentOwnershipEpoch: 'target-epoch',
-        agentSessionId: null,
-        carryOverSegments: targetSegments,
-      });
+      agentOwnershipEpoch: 'source-epoch',
     });
-    const service = createService({
-      registry,
-      carryOver,
-      settledCapture,
-      ownership: {
-        findHandoff: () => existing,
-        beginHandoff: mock(async () => { throw new Error('unexpected begin'); }),
-        commitHandoff,
-        compensateHandoff: mock(async () => {}),
-      },
-    });
-    const preparation = service.createPreparation({
-      chatId: 'chat',
-      clientRequestId: 'request-1',
-      handoff: handoff(),
-      source: current,
-      target: target(),
-    });
-
-    await preparation.prepare(context());
-
-    expect(settledCapture.loadStable).not.toHaveBeenCalled();
-    expect(commitHandoff).toHaveBeenCalledWith('existing-operation', expect.any(Function));
-    expect(await segmentDirectories(workspaceDir)).toEqual([segmentId]);
   });
 
-  it('rejects a resumed request whose submitted handoff target differs', async () => {
+  it('fences duplicate matching switch markers instead of choosing one', async () => {
     const current = sourceChat();
-    const registry = { getChat: () => current };
-    const existing = handoffIntent({
-      operationId: 'existing-operation',
-      clientRequestId: 'request-1',
-      submittedTargetHash: hashTarget(handoff()),
-      chatId: 'chat',
-      source: current,
-      target: target(),
-      targetCarryOverSegments: [],
-    }, 'target-epoch');
-    const commitHandoff = mock(async () => {});
+    const calls = [];
+    const state = handoffState(current, calls);
+    state.setIntent(persistedIntent());
+    const ledger = ledgerState(calls);
+    const detail = {
+      fromAgentId: 'source-agent',
+      toAgentId: 'target-agent',
+      toModel: 'target-model',
+    };
+    ledger.rowsAfter.mockReturnValue([
+      { kind: 'agent-switch', ordinal: 8, detail },
+      { kind: 'agent-switch', ordinal: 9, detail },
+    ]);
     const service = createService({
-      registry,
-      carryOver,
-      ownership: {
-        findHandoff: () => existing,
-        beginHandoff: mock(async () => {}),
-        commitHandoff,
-        compensateHandoff: mock(async () => {}),
-      },
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger,
     });
-    const preparation = service.createPreparation({
+
+    await service.recoverPendingHandoffs();
+
+    expect(ledger.appendAgentSwitch).not.toHaveBeenCalled();
+    expect(ledger.advanceContentStart).not.toHaveBeenCalled();
+    expect(state.ownership.applyHandoffDecision).not.toHaveBeenCalled();
+    expect(state.ownership.completeHandoff).not.toHaveBeenCalled();
+    expect(current).toMatchObject({
+      agentId: 'source-agent',
+      agentOwnershipEpoch: 'source-epoch',
+    });
+  });
+
+  it('rejects a resumed request whose target differs from the durable decision', async () => {
+    const current = sourceChat();
+    const state = handoffState(current, []);
+    state.setIntent(persistedIntent());
+    const service = createService({
+      registry: { getChat: () => current },
+      ownership: state.ownership,
+      ledger: ledgerState([]),
+    });
+
+    await expect(service.createPreparation({
       chatId: 'chat',
       clientRequestId: 'request-1',
       handoff: handoff('other-agent'),
@@ -279,64 +571,16 @@ describe('AgentHandoffService', () => {
         model: 'other-agent-model',
         agentSettings: envelope('other-agent'),
       },
-    });
-
-    await expect(preparation.prepare(context())).rejects.toMatchObject({
+    }).prepare(context())).rejects.toMatchObject({
       code: 'IDEMPOTENCY_CONFLICT',
       status: 409,
     });
-    expect(commitHandoff).not.toHaveBeenCalled();
-  });
-
-  it('rejects quarantined history before resolving or preparing a handoff', async () => {
-    const current = {
-      ...sourceChat(),
-      carryOverMigrationQuarantine: {
-        artifactId: 'legacy-artifact',
-        errorCode: 'INVALID_CARRYOVER_ENTRY',
-      },
-    };
-    const beginHandoff = mock(async () => { throw new Error('unexpected begin'); });
-    const service = createService({
-      registry: { getChat: () => current },
-      carryOver,
-      ownership: {
-        findHandoff: () => null,
-        beginHandoff,
-        commitHandoff: mock(async () => {}),
-        compensateHandoff: mock(async () => {}),
-      },
-      ...targetResolutionDeps(),
-    });
-
-    await expect(service.resolveTarget({
-      chat: current,
-      handoff: handoff(),
-    })).rejects.toMatchObject({
-      code: 'CARRYOVER_HISTORY_UNAVAILABLE',
-      status: 422,
-      retryable: false,
-    });
-
-    const preparation = service.createPreparation({
-      chatId: 'chat',
-      clientRequestId: 'request-quarantined',
-      handoff: handoff(),
-      source: current,
-      target: target(),
-    });
-    await expect(preparation.prepare(context())).rejects.toMatchObject({
-      code: 'CARRYOVER_HISTORY_UNAVAILABLE',
-      status: 422,
-    });
-    expect(beginHandoff).not.toHaveBeenCalled();
   });
 
   it('requires an explicit target bypass mode under the CLI fallback policy', async () => {
     const current = sourceChat();
     const service = createService({
       registry: { getChat: () => current },
-      carryOver,
       ...targetResolutionDeps({ permissionModes: ['bypassPermissions'] }),
     });
     const request = handoff();
@@ -346,10 +590,7 @@ describe('AgentHandoffService', () => {
       chat: current,
       handoff: request,
       permissionFallbackPolicy: 'require-explicit-bypass',
-    })).rejects.toMatchObject({
-      code: 'EXPLICIT_BYPASS_REQUIRED',
-      status: 422,
-    });
+    })).rejects.toMatchObject({ code: 'EXPLICIT_BYPASS_REQUIRED', status: 422 });
 
     request.target.permissionMode = 'bypassPermissions';
     await expect(service.resolveTarget({
@@ -359,70 +600,132 @@ describe('AgentHandoffService', () => {
     })).resolves.toMatchObject({
       agentId: 'target-agent',
       permissionMode: 'bypassPermissions',
-      agentSettings: envelope('target-agent'),
-    });
-  });
-
-  it('validates target settings without requiring valid source execution settings', async () => {
-    const current = {
-      ...sourceChat(),
-      agentSettingsById: {},
-    };
-    const service = createService({
-      registry: { getChat: () => current },
-      carryOver,
-      ...targetResolutionDeps(),
-    });
-
-    await expect(service.resolveTarget({
-      chat: current,
-      handoff: handoff(),
-    })).resolves.toMatchObject({
-      agentId: 'target-agent',
-      model: 'target-model',
-      agentSettings: envelope('target-agent'),
-    });
-
-    const invalid = handoff();
-    invalid.target.agentSettings = envelope('source-agent');
-    await expect(service.resolveTarget({
-      chat: current,
-      handoff: invalid,
-    })).rejects.toMatchObject({
-      code: 'INCOMPLETE_EXECUTION_CONFIG',
-      status: 422,
     });
   });
 });
 
-function createService({
-  registry,
-  ownership,
-  carryOver,
-  settledCapture,
-  integrations: integrationRegistry,
-  endpointResolver,
-  catalog,
-} = {}) {
+function createService(overrides = {}) {
   const integrations = new Map([
     ['source-agent', integration('source-agent')],
     ['target-agent', integration('target-agent')],
   ]);
   return new AgentHandoffService({
-    registry,
-    ownership,
-    carryOver,
-    settledCapture: settledCapture ?? {
-      loadStable: mock(async () => ({
-        messages: [new UserMessage(timestamp, 'captured')],
-        revision: 'native-r1',
-      })),
-      assertRevision: mock(async () => {}),
+    registry: overrides.registry ?? { getChat: () => sourceChat() },
+    ownership: overrides.ownership ?? handoffState(sourceChat(), []).ownership,
+    ledger: overrides.ledger ?? ledgerState([]),
+    carryOver: overrides.carryOver ?? {},
+    capture: overrides.capture ?? {},
+    integrations: overrides.integrations ?? {
+      get: (agentId) => integrations.get(agentId),
+      require: (agentId) => integrations.get(agentId),
     },
-    integrations: integrationRegistry ?? { get: (agentId) => integrations.get(agentId) },
-    endpointResolver: endpointResolver ?? {},
-    catalog: catalog ?? {},
+    endpointResolver: overrides.endpointResolver ?? {},
+    catalog: overrides.catalog ?? {},
+    reopenProducer: overrides.reopenProducer ?? (() => {}),
+    onCommitted: overrides.onCommitted,
   });
+}
+
+function handoffState(current, calls) {
+  let intent = null;
+  let decided = null;
+  const ownership = {
+    findHandoff: () => intent,
+    pendingHandoffs: () => intent ? [intent] : [],
+    decideHandoff: mock(async (input) => {
+      calls.push('decision');
+      intent = {
+        version: 5,
+        operationId: input.operationId,
+        clientRequestId: input.clientRequestId,
+        submittedTargetHash: input.submittedTargetHash,
+        kind: 'handoff',
+        chatId: input.chatId,
+        phase: 'commit-decided',
+        source: {
+          agentId: input.source.agentId,
+          agentOwnershipEpoch: input.source.agentOwnershipEpoch,
+        },
+        target: {
+          execution: input.target,
+          agentOwnershipEpoch: input.targetAgentOwnershipEpoch,
+        },
+        watermark: input.watermark,
+        createdAt: '2026-01-01T00:00:00.000Z',
+      };
+      decided = intent;
+      return intent;
+    }),
+    applyHandoffDecision: mock(async () => {
+      calls.push('registry');
+      Object.assign(current, {
+        agentId: intent.target.execution.agentId,
+        agentOwnershipEpoch: intent.target.agentOwnershipEpoch,
+        agentSessionId: null,
+        nativeSession: null,
+        nativeSeedReceipt: null,
+      });
+      return { id: 'chat', ...current };
+    }),
+    completeHandoff: mock(async () => {
+      calls.push('complete');
+      intent = null;
+    }),
+  };
+  return {
+    ownership,
+    get decided() { return decided; },
+    setIntent(value) { intent = value; },
+  };
+}
+
+function ledgerState(calls) {
+  return {
+    closeProducer: mock(() => calls.push('close')),
+    highWatermark: mock(() => {
+      calls.push('watermark');
+      return { viewId: 'view-1', ordinal: 7 };
+    }),
+    checkpointForHandoff: mock(() => {
+      calls.push('checkpoint');
+      return { viewId: 'view-1', ordinal: 7 };
+    }),
+    rowsAfter: mock(() => []),
+    appendAgentSwitch: mock(() => {
+      calls.push('marker');
+      return { kind: 'agent-switch', ordinal: 8 };
+    }),
+    advanceContentStart: mock(() => {
+      calls.push('boundary');
+      return {};
+    }),
+  };
+}
+
+function persistedIntent() {
+  return {
+    version: 5,
+    operationId: 'agent-handoff:existing',
+    clientRequestId: 'request-1',
+    submittedTargetHash: hashTarget(handoff()),
+    kind: 'handoff',
+    chatId: 'chat',
+    phase: 'commit-decided',
+    source: { agentId: 'source-agent', agentOwnershipEpoch: 'source-epoch' },
+    target: { execution: target(), agentOwnershipEpoch: 'target-epoch' },
+    watermark: { viewId: 'view-1', ordinal: 7 },
+    createdAt: '2026-01-01T00:00:00.000Z',
+  };
+}
+
+function integration(agentId) {
+  return {
+    descriptor: { id: agentId },
+    settings: {
+      defaults: () => envelope(agentId),
+      parse: (value) => value,
+    },
+  };
 }
 
 function targetResolutionDeps({ permissionModes = ['default'] } = {}) {
@@ -451,36 +754,6 @@ function targetResolutionDeps({ permissionModes = ['default'] } = {}) {
   };
 }
 
-function handoffIntent(input, targetEpoch) {
-  return {
-    version: 3,
-    operationId: input.operationId,
-    clientRequestId: input.clientRequestId,
-    submittedTargetHash: input.submittedTargetHash,
-    kind: 'handoff',
-    chatId: input.chatId,
-    phase: 'segment-prepared',
-    source: {
-      agentId: input.source.agentId,
-      model: input.source.model,
-      sessionId: input.source.agentSessionId,
-      agentOwnershipEpoch: input.source.agentOwnershipEpoch,
-      carryOverRevision: carryOverRevision(
-        input.source.carryOverSegments,
-        input.source.carryOverMigrationQuarantine,
-      ),
-      nativeSeedReceipt: input.source.nativeSeedReceipt,
-      reference: {},
-    },
-    target: {
-      execution: input.target,
-      agentOwnershipEpoch: targetEpoch,
-      carryOverSegments: input.targetCarryOverSegments,
-    },
-    createdAt: timestamp,
-  };
-}
-
 function hashTarget(request) {
   return crypto.createHash('sha256').update(stableStringify(request.target)).digest('hex');
 }
@@ -493,8 +766,4 @@ function stableStringify(value) {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
     .join(',')}}`;
-}
-
-async function segmentDirectories(workspaceDir) {
-  return (await fs.readdir(path.join(workspaceDir, 'carryover-transcripts', 'segments'))).sort();
 }

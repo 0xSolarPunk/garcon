@@ -26,15 +26,32 @@ export interface ChatSearchRequest {
   limit?: number;
 }
 
+export interface TranscriptSearchAllowedChat {
+  readonly chatId: string;
+  readonly transcriptViewId: string;
+}
+
 export interface ChatSearchSnippet {
-  messageOrdinal: number;
+  ordinal: number;
   role: ChatSearchSnippetRole;
   timestamp: string | null;
   text: string;
 }
 
+export interface ChatSearchNavigateRequest {
+  readonly chatId: string;
+  readonly transcriptViewId: string;
+  readonly ordinal: number;
+}
+
+export interface ChatSearchNavigateResponse {
+  readonly chatId: string;
+  readonly ordinal: number;
+}
+
 export interface ChatSearchResult {
   chatId: string;
+  transcriptViewId: string;
   score: number;
   matchedMessageCount: number;
   snippets: ChatSearchSnippet[];

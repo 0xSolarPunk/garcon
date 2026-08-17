@@ -3,7 +3,6 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   ChatMessagesMessage,
-  PendingUserInputUpdatedMessage,
 } from '../../../../common/ws-events.js';
 import {
   assistantContents,
@@ -19,6 +18,8 @@ import {
   exactReplyPrompt,
   expectAssistantMarker,
   expectFinished,
+  expectNoCompletionReply,
+  foldableReplyPrompt,
   liveMarker as marker,
   LIVE_TURN_TIMEOUT_MS as TURN_TIMEOUT_MS,
   waitForVisibleResponse as waitForVisibleClaudeResponse,
@@ -92,19 +93,18 @@ describe('live Claude lifecycle', () => {
         timeoutMs: TURN_TIMEOUT_MS,
       })).type);
 
-      const successor = await fixture.client.waitForEvent(
-        (event): event is PendingUserInputUpdatedMessage =>
-          event.type === 'pending-user-input-updated'
-          && event.input.chatId === chatId
-          && event.input.content === successorPrompt
-          && typeof event.input.turnId === 'string',
-        'live Claude post-background successor identity',
+      const successor = await fixture.client.waitForCommittedUserInput(
+        chatId,
+        successorPrompt,
         { afterIndex: queueCursor, timeoutMs: TURN_TIMEOUT_MS },
       );
       expectFinished((await fixture.client.waitForTurnTerminal(
         chatId,
-        successor.input.turnId,
-        { afterIndex: queueCursor, timeoutMs: TURN_TIMEOUT_MS },
+        undefined,
+        {
+          afterIndex: fixture.client.events().lastIndexOf(successor) + 1,
+          timeoutMs: TURN_TIMEOUT_MS,
+        },
       )).type);
 
       const transcript = await fixture.client.getMessages(chatId);
@@ -133,7 +133,7 @@ describe('live Claude lifecycle', () => {
         `After it succeeds, reply with exactly ${firstMarker}.`,
         'Do not run any other command.',
       ].join(' ');
-      const secondPrompt = exactReplyPrompt(secondMarker);
+      const secondPrompt = foldableReplyPrompt(secondMarker);
       const firstCursor = fixture.client.markEvents();
       const first = await fixture.client.startChat(liveClaudeStartRequest({
         chatId: parentChatId,
@@ -165,19 +165,18 @@ describe('live Claude lifecycle', () => {
         afterIndex: firstCursor,
         timeoutMs: TURN_TIMEOUT_MS,
       })).type);
-      const secondInput = await fixture.client.waitForEvent(
-        (event): event is PendingUserInputUpdatedMessage =>
-          event.type === 'pending-user-input-updated'
-          && event.input.chatId === parentChatId
-          && event.input.content === secondPrompt
-          && typeof event.input.turnId === 'string',
-        'live Claude queued turn identity',
+      const secondInput = await fixture.client.waitForCommittedUserInput(
+        parentChatId,
+        secondPrompt,
         { afterIndex: queueCursor, timeoutMs: TURN_TIMEOUT_MS },
       );
       expectFinished((await fixture.client.waitForTurnTerminal(
         parentChatId,
-        secondInput.input.turnId,
-        { afterIndex: queueCursor, timeoutMs: TURN_TIMEOUT_MS },
+        undefined,
+        {
+          afterIndex: fixture.client.events().lastIndexOf(secondInput) + 1,
+          timeoutMs: TURN_TIMEOUT_MS,
+        },
       )).type);
 
       const parentAfterQueue = await fixture.client.getMessages(parentChatId);
@@ -217,7 +216,8 @@ describe('live Claude lifecycle', () => {
       await fixture.client.forkChat({
         sourceChatId: parentChatId,
         chatId: pointChatId,
-        upToSeq: firstAssistant.seq,
+        transcriptViewId: parentAfterQueue.transcriptViewId,
+        upToOrdinal: firstAssistant.ordinal,
       });
       const pointMarker = marker('POINT_FORK');
       const pointPrompt = exactReplyPrompt(pointMarker);
@@ -282,12 +282,15 @@ describe('live Claude lifecycle', () => {
         parentContinuationPrompt,
       ]);
       expect(userContents(pointTranscript.messages)).toEqual([firstPrompt, pointPrompt]);
-      expect(userContents(childTranscript.messages)).toEqual([
+      expectPromptsInOrder(userContents(childTranscript.messages), [
         firstPrompt,
         secondPrompt,
         childPrompt,
       ]);
-      expect(userContents(grandchildTranscript.messages)).toEqual([
+      // These are native forks, so their feeds are Claude's own record of the sessions they
+      // resume from. A fork-run dispatched while an earlier prompt is unanswered is sent as one
+      // folded prompt, so a single row can carry two of these; the order is what must hold.
+      expectPromptsInOrder(userContents(grandchildTranscript.messages), [
         firstPrompt,
         secondPrompt,
         childPrompt,
@@ -332,29 +335,21 @@ describe('live Claude lifecycle', () => {
         command: prompt,
       }));
 
-      const permissionEvent = await fixture.client.waitForEvent(
-        (event): event is ChatMessagesMessage =>
-          event.type === 'chat-messages'
-          && event.chatId === chatId
-          && event.messages.some((entry) =>
-            entry.message.type === 'permission-request'
-            && entry.message.requestedTool.type === 'bash-tool-use'
-            && entry.message.requestedTool.command.includes(toolCommand)),
-        'live Claude Bash permission request',
+      const permissionRequest = await fixture.client.waitForTransientPermission(
+        chatId,
+        (row) => row.message.type === 'permission-request'
+          && row.message.requestedTool.type === 'bash-tool-use'
+          && row.message.requestedTool.command.includes(toolCommand),
         { afterIndex: cursor, timeoutMs: TURN_TIMEOUT_MS },
       );
-      const permissionRequest = permissionEvent.messages.find((entry) =>
-        entry.message.type === 'permission-request'
-        && entry.message.requestedTool.type === 'bash-tool-use'
-        && entry.message.requestedTool.command.includes(toolCommand));
-      if (permissionRequest?.message.type !== 'permission-request') {
+      if (permissionRequest.message.type !== 'permission-request') {
         throw new Error('Live Claude permission request was not found.');
       }
-      const permissionRequestId = permissionRequest.message.permissionRequestId;
+      const permissionOccurrenceId = permissionRequest.message.permissionOccurrenceId;
       const decision = await fixture.client.sendPermissionDecision({
         clientRequestId: crypto.randomUUID(),
         chatId,
-        permissionRequestId,
+        permissionOccurrenceId,
         allow: true,
         alwaysAllow: false,
       });
@@ -369,10 +364,10 @@ describe('live Claude lifecycle', () => {
       });
       const beforeRestart = await fixture.client.getMessages(chatId);
       const permission = messagesOfType(beforeRestart.messages, 'permission-request').find(
-        (message) => message.permissionRequestId === permissionRequestId,
+        (message) => message.permissionOccurrenceId === permissionOccurrenceId,
       );
       const resolution = messagesOfType(beforeRestart.messages, 'permission-resolved').find(
-        (message) => message.permissionRequestId === permissionRequestId,
+        (message) => message.permissionOccurrenceId === permissionOccurrenceId,
       );
       const bash = messagesOfType(beforeRestart.messages, 'bash-tool-use').find(
         (message) => message.command.includes(toolCommand),
@@ -381,17 +376,17 @@ describe('live Claude lifecycle', () => {
       const result = messagesOfType(beforeRestart.messages, 'tool-result').find(
         (message) => message.toolId === bash.toolId,
       );
-      expect(permission?.requestedTool.type).toBe('bash-tool-use');
+      expect(permission?.permissionOccurrenceId).toBe(permissionOccurrenceId);
       expect(resolution?.allowed).toBe(true);
       expect(result?.isError).toBe(false);
       expect(JSON.stringify(result?.content)).toContain(toolMarker);
       const bashSeq = beforeRestart.messages.find((entry) =>
-        entry.message.type === 'bash-tool-use' && entry.message.toolId === bash.toolId)?.seq;
+        entry.message.type === 'bash-tool-use' && entry.message.toolId === bash.toolId)?.ordinal;
       const resultSeq = beforeRestart.messages.find((entry) =>
-        entry.message.type === 'tool-result' && entry.message.toolId === bash.toolId)?.seq;
+        entry.message.type === 'tool-result' && entry.message.toolId === bash.toolId)?.ordinal;
       const responseSeq = beforeRestart.messages.find((entry) =>
         entry.message.type === 'assistant-message'
-        && entry.message.content.includes(toolMarker))?.seq;
+        && entry.message.content.includes(toolMarker))?.ordinal;
       expect(resultSeq).toBeGreaterThan(bashSeq ?? Number.MAX_SAFE_INTEGER);
       expect(responseSeq).toBeGreaterThan(resultSeq ?? Number.MAX_SAFE_INTEGER);
       expect(countUserContent(beforeRestart.messages, prompt)).toBe(1);
@@ -421,29 +416,21 @@ describe('live Claude lifecycle', () => {
         chatId,
         command: deniedPrompt,
       }));
-      const deniedPermissionEvent = await fixture.client.waitForEvent(
-        (event): event is ChatMessagesMessage =>
-          event.type === 'chat-messages'
-          && event.chatId === chatId
-          && event.messages.some((entry) =>
-            entry.message.type === 'permission-request'
-            && entry.message.requestedTool.type === 'bash-tool-use'
-            && entry.message.requestedTool.command.includes(deniedToolCommand)),
-        'live Claude denied Bash permission request',
+      const deniedPermission = await fixture.client.waitForTransientPermission(
+        chatId,
+        (row) => row.message.type === 'permission-request'
+          && row.message.requestedTool.type === 'bash-tool-use'
+          && row.message.requestedTool.command.includes(deniedToolCommand),
         { afterIndex: deniedCursor, timeoutMs: TURN_TIMEOUT_MS },
       );
-      const deniedPermission = deniedPermissionEvent.messages.find((entry) =>
-        entry.message.type === 'permission-request'
-        && entry.message.requestedTool.type === 'bash-tool-use'
-        && entry.message.requestedTool.command.includes(deniedToolCommand));
-      if (deniedPermission?.message.type !== 'permission-request') {
+      if (deniedPermission.message.type !== 'permission-request') {
         throw new Error('Live Claude denied permission request was not found.');
       }
-      const deniedPermissionId = deniedPermission.message.permissionRequestId;
+      const deniedPermissionId = deniedPermission.message.permissionOccurrenceId;
       expect((await fixture.client.sendPermissionDecision({
         clientRequestId: crypto.randomUUID(),
         chatId,
-        permissionRequestId: deniedPermissionId,
+        permissionOccurrenceId: deniedPermissionId,
         allow: false,
         alwaysAllow: false,
       })).status).toBe('accepted');
@@ -454,7 +441,7 @@ describe('live Claude lifecycle', () => {
 
       const afterDenial = await fixture.client.getMessages(chatId);
       const deniedResolution = messagesOfType(afterDenial.messages, 'permission-resolved').find(
-        (message) => message.permissionRequestId === deniedPermissionId,
+        (message) => message.permissionOccurrenceId === deniedPermissionId,
       );
       const deniedBash = messagesOfType(afterDenial.messages, 'bash-tool-use').find(
         (message) => message.command.includes(deniedToolCommand),
@@ -549,8 +536,10 @@ describe('live Claude lifecycle', () => {
         && event.chatId === chatId
         && event.outcome === 'interrupt-requested'
         && event.intent === 'stop');
-      expect(stoppingIndex).toBeGreaterThanOrEqual(0);
-      expect(outcomeIndex).toBeGreaterThan(stoppingIndex);
+      expect(outcomeIndex).toBeGreaterThanOrEqual(0);
+      // Stopping is sampled from stop-in-flight state rather than emitted per stop, so a stop
+      // that settles between samples never reports it. Its ordering only binds when observed.
+      if (stoppingIndex >= 0) expect(outcomeIndex).toBeGreaterThan(stoppingIndex);
       expect(stopEvents).not.toContainEqual(expect.objectContaining({
         type: 'agent-run-failed',
         chatId,
@@ -639,25 +628,24 @@ describe('live Claude lifecycle', () => {
         cancelledCount: 0,
         stillQueuedCount: 0,
       });
-      const successorInput = await fixture.client.waitForEvent(
-        (event): event is PendingUserInputUpdatedMessage =>
-          event.type === 'pending-user-input-updated'
-          && event.input.chatId === chatId
-          && event.input.content === successorPrompt
-          && typeof event.input.turnId === 'string',
-        'live Claude interrupt successor identity',
+      const successorInput = await fixture.client.waitForCommittedUserInput(
+        chatId,
+        successorPrompt,
         { afterIndex: interruptCursor, timeoutMs: TURN_TIMEOUT_MS },
       );
       expectFinished((await fixture.client.waitForTurnTerminal(
         chatId,
-        successorInput.input.turnId,
-        { afterIndex: interruptCursor, timeoutMs: TURN_TIMEOUT_MS },
+        undefined,
+        {
+          afterIndex: fixture.client.events().lastIndexOf(successorInput) + 1,
+          timeoutMs: TURN_TIMEOUT_MS,
+        },
       )).type);
 
       const transcript = await fixture.client.getMessages(chatId);
       expect(countUserContent(transcript.messages, successorPrompt)).toBe(1);
       expectAssistantMarker(assistantContents(transcript.messages), successorMarker);
-      expect(assistantContents(transcript.messages).join('\n')).not.toContain('SHOULD_NOT_COMPLETE');
+      expectNoCompletionReply(assistantContents(transcript.messages), 'SHOULD_NOT_COMPLETE');
       expect((await fixture.client.getExecutionControl(chatId)).queue.entries).toEqual([]);
 
       const stoppedStarted = join(fixture.dirs.project, '.claude-stop-started');
@@ -740,9 +728,12 @@ describe('live Claude lifecycle', () => {
         event.type === 'chat-processing-updated'
         && event.chatId === chatId
         && event.phase === null);
-      expect(stoppingIndex).toBeGreaterThanOrEqual(0);
-      expect(outcomeIndex).toBeGreaterThan(stoppingIndex);
-      expect(idleIndex).toBeGreaterThan(stoppingIndex);
+      expect(outcomeIndex).toBeGreaterThanOrEqual(0);
+      expect(idleIndex).toBeGreaterThan(outcomeIndex);
+      if (stoppingIndex >= 0) {
+        expect(outcomeIndex).toBeGreaterThan(stoppingIndex);
+        expect(idleIndex).toBeGreaterThan(stoppingIndex);
+      }
       expect(stopEvents).not.toContainEqual(expect.objectContaining({
         type: 'agent-run-failed',
         chatId,
@@ -754,8 +745,10 @@ describe('live Claude lifecycle', () => {
       });
 
       const stoppedTranscript = await fixture.client.getMessages(chatId);
-      expect(assistantContents(stoppedTranscript.messages).join('\n'))
-        .not.toContain('STOPPED_TURN_SHOULD_NOT_COMPLETE');
+      expectNoCompletionReply(
+        assistantContents(stoppedTranscript.messages),
+        'STOPPED_TURN_SHOULD_NOT_COMPLETE',
+      );
       const stoppedBash = messagesOfType(stoppedTranscript.messages, 'bash-tool-use')
         .findLast((message) => message.command.includes(stoppedCommand));
       if (!stoppedBash) throw new Error('Live Claude stopped Bash tool use was not rendered.');
@@ -796,6 +789,17 @@ async function waitForFile(path: string): Promise<void> {
     await Bun.sleep(25);
   }
   throw new Error('Timed out waiting for the live Claude command marker.');
+}
+
+// A row may carry more than one prompt when a fork-run folds an unanswered one into its own,
+// so the cursor stays on a matching row rather than advancing past it.
+function expectPromptsInOrder(rows: readonly string[], prompts: readonly string[]): void {
+  let cursor = 0;
+  for (const prompt of prompts) {
+    const index = rows.findIndex((row, position) => position >= cursor && row.includes(prompt));
+    expect(index).toBeGreaterThanOrEqual(0);
+    cursor = index;
+  }
 }
 
 interface PersistedClaudeChat {

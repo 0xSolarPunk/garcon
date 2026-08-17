@@ -13,25 +13,19 @@ import {
   type AgentIntegration,
 } from '@garcon/server-agent-interface';
 import { createModelCatalog } from '@garcon/server-agent-common/catalog/model-catalog';
-import { resolveAgentStandaloneEntrypoint } from '@garcon/server-agent-common/build/standalone-entrypoint';
 import { classifyDirectIntegrationError } from '@garcon/server-agent-common/direct/errors';
 import { DirectExecution } from '@garcon/server-agent-common/direct/execution';
+import { createDirectLegacyHistoryImport } from '@garcon/server-agent-common/direct/legacy-history-import';
 import { relocateLegacySessionDirectory } from '@garcon/server-agent-common/direct/legacy-session-relocation';
 import { createDirectAnthropicRuntime } from '@garcon/server-agent-common/direct/router';
-import { createDirectSessionPaths } from '@garcon/server-agent-common/direct/session-paths';
-import {
-  createDirectTranscript,
-} from '@garcon/server-agent-common/direct/transcript';
-import { createDirectCompatibleTranscriptSource } from '@garcon/server-agent-common/direct/transcript-source';
 import { resolveAgentEndpoint } from '@garcon/server-agent-common/execution/resolve-endpoint';
-import { createJsonlForking } from '@garcon/server-agent-common/forking/jsonl-forking';
 import { createIntegrationLifecycle } from '@garcon/server-agent-common/lifecycle/integration-lifecycle';
 import { createVersion1RecordMigration } from '@garcon/server-agent-common/migration/version-1-record-migration';
-import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
 import { createVersionedSettings } from '@garcon/server-agent-common/settings/versioned-settings';
 import { singleQueryRuntimeOptions } from '@garcon/server-agent-common/shared/single-query-control';
+import { createAgentProducerAdapter } from '@garcon/server-agent-common/execution/producer-adapter';
 
-const SESSIONS_LABEL = 'anthropic-compatible-sessions';
+const LEGACY_SESSIONS_NAMESPACE = 'anthropic-compatible-sessions';
 
 const DESCRIPTOR = {
   id: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
@@ -48,16 +42,7 @@ const DESCRIPTOR = {
 
 export default class DirectAnthropicCompatibleIntegration implements AgentIntegration {
   static readonly integrationId = DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID;
-  static readonly apiVersion = 3 as const;
-  static readonly transcriptIndex = {
-    apiVersion: 1,
-    moduleUrl: resolveAgentStandaloneEntrypoint({
-      integrationId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
-      name: 'transcript-index-source',
-      sourceUrl: new URL('./transcript-index-source.ts', import.meta.url),
-    }),
-  } as const;
-
+  static readonly apiVersion = 5 as const;
   readonly descriptor = DESCRIPTOR;
   readonly attachments = {
     fileMimeTypes: [
@@ -66,7 +51,12 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
     ],
   } as const;
   readonly execution;
-  readonly transcript;
+  readonly legacyHistoryImport;
+  readonly nativeHistoryImport = null;
+  readonly nativeActivity = null;
+  readonly nativeSessions = null;
+  readonly sessionConfiguration = null;
+  readonly projectPathUpdates: NonNullable<AgentIntegration['projectPathUpdates']>;
   readonly catalog;
   readonly settings;
   readonly lifecycle;
@@ -74,32 +64,20 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
   readonly auth: NonNullable<AgentIntegration['auth']>;
   readonly commands = null;
   readonly compaction = null;
-  readonly forking;
+  readonly forking = null;
   readonly steering = null;
   readonly goals = null;
   readonly endpoints: NonNullable<AgentIntegration['endpoints']>;
   readonly singleQuery: NonNullable<AgentIntegration['singleQuery']>;
 
   constructor(host: AgentHost) {
-    const nativeSessions = createPathNativeSessionCodec(
-      DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
-    );
-    const sessionPaths = createDirectSessionPaths(
-      host.storage.rootDirectory,
-      SESSIONS_LABEL,
-    );
     const runtime = createDirectAnthropicRuntime({
-      runtimeId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
       runtimeLabel: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_LABEL,
-      sessionPaths,
-      logger: host.logger,
     });
-    const reader = createDirectCompatibleTranscriptSource({
-      agentId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
-      sessionLabel: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_LABEL,
-      findSessionFilePath: sessionPaths.findSessionFilePath,
-      logger: host.logger,
-    });
+    this.legacyHistoryImport = createDirectLegacyHistoryImport(
+      host,
+      LEGACY_SESSIONS_NAMESPACE,
+    );
 
     this.settings = createVersionedSettings({
       ownerId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
@@ -107,12 +85,11 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
       defaults: {},
       descriptors: [],
     });
-    this.execution = new DirectExecution(host, runtime, nativeSessions);
-    this.transcript = createDirectTranscript({
-      ownerId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
-      reader,
-      nativeSessions,
-    });
+    const providerExecution = new DirectExecution(host, runtime);
+    this.projectPathUpdates = {
+      prepare: (request) => providerExecution.prepareProjectPathUpdate(request),
+    };
+    this.execution = createAgentProducerAdapter(providerExecution, host.logger).execution;
     this.catalog = createModelCatalog({
       logger: host.logger,
       defaultModel: '',
@@ -120,18 +97,13 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
       requiresStrictModelDiscovery: false,
       generation: { priority: 20, model: '' },
     });
-    this.migration = createVersion1RecordMigration({ settings: this.settings, nativeSessions });
+    this.migration = createVersion1RecordMigration({ settings: this.settings, nativeSessions: null });
     this.auth = {
       async status(signal) {
         signal.throwIfAborted();
         return { authenticated: false, canReauth: false, label: '', source: 'none' };
       },
     };
-    this.forking = createJsonlForking({
-      supportsWhileRunning: false,
-      transcript: this.transcript,
-      nativeSessions,
-    });
     this.endpoints = {
       async validate(selection) {
         if (selection.protocol !== 'anthropic-messages') {
@@ -165,7 +137,11 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
       },
     };
     this.lifecycle = createIntegrationLifecycle({
-      migrateOwnedStorage: (store) => relocateLegacySessionDirectory(host, store, SESSIONS_LABEL),
+      migrateOwnedStorage: (store) => relocateLegacySessionDirectory(
+        host,
+        store,
+        LEGACY_SESSIONS_NAMESPACE,
+      ),
       start: () => runtime.startPurgeTimer(),
       stop: async () => {
         runtime.shutdown();

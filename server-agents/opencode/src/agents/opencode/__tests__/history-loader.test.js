@@ -9,13 +9,34 @@ import {
 } from '@garcon/common/chat-types';
 import {
   getOpenCodePreviewFromSessionId,
+  loadLegacyOpenCodeChatMessages,
   loadOpenCodeChatMessages,
+  loadRequiredOpenCodeChatMessages,
 } from '../history-loader.js';
 import { FILE_CONTEXT_SEPARATOR } from '@garcon/server-agent-common/shared/file-mention-context';
 import { getNativeMessageRevisionSource } from '@garcon/server-agent-common/shared/native-message-source';
+import { convertOpenCodeEventToChatMessages } from '../event-converter.js';
 
 let originalError;
 let originalWarn;
+
+const invalidImportPartCases = [
+  ['user text missing', 'user', { type: 'text' }],
+  ['user text non-string', 'user', { type: 'text', text: 17 }],
+  ['assistant text missing', 'assistant', { type: 'text' }],
+  ['assistant text non-string', 'assistant', { type: 'text', text: 17 }],
+  ['reasoning payloads missing', 'assistant', { type: 'reasoning' }],
+  ['reasoning non-string', 'assistant', { type: 'reasoning', reasoning: false }],
+  ['reasoning fallback text non-string', 'assistant', { type: 'reasoning', text: 17 }],
+  ['reasoning carriers non-string', 'assistant', { type: 'reasoning', reasoning: false, text: 17 }],
+];
+
+function storedImportMessage(id, role, parts) {
+  return {
+    info: { id, role, time: { created: '2026-08-16T00:00:00.000Z' } },
+    parts,
+  };
+}
 
 beforeEach(() => {
   originalError = console.error;
@@ -36,14 +57,14 @@ describe('OpenCode history loader', () => {
         messages: mock(() => Promise.resolve({
           data: [
             {
-              info: { id: 'message-user-1', role: 'user', time: { created: '2026-07-04T00:00:00.000Z' } },
+              info: { role: 'user', time: { created: '2026-07-04T00:00:00.000Z' } },
               parts: [{
                 type: 'text',
                 text: `hello${FILE_CONTEXT_SEPARATOR}secret file context`,
               }],
             },
             {
-              info: { id: 'message-assistant-1', role: 'assistant', time: { created: '2026-07-04T00:00:01.000Z' } },
+              info: { role: 'assistant', time: { created: '2026-07-04T00:00:01.000Z' } },
               parts: [
                 { type: 'reasoning', reasoning: 'thinking' },
                 { type: 'text', text: 'world' },
@@ -92,15 +113,55 @@ describe('OpenCode history loader', () => {
     expect(messages[6]).toBeInstanceOf(ToolResultMessage);
     expect(messages[6].toolId).toBe('tool-2');
     expect(messages[6].isError).toBe(true);
-    expect(messages.map((message) => getNativeMessageRevisionSource(message))).toEqual([
-      { entryId: 'message-user-1', withinSourceOrdinal: 0 },
-      { entryId: 'message-assistant-1', withinSourceOrdinal: 0 },
-      { entryId: 'message-assistant-1', withinSourceOrdinal: 1 },
-      { entryId: 'message-assistant-1', withinSourceOrdinal: 2 },
-      { entryId: 'message-assistant-1', withinSourceOrdinal: 3 },
-      { entryId: 'message-assistant-1', withinSourceOrdinal: 4 },
-      { entryId: 'message-assistant-1', withinSourceOrdinal: 5 },
+  });
+
+  it('carries stable part and message identities identically for stored and live rows', async () => {
+    const getClient = mock(() => Promise.resolve({
+      session: {
+        messages: mock(() => Promise.resolve({
+          data: [
+            {
+              info: { id: 'msg_user', role: 'user', time: { created: '2026-07-04T00:00:00.000Z' } },
+              parts: [{ id: 'prt_u1', type: 'text', text: 'prompt' }],
+            },
+            {
+              info: { id: 'msg_a', role: 'assistant', time: { created: '2026-07-04T00:00:01.000Z' } },
+              parts: [
+                { id: 'prt_think', type: 'reasoning', reasoning: 'why' },
+                { id: 'prt_tool', type: 'tool', tool: 'bash', callID: 'tool-1', state: { status: 'completed', input: { command: 'pwd' }, output: 'ok' } },
+                { id: 'prt_text', type: 'text', text: 'done' },
+              ],
+            },
+          ],
+        })),
+      },
+    }));
+    const stored = await loadOpenCodeChatMessages('session-1', getClient);
+    const storedTuples = stored.map((message) => getNativeMessageRevisionSource(message));
+    expect(storedTuples).toEqual([
+      { entryId: 'msg_user', withinSourceOrdinal: 0 },
+      { entryId: 'prt_think', withinSourceOrdinal: 0 },
+      { entryId: 'prt_tool', withinSourceOrdinal: 0 },
+      { entryId: 'prt_tool', withinSourceOrdinal: 1 },
+      { entryId: 'prt_text', withinSourceOrdinal: 0 },
     ]);
+
+    // Live conversion of the same parts yields identical identity tuples in
+    // the same order, so audits match without type or content guessing.
+    const turn = {
+      assistantPartTypes: new Map(),
+      messageRoles: new Map(),
+      publishedPartIds: new Set(),
+    };
+    const logger = { debug() {}, info() {}, warn() {}, error() {} };
+    const live = [
+      { type: 'message.part.updated', properties: { part: { id: 'prt_think', messageID: 'msg_a', role: 'assistant', type: 'reasoning', text: 'why' } } },
+      { type: 'message.part.updated', properties: { part: { id: 'prt_tool', messageID: 'msg_a', role: 'assistant', type: 'tool', tool: 'bash', callID: 'tool-1', state: { status: 'completed', input: { command: 'pwd' }, output: 'ok' } } } },
+      { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_a', role: 'assistant', type: 'text', text: 'done' } } },
+    ].flatMap((event) => convertOpenCodeEventToChatMessages(event, turn, logger) ?? []);
+    expect(live.map((message) => getNativeMessageRevisionSource(message))).toEqual(
+      storedTuples.slice(1),
+    );
   });
 
   it('hides provider-owned compaction messages and an overflow replay', async () => {
@@ -323,6 +384,102 @@ describe('OpenCode history loader', () => {
     await expect(loadOpenCodeChatMessages('session-1', getClient)).resolves.toEqual([]);
   });
 
+  it('[TLV5-ADOPT.07-OPENCODE-UNIT-01] rejects invalid stored parts and recognized content payloads before retry', async () => {
+    let storedMessages = [{
+      info: { id: 'message-1', role: 'user' },
+      parts: [{}],
+    }];
+    const get = mock(() => Promise.resolve({ data: { directory: '/tmp' } }));
+    const messages = mock(() => Promise.resolve({ data: storedMessages }));
+    const getClient = mock(() => Promise.resolve({ session: { get, messages } }));
+
+    await expect(loadLegacyOpenCodeChatMessages('session-1', getClient, {
+      directory: '/tmp',
+    })).rejects.toThrow();
+
+    const outcomes = [];
+    for (const [label, role, part] of invalidImportPartCases) {
+      storedMessages = [storedImportMessage(`message-${label}`, role, [part])];
+      try {
+        await loadLegacyOpenCodeChatMessages('session-1', getClient, { directory: '/tmp' });
+        outcomes.push([label, 'fulfilled']);
+      } catch {
+        outcomes.push([label, 'rejected']);
+      }
+    }
+
+    storedMessages = [
+      storedImportMessage('empty-user', 'user', [{ type: 'text', text: '' }]),
+      storedImportMessage('empty-assistant', 'assistant', [
+        { type: 'text', text: '' },
+        { type: 'reasoning', reasoning: '' },
+        { type: 'reasoning', text: '' },
+        { type: 'reasoning', reasoning: false, text: '' },
+        { type: 'reasoning', reasoning: '', text: 17 },
+        { type: 'step-start' },
+      ]),
+    ];
+    await expect(loadLegacyOpenCodeChatMessages('session-1', getClient, {
+      directory: '/tmp',
+    })).resolves.toEqual([]);
+
+    storedMessages = [];
+    await expect(loadLegacyOpenCodeChatMessages('session-1', getClient, {
+      directory: '/tmp',
+    })).resolves.toEqual([]);
+    expect(outcomes).toEqual(invalidImportPartCases.map(([label]) => [label, 'rejected']));
+    expect(get).toHaveBeenCalledTimes(invalidImportPartCases.length + 3);
+    expect(messages).toHaveBeenCalledTimes(invalidImportPartCases.length + 3);
+  });
+
+  it('[TLV5-ADOPT.08-OPENCODE-NATIVE-UNIT-01] rejects invalid selected parts and recognized content payloads before retry', async () => {
+    let storedMessages = [{
+      info: { id: 'message-1', role: 'user' },
+      parts: [{}],
+    }];
+    const get = mock(() => Promise.resolve({ data: { directory: '/tmp' } }));
+    const messages = mock(() => Promise.resolve({ data: storedMessages }));
+    const getClient = mock(() => Promise.resolve({ session: { get, messages } }));
+
+    await expect(loadRequiredOpenCodeChatMessages('session-1', getClient, {
+      directory: '/tmp',
+    })).rejects.toThrow();
+
+    const outcomes = [];
+    for (const [label, role, part] of invalidImportPartCases) {
+      storedMessages = [storedImportMessage(`message-${label}`, role, [part])];
+      try {
+        await loadRequiredOpenCodeChatMessages('session-1', getClient, { directory: '/tmp' });
+        outcomes.push([label, 'fulfilled']);
+      } catch {
+        outcomes.push([label, 'rejected']);
+      }
+    }
+
+    storedMessages = [
+      storedImportMessage('empty-user', 'user', [{ type: 'text', text: '' }]),
+      storedImportMessage('empty-assistant', 'assistant', [
+        { type: 'text', text: '' },
+        { type: 'reasoning', reasoning: '' },
+        { type: 'reasoning', text: '' },
+        { type: 'reasoning', reasoning: false, text: '' },
+        { type: 'reasoning', reasoning: '', text: 17 },
+        { type: 'step-start' },
+      ]),
+    ];
+    await expect(loadRequiredOpenCodeChatMessages('session-1', getClient, {
+      directory: '/tmp',
+    })).resolves.toEqual([]);
+
+    storedMessages = [];
+    await expect(loadRequiredOpenCodeChatMessages('session-1', getClient, {
+      directory: '/tmp',
+    })).resolves.toEqual([]);
+    expect(outcomes).toEqual(invalidImportPartCases.map(([label]) => [label, 'rejected']));
+    expect(get).toHaveBeenCalledTimes(invalidImportPartCases.length + 3);
+    expect(messages).toHaveBeenCalledTimes(invalidImportPartCases.length + 3);
+  });
+
   it('passes directory when loading transcript messages', async () => {
     const messages = mock(() => Promise.resolve({ data: [] }));
     const getClient = mock(() => Promise.resolve({
@@ -332,31 +489,6 @@ describe('OpenCode history loader', () => {
     await expect(loadOpenCodeChatMessages('session-1', getClient, { directory: '/repo' })).resolves.toEqual([]);
 
     expect(messages).toHaveBeenCalledWith({ sessionID: 'session-1', directory: '/repo' });
-  });
-
-  it('retries transcript loading without directory for legacy unscoped sessions', async () => {
-    const messages = mock((args) => Promise.resolve(
-      args.directory
-        ? { error: { name: 'NotFoundError', data: { message: 'Session not found: session-1' } } }
-        : {
-            data: [{
-              info: { role: 'user', time: { created: '2026-07-04T00:00:00.000Z' } },
-              parts: [{ type: 'text', text: 'legacy' }],
-            }],
-          },
-    ));
-    const getClient = mock(() => Promise.resolve({
-      session: { messages },
-    }));
-
-    const loaded = await loadOpenCodeChatMessages('session-1', getClient, { directory: '/repo' });
-
-    expect(messages.mock.calls.map((call) => call[0])).toEqual([
-      { sessionID: 'session-1', directory: '/repo' },
-      { sessionID: 'session-1' },
-    ]);
-    expect(loaded[0]).toBeInstanceOf(UserMessage);
-    expect(loaded[0].content).toBe('legacy');
   });
 
   it('loads preview metadata from session and tail messages', async () => {

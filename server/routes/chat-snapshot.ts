@@ -9,8 +9,9 @@ import { parseChatId, type ChatId } from '../../common/chat-id.js';
 import { toClientChatExecutionControlState } from '../chat-execution/control-state.js';
 import type { ChatExecutionQueries } from '../chat-execution/types.js';
 import type { ChatListProjector } from '../chats/chat-list-projector.js';
-import type { ChatViewPageReader } from '../chats/chat-message-reader.js';
-import type { PendingUserInputServiceContract } from '../chats/pending-user-input-service.js';
+import type { TranscriptPageReader } from '../chats/chat-message-reader.js';
+import type { ChatTransientFeedStore } from '../chats/chat-transient-feed.js';
+import { TranscriptHistoryUnavailableError } from '../chats/errors.js';
 import { transcriptUnavailableMessage } from '../lib/domain-error.js';
 import { jsonError, jsonErrorFromUnknown } from '../lib/http-error.js';
 import type { RouteMap } from '../lib/http-route-types.js';
@@ -21,11 +22,8 @@ const defaultLogger = createLogger('routes:chat-snapshot');
 interface ChatSnapshotRouteDeps {
   summaries: Pick<ChatListProjector, 'buildSummary'>;
   execution: Pick<ChatExecutionQueries, 'readChatExecutionControl'>;
-  chatViews: Pick<ChatViewPageReader, 'getOrCreatePage'>;
-  pendingInputs: Pick<
-    PendingUserInputServiceContract,
-    'reconcileRetainedHistory' | 'listForTransport'
-  >;
+  chatViews: Pick<TranscriptPageReader, 'page'>;
+  transientFeeds: Pick<ChatTransientFeedStore, 'snapshot' | 'currentSnapshot'>;
   logger?: Pick<Logger, 'error'>;
   now?: () => Date;
 }
@@ -54,14 +52,21 @@ export function createChatSnapshotRoutes(deps: ChatSnapshotRouteDeps): RouteMap 
             await deps.execution.readChatExecutionControl(chatId),
           );
           const transcript = await readTranscript(deps, chatId, messageLimit);
-          await deps.pendingInputs.reconcileRetainedHistory(chatId);
+          const transcriptViewId = transcript.availability === 'available'
+            ? transcript.transcriptViewId
+            : deps.transientFeeds.currentSnapshot(chatId)?.transcriptViewId
+              ?? `pending:${summary.chat.agentOwnershipEpoch}`;
+          const transientFeed = deps.transientFeeds.snapshot({
+            chatId,
+            transcriptViewId,
+          });
           const response = {
             observedAt,
             messageLimit,
             chat: summary.chat,
             processingPhase: summary.processingPhase,
             control,
-            pendingUserInputs: deps.pendingInputs.listForTransport(chatId),
+            transientFeed,
             transcript,
           } satisfies ChatSnapshotResponse;
           return noStore(Response.json(response));
@@ -81,9 +86,19 @@ async function readTranscript(
 ): Promise<ChatSnapshotTranscript> {
   if (messageLimit === 0) return { availability: 'not-requested' };
   try {
-    const page = await deps.chatViews.getOrCreatePage(chatId, messageLimit);
+    const page = await deps.chatViews.page(chatId, messageLimit);
     return { availability: 'available', ...page };
   } catch (error) {
+    // Typed deferred/degraded reads keep the rest of the snapshot usable: the
+    // transcript section names the history state instead of failing the call.
+    if (error instanceof TranscriptHistoryUnavailableError) {
+      return {
+        availability: 'unavailable',
+        errorCode: error.historyState.errorCode,
+        retryable: error.retryable,
+        message: error.message,
+      };
+    }
     if (
       error instanceof AgentIntegrationError
       && error.code === 'TRANSCRIPT_UNAVAILABLE'

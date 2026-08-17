@@ -7,16 +7,14 @@ import type { DrainHandle } from '$lib/ws/drain';
 import type { ServerWsMessage, EventKey } from '$shared/ws-events';
 import {
 	ChatMessagesMessage,
-	ChatGenerationResetMessage,
+	ChatTranscriptReplacedMessage,
+	ChatOperationalNoticeMessage,
+	ChatTransientFeedMutationMessage,
 	AgentRunFinishedMessage,
 	AgentRunFailedMessage,
 	ChatSessionCreatedMessage,
 	ChatSessionStoppedMessage,
 	ChatExecutionControlUpdatedMessage,
-	QueueDispatchingMessage,
-	PendingUserInputUpdatedMessage,
-	PendingUserInputStatusUpdatedMessage,
-	PendingUserInputClearedMessage,
 	WsFaultMessage,
 	ChatTitleUpdatedMessage,
 	ChatProjectPathUpdatedMessage,
@@ -24,7 +22,7 @@ import {
 	ChatReadUpdatedV1Message,
 	ChatListRefreshRequestedMessage,
 } from '$shared/ws-events';
-import type { ChatViewMessage } from '$shared/chat-view';
+import type { ResendCandidate, TranscriptMessage } from '$shared/chat-view';
 import { AssistantMessage, UserMessage, ThinkingMessage } from '$shared/chat-types';
 import type { ChatMessage, PermissionMode } from '$lib/types/chat';
 import type { ActiveTranscriptPort } from '$lib/chat/transcript/active-transcript-state.svelte.js';
@@ -36,6 +34,7 @@ import {
 } from '$lib/chat/conversation/pending-chat-handoff.js';
 import type { ConversationUiPort } from '$lib/chat/conversation/conversation-ui-state.svelte.js';
 import type { ChatSessionsPort } from '$lib/chat/sessions/chat-sessions.svelte.js';
+import { getChatSnapshot } from '$lib/api/chats.js';
 
 import { untrack } from 'svelte';
 import { normalizeEvent } from '$lib/ws/normalize';
@@ -94,27 +93,32 @@ export type EventRouterChatStateStore = Pick<
 	ActiveTranscriptPort,
 	| 'getCursor'
 	| 'appendLocalNotice'
-	| 'upsertPendingUserInput'
-	| 'clearPendingUserInput'
-	| 'updatePendingUserInputDeliveryStatus'
+	| 'appendServerNotice'
 	| 'loadMessages'
 > & {
 	applyChatMessages: (
 		chatId: string,
-		generationId: string,
-		messages: ChatViewMessage[],
-	) => 'applied' | 'generation-changed' | 'gap-detected';
+		transcriptViewId: string,
+		messages: TranscriptMessage[],
+		firstOrdinal: number,
+		lastOrdinal: number,
+		resendCandidates: ResendCandidate[],
+	) => 'applied' | 'view-changed' | 'gap-detected';
 	reloadChatTranscript: (chatId: string) => void;
 	warmBackgroundTranscript: (
 		chatId: string,
-		generationId: string,
-		messages: ChatViewMessage[],
+		transcriptViewId: string,
+		messages: TranscriptMessage[],
+		firstOrdinal: number,
+		lastOrdinal: number,
 	) => boolean;
 	isVisiblePreviewChat: (chatId: string) => boolean;
 	warmVisibleChatPreview: (
 		chatId: string,
-		generationId: string,
-		messages: ChatViewMessage[],
+		transcriptViewId: string,
+		messages: TranscriptMessage[],
+		firstOrdinal: number,
+		lastOrdinal: number,
 	) => boolean | void;
 	loadVisibleChatPreview: (chatId: string) => Promise<void> | void;
 	markVisibleChatPreviewStale: (chatId: string) => void;
@@ -192,32 +196,55 @@ export function selectPreviewFromBatch(
 export function createChatMessagesAccumulator(
 	chatState: Pick<EventRouterChatStateStore, 'applyChatMessages' | 'reloadChatTranscript'>,
 ) {
-	let pendingMessages: ChatViewMessage[] = [];
-	let pendingGenerationId = '';
+	let pendingMessages: TranscriptMessage[] = [];
+	let pendingTranscriptViewId = '';
 	let pendingChatId = '';
+	let pendingFirstOrdinal = 0;
+	let pendingLastOrdinal = 0;
+	let pendingResendCandidates: ResendCandidate[] = [];
+	let hasPending = false;
 
 	return {
 		enqueue(msg: ChatMessagesMessage) {
-			if (msg.messages.length === 0) return;
 			if (
-				pendingMessages.length > 0 &&
-				(msg.generationId !== pendingGenerationId || msg.chatId !== pendingChatId)
+				hasPending &&
+				(msg.transcriptViewId !== pendingTranscriptViewId ||
+					msg.chatId !== pendingChatId ||
+					msg.firstOrdinal > pendingLastOrdinal + 1)
 			) {
 				this.flush();
 			}
-			pendingGenerationId = msg.generationId;
+			if (!hasPending) pendingFirstOrdinal = msg.firstOrdinal;
+			hasPending = true;
+			pendingTranscriptViewId = msg.transcriptViewId;
 			pendingChatId = msg.chatId;
+			pendingLastOrdinal = Math.max(pendingLastOrdinal, msg.lastOrdinal);
+			pendingResendCandidates = msg.resendCandidates;
 			pendingMessages.push(...msg.messages);
 		},
 		flush() {
-			if (pendingMessages.length === 0) return;
+			if (!hasPending) return;
 			const messages = pendingMessages;
-			const generationId = pendingGenerationId;
+			const transcriptViewId = pendingTranscriptViewId;
 			const chatId = pendingChatId;
+			const firstOrdinal = pendingFirstOrdinal;
+			const lastOrdinal = pendingLastOrdinal;
+			const resendCandidates = pendingResendCandidates;
 			pendingMessages = [];
-			pendingGenerationId = '';
+			pendingTranscriptViewId = '';
 			pendingChatId = '';
-			const result = chatState.applyChatMessages(chatId, generationId, messages);
+			pendingFirstOrdinal = 0;
+			pendingLastOrdinal = 0;
+			pendingResendCandidates = [];
+			hasPending = false;
+			const result = chatState.applyChatMessages(
+				chatId,
+				transcriptViewId,
+				messages,
+				firstOrdinal,
+				lastOrdinal,
+				resendCandidates,
+			);
 			if (result !== 'applied') {
 				chatState.reloadChatTranscript(chatId);
 			}
@@ -251,7 +278,7 @@ function buildDispatch(
 	const lifecycleCtx: LifecycleContext = {
 		getCurrentChatId: stores.lifecycle.currentChatId,
 		setCurrentChatId: stores.lifecycle.setCurrentChatId,
-		appendLocalNotice: stores.chatState.appendLocalNotice,
+		appendServerNotice: stores.chatState.appendServerNotice,
 		setIsSystemChatChange: stores.lifecycle.setIsSystemChatChange,
 		conversationUi: stores.conversationUi,
 		clearTurnStatus,
@@ -303,6 +330,46 @@ function buildDispatch(
 		refreshChats: () => { void stores.sessions.quietRefreshChats(); },
 		removeChatTranscript: stores.chatState.removeChatTranscript,
 	};
+	const transientTranscriptViews = new Map<string, string>();
+
+	const refreshTransientFeed = (chatId: string, requestedTranscriptViewId: string) => {
+		const knownTranscriptViewId = transientTranscriptViews.get(chatId);
+		if (knownTranscriptViewId && knownTranscriptViewId !== requestedTranscriptViewId) return;
+		transientTranscriptViews.set(chatId, requestedTranscriptViewId);
+		const previousTranscriptViewId = stores.conversationUi.getTransientFeed(chatId)?.transcriptViewId;
+		void getChatSnapshot(chatId, 1)
+			.then((snapshot) => {
+				if (transientTranscriptViews.get(chatId) !== requestedTranscriptViewId) return;
+				const result = stores.conversationUi.setTransientFeedFromSnapshot(snapshot.transientFeed);
+				if (result.kind !== 'applied') return;
+				const snapshotTranscriptViewId = snapshot.transientFeed.transcriptViewId;
+				transientTranscriptViews.set(chatId, snapshotTranscriptViewId);
+				if (
+					(previousTranscriptViewId && previousTranscriptViewId !== snapshotTranscriptViewId)
+					|| requestedTranscriptViewId !== snapshotTranscriptViewId
+				) handleViewTransition(chatId, snapshotTranscriptViewId);
+			})
+			.catch(() => undefined);
+	};
+
+	const handleViewTransition = (chatId: string, transcriptViewId: string) => {
+		messagesAccumulator.flush();
+		const selectedChatId = stores.sessions.selectedChat?.id ?? null;
+		if (selectedChatId === chatId) {
+			const cursor = stores.chatState.getCursor();
+			if (cursor.transcriptViewId !== transcriptViewId) {
+				stores.chatState.reloadChatTranscript(chatId);
+			} else {
+				stores.chatState.markChatTranscriptValidated(chatId);
+			}
+			return;
+		}
+		if (stores.chatState.isVisiblePreviewChat(chatId)) {
+			stores.chatState.markVisibleChatPreviewStale(chatId);
+			void stores.chatState.loadVisibleChatPreview(chatId);
+		}
+		stores.chatState.markChatTranscriptStale(chatId);
+	};
 
 	return {
 		'chat-messages': (msg) => {
@@ -312,24 +379,18 @@ function buildDispatch(
 			handlePlanModeMessages(batch, planModeCtx);
 			handlePermissionLifecycleFromBatch(batch, permLifecycleCtx);
 		},
-		'chat-generation-reset': (msg) => {
-			if (!(msg instanceof ChatGenerationResetMessage)) return;
-			messagesAccumulator.flush();
-			const selectedChatId = stores.sessions.selectedChat?.id ?? null;
-			if (selectedChatId === msg.chatId) {
-				const cursor = stores.chatState.getCursor();
-				if (cursor.generationId !== msg.generationId) {
-					stores.chatState.reloadChatTranscript(msg.chatId);
-				} else {
-					stores.chatState.markChatTranscriptValidated(msg.chatId);
-				}
-				return;
+		'chat-transcript-replaced': (msg) => {
+			if (!(msg instanceof ChatTranscriptReplacedMessage)) return;
+			transientTranscriptViews.set(msg.chatId, msg.transcriptViewId);
+			stores.conversationUi.removeTransientFeed(msg.chatId);
+			handleViewTransition(msg.chatId, msg.transcriptViewId);
+		},
+		'chat-transient-feed-mutation': (msg) => {
+			if (!(msg instanceof ChatTransientFeedMutationMessage)) return;
+			const result = stores.conversationUi.applyTransientFeedMutation(msg);
+			if (result.kind === 'snapshot-required' || result.kind === 'corrupt') {
+				refreshTransientFeed(msg.chatId, msg.transcriptViewId);
 			}
-			if (stores.chatState.isVisiblePreviewChat(msg.chatId)) {
-				stores.chatState.markVisibleChatPreviewStale(msg.chatId);
-				void stores.chatState.loadVisibleChatPreview(msg.chatId);
-			}
-			stores.chatState.markChatTranscriptStale(msg.chatId);
 		},
 		'agent-run-finished': (msg) => {
 			if (msg instanceof AgentRunFinishedMessage) {
@@ -359,31 +420,9 @@ function buildDispatch(
 				handleExecutionControlUpdated(msg, queueCtx);
 			}
 		},
-		'queue-dispatching': (msg) => {
-			if (!(msg instanceof QueueDispatchingMessage)) return;
-			const sendChatId = msg.chatId || stores.lifecycle.currentChatId();
-			if (sendChatId && msg.content) {
-				stores.sessions.patchPreview(
-					sendChatId,
-					String(msg.content).slice(0, 200),
-				);
-			}
-		},
-		'pending-user-input-updated': (msg) => {
-			if (!(msg instanceof PendingUserInputUpdatedMessage)) return;
-			stores.chatState.upsertPendingUserInput(msg.input);
-		},
-		'pending-user-input-status-updated': (msg) => {
-			if (!(msg instanceof PendingUserInputStatusUpdatedMessage)) return;
-			stores.chatState.updatePendingUserInputDeliveryStatus(
-				msg.clientRequestId,
-				msg.deliveryStatus,
-			);
-		},
-		'pending-user-input-cleared': (msg) => {
-			if (!(msg instanceof PendingUserInputClearedMessage)) return;
-			messagesAccumulator.flush();
-			stores.chatState.clearPendingUserInput(msg.clientRequestId);
+		'chat-operational-notice': (msg) => {
+			if (!(msg instanceof ChatOperationalNoticeMessage)) return;
+			stores.chatState.appendServerNotice(msg.chatId, msg.noticeType, msg.content);
 		},
 		'ws-fault': (msg) => {
 			if (msg instanceof WsFaultMessage) {
@@ -400,7 +439,11 @@ function buildDispatch(
 				handleChatProjectPathUpdated(msg, sidebarCtx);
 		},
 		'chat-session-deleted': (msg) => {
-			if (msg instanceof ChatSessionDeletedWsMessage) handleChatDeleted(msg, sidebarCtx);
+			if (msg instanceof ChatSessionDeletedWsMessage) {
+				transientTranscriptViews.delete(msg.chatId);
+				stores.conversationUi.removeTransientFeed(msg.chatId);
+				handleChatDeleted(msg, sidebarCtx);
+			}
 		},
 		'chat-read-updated-v1': (msg) => {
 			if (msg instanceof ChatReadUpdatedV1Message) handleChatReadUpdated(msg, sidebarCtx);
@@ -448,13 +491,15 @@ export function createEventRouter(
 				// background transcripts are warmed only when already contiguous.
 				if (event.message instanceof ChatMessagesMessage) {
 					const agentMsg = event.message;
-					if (agentMsg.chatId && agentMsg.messages.length > 0) {
+					if (agentMsg.chatId) {
 						if (agentMsg.chatId !== activeViewChatId) {
 							if (stores.chatState.isVisiblePreviewChat(agentMsg.chatId)) {
 								const applied = stores.chatState.warmVisibleChatPreview(
 									agentMsg.chatId,
-									agentMsg.generationId,
+									agentMsg.transcriptViewId,
 									agentMsg.messages,
+									agentMsg.firstOrdinal,
+									agentMsg.lastOrdinal,
 								);
 								if (applied === false) {
 									stores.chatState.markVisibleChatPreviewStale(agentMsg.chatId);
@@ -463,8 +508,10 @@ export function createEventRouter(
 							}
 							stores.chatState.warmBackgroundTranscript(
 								agentMsg.chatId,
-								agentMsg.generationId,
+								agentMsg.transcriptViewId,
 								agentMsg.messages,
+								agentMsg.firstOrdinal,
+								agentMsg.lastOrdinal,
 							);
 						}
 						const preview = selectPreviewFromBatch(agentMsg.messages.map((entry) => entry.message));

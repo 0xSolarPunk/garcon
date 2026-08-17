@@ -31,7 +31,7 @@ describe('scripted Codex fork while running', () => {
     await environment?.dispose();
   });
 
-  test('forks the native prefix, refuses a streamed point, then accepts it after settle', async () => {
+  test('forks streamed ledger points and rejects only a replaced view', async () => {
     if (!environment) throw new Error('Scripted Codex environment was not initialized.');
     const testEnvironment = environment;
     const prompt = `SCRIPTED_CODEX_FORK_PROMPT_${crypto.randomUUID().replaceAll('-', '')}`;
@@ -65,12 +65,21 @@ describe('scripted Codex fork while running', () => {
         expect(messagesOfType(wholeFork.messages, 'assistant-message')
           .some((message) => message.content.includes(reply))).toBe(false);
 
-        await expectNativeHistoryRefusal(fixture.client.forkChat({
+        // Carryover remains complete even when native-fidelity forking cannot
+        // resolve an in-flight provider position.
+        const streamedForkId = fixture.newChatId();
+        await fixture.client.forkChat({
           sourceChatId,
-          chatId: fixture.newChatId(),
-          upToSeq: streamedBash.seq,
-          generationId: streamedBash.generationId,
-        }));
+          chatId: streamedForkId,
+          upToOrdinal: streamedBash.ordinal,
+          transcriptViewId: streamedBash.transcriptViewId,
+        });
+        const streamedFork = await fixture.client.getMessages(streamedForkId);
+        expect(userContents(streamedFork.messages)).toEqual([prompt]);
+        expect(messagesOfType(streamedFork.messages, 'bash-tool-use')
+          .some((message) => message.command === command)).toBe(true);
+        expect(messagesOfType(streamedFork.messages, 'assistant-message')
+          .some((message) => message.content.includes(reply))).toBe(false);
       } finally {
         heldReply.release();
       }
@@ -86,21 +95,21 @@ describe('scripted Codex fork while running', () => {
       const persistedBash = persisted.messages.find((entry) =>
         entry.message.type === 'bash-tool-use' && entry.message.command === command);
       if (!persistedBash) throw new Error('Codex did not persist the scripted command.');
-      expect(persisted.generationId).not.toBe(streamedBash.generationId);
+      expect(persisted.transcriptViewId).not.toBe(streamedBash.transcriptViewId);
 
       await expectForkRefusal(fixture.client.forkChat({
         sourceChatId,
         chatId: fixture.newChatId(),
-        upToSeq: persistedBash.seq,
-        generationId: streamedBash.generationId,
-      }), 'STALE_VIEW_GENERATION');
+        upToOrdinal: persistedBash.ordinal,
+        transcriptViewId: streamedBash.transcriptViewId,
+      }), 'STALE_TRANSCRIPT_VIEW');
 
       const recoveredForkId = fixture.newChatId();
       await fixture.client.forkChat({
         sourceChatId,
         chatId: recoveredForkId,
-        upToSeq: persistedBash.seq,
-        generationId: persisted.generationId,
+        upToOrdinal: persistedBash.ordinal,
+        transcriptViewId: persisted.transcriptViewId,
       });
       const recovered = await fixture.client.getMessages(recoveredForkId);
       expect(userContents(recovered.messages)).toEqual([prompt]);
@@ -120,25 +129,22 @@ async function waitForBash(
   fixture: IntegrationFixture,
   chatId: string,
   command: string,
-): Promise<{ seq: number; generationId: string }> {
+): Promise<{ ordinal: number; transcriptViewId: string }> {
   const deadline = Date.now() + LIVE_TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const page = await fixture.client.getMessages(chatId);
     const bash = page.messages.find((entry) =>
       entry.message.type === 'bash-tool-use' && entry.message.command === command);
-    if (bash) return { seq: bash.seq, generationId: page.generationId };
+    if (bash) return { ordinal: bash.ordinal, transcriptViewId: page.transcriptViewId };
     await Bun.sleep(100);
   }
   throw new Error(`Codex never rendered ${command}.`);
 }
 
-async function expectNativeHistoryRefusal(promise: Promise<unknown>): Promise<void> {
-  return expectForkRefusal(promise, 'MESSAGE_NOT_IN_NATIVE_HISTORY');
-}
 
 async function expectForkRefusal(
   promise: Promise<unknown>,
-  errorCode: 'MESSAGE_NOT_IN_NATIVE_HISTORY' | 'STALE_VIEW_GENERATION',
+  errorCode: 'STALE_TRANSCRIPT_VIEW',
 ): Promise<void> {
   let failure: unknown;
   try {

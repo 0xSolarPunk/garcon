@@ -12,8 +12,8 @@ import type { ChatDisplayRow } from '../active-transcript-state.svelte.js';
 
 const TS = '2026-08-03T00:00:00.000Z';
 
-function row(seq: number, message: ChatMessage): ChatDisplayRow {
-	return { kind: 'message', id: `generation-1:${seq}`, seq, message };
+function row(ordinal: number, message: ChatMessage): ChatDisplayRow {
+	return { kind: 'message', id: `generation-1:${ordinal}`, ordinal, message };
 }
 
 describe('ConversationFeedRenderModelController', () => {
@@ -114,7 +114,7 @@ describe('ConversationFeedRenderModelController', () => {
 		]);
 	});
 
-	it('keeps distinct identical assistant messages because their row ids differ', () => {
+	it('[TLV5-L02.03-WEB-UNIT-01] keeps distinct identical assistant messages because their row ids differ', () => {
 		const controller = new ConversationFeedRenderModelController();
 		const messages = [
 			row(10, new AssistantMessage(TS, 'Standing by.')),

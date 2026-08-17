@@ -94,11 +94,12 @@ function createRoutesFixture({ unavailableProjectPaths = [], lastActivityAtByCha
     addNewChatMetadata: mock(() => undefined),
   };
   const chatViews = {
-    getOrCreatePage: mock(async () => ({
+    page: mock(async () => ({
+      transcriptViewId: 'view-1',
       messages: [],
-      generationId: 'generation-1',
-      lastSeq: 0,
-      pageOldestSeq: 0,
+      lastOrdinal: 0,
+      pageOldestOrdinal: 0,
+      pageNewestOrdinal: 0,
       hasMore: false,
     })),
   };
@@ -114,19 +115,13 @@ function createRoutesFixture({ unavailableProjectPaths = [], lastActivityAtByCha
     resolvePermission: mock(() => undefined),
     updateSessionSettings: mock(async () => undefined),
   };
-  const pendingInputs = {
-    register: mock(async () => undefined),
-    reconcileRetainedHistory: mock(async () => undefined),
-    reconcileNativeHistory: mock(async () => undefined),
-    listForChat: mock(() => []),
-    hasInFlightForChat: mock(() => false),
-    clearChat: mock(() => undefined),
-  };
   const searchIndex = {
+    validateResultView: mock(() => true),
     search: mock((request) => ({
       results: request.allowedChatIds.length > 0 ? [
         {
           chatId: request.allowedChatIds[0],
+          transcriptViewId: 'view-1',
           score: 1,
           matchedMessageCount: 1,
           snippets: [],
@@ -155,11 +150,11 @@ function createRoutesFixture({ unavailableProjectPaths = [], lastActivityAtByCha
     registry,
     settings,
     queue,
+    processing: { phase: mock(() => null) },
     pathCache,
     metadata,
     chatViews,
     agents,
-    pendingInputs,
     searchIndex,
     chatListProjector,
     commandService: createRouteCommandService({
@@ -169,11 +164,10 @@ function createRoutesFixture({ unavailableProjectPaths = [], lastActivityAtByCha
       metadata,
       agents,
       commandLedger,
-      pendingInputs,
     }),
   });
 
-  return { routes, searchIndex };
+  return { routes, searchIndex, registry, agents };
 }
 
 async function postSearch(routes, body) {
@@ -318,5 +312,67 @@ describe('POST /api/v1/chats/search', () => {
       expect(response.status).toBe(503);
       await expect(response.json()).resolves.toMatchObject({ errorCode: code, retryable: true });
     }
+  });
+});
+
+describe('POST /api/v1/chats/search/navigate', () => {
+  const request = (overrides = {}) => ({
+    chatId: 'c1',
+    transcriptViewId: 'view-1',
+    ordinal: 3,
+    ...overrides,
+  });
+
+  async function navigate(fixture, body) {
+    return fixture.routes['/api/v1/chats/search/navigate'].POST(
+      new Request('http://localhost/api/v1/chats/search/navigate', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    );
+  }
+
+  it('resolves a view-qualified ledger row', async () => {
+    const fixture = createRoutesFixture();
+    fixture.registry.getChat.mockImplementation(() => ({
+      agentId: 'claude',
+      agentSessionId: 's1',
+      agentOwnershipEpoch: 'owner-1',
+      carryOverSegments: [],
+      projectPath: '/tmp/project',
+      tags: [],
+      model: 'sonnet',
+    }));
+
+    const response = await navigate(fixture, request());
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ chatId: 'c1', ordinal: 3 });
+    expect(fixture.searchIndex.validateResultView)
+      .toHaveBeenCalledWith('c1', 'view-1');
+  });
+
+  it('rejects a result whose transcript view was replaced', async () => {
+    const fixture = createRoutesFixture();
+    fixture.searchIndex.validateResultView.mockImplementation(() => false);
+
+    const response = await navigate(fixture, request());
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      errorCode: 'SEARCH_RESULT_STALE',
+    });
+  });
+
+  it('validates the navigation payload', async () => {
+    const fixture = createRoutesFixture();
+
+    const response = await navigate(fixture, request({ ordinal: 0 }));
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      errorCode: 'VALIDATION_FAILED',
+    });
   });
 });

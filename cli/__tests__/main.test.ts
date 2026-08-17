@@ -45,6 +45,60 @@ function acceptedControlResponse(_input: string | URL | Request, init?: RequestI
   });
 }
 
+function controlSnapshotResponse(): Response {
+  return Response.json({
+    observedAt: '2026-08-04T12:00:00.000Z',
+    messageLimit: 1,
+    chat: {
+      id: CHAT_ID,
+      title: 'Review',
+      agentId: 'codex',
+      agentOwnershipEpoch: 'epoch-1',
+      carryOverRevision: 'carry-v1:0',
+      model: null,
+      apiProviderId: null,
+      modelEndpointId: null,
+      modelProtocol: null,
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      projectPath: '/project',
+      tags: [],
+      canReloadFromNativeHistory: false,
+      activity: { createdAt: null, lastActivityAt: null },
+    },
+    processingPhase: null,
+    control: {
+      serverInstanceId: 'instance',
+      queue: {
+        entries: [],
+        steeringEntryId: null,
+        recentlyDispatched: [],
+        pause: null,
+        reorderRevision: 0,
+      },
+      version: 0,
+      updatedAt: null,
+    },
+    transcript: {
+      availability: 'available',
+      transcriptViewId: 'view-1',
+      messages: [],
+      lastOrdinal: 0,
+      pageOldestOrdinal: 0,
+      pageNewestOrdinal: 0,
+      nextBeforeOrdinal: null,
+      hasMore: false,
+    },
+    transientFeed: {
+      serverInstanceId: 'instance',
+      chatId: CHAT_ID,
+      transcriptViewId: 'view-1',
+      transientRevision: 0,
+      rows: [],
+    },
+  });
+}
+
 describe('main', () => {
   test('status reads one snapshot without reading stdin or resolving a project path', async () => {
     const capture = capturedOutput();
@@ -69,6 +123,7 @@ describe('main', () => {
             thinkingMode: 'none',
             projectPath: '/project/that/need/not/exist',
             tags: ['cli'],
+            canReloadFromNativeHistory: false,
             activity: { createdAt: null, lastActivityAt: null },
           },
           processingPhase: null,
@@ -76,7 +131,6 @@ describe('main', () => {
             serverInstanceId: 'instance',
             queue: {
               entries: [],
-              dispatchingEntryId: null,
               steeringEntryId: null,
               recentlyDispatched: [],
               pause: null,
@@ -85,8 +139,14 @@ describe('main', () => {
             version: 0,
             updatedAt: null,
           },
-          pendingUserInputs: [],
           transcript: { availability: 'not-requested' },
+          transientFeed: {
+            serverInstanceId: 'instance',
+            chatId: CHAT_ID,
+            transcriptViewId: 'view-1',
+            transientRevision: 0,
+            rows: [],
+          },
         });
       },
       discoverRuntime: stubDiscovery,
@@ -176,33 +236,39 @@ describe('main', () => {
 
   test('exits after SIGINT while a stdin pipe remains open', async () => {
     const cliEntry = path.join(import.meta.dir, '..', 'main.ts');
-    const child = Bun.spawn([
-      process.execPath,
-      cliEntry,
-      '--agent', 'codex',
-      '--model', 'gpt-5.4',
-      '-',
-    ], {
-      cwd: path.join(import.meta.dir, '..', '..'),
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const timeout = new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error('CLI did not exit after SIGINT')), 3_000);
-    });
-
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      child.kill('SIGINT');
-
-      await expect(Promise.race([child.exited, timeout])).resolves.toBe(130);
-      expect(await new Response(child.stderr).text()).toContain(
-        'terminal interrupted; no Garcon agent was stopped',
-      );
-    } finally {
-      child.stdin.end();
-      if (child.exitCode === null) child.kill('SIGKILL');
+    // A signal delivered before the CLI installs its handler terminates the
+    // process with the default disposition; retry a fresh spawn until the
+    // handler owned the interrupt and reported the contract exit.
+    for (let attempt = 0; ; attempt += 1) {
+      const child = Bun.spawn([
+        process.execPath,
+        cliEntry,
+        '--agent', 'codex',
+        '--model', 'gpt-5.4',
+        '-',
+      ], {
+        cwd: path.join(import.meta.dir, '..', '..'),
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const timeout = new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('CLI did not exit after SIGINT')), 3_000);
+      });
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        child.kill('SIGINT');
+        const exitCode = await Promise.race([child.exited, timeout]);
+        if (exitCode !== 130 && attempt < 3) continue;
+        expect(exitCode).toBe(130);
+        expect(await new Response(child.stderr).text()).toContain(
+          'terminal interrupted; no Garcon agent was stopped',
+        );
+        return;
+      } finally {
+        child.stdin.end();
+        if (child.exitCode === null) child.kill('SIGKILL');
+      }
     }
   });
 
@@ -211,7 +277,9 @@ describe('main', () => {
     const exitCode = await main([
       'send-async', CHAT_ID, 'Implement the review',
     ], {
-      fetch: acceptedControlResponse,
+      fetch: (input, init) => String(input).includes('/snapshot?')
+        ? controlSnapshotResponse()
+        : acceptedControlResponse(input, init),
       discoverRuntime: stubDiscovery,
       output: capture.output,
     });
@@ -224,12 +292,14 @@ describe('main', () => {
     const exitCode = await main([
       'send-async', CHAT_ID, 'Implement the review',
     ], {
-      fetch: async () => Response.json({
-        success: false,
-        error: 'Chat is busy',
-        errorCode: 'SESSION_BUSY',
-        retryable: true,
-      }, { status: 409 }),
+      fetch: async (input) => String(input).includes('/snapshot?')
+        ? controlSnapshotResponse()
+        : Response.json({
+          success: false,
+          error: 'Chat is busy',
+          errorCode: 'SESSION_BUSY',
+          retryable: true,
+        }, { status: 409 }),
       discoverRuntime: stubDiscovery,
       output: capture.output,
     });
@@ -245,6 +315,7 @@ describe('main', () => {
     ], {
       fetch: async (input, init) => {
         const url = String(input);
+        if (url.includes('/snapshot?')) return controlSnapshotResponse();
         if (url.endsWith('/api/v1/chats/run')) {
           runCalls += 1;
           return Response.json({
@@ -304,7 +375,6 @@ describe('main', () => {
             serverInstanceId: 'instance',
             queue: {
               entries: [],
-              dispatchingEntryId: null,
               steeringEntryId: null,
               recentlyDispatched: [],
               pause: null,
@@ -339,7 +409,6 @@ describe('main', () => {
             serverInstanceId: 'instance',
             queue: {
               entries: [],
-              dispatchingEntryId: null,
               steeringEntryId: null,
               recentlyDispatched: [],
               pause: null,

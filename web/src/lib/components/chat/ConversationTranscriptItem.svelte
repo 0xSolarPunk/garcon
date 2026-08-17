@@ -33,8 +33,15 @@
 		showThinking?: boolean;
 		pendingPermissionRequests?: PendingPermissionRequest[];
 		chatContext?: ConversationMessageChatContext | null;
-		onPermissionDecision?: (permissionRequestId: string, decision: PermissionDecision) => void;
-		onExitPlanMode?: (permissionRequestId: string, choice: string, plan: string) => void;
+		onPermissionDecision?: (
+			permissionOccurrenceId: string,
+			decision: PermissionDecision,
+		) => void;
+		onExitPlanMode?: (
+			permissionOccurrenceId: string,
+			choice: string,
+			plan: string,
+		) => void;
 		onForkChat?: (upToSeq?: number) => void;
 		onGenerateTitleFromMessage?: (message: string, messageSeq?: number) => void | Promise<void>;
 		canForkAtMessageNow?: boolean;
@@ -58,23 +65,33 @@
 		acquireTransientActivity,
 	}: Props = $props();
 
-	const pendingExitPlanIds = $derived(
+	const pendingPermissionOccurrences = $derived(
 		new Set(
 			pendingPermissionRequests
-				.filter((request) => request.requestedTool.type === 'exit-plan-mode-tool-use')
-				.map((request) => request.permissionRequestId),
+				.map((request) => request.permissionOccurrenceId),
 		),
 	);
 	const disclosureState = $derived(itemState?.disclosurePort(item.id));
 
+	function permissionActionableFor(message: ChatMessage): boolean {
+		if (message instanceof PermissionRequestMessage) {
+			return pendingPermissionRequests.some((request) => (
+				request.permissionOccurrenceId === message.permissionOccurrenceId
+				&& request.control?.permissionOccurrenceId === message.permissionOccurrenceId
+			));
+		}
+		if (message.type !== 'exit-plan-mode-tool-use') return false;
+		return pendingPermissionOccurrences.has(`plan-exit-${message.toolId}`);
+	}
+
 	function permissionTerminalFor(message: ChatMessage): PermissionTerminalState | undefined {
 		if (message instanceof PermissionRequestMessage) {
-			return renderModel.permissionTerminalById.get(message.permissionRequestId);
+			return renderModel.permissionTerminalByOccurrence.get(message.permissionOccurrenceId);
 		}
 		if (message.type !== 'exit-plan-mode-tool-use') return undefined;
-		const permissionRequestId = `plan-exit-${message.toolId}`;
-		if (pendingExitPlanIds.has(permissionRequestId)) return undefined;
-		return { state: 'resolved', allowed: true };
+		const permissionOccurrenceId = `plan-exit-${message.toolId}`;
+		if (pendingPermissionOccurrences.has(permissionOccurrenceId)) return undefined;
+		return { permissionOccurrenceId, state: 'resolved', allowed: true };
 	}
 </script>
 
@@ -99,13 +116,15 @@
 		<ConversationMessage
 			{message}
 			rowId={item.id}
-			anchorId={item.seq === undefined ? undefined : item.id}
+			awaitingDelivery={item.awaitingDelivery}
+			anchorId={item.ordinal === undefined ? undefined : item.id}
 			index={item.index}
-			forkUpToSeq={item.seq}
+			forkUpToSeq={item.ordinal}
 			{toolResult}
 			{toolResultRowId}
 			{pairedToolUse}
 			permissionTerminal={permTerminal}
+			permissionActionable={permissionActionableFor(message)}
 			{onPermissionDecision}
 			{onExitPlanMode}
 			{agentId}
@@ -115,7 +134,9 @@
 			{onGenerateTitleFromMessage}
 			{canForkAtMessageNow}
 			{disclosureState}
-			permissionDraft={itemState ? (id) => itemState.permissionDraft(id) : undefined}
+			permissionDraft={itemState
+				? (id) => itemState.permissionDraft(id)
+				: undefined}
 			onPermissionDraftChange={itemState
 				? (id, draft) => itemState.setPermissionDraft(id, draft)
 				: undefined}

@@ -9,23 +9,20 @@ import type {
   AcceptedSteerOutcome,
   AgentTurnRunnerPort,
   CapturedSteerTarget,
-  PendingInputsPort,
-  PendingUserInputRegistrationOptions,
+  UserInputAdmissionOptions,
 } from './types.ts';
 
 interface SteerInputDeliveryOptions {
   turnRunner: AgentTurnRunnerPort;
-  pendingInputs: PendingInputsPort;
   ownership: ExecutionOwnership;
   isShuttingDown(): boolean;
-  registerPending(
+  admitInput(
     chatId: string,
     content: string,
-    options: PendingUserInputRegistrationOptions,
-  ): Promise<void>;
+    options: UserInputAdmissionOptions,
+  ): Promise<boolean>;
+  discardPreparedInput(chatId: string, clientMessageId: string | null | undefined): void;
 }
-
-export type SteerNotSentDisposition = 'mark-failed' | 'queue-handler-settles';
 
 export class SteerInputDelivery {
   constructor(private readonly options: SteerInputDeliveryOptions) {}
@@ -51,12 +48,21 @@ export class SteerInputDelivery {
     options: AgentSteerOptions,
     target: CapturedSteerTarget,
     afterPendingRegistered: (turnId: string) => Promise<void>,
-    notSentDisposition: SteerNotSentDisposition = 'mark-failed',
   ): Promise<AcceptedSteerOutcome> {
-    let pendingRegistered = false;
     let deliveryPrepared = false;
+    let inserted = false;
     let result: AgentSteerResult;
     try {
+      this.#assertTarget(chatId, target);
+      inserted = await this.options.admitInput(chatId, content, {
+        clientRequestId: options.clientRequestId,
+        clientMessageId: options.clientMessageId,
+        transcriptViewId: options.transcriptViewId,
+        turnId: target.identity.turnId,
+        commandType: 'steer',
+      });
+      if (!inserted) return { turnId: target.identity.turnId, duplicate: true };
+      await afterPendingRegistered(target.identity.turnId);
       result = await this.options.turnRunner.steerInput(
         chatId,
         providerContent,
@@ -64,27 +70,14 @@ export class SteerInputDelivery {
         target.providerTarget,
         async () => {
           this.#assertTarget(chatId, target);
-          await this.options.registerPending(chatId, content, {
-            clientRequestId: options.clientRequestId,
-            clientMessageId: options.clientMessageId,
-            turnId: target.identity.turnId,
-          });
-          pendingRegistered = true;
-          await afterPendingRegistered(target.identity.turnId);
           deliveryPrepared = true;
         },
       );
     } catch (error) {
-      if (pendingRegistered) {
-        this.#settlePending(
-          chatId,
-          options.clientRequestId,
-          deliveryPrepared ? 'unknown' : 'not-sent',
-          notSentDisposition,
-        );
-      }
       if (error instanceof DomainError) throw error;
       throw new SteerDeliveryError(error, deliveryPrepared ? 'unknown' : 'not-sent');
+    } finally {
+      if (inserted) this.options.discardPreparedInput(chatId, options.clientMessageId);
     }
 
     if (result.kind === 'accepted') {
@@ -94,16 +87,10 @@ export class SteerInputDelivery {
           'not-sent',
         );
       }
-      return { turnId: target.identity.turnId };
+      return { turnId: target.identity.turnId, duplicate: false };
     }
     if (result.kind === 'rejected') {
-      if (pendingRegistered) {
-        this.#settlePending(chatId, options.clientRequestId, 'not-sent', notSentDisposition);
-      }
       throw steerRejectionError(result.reason);
-    }
-    if (pendingRegistered) {
-      this.#settlePending(chatId, options.clientRequestId, result.outcome, notSentDisposition);
     }
     throw new SteerDeliveryError(new Error(result.message), result.outcome);
   }
@@ -128,18 +115,6 @@ export class SteerInputDelivery {
     }
   }
 
-  #settlePending(
-    chatId: string,
-    clientRequestId: string,
-    outcome: 'not-sent' | 'unknown',
-    notSentDisposition: SteerNotSentDisposition,
-  ): void {
-    if (outcome === 'unknown') {
-      this.options.pendingInputs.markUnconfirmed(chatId, clientRequestId);
-    } else if (notSentDisposition === 'mark-failed') {
-      this.options.pendingInputs.markFailed(chatId, clientRequestId);
-    }
-  }
 }
 
 function steerRejectionError(reason: AgentSteerRejectionReason): DomainError {

@@ -1,14 +1,11 @@
 // Implements Direct over OpenAI-compatible Responses APIs.
 // Keeps Responses request/stream parsing separate from chat completions.
 
-import type { SharedModelOption } from '@garcon/common/models';
 import type { AgentAttachment } from '@garcon/common/agent-execution';
 import {
   DirectChatRuntimeBase,
   type DirectRuntimeSession,
-  type DirectUserTurn,
 } from "./direct-chat-runtime-base.js";
-import type { DirectConversationMessage } from "./session-store.js";
 import { readSseDataEvents } from '@garcon/server-agent-common/shared/sse';
 import { appendTextAttachmentContext, imageAttachments } from '@garcon/server-agent-common/shared/attachments';
 import {
@@ -18,6 +15,7 @@ import {
 import { resolveDirectExplicitEffort } from './reasoning-effort.js';
 import { isJsonResponse } from './response-media-type.js';
 import { stripThinkBlocks } from './strip-think-blocks.js';
+import type { ChatMessage } from '@garcon/common/chat-types';
 
 const STREAM_TIMEOUT_MS = 5 * 60_000;
 
@@ -40,14 +38,10 @@ interface ResponsesInputMessage {
 }
 
 export interface OpenAiCompatibleResponsesRuntimeConfig {
-  runtimeId: string;
   runtimeLabel: string;
   defaultModel: string;
-  fallbackModels: SharedModelOption[];
   getApiKey: () => string;
   getBaseUrl: () => string;
-  getSessionDir: () => string;
-  getSessionFilePath: (sessionId: string) => string;
   buildHeaders?: (apiKey: string) => Record<string, string>;
 }
 
@@ -89,13 +83,6 @@ export function extractOpenAiResponsesTextContent(content: ResponsesInputContent
     .filter((part): part is ResponsesInputText => part.type === 'input_text')
     .map((part) => part.text)
     .join('\n');
-}
-
-function persistedToResponsesMessage(message: DirectConversationMessage): ResponsesInputMessage {
-  return {
-    role: message.role,
-    content: message.content,
-  };
 }
 
 interface ResponsesOutputTextPart {
@@ -291,23 +278,30 @@ export class OpenAiCompatibleResponsesRuntime extends DirectChatRuntimeBase<
     super(config);
   }
 
-  protected buildUserTurn(
+  protected buildUserMessage(
     command: string,
     images?: readonly AgentAttachment[],
-  ): DirectUserTurn<ResponsesInputMessage> {
+  ): ResponsesInputMessage {
     const content = buildOpenAiResponsesUserContent(command, images);
-    return {
-      message: { role: 'user', content },
-      persistedContent: extractOpenAiResponsesTextContent(content),
-    };
+    return { role: 'user', content };
   }
 
   protected buildAssistantMessage(content: string): ResponsesInputMessage {
     return { role: 'assistant', content };
   }
 
-  protected persistedToMessage(message: DirectConversationMessage): ResponsesInputMessage {
-    return persistedToResponsesMessage(message);
+  protected contextMessage(message: ChatMessage): ResponsesInputMessage | null {
+    if (message.type === 'user-message') {
+      return {
+        role: 'user',
+        content: buildOpenAiResponsesUserContent(message.content, message.images?.map((image) => ({
+          kind: 'image', data: image.data, name: image.name || null,
+          mimeType: image.mimeType ?? 'application/octet-stream',
+        }))),
+      };
+    }
+    if (message.type === 'assistant-message') return { role: 'assistant', content: message.content };
+    return { role: 'assistant', content: JSON.stringify(message) };
   }
 
   protected async streamSession(session: DirectRuntimeSession<ResponsesInputMessage>): Promise<string> {

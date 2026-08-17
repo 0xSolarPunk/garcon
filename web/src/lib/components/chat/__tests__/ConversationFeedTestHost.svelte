@@ -20,10 +20,7 @@
 	} from '$lib/context';
 
 	interface Props {
-		onUserScrollIntent?: (
-			direction: 'earlier' | 'later' | null,
-			source?: 'viewport' | 'scrollbar-drag',
-		) => boolean | void;
+		onUserScrollIntent?: (direction: 'earlier' | 'later' | null) => void;
 		reserveTopFloatingToolbar?: boolean;
 		isPreparingInitialScroll?: boolean;
 		showAnnouncementTrigger?: boolean;
@@ -55,23 +52,23 @@
 			'generation-1',
 			[
 				{
-					seq: 1,
+					ordinal: 1,
 					message: new UserMessage('2026-07-01T00:00:00.000Z', 'Durable user message'),
 				},
 			],
 			{
-				lastSeq: 1,
-				pageOldestSeq: 1,
+				lastOrdinal: 1,
+				pageOldestOrdinal: 1,
+				nextBeforeOrdinal: null,
 				hasMore: false,
 			},
 		);
-		chatState.upsertPendingUserInput({
+		chatState.upsertOptimisticUserInput({
 			chatId: 'chat-1',
-			clientRequestId: 'request-1',
+			clientMessageId: 'message-1',
 			content: 'Pending user message',
 			createdAt: '2026-07-01T00:00:01.000Z',
-			deliveryStatus: 'submitting',
-			attachments: [],
+			delivery: 'pending',
 		});
 	} else if (initialTranscriptScenario !== 'empty') {
 		const messageCount =
@@ -81,12 +78,13 @@
 					? 5
 					: 120;
 		const messages = Array.from({ length: messageCount }, (_, index) => ({
-			seq: index + 1,
+			ordinal: index + 1,
 			message: new AssistantMessage('2026-07-01T00:00:00.000Z', `message ${index + 1}`),
 		}));
 		chatState.replaceGeneration('chat-1', 'generation-1', messages, {
-			lastSeq: initialTranscriptScenario === 'loading-later' ? 100 : messageCount,
-			pageOldestSeq: 1,
+			lastOrdinal: initialTranscriptScenario === 'loading-later' ? 100 : messageCount,
+			pageOldestOrdinal: 1,
+			nextBeforeOrdinal: null,
 			hasMore: false,
 		});
 		if (initialTranscriptScenario === 'loading-later') {
@@ -109,12 +107,13 @@
 
 	function shrinkTranscript(): void {
 		const messages = Array.from({ length: 20 }, (_, index) => ({
-			seq: index + 1,
+			ordinal: index + 1,
 			message: new AssistantMessage('2026-07-01T00:00:00.000Z', `message ${index + 1}`),
 		}));
 		chatState.replaceGeneration('chat-1', 'generation-1', messages, {
-			lastSeq: messages.length,
-			pageOldestSeq: 1,
+			lastOrdinal: messages.length,
+			pageOldestOrdinal: 1,
+			nextBeforeOrdinal: null,
 			hasMore: false,
 		});
 		chatState.revealAllLoadedMessages();
@@ -122,13 +121,14 @@
 
 	function shrinkTranscriptKeepingTail(): void {
 		const messages = Array.from({ length: 20 }, (_, index) => ({
-			seq: index + 101,
+			ordinal: index + 101,
 			message: new AssistantMessage('2026-07-01T00:00:00.000Z', `message ${index + 101}`),
 		}));
 		chatState.replaceGeneration('chat-1', 'generation-1', messages, {
-			lastSeq: 120,
-			pageOldestSeq: 101,
-			hasMore: true,
+			lastOrdinal: 120,
+			pageOldestOrdinal: 101,
+			nextBeforeOrdinal: null,
+			hasMore: false,
 		});
 		chatState.revealAllLoadedMessages();
 	}
@@ -178,7 +178,7 @@
 	onLoadEarlier={retryEarlierPage}
 	isVisible={true}
 	pinnedToBottom={true}
-	surfaceIdentity={`${chatState.activeChatId ?? 'none'}:${chatState.generationId}`}
+	surfaceIdentity={`${chatState.activeChatId ?? 'none'}:${chatState.transcriptViewId}`}
 />
 {#if showAnnouncementTrigger}
 	<button onclick={() => chatState.appendLocalNotice('progress', 'Repeated update')}

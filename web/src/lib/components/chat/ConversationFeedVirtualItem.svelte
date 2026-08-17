@@ -11,7 +11,7 @@
 	import type { PendingPermissionRequest } from '$lib/types/chat';
 	import type { SessionAgentId } from '$lib/types/app';
 	import type { ConversationMessageChatContext } from '$lib/chat/transcript/conversation-message-context.js';
-	import type { TranscriptPageState } from '$lib/chat/transcript/active-transcript-state.svelte.js';
+	import type { TranscriptPageState } from '$lib/chat/transcript/transcript-page-progress.js';
 	import type { ConversationFeedRenderModel } from '$lib/chat/transcript/conversation-feed-items.js';
 	import type { ConversationVirtualFeedItem } from './conversation-feed-virtual-items.js';
 	import type { ConversationFeedItemState } from './ConversationFeedItemState.svelte.js';
@@ -37,8 +37,15 @@
 		onRetry?: () => void;
 		onLoadEarlier: () => void;
 		onLoadLater: () => void;
-		onPermissionDecision?: (permissionRequestId: string, decision: PermissionDecision) => void;
-		onExitPlanMode?: (permissionRequestId: string, choice: string, plan: string) => void;
+		onPermissionDecision?: (
+			permissionOccurrenceId: string,
+			decision: PermissionDecision,
+		) => void;
+		onExitPlanMode?: (
+			permissionOccurrenceId: string,
+			choice: string,
+			plan: string,
+		) => void;
 		onForkChat?: (upToSeq?: number) => void;
 		onGenerateTitleFromMessage?: (message: string, messageSeq?: number) => void | Promise<void>;
 		canForkAtMessageNow: boolean;
@@ -73,7 +80,7 @@
 		const timestamp = request.receivedAt?.toISOString() ?? request.requestedTool.timestamp;
 		return new PermissionRequestMessage(
 			timestamp,
-			request.permissionRequestId,
+			request.permissionOccurrenceId,
 			request.requestedTool,
 		);
 	}
@@ -125,10 +132,15 @@
 			<PermissionRequestRow
 				request={permissionRequestMessage(item.request)}
 				onDecision={onPermissionDecision}
-				draft={itemState.permissionDraft(item.request.permissionRequestId)}
+				draft={itemState.permissionDraft(
+					item.request.permissionOccurrenceId,
+				)}
 				{acquireTransientActivity}
 				onDraftChange={(draft) =>
-					itemState.setPermissionDraft(item.request.permissionRequestId, draft)}
+					itemState.setPermissionDraft(
+						item.request.permissionOccurrenceId,
+						draft,
+					)}
 			/>
 		{/if}
 		{#if item.spacingAfter === 'responsive-feed'}

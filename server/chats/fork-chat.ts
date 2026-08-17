@@ -6,15 +6,38 @@ import type {
 } from '../agents/session-types.js';
 import { extractFirstLine } from '../lib/text.js';
 import type { AgentOwnershipJournal } from './agent-ownership-journal.js';
-import type {
-  CarryOverTranscriptStore,
-} from './carryover-transcript-store.js';
 import { DomainError } from '../lib/domain-error.js';
 import { createLogger } from '../lib/log.js';
-import { CommandValidationError } from '../lib/command-validation-error.js';
-import type { NativeUserIdentityRegistry } from './native-user-identity-registry.js';
+import type { TranscriptLedgerService } from '../ledger/service.js';
+import type { LedgerRow, LedgerRowDraft } from '../ledger/contracts.js';
+import { frozenConversationDrafts } from '../ledger/projection.js';
+import type { JsonObject } from '../../common/json.js';
 
 const logger = createLogger('chats:fork');
+
+// The nearest provider row at or before the point owns the native position. Core-authored rows
+// carry no provider identity by construction and resolve back to it, but a provider row resolves
+// to itself even when the provider has not correlated it yet: handing the facet that row's empty
+// identity is what lets the integration refuse, and skipping past it would silently fork from
+// somewhere the user did not choose. Rows below the content start belong to an earlier binding
+// and anchor nothing.
+function nativeForkAnchor(
+  rows: readonly LedgerRow[],
+  contentStartOrdinal: number,
+): LedgerRow | null {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (row.ordinal < contentStartOrdinal) return null;
+    if (row.kind === 'provider-row') return row;
+  }
+  return null;
+}
+
+// The integration refuses a point it cannot fork natively. With consent that refusal means
+// "seed from the frozen conversation instead"; without it, it reaches the caller unchanged.
+function isUnsettledForkPoint(error: unknown): boolean {
+  return error instanceof DomainError && error.code === 'TRANSCRIPT_NOT_YET_PERSISTED';
+}
 
 interface ForkChatSettings {
   getChatName(chatId: string): string | null | undefined;
@@ -29,30 +52,37 @@ interface ForkChatMetadata {
   addNewChatMetadata(chatId: string, firstMessage: string): void;
 }
 
-type ForkChatCarryOver = Pick<
-  CarryOverTranscriptStore,
-  'assertAvailable' | 'logicalMessageCount' | 'resolveCutoff'
->;
-
 interface ForkChatInput {
   sourceSession: ChatRegistryEntry;
   sourceChatId: string;
   targetChatId: string;
-  upToSequence?: number;
+  upToOrdinal?: number;
+  // Consent to a handoff fork when the point cannot be forked natively. Without it the
+  // integration's refusal reaches the caller, who asks the user before repeating the request.
+  allowHandoffFork?: boolean;
   registry: IChatRegistry;
   settings: ForkChatSettings;
   metadata: ForkChatMetadata;
-  carryOver: ForkChatCarryOver;
+  ledger: Pick<
+    TranscriptLedgerService,
+    'currentView' | 'highWatermark' | 'rowsThrough' | 'initializeChat' | 'deleteChat'
+  >;
   ownership: Pick<AgentOwnershipJournal, 'delete'>;
-  getViewCursor(chatId: string): { lastSeq: number } | null;
   forkAgentSession: (args: {
     sourceSession: ChatRegistryEntry;
     sourceChatId: string;
     targetChatId: string;
-    messageSequence?: number;
+    messageOrdinal?: number;
+    providerMeta?: JsonObject | null;
   }) => Promise<ForkedAgentSessionOutcome | null>;
   discardForkedAgentSession: (agentId: string, session: StartedAgentSession) => Promise<void>;
-  nativeUserIdentities: Pick<NativeUserIdentityRegistry, 'copyChat' | 'clearChat'>;
+  // Reads the forked session's own history so the target feed matches the session it resumes
+  // from. Answers null when the provider offers no import, which keeps the frozen projection.
+  readForkedNativeHistory: (args: {
+    targetChatId: string;
+    sourceSession: ChatRegistryEntry;
+    fork: StartedAgentSession;
+  }) => Promise<LedgerRowDraft[] | null>;
 }
 
 export interface ForkChatFileCopyResult {
@@ -98,67 +128,69 @@ export async function forkChatFileCopy({
   sourceSession,
   sourceChatId,
   targetChatId,
-  upToSequence,
+  upToOrdinal,
+  allowHandoffFork = false,
   registry,
   settings,
   metadata,
-  carryOver,
+  ledger,
   ownership,
-  getViewCursor,
   forkAgentSession,
   discardForkedAgentSession,
-  nativeUserIdentities,
+  readForkedNativeHistory,
 }: ForkChatInput): Promise<ForkChatFileCopyResult> {
   const startedAt = Date.now();
   const sourceAgentSessionId = sourceSession.agentSessionId;
   const targetEpoch = crypto.randomUUID();
-  const sourceSegments = sourceSession.carryOverSegments;
-  await carryOver.assertAvailable(sourceSegments);
-  const sourceArchivedCount = carryOver.logicalMessageCount(sourceSegments);
-  let selectedArchivedCount = sourceArchivedCount;
-  let targetSegments = sourceSegments;
-  if (upToSequence !== undefined && upToSequence <= sourceArchivedCount) {
-    selectedArchivedCount = upToSequence;
-    targetSegments = carryOver.resolveCutoff(sourceSegments, upToSequence);
+  const sourceView = ledger.currentView(sourceChatId);
+  if (!sourceView) {
+    throw new DomainError('TRANSCRIPT_UNAVAILABLE', 'Source transcript is unavailable', 422);
   }
-  const selectedNativeCount = upToSequence === undefined
-    ? null
-    : upToSequence - selectedArchivedCount;
-  if (selectedNativeCount !== null && selectedNativeCount > 0 && !sourceAgentSessionId) {
+  const sourceWatermark = ledger.highWatermark(sourceChatId);
+  const selectedOrdinal = upToOrdinal ?? sourceWatermark.ordinal;
+  if (!Number.isSafeInteger(selectedOrdinal)
+      || selectedOrdinal < 0
+      || selectedOrdinal > sourceWatermark.ordinal) {
     throw new DomainError(
       'TRANSCRIPT_UNAVAILABLE',
       'Fork message is outside the source transcript',
       422,
     );
   }
+  const selectedWatermark = { viewId: sourceWatermark.viewId, ordinal: selectedOrdinal };
+  const sourceRows = ledger.rowsThrough(sourceChatId, selectedWatermark);
+  const anchor = nativeForkAnchor(sourceRows, sourceView.contentStartOrdinal);
+  // Whether the anchor is forkable is the integration's call, so the request is delegated with
+  // whatever identity that row carries, including none. Only the owning integration knows what
+  // its metadata means and whether the provider has persisted far enough to honour it. Forking
+  // the whole chat continues from the session tip, which is always a native position; forking at
+  // a point needs an anchor, and with none there is nothing native to branch from, so the
+  // handoff fork is taken without asking.
   const needsNativeFork = Boolean(sourceAgentSessionId)
-    && (selectedNativeCount === null || selectedNativeCount > 0);
+    && (upToOrdinal === undefined || anchor !== null);
   let forkOutcome: ForkedAgentSessionOutcome | null = null;
-  try {
-    if (needsNativeFork) {
+  if (needsNativeFork) {
+    try {
       forkOutcome = await forkAgentSession({
         sourceSession,
         sourceChatId,
         targetChatId,
-        ...(upToSequence === undefined ? {} : { messageSequence: upToSequence }),
+        ...(upToOrdinal === undefined
+          ? {}
+          : {
+              messageOrdinal: upToOrdinal,
+              providerMeta: anchor?.providerMeta ?? null,
+            }),
       });
+    } catch (error) {
+      if (!allowHandoffFork || !isUnsettledForkPoint(error)) throw error;
+      forkOutcome = null;
     }
-  } catch (error) {
-    throw error;
   }
-  if (needsNativeFork && !forkOutcome) {
-    throw new Error(`Failed to create fork target for chat ${targetChatId}`);
-  }
-  if (
-    forkOutcome?.kind === 'unmaterialized'
-    && (getViewCursor(sourceChatId)?.lastSeq ?? 0)
-      > selectedArchivedCount
-  ) {
-    // Empty-snapshot forks succeed only when the user cannot see anything the child would lose;
-    // otherwise the provider transcript is still flushing and the fork is retryable.
-    throw new CommandValidationError(
+  if (forkOutcome?.kind === 'unmaterialized' && !allowHandoffFork) {
+    throw new DomainError(
       'TRANSCRIPT_NOT_YET_PERSISTED',
-      "This chat's transcript hasn't been written yet. Try the fork again in a moment.",
+      'The native fork is not materialized yet. Try again shortly or confirm a handoff fork.',
       409,
       true,
     );
@@ -166,6 +198,69 @@ export async function forkChatFileCopy({
   const nativeFork = forkOutcome?.kind === 'materialized' ? forkOutcome.session : null;
   try {
     validateForkedSeedReceipt(sourceSession, nativeFork);
+  } catch (error) {
+    const cleanupErrors = await discardForkResources(
+      nativeFork,
+      sourceSession.agentId,
+      discardForkedAgentSession,
+    );
+    if (cleanupErrors.length > 0) throw new AggregateError([error, ...cleanupErrors]);
+    throw error;
+  }
+
+  if (ledger.currentView(targetChatId)) {
+    const error = new Error(`Chat ID collision: ${targetChatId}`);
+    const cleanupErrors = await discardForkResources(
+      nativeFork,
+      sourceSession.agentId,
+      discardForkedAgentSession,
+    );
+    if (cleanupErrors.length > 0) throw new AggregateError([error, ...cleanupErrors], error.message);
+    throw error;
+  }
+  // The forked session, not the source's rows, is what the target resumes from, so its own
+  // history decides the feed. Copying the source across would start the chat already
+  // disagreeing with its session. A handoff fork has no session to read and keeps the
+  // frozen projection.
+  let nativeSeed: LedgerRowDraft[] | null = null;
+  if (nativeFork) {
+    try {
+      nativeSeed = await readForkedNativeHistory({
+        targetChatId,
+        sourceSession,
+        fork: nativeFork,
+      });
+    } catch (error) {
+      const cleanupErrors = await discardForkResources(
+        nativeFork,
+        sourceSession.agentId,
+        discardForkedAgentSession,
+      );
+      if (cleanupErrors.length > 0) throw new AggregateError([error, ...cleanupErrors]);
+      throw error;
+    }
+  }
+  const sessionRow: LedgerRowDraft[] = nativeFork
+    ? [{
+      kind: 'session',
+      at: new Date().toISOString(),
+      detail: nativeFork,
+      providerMeta: null,
+    }]
+    : [];
+  // A native seed describes the current binding itself, so only what sits below the source's
+  // content start is frozen ahead of it: history from earlier agents that no provider ever
+  // held, carried across the fork the same way a reload preserves it. Without a seed the whole
+  // selection freezes.
+  const frozenPrefix = frozenConversationDrafts(
+    nativeSeed
+      ? sourceRows.filter((row) => row.ordinal < sourceView.contentStartOrdinal)
+      : sourceRows,
+  );
+  const seedRows = [...frozenPrefix, ...sessionRow, ...(nativeSeed ?? [])];
+  const contentStartOrdinal = frozenPrefix.length + 1;
+  try {
+    ledger.initializeChat(targetChatId, seedRows, contentStartOrdinal);
   } catch (error) {
     const cleanupErrors = await discardForkResources(
       nativeFork,
@@ -197,11 +292,12 @@ export async function forkChatFileCopy({
       permissionMode: sourceSession.permissionMode,
       thinkingMode: sourceSession.thinkingMode,
       agentSettingsById: { ...sourceSession.agentSettingsById },
-      carryOverSegments: targetSegments,
+      carryOverSegments: [],
       nativeSeedReceipt: nativeFork?.nativeSeedReceipt ?? null,
-      carryOverMigrationQuarantine: sourceSession.carryOverMigrationQuarantine,
+      carryOverMigrationQuarantine: null,
     });
   } catch (error) {
+    ledger.deleteChat(targetChatId);
     const cleanupErrors = await discardForkResources(
       nativeFork,
       sourceSession.agentId,
@@ -212,6 +308,7 @@ export async function forkChatFileCopy({
   }
   if (!created) {
     const error = new Error(`Chat ID collision: ${targetChatId}`);
+    ledger.deleteChat(targetChatId);
     const cleanupErrors = await discardForkResources(
       nativeFork,
       sourceSession.agentId,
@@ -226,7 +323,6 @@ export async function forkChatFileCopy({
   let rolledBack = false;
   const rollback = async () => {
     if (rolledBack) return;
-    nativeUserIdentities.clearChat(targetChatId);
     const cleanupErrors: unknown[] = [];
     try {
       await rollbackForkTarget({
@@ -257,7 +353,6 @@ export async function forkChatFileCopy({
   };
 
   try {
-    if (nativeFork) nativeUserIdentities.copyChat(sourceChatId, targetChatId);
     await registry.flush();
     await registry.updateChat(sourceChatId, {
       nextForkOrdinal: nextForkOrdinal + 1,
@@ -281,8 +376,8 @@ export async function forkChatFileCopy({
     targetChatId,
     agentId: sourceSession.agentId,
     kind: nativeFork ? 'native' : 'lazy',
-    point: upToSequence ?? null,
-    carryOverMessages: selectedArchivedCount,
+    point: upToOrdinal ?? null,
+    copiedRows: frozenPrefix.length,
     durationMs: Date.now() - startedAt,
   });
 

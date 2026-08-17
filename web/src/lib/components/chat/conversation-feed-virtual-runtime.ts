@@ -30,6 +30,14 @@ export interface ConversationVirtualAnchor {
 	fallbackKeys: readonly string[];
 }
 
+export interface ConversationVirtualAnchorSettlePort {
+	readonly options: { readonly scrollMargin: number };
+	cancelScroll(): void;
+	getVirtualItems(): VirtualItem[];
+	scrollToIndex(index: number, options: { align: 'start'; behavior: 'auto' }): void;
+	scrollToOffset(offset: number, options: { behavior: 'auto' }): void;
+}
+
 export class ConversationProgrammaticScrollOwnership {
 	#active = false;
 	#epoch = 0;
@@ -263,7 +271,7 @@ export class ConversationMountedVirtualItems {
 	}
 
 	committedVirtualItem(
-		instance: SvelteVirtualizer<HTMLElement, HTMLDivElement>,
+		instance: Pick<ConversationVirtualAnchorSettlePort, 'getVirtualItems'>,
 		configuredKeys: readonly string[],
 		key: string,
 	): VirtualItem | undefined {
@@ -323,7 +331,7 @@ export class ConversationMountedVirtualItems {
 }
 
 export async function settleConversationVirtualAnchor(input: {
-	instance: SvelteVirtualizer<HTMLElement, HTMLDivElement>;
+	instance: ConversationVirtualAnchorSettlePort;
 	mountedItems: ConversationMountedVirtualItems;
 	configuredKeys: readonly string[];
 	key: string;
@@ -350,7 +358,10 @@ export async function settleConversationVirtualAnchor(input: {
 			input.instance.options.scrollMargin,
 			input.viewportOffset,
 		);
-		input.instance.scrollToOffset(scrollOffset, { behavior: 'auto' });
+		const currentOffset = input.readScrollOffset();
+		if (currentOffset === null || Math.abs(currentOffset - scrollOffset) > GEOMETRY_TOLERANCE_PX) {
+			input.instance.scrollToOffset(scrollOffset, { behavior: 'auto' });
+		}
 		await nextConversationAnimationFrame();
 		if (!input.isCurrent()) return false;
 		const settledItem = input.instance
@@ -369,6 +380,7 @@ export async function settleConversationVirtualAnchor(input: {
 					),
 			) <= GEOMETRY_TOLERANCE_PX
 		) {
+			input.instance.cancelScroll();
 			return true;
 		}
 	}

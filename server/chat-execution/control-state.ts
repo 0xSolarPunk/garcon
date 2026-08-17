@@ -8,15 +8,15 @@ import { MAX_RECENTLY_DISPATCHED_QUEUE_ENTRIES } from '../../common/queue-state.
 
 export { MAX_RECENTLY_DISPATCHED_QUEUE_ENTRIES } from '../../common/queue-state.ts';
 
-export interface StoredQueueDeliveryIdentity {
-  clientRequestId: string;
+export interface StoredQueueSubmissionIdentity {
   clientMessageId: string;
-  turnId: string;
+  transcriptViewId: string;
+  excludedResendOrdinals?: readonly number[];
 }
 
 export interface StoredQueueEntry extends QueueEntry {
-  status: 'queued' | 'sending' | 'steering';
-  delivery?: StoredQueueDeliveryIdentity;
+  status: 'queued' | 'steering';
+  submission?: StoredQueueSubmissionIdentity;
 }
 
 export type StoredQueueCommandOperation = 'create' | 'replace' | 'delete' | 'move';
@@ -64,7 +64,14 @@ export function cloneStoredChatExecutionControl(
     ...control,
     entries: control.entries.map((entry) => ({
       ...entry,
-      ...(entry.delivery ? { delivery: { ...entry.delivery } } : {}),
+      ...(entry.submission ? {
+        submission: {
+          ...entry.submission,
+          ...(entry.submission.excludedResendOrdinals
+            ? { excludedResendOrdinals: [...entry.submission.excludedResendOrdinals] }
+            : {}),
+        },
+      } : {}),
     })),
     recentlyDispatched: control.recentlyDispatched.map((entry) => ({ ...entry })),
     appliedCommands: control.appliedCommands.map((command) => ({ ...command })),
@@ -85,9 +92,7 @@ export function toClientChatExecutionControlState(
     serverInstanceId: control.serverInstanceId,
     queue: {
       entries: control.entries
-        .filter((entry) => entry.status === 'queued' || entry.status === 'steering')
-        .map(({ status: _status, delivery: _delivery, ...entry }) => ({ ...entry })),
-      dispatchingEntryId: control.entries.find((entry) => entry.status === 'sending')?.id ?? null,
+        .map(({ status: _status, submission: _submission, ...entry }) => ({ ...entry })),
       steeringEntryId: control.entries.find((entry) => entry.status === 'steering')?.id ?? null,
       recentlyDispatched: control.recentlyDispatched
         .slice(-MAX_RECENTLY_DISPATCHED_QUEUE_ENTRIES)

@@ -74,7 +74,7 @@ export class ConversationFeedRenderModelController {
 				return false;
 			}
 			if (previous.kind === 'message' && next.kind === 'message') {
-				if (previous.seq !== next.seq || previous.message !== next.message) return false;
+				if (previous.ordinal !== next.ordinal || previous.message !== next.message) return false;
 			} else if (previous !== next) {
 				return false;
 			}

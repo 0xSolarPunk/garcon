@@ -9,7 +9,10 @@ import {
 	updateSavedSearch as updateSavedSearchApi,
 	type SavedChatSearch,
 } from '$lib/api/settings';
-import { searchChatTranscripts as searchChatTranscriptsApi } from '$lib/api/chats';
+import {
+	navigateToSearchResult as navigateToSearchResultApi,
+	searchChatTranscripts as searchChatTranscriptsApi,
+} from '$lib/api/chats';
 import { ApiError } from '$lib/api/client';
 import {
 	isEmptyFilter,
@@ -62,6 +65,7 @@ export interface SidebarSearchStoreDeps {
 		request: ChatSearchRequest,
 		options?: { signal?: AbortSignal },
 	) => Promise<ChatSearchResponse>;
+	navigateToSearchResult?: typeof navigateToSearchResultApi;
 	waitForTranscriptIndexRetry?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -125,6 +129,37 @@ export class SidebarSearchStore {
 
 	get transcriptSearchResultsByChatId(): Map<string, ChatSearchResult> {
 		return new Map(this.transcriptSearchResults.map((result) => [result.chatId, result]));
+	}
+
+	// Revalidates the transcript view before scrolling to a durable row.
+	async openTranscriptResult(
+		chatId: string,
+		onOpen: (chatId: string, seq: number | null) => void,
+	): Promise<void> {
+		const result = this.transcriptSearchResultsByChatId.get(chatId);
+		const snippet = result?.snippets[0];
+		if (!result || !snippet) {
+			onOpen(chatId, null);
+			return;
+		}
+		try {
+			const resolved = await (this.deps.navigateToSearchResult ?? navigateToSearchResultApi)({
+				chatId,
+				transcriptViewId: result.transcriptViewId,
+				ordinal: snippet.ordinal,
+			});
+			onOpen(chatId, resolved.ordinal);
+		} catch (error) {
+			if (error instanceof ApiError && error.errorCode === 'SEARCH_RESULT_STALE') {
+				this.transcriptSearchResults = this.transcriptSearchResults.filter(
+					(entry) => entry.chatId !== chatId,
+				);
+				void this.refreshTranscriptSearch(this.transcriptSearchQuery);
+			} else {
+				this.deps.logError?.('Search result navigation failed', error);
+			}
+			onOpen(chatId, null);
+		}
 	}
 
 	get isFiltered(): boolean {

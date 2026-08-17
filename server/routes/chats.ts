@@ -1,7 +1,5 @@
-// /api/chats/* route handlers. Provides CRUD for the session registry
-// and dispatches message reads to the appropriate agent parser.
+// /api/chats/* route handlers for registry operations and ledger-backed transcripts.
 
-import { AgentIntegrationError } from '@garcon/server-agent-interface';
 import { promises as fs } from 'fs';
 import { withJsonBody } from '../lib/json-route.js';
 import type { IChatRegistry } from '../chats/store.js';
@@ -36,18 +34,17 @@ import type {
   SetLastSelectedChatRequest,
   SetLastSelectedChatResponse,
 } from '../../common/chat-list.js';
-import { CHAT_MESSAGES_MAX_LIMIT, parsePagination } from '../lib/pagination.js';
+import { CHAT_MESSAGES_MAX_LIMIT } from '../lib/pagination.js';
 import { assertRealWithinProjectBase, isProjectBoundaryError } from '../lib/path-boundary.js';
 import { jsonError, jsonErrorFromUnknown } from '../lib/http-error.js';
 import {
   GoalControlDeliveryError,
   DomainError,
   QueueEntrySteerError,
-  transcriptUnavailableMessage,
   ValidationDomainError,
 } from '../lib/domain-error.js';
 import { AttachmentValidationError, validateCommandAttachments } from '../attachments/validation.js';
-import { TranscriptSearchUnavailableError } from '../chats/search/errors.js';
+import { TranscriptHistoryUnavailableError } from '../chats/errors.js';
 import type { ChatReorderResult } from '../settings/types.js';
 import type { RouteMap } from '../lib/http-route-types.js';
 import { InMemoryLastSelectedChatState, type LastSelectedChatState } from '../chats/last-selected-chat-state.js';
@@ -56,16 +53,15 @@ import {
   QueuePauseChangedError,
   type ChatExecutionService,
 } from '../chat-execution/chat-execution-coordinator.js';
-import type { ChatViewPageReader } from '../chats/chat-message-reader.js';
+import type { TranscriptPageReader } from '../chats/chat-message-reader.js';
+import { StaleTranscriptViewError } from '../ledger/errors.js';
 import type { ChatMetadata } from '../chats/metadata-store.js';
-import type { PendingUserInputServiceContract } from '../chats/pending-user-input-service.js';
 import type { AgentRegistryServiceContract } from '../agents/registry.js';
 import { createLogger } from '../lib/log.js';
 import { readOnlyGitOptions, runGit } from '../git/run.js';
-import {
-  isRequestedChatViewPage,
-  type CompleteChatHistoryResponse,
-  type DegradedChatHistoryResponse,
+import type {
+  CompleteChatHistoryResponse,
+  UnavailableChatHistoryResponse,
 } from '../../common/chat-view.js';
 import {
   archivedLogicalCount,
@@ -73,18 +69,12 @@ import {
 } from '../chats/carryover-segments.js';
 
 const logger = createLogger('routes:chats');
-const MAX_SEARCH_QUERY_CHARS = 4_096;
-const MAX_SEARCH_TEXT_TOKEN_CHARS = 1_024;
-const MAX_SEARCH_TEXT_CHARS = 8_192;
-const MAX_SEARCH_CHAT_IDS = 10_000;
-const MAX_SEARCH_CHAT_ID_CHARS = 512;
 import type {
   ExecutionSettingsPatchRequest,
   ModelPatchRequest,
   CommandAcceptedResponse,
   QueueCommandErrorResponse,
   QueueEntrySteerErrorResponse,
-  RepairHistoryAcceptNativeResponse,
   RunningChatsResponse,
 } from '../../common/chat-command-contracts.ts';
 import {
@@ -102,10 +92,6 @@ import {
 } from '../../common/chat-command-contracts.js';
 import { parseSelfHandoffRunCommandRequest } from '../../common/self-handoff-contracts.js';
 import {
-  parseRepairHistoryRequest,
-  type RepairHistoryRetryAbandonedResponse,
-} from '../../common/chat-history-repair.js';
-import {
   parsePermissionDecisionCommandRequest,
   parseProjectPathPatchRequest,
   parseQueueEntryCreateCommandRequest,
@@ -120,12 +106,9 @@ import type {
   GenerateChatTitleRequest,
   GenerateChatTitleResponse,
 } from '../../common/chat-title-contracts.js';
-import type {
-  ChatSearchRequest,
-  ChatSearchResponse,
-} from '../../common/chat-search.js';
 import type { ChatDetailsResponse } from '../../common/chat-details.js';
-import { CHAT_SEARCH_MAX_TERMS, CHAT_SEARCH_MAX_WORDS } from '../../common/chat-search.js';
+import type { ChatProcessingActivity } from '../chats/chat-processing-activity.js';
+import { createChatSearchRoutes, type ChatSearchDep } from './chat-search-routes.js';
 import {
   generateChatTitleFromMessage,
   TitleGenerationError,
@@ -172,22 +155,8 @@ interface MetadataDep {
 }
 
 type QueueDep = ChatExecutionService;
-type ChatViewsDep = ChatViewPageReader;
+type ChatViewsDep = TranscriptPageReader;
 type AgentRegistryDep = AgentRegistryServiceContract;
-type PendingInputsDep = PendingUserInputServiceContract;
-
-interface ChatSearchDep {
-  catalogMayHaveChanged(chatId?: string): void;
-  search(options: {
-    query: string;
-    textTokens?: string[];
-    allowedChatIds: string[];
-    limit?: number;
-  }): Promise<{
-    results: ChatSearchResponse['results'];
-    index: ChatSearchResponse['index'];
-  }>;
-}
 
 async function isGitRepository(projectPath: string): Promise<boolean> {
   try {
@@ -246,13 +215,22 @@ function optionalNonNegativeIntegerField(body: Record<string, unknown>, field: s
   throw new ValidationDomainError(`${field} must be a non-negative integer`);
 }
 
-function parseBeforeSeq(value: string | null): number | Response | undefined {
+function parseBeforeOrdinal(value: string | null): number | Response | undefined {
   if (value === null || value.trim() === '') return undefined;
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    return jsonError('beforeSeq must be a positive integer', 400, 'VALIDATION_FAILED');
+    return jsonError('beforeOrdinal must be a positive integer', 400, 'VALIDATION_FAILED');
   }
   return parsed;
+}
+
+function parseMessagesLimit(value: string | null): number | Response {
+  if (value === null || value.trim() === '') return 20;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return jsonError('limit must be a positive integer', 400, 'VALIDATION_FAILED', false);
+  }
+  return Math.min(parsed, CHAT_MESSAGES_MAX_LIMIT);
 }
 
 function optionalStringOrNull(value: unknown): string | null | undefined {
@@ -262,14 +240,6 @@ function optionalStringOrNull(value: unknown): string | null | undefined {
 }
 
 function chatSettingsPatchErrorResponse(error: unknown): Response {
-  if (error instanceof AgentIntegrationError && error.code === 'TRANSCRIPT_UNAVAILABLE') {
-    return jsonError(
-      transcriptUnavailableMessage(error.retryable),
-      503,
-      error.code,
-      error.retryable,
-    );
-  }
   if (error instanceof ModelSelectionError) {
     return jsonError(error.message, 422, 'MODEL_SELECTION_ERROR');
   }
@@ -289,119 +259,19 @@ function pathValidationError(error: string, errorCode: string, status = 200): Re
   );
 }
 
-function stringArrayOrNull(value: unknown): string[] | null {
-  return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : null;
-}
-
-function optionalStringArrayField(body: Record<string, unknown>, field: string): string[] | undefined {
-  if (body[field] === undefined) return undefined;
-  const values = stringArrayOrNull(body[field]);
-  if (!values) throw new ValidationDomainError(`${field} must be an array of strings`);
-  return values.map((value) => value.trim()).filter(Boolean);
-}
-
-function optionalBoundedStringArrayField(
-  body: Record<string, unknown>,
-  field: string,
-  limits: { maxItems: number; maxItemChars: number; maxTotalChars: number },
-): string[] | undefined {
-  if (body[field] === undefined) return undefined;
-  const values = stringArrayOrNull(body[field]);
-  if (!values) throw new ValidationDomainError(`${field} must be an array of strings`);
-  if (values.length > limits.maxItems) {
-    throw new ValidationDomainError(`${field} must contain at most ${limits.maxItems} items`);
-  }
-  let totalChars = 0;
-  for (const value of values) {
-    if (value.length > limits.maxItemChars) {
-      throw new ValidationDomainError(`${field} entries must be at most ${limits.maxItemChars} characters`);
-    }
-    totalChars += value.length;
-    if (totalChars > limits.maxTotalChars) {
-      throw new ValidationDomainError(`${field} is too large`);
-    }
-  }
-  return values.map((value) => value.trim()).filter(Boolean);
-}
-
-function parseSearchRequest(body: unknown): ChatSearchRequest {
-  const input = bodyRecord(body);
-  const textTokens = optionalBoundedStringArrayField(input, 'textTokens', {
-    maxItems: CHAT_SEARCH_MAX_TERMS,
-    maxItemChars: MAX_SEARCH_TEXT_TOKEN_CHARS,
-    maxTotalChars: MAX_SEARCH_TEXT_CHARS,
-  });
-  const rawQuery = typeof input.query === 'string' ? input.query : '';
-  if (rawQuery.length > MAX_SEARCH_QUERY_CHARS) {
-    throw new ValidationDomainError(`query must be at most ${MAX_SEARCH_QUERY_CHARS} characters`);
-  }
-  const query = rawQuery.trim();
-  const effectiveTerms = textTokens?.length
-    ? textTokens
-    : [...query.matchAll(/"([^"]+)"|(\S+)/g)].map((match) => match[1] ?? match[2] ?? '');
-  if (effectiveTerms.length > CHAT_SEARCH_MAX_TERMS) {
-    throw new ValidationDomainError(`search must contain at most ${CHAT_SEARCH_MAX_TERMS} terms`);
-  }
-  const wordCount = effectiveTerms.reduce(
-    (count, term) => count + (term.match(/[\p{L}\p{N}_]+/gu)?.length ?? 0),
-    0,
-  );
-  if (wordCount > CHAT_SEARCH_MAX_WORDS) {
-    throw new ValidationDomainError(`search must contain at most ${CHAT_SEARCH_MAX_WORDS} words`);
-  }
-  const effectiveQuery = query || textTokens?.join(' ') || '';
-  if (!effectiveQuery) throw new ValidationDomainError('query is required');
-
-  return {
-    query: effectiveQuery,
-    textTokens,
-    chatIds: optionalBoundedStringArrayField(input, 'chatIds', {
-      maxItems: MAX_SEARCH_CHAT_IDS,
-      maxItemChars: MAX_SEARCH_CHAT_ID_CHARS,
-      maxTotalChars: MAX_SEARCH_CHAT_IDS * MAX_SEARCH_CHAT_ID_CHARS,
-    }),
-    limit: optionalNonNegativeIntegerField(input, 'limit'),
-  };
-}
-
-async function searchableChatIds(
-  registry: IChatRegistry,
-  pathCache: PathCacheDep,
-  chatListProjector: import('../chats/chat-list-projector.js').ChatListProjector,
-  requestedChatIds: string[] | undefined,
-): Promise<string[]> {
-  const sessions = registry.listAllChats();
-  const sessionEntries = Object.entries(sessions);
-  const statuses = await pathCache.resolveProjectPaths(
-    sessionEntries.map(([, session]) => session.projectPath),
-  );
-  const visibleEntries = await chatListProjector.buildMany(sessionEntries, statuses);
-  if (requestedChatIds !== undefined) {
-    return requestedChatIds.filter((chatId) => visibleEntries.has(chatId));
-  }
-  return [...visibleEntries.values()]
-    .sort((left, right) => {
-      const leftActivity = left.activity.lastActivityAt ?? left.activity.createdAt ?? '';
-      const rightActivity = right.activity.lastActivityAt ?? right.activity.createdAt ?? '';
-      return rightActivity.localeCompare(leftActivity) || left.id.localeCompare(right.id);
-    })
-    .map((entry) => entry.id);
-}
-
 interface ChatRouteDeps {
   registry: IChatRegistry;
   settings: SettingsDep;
   recentTitleIcons: RecentTitleIconSource;
   queue: QueueDep;
+  processing: Pick<ChatProcessingActivity, 'phase'>;
   pathCache: PathCacheDep;
   metadata: MetadataDep;
   chatViews: ChatViewsDep;
   agents: AgentRegistryDep;
-  pendingInputs: PendingInputsDep;
   commandService: ChatCommandService;
   chatListProjector: import('../chats/chat-list-projector.js').ChatListProjector;
   searchIndex?: ChatSearchDep;
-  notifyHistoryChanged?: (chatId: string) => void;
   lastSelectedChat?: LastSelectedChatState;
 }
 
@@ -410,18 +280,23 @@ export default function createChatRoutes({
   settings,
   recentTitleIcons,
   queue,
+  processing,
   pathCache,
   metadata,
   chatViews,
   agents,
-  pendingInputs,
   commandService,
   chatListProjector,
   searchIndex,
-  notifyHistoryChanged,
   lastSelectedChat = new InMemoryLastSelectedChatState(),
 }: ChatRouteDeps): RouteMap {
   const commands = commandService;
+  const searchRoutes = createChatSearchRoutes({
+    registry,
+    pathCache,
+    chatListProjector,
+    searchIndex,
+  });
 
   function validatedLastSelectedChatId(
     rememberedChatId: string | null,
@@ -541,67 +416,6 @@ export default function createChatRoutes({
     }
   }
 
-  async function postRepairHistory(body: unknown): Promise<Response> {
-    try {
-      const input = parseCommandRequest(parseRepairHistoryRequest, body);
-      if (input.action === 'retry-abandoned-release') {
-        const outcome = await commands.retryRetainedTransferCleanups();
-        const record = (cleanup: { chatId: string; source: { agentId: string }; lastErrorCode: string | null }) => ({
-          chatId: cleanup.chatId,
-          agentId: cleanup.source.agentId,
-          lastErrorCode: cleanup.lastErrorCode,
-        });
-        return Response.json({
-          success: true,
-          action: 'retry-abandoned-release',
-          retried: outcome.retried.map(record),
-          unresolved: outcome.unresolved.map(record),
-        } satisfies RepairHistoryRetryAbandonedResponse);
-      }
-      const current = registry.getChat(input.chatId);
-      if (!current) throw new DomainError('SESSION_NOT_FOUND', 'Session not found', 404, false);
-      if (
-        current.agentOwnershipEpoch !== input.expectedAgentOwnershipEpoch
-        || carryOverRevision(
-          current.carryOverSegments,
-          current.carryOverMigrationQuarantine,
-        ) !== input.expectedCarryOverRevision
-      ) {
-        throw new DomainError(
-          'STALE_CHAT_OWNERSHIP',
-          'Chat history ownership changed before repair.',
-          409,
-          true,
-        );
-      }
-      const receiptCleared = current.nativeSeedReceipt !== null;
-      if (receiptCleared) {
-        const updated = await registry.updateChat(
-          input.chatId,
-          { nativeSeedReceipt: null },
-          { flush: true },
-        );
-        if (!updated) throw new DomainError('SESSION_NOT_FOUND', 'Session not found', 404, false);
-        searchIndex?.catalogMayHaveChanged(input.chatId);
-        notifyHistoryChanged?.(input.chatId);
-      }
-      logger.warn('history repair accepted the current native transcript', {
-        chatId: input.chatId,
-        agentId: current.agentId,
-        action: input.action,
-        receiptCleared,
-      });
-      return Response.json({
-        success: true,
-        action: 'accept-native',
-        chatId: input.chatId,
-        receiptCleared,
-      } satisfies RepairHistoryAcceptNativeResponse);
-    } catch (error: unknown) {
-      return jsonErrorFromUnknown(error);
-    }
-  }
-
   async function putLastSelectedChat(body: SetLastSelectedChatRequest | unknown): Promise<Response> {
     const input = bodyRecord(body);
     const rawChatId = input.chatId;
@@ -638,31 +452,63 @@ export default function createChatRoutes({
         return jsonError('Session not found', 404, 'SESSION_NOT_FOUND');
       }
 
-      const { limit } = parsePagination(url.searchParams.get('limit'), null, {
-        maxLimit: CHAT_MESSAGES_MAX_LIMIT,
-      });
-      const beforeSeqRaw = url.searchParams.get('beforeSeq');
-      const beforeSeq = parseBeforeSeq(beforeSeqRaw);
-      if (beforeSeq instanceof Response) return beforeSeq;
-
-      const page = await chatViews.getOrCreatePage(chatId, limit, beforeSeq);
-      if (!isRequestedChatViewPage({ limit, beforeSeq }, { ...page, limit })) {
-        throw new Error('Chat message reader returned an invalid requested page');
+      const limit = parseMessagesLimit(url.searchParams.get('limit'));
+      if (limit instanceof Response) return limit;
+      const beforeOrdinalRaw = url.searchParams.get('beforeOrdinal');
+      const beforeOrdinal = parseBeforeOrdinal(beforeOrdinalRaw);
+      if (beforeOrdinal instanceof Response) return beforeOrdinal;
+      const expectedTranscriptViewId = url.searchParams.get('transcriptViewId')?.trim() ?? '';
+      if (beforeOrdinal !== undefined && !expectedTranscriptViewId) {
+        return jsonError(
+          'transcriptViewId query parameter is required for earlier pages',
+          400,
+          'VALIDATION_FAILED',
+          false,
+        );
       }
-      await pendingInputs.reconcileRetainedHistory(chatId);
+
+      const page = await chatViews.page(
+        chatId,
+        limit,
+        beforeOrdinal,
+        expectedTranscriptViewId || undefined,
+      );
+      if (
+        expectedTranscriptViewId
+        && page.transcriptViewId !== expectedTranscriptViewId
+      ) {
+        return jsonError(
+          'Transcript view changed while paging',
+          409,
+          'STALE_TRANSCRIPT_VIEW',
+          false,
+        );
+      }
       return Response.json({
         historyState: { kind: 'complete' },
         chatId,
-        generationId: page.generationId,
+        transcriptViewId: page.transcriptViewId,
         messages: page.messages,
-        lastSeq: page.lastSeq,
-        pageOldestSeq: page.pageOldestSeq,
+        lastOrdinal: page.lastOrdinal,
+        pageOldestOrdinal: page.pageOldestOrdinal,
+        pageNewestOrdinal: page.pageNewestOrdinal,
+        nextBeforeOrdinal: page.nextBeforeOrdinal,
         hasMore: page.hasMore,
+        resendCandidates: processing.phase(chatId) === null
+          ? [...agents.resendCandidates(chatId)]
+          : [],
         limit,
-        pendingUserInputs: pendingInputs.listForTransport(chatId),
       } satisfies CompleteChatHistoryResponse);
     } catch (error: unknown) {
       logger.error(`sessions: error reading messages for ${chatId}:`, (error as Error).message);
+      if (error instanceof StaleTranscriptViewError) {
+        return jsonError(
+          'Transcript view changed while paging',
+          409,
+          'STALE_TRANSCRIPT_VIEW',
+          false,
+        );
+      }
       if (error instanceof DomainError && error.code === 'CARRYOVER_HISTORY_UNAVAILABLE') {
         return Response.json({
           historyState: {
@@ -672,48 +518,18 @@ export default function createChatRoutes({
           },
           chatId,
           messages: [],
-        } satisfies DegradedChatHistoryResponse);
+        } satisfies UnavailableChatHistoryResponse);
       }
-      if (error instanceof AgentIntegrationError && error.code === 'TRANSCRIPT_UNAVAILABLE') {
-        return jsonError(
-          transcriptUnavailableMessage(error.retryable),
-          503,
-          error.code,
-          error.retryable,
-        );
+      // A non-ready transcript read is a typed history state, not exhaustion:
+      // deferred retries once on the execution-to-idle transition and degraded
+      // carries the store's own failure code.
+      if (error instanceof TranscriptHistoryUnavailableError) {
+        return Response.json({
+          historyState: error.historyState,
+          chatId,
+          messages: [],
+        } satisfies UnavailableChatHistoryResponse);
       }
-      return jsonErrorFromUnknown(error);
-    }
-  }
-
-  async function postSearchChats(body: unknown): Promise<Response> {
-    try {
-      if (!searchIndex) {
-        throw new TranscriptSearchUnavailableError(
-          'SEARCH_INDEX_UNAVAILABLE',
-          'Chat search index is not available',
-          true,
-        );
-      }
-      const search = parseSearchRequest(body);
-      const result = await searchIndex.search({
-        query: search.query,
-        textTokens: search.textTokens,
-        allowedChatIds: await searchableChatIds(
-          registry,
-          pathCache,
-          chatListProjector,
-          search.chatIds,
-        ),
-        limit: search.limit,
-      });
-      return Response.json({
-        query: search.query,
-        results: result.results,
-        total: result.results.length,
-        index: result.index,
-      } satisfies ChatSearchResponse);
-    } catch (error: unknown) {
       return jsonErrorFromUnknown(error);
     }
   }
@@ -1283,8 +1099,8 @@ export default function createChatRoutes({
     '/api/v1/chats/handoff-run': { POST: withJsonBody(postSelfHandoffRunChat) },
     '/api/v1/chats/compact': { POST: withJsonBody(postCompactChat) },
     '/api/v1/chats/messages': { GET: getMessages },
-    '/api/v1/chats/repair-history': { POST: withJsonBody(postRepairHistory) },
-    '/api/v1/chats/search': { POST: withJsonBody(postSearchChats) },
+    '/api/v1/chats/search': { POST: withJsonBody(searchRoutes.postSearchChats) },
+    '/api/v1/chats/search/navigate': { POST: withJsonBody(searchRoutes.postSearchNavigate) },
     '/api/v1/chats/running': { GET: getRunningChats },
     '/api/v1/chats/queue': { GET: getQueue },
     '/api/v1/chats/queue/entries': {

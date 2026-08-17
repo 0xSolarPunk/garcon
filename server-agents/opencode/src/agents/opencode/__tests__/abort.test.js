@@ -1,6 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test';
 import { OpenCodeRuntime } from '../opencode.js';
-import { openCodeSessionError } from '../sse-events.js';
 
 function deferred() {
   let resolve;
@@ -12,8 +11,72 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function pendingUntilAborted(signal) {
+  return new Promise((_, reject) => {
+    const abort = () => reject(signal.reason ?? new Error('OpenCode request aborted'));
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
 function envelope(event) {
   return { directory: '/repo', payload: event };
+}
+
+function collectOperation(runId = 'run-default') {
+  const events = [];
+  return {
+    events,
+    operation: {
+      runId,
+      publish(event) {
+        events.push(event);
+      },
+    },
+  };
+}
+
+function publishedMessages(events) {
+  return events.flatMap((event) => (
+    event.type === 'rows' ? event.rows.map((row) => row.message) : []
+  ));
+}
+
+function terminalEvents(events) {
+  return events.filter((event) => event.type === 'run-ended');
+}
+
+function failureMessages(events) {
+  return terminalEvents(events)
+    .filter((event) => event.outcome === 'failed')
+    .map((event) => event.error?.message);
+}
+
+function completedAssistantEnvelope({
+  eventId,
+  messageId,
+  parentId,
+  error,
+  finish = 'stop',
+}) {
+  return envelope({
+    id: eventId,
+    type: 'message.updated',
+    properties: {
+      sessionID: 'session-1',
+      info: {
+        id: messageId,
+        role: 'assistant',
+        parentID: parentId,
+        finish,
+        time: { completed: Date.now() },
+        ...(error ? { error } : {}),
+      },
+    },
+  });
 }
 
 function connectedEnvelope() {
@@ -23,11 +86,44 @@ function connectedEnvelope() {
 function createEventStream({ connected = true } = {}) {
   const events = connected ? [connectedEnvelope()] : [];
   const waiters = [];
+  const promptRequestsByPart = new Map();
+  const promptRequestsByMessage = new Map();
   let closed = false;
+  const observe = (envelope) => {
+    const event = envelope.payload;
+    if (event?.type === 'message.part.updated') {
+      const part = event.properties?.part;
+      const operationPartId = part?.metadata?.garcon_operation_part_id ?? part?.id;
+      const request = promptRequestsByPart.get(operationPartId);
+      if (request && typeof part?.messageID === 'string') {
+        promptRequestsByMessage.set(part.messageID, request);
+      }
+      return;
+    }
+    const info = event?.type === 'message.updated' ? event.properties?.info : null;
+    if (typeof info?.time?.completed !== 'number') return;
+    const request = promptRequestsByMessage.get(info.parentID);
+    if (!request) return;
+    setImmediate(() => request.resolve({ data: { info, parts: [] } }));
+  };
   return {
     push(event) {
       events.push(event);
       for (const resolve of waiters.splice(0)) resolve();
+      observe(event);
+    },
+    prompt(input, options) {
+      const response = deferred();
+      const partId = input.parts[0].id;
+      const request = { resolve: response.resolve, sessionId: input.sessionID };
+      promptRequestsByPart.set(partId, request);
+      const abort = () => {
+        promptRequestsByPart.delete(partId);
+        response.reject(options.signal.reason ?? new Error('OpenCode prompt request aborted'));
+      };
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+      return response.promise;
     },
     close() {
       closed = true;
@@ -64,16 +160,26 @@ function createRuntime(
   subscribe = mock(() => Promise.resolve({ stream: neverEndingStream() })),
   runtimeOptions = {},
 ) {
+  const {
+    turnPrompt,
+    permissionReply = mock(() => Promise.resolve({})),
+    ...options
+  } = runtimeOptions;
+  const prompt = turnPrompt ?? mock((...args) => {
+    void Promise.resolve(promptAsync(...args)).catch(() => undefined);
+    return pendingUntilAborted(args[1].signal);
+  });
   const runtime = new OpenCodeRuntime({
-    ...runtimeOptions,
+    ...options,
     createInstance: mock(() => Promise.resolve({
       client: {
-        permission: { reply: mock(() => Promise.resolve({})) },
+        permission: { reply: permissionReply },
         global: {
           event: subscribe,
         },
         session: {
           create: mock(() => Promise.resolve({ data: { id: 'session-1' } })),
+          prompt,
           promptAsync,
           abort,
         },
@@ -84,14 +190,25 @@ function createRuntime(
   return runtime;
 }
 
+function promptThrough(eventStream, promptAsync) {
+  return mock((...args) => {
+    void Promise.resolve(promptAsync(...args)).catch(() => undefined);
+    return eventStream.prompt(...args);
+  });
+}
+
 async function start(runtime, overrides = {}) {
+  const { runId = 'run-default', ...requestOverrides } = overrides;
+  const published = collectOperation(runId);
   await runtime.startSession({
     command: 'hello',
     chatId: 'chat-1',
     projectPath: '/repo',
     permissionMode: 'default',
-    ...overrides,
+    operation: published.operation,
+    ...requestOverrides,
   });
+  return published;
 }
 
 describe('OpenCodeRuntime abort', () => {
@@ -107,6 +224,10 @@ describe('OpenCodeRuntime abort', () => {
           global: { event: subscribe },
           session: {
             create,
+            prompt: (...args) => {
+              void promptAsync(...args);
+              return new Promise(() => {});
+            },
             promptAsync,
             abort: mock(() => Promise.resolve({ data: true })),
           },
@@ -173,6 +294,7 @@ describe('OpenCodeRuntime abort', () => {
           global: { event: subscribe },
           session: {
             create,
+            prompt: mock((_input, options) => pendingUntilAborted(options.signal)),
             promptAsync: mock(() => Promise.resolve({})),
             abort: mock(() => Promise.resolve({ data: true })),
           },
@@ -212,6 +334,7 @@ describe('OpenCodeRuntime abort', () => {
           global: { event: subscribe },
           session: {
             create: mock(() => Promise.resolve({ data: { id: 'session-1' } })),
+            prompt: mock((_input, options) => pendingUntilAborted(options.signal)),
             promptAsync: mock(() => Promise.resolve({})),
             abort: mock(() => Promise.resolve({ data: true })),
           },
@@ -219,13 +342,12 @@ describe('OpenCodeRuntime abort', () => {
         server: { close },
       })),
     });
-    const failures = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
+    const published = await start(runtime);
+    await waitFor(() => failureMessages(published.events).length === 1);
 
-    await start(runtime);
-    await waitFor(() => failures.length === 1);
-
-    expect(failures).toEqual(['OpenCode event stream heartbeat timed out after 10ms']);
+    expect(failureMessages(published.events)).toEqual([
+      'OpenCode event stream heartbeat timed out after 10ms',
+    ]);
     expect(runtime.isRunning('session-1')).toBe(false);
     expect(close).toHaveBeenCalledTimes(1);
     await runtime.shutdown();
@@ -264,16 +386,14 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       mock(() => prompt.promise),
     );
-    const failures = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-    await start(runtime);
+    const published = await start(runtime);
 
     await expect(runtime.abort('session-1')).resolves.toBe(true);
     prompt.reject(new Error('request cancelled by abort'));
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(failures).toEqual([]);
+    expect(failureMessages(published.events)).toEqual([]);
     runtime.shutdown();
   });
 
@@ -291,19 +411,17 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
     );
-    const failures = [];
-    runtime.onFailed((_chatId, message, metadata) => failures.push({ message, metadata }));
-    await start(runtime, { clientRequestId: 'req-a', turnId: 'turn-a' });
+    const firstPublished = await start(runtime);
     await expect(runtime.abort('session-1')).resolves.toBe(true);
 
+    const successorPublished = collectOperation('run-successor');
     const successor = runtime.runTurn({
       command: 'successor',
       agentSessionId: 'session-1',
       chatId: 'chat-1',
       projectPath: '/repo',
       permissionMode: 'default',
-      clientRequestId: 'req-b',
-      turnId: 'turn-b',
+      operation: successorPublished.operation,
     });
     const successorOutcome = successor.then(
       () => null,
@@ -315,7 +433,8 @@ describe('OpenCodeRuntime abort', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(failures).toEqual([]);
+    expect(failureMessages(firstPublished.events)).toEqual([]);
+    expect(failureMessages(successorPublished.events)).toEqual([]);
     expect(runtime.isRunning('session-1')).toBe(true);
 
     await expect(runtime.abort('session-1')).resolves.toBe(true);
@@ -330,13 +449,11 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const messages = [];
-    const finishes = [];
-    runtime.onMessages((_chatId, emitted, metadata) => messages.push({ emitted, metadata }));
-    runtime.onFinished((_chatId, _exitCode, metadata) => finishes.push(metadata));
-
-    await start(runtime, { clientRequestId: 'req-a', turnId: 'turn-a' });
+    const firstPublished = await start(runtime, {
+      runId: 'run-a',
+    });
     eventStream.push(envelope({
       id: 'evt_0001',
       type: 'message.updated',
@@ -366,21 +483,21 @@ describe('OpenCodeRuntime abort', () => {
         info: { id: 'assistant-a', role: 'assistant', parentID: 'user-a' },
       },
     }));
-    eventStream.push(envelope({
-      id: 'evt_0004',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0004',
+      messageId: 'assistant-a',
+      parentId: 'user-a',
     }));
-    await waitFor(() => finishes.length === 1);
+    await waitFor(() => terminalEvents(firstPublished.events).length === 1);
 
+    const successorPublished = collectOperation('run-b');
     const successor = runtime.runTurn({
       command: 'successor',
       agentSessionId: 'session-1',
       chatId: 'chat-1',
       projectPath: '/repo',
       permissionMode: 'default',
-      clientRequestId: 'req-b',
-      turnId: 'turn-b',
+      operation: successorPublished.operation,
     });
     await waitFor(() => promptAsync.mock.calls.length === 2);
 
@@ -409,8 +526,10 @@ describe('OpenCodeRuntime abort', () => {
     await Promise.resolve();
 
     expect(runtime.isRunning('session-1')).toBe(true);
-    expect(messages).toEqual([]);
-    expect(finishes).toHaveLength(1);
+    expect(publishedMessages(firstPublished.events)).toEqual([]);
+    expect(publishedMessages(successorPublished.events)).toEqual([]);
+    expect(terminalEvents(firstPublished.events)).toHaveLength(1);
+    expect(terminalEvents(successorPublished.events)).toEqual([]);
 
     eventStream.push(envelope({
       id: 'evt_0005',
@@ -441,7 +560,7 @@ describe('OpenCodeRuntime abort', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(runtime.isRunning('session-1')).toBe(true);
-    expect(finishes).toHaveLength(1);
+    expect(terminalEvents(successorPublished.events)).toEqual([]);
 
     eventStream.push(envelope({
       id: 'evt_0008',
@@ -469,20 +588,25 @@ describe('OpenCodeRuntime abort', () => {
         part: { id: 'part-b', messageID: 'assistant-b', type: 'text', text: 'current' },
       },
     }));
-    eventStream.push(envelope({
-      id: 'evt_0011',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0011',
+      messageId: 'assistant-b',
+      parentId: 'user-b',
     }));
 
     await expect(successor).resolves.toBeUndefined();
-    expect(messages).toHaveLength(1);
-    expect(messages[0].emitted[0].content).toBe('current');
-    expect(messages[0].metadata).toMatchObject({ clientRequestId: 'req-b', turnId: 'turn-b' });
-    expect(finishes).toEqual([
-      expect.objectContaining({ clientRequestId: 'req-a', turnId: 'turn-a' }),
-      expect.objectContaining({ clientRequestId: 'req-b', turnId: 'turn-b' }),
-    ]);
+    expect(publishedMessages(firstPublished.events)).toEqual([]);
+    expect(publishedMessages(successorPublished.events)).toMatchObject([{ content: 'current' }]);
+    expect(terminalEvents(firstPublished.events)).toEqual([{
+      type: 'run-ended',
+      runId: 'run-a',
+      outcome: 'finished',
+    }]);
+    expect(terminalEvents(successorPublished.events)).toEqual([{
+      type: 'run-ended',
+      runId: 'run-b',
+      outcome: 'finished',
+    }]);
 
     eventStream.close();
     runtime.shutdown();
@@ -495,11 +619,9 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const finishes = [];
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
+    const published = await start(runtime);
     eventStream.push(envelope({
       id: 'evt_sync_0001',
       type: 'sync',
@@ -535,13 +657,13 @@ describe('OpenCodeRuntime abort', () => {
         info: { id: 'assistant-a', role: 'assistant', parentID: 'user-a' },
       },
     }));
-    eventStream.push(envelope({
-      id: 'evt_0004',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0004',
+      messageId: 'assistant-a',
+      parentId: 'user-a',
     }));
 
-    await waitFor(() => finishes.length === 1);
+    await waitFor(() => terminalEvents(published.events).length === 1);
     expect(runtime.isRunning('session-1')).toBe(false);
 
     eventStream.close();
@@ -555,13 +677,9 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const messages = [];
-    const finishes = [];
-    runtime.onMessages((_chatId, emitted) => messages.push(...emitted));
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
+    const published = await start(runtime);
     eventStream.push(envelope({
       id: 'evt_0001',
       type: 'message.updated',
@@ -641,15 +759,14 @@ describe('OpenCodeRuntime abort', () => {
         part: { id: 'part-new', messageID: 'assistant-new', type: 'text', text: 'current' },
       },
     }));
-    eventStream.push(envelope({
-      id: 'evt_0009',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0009',
+      messageId: 'assistant-new',
+      parentId: 'user-new',
     }));
 
-    await waitFor(() => finishes.length === 1);
-    expect(messages).toHaveLength(1);
-    expect(messages[0].content).toBe('current');
+    await waitFor(() => terminalEvents(published.events).length === 1);
+    expect(publishedMessages(published.events)).toMatchObject([{ content: 'current' }]);
 
     eventStream.close();
     runtime.shutdown();
@@ -657,39 +774,40 @@ describe('OpenCodeRuntime abort', () => {
 
   it('does not leave a rejected turn waiter unhandled while prompt submission is pending', async () => {
     const eventStream = createEventStream();
-    const prompt = deferred();
-    const promptAsync = mock(() => prompt.promise);
+    const promptRequest = deferred();
+    const turnPrompt = mock(() => promptRequest.promise);
     const runtime = createRuntime(
       mock(() => Promise.resolve({ data: true })),
-      promptAsync,
+      mock(() => Promise.resolve({})),
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt },
     );
-    const failures = [];
     const unhandled = [];
     const onUnhandledRejection = (reason) => unhandled.push(reason);
-    runtime.onFailed((_chatId, message) => failures.push(message));
     process.on('unhandledRejection', onUnhandledRejection);
 
     try {
+      const published = collectOperation('run-pending-submit');
       const turn = runtime.runTurn({
         command: 'hello',
         agentSessionId: 'session-1',
         chatId: 'chat-1',
         projectPath: '/repo',
         permissionMode: 'default',
+        operation: published.operation,
       });
       const outcome = turn.then(
         () => null,
         (error) => error,
       );
-      await waitFor(() => promptAsync.mock.calls.length === 1);
+      await waitFor(() => turnPrompt.mock.calls.length === 1);
 
       eventStream.close();
-      await waitFor(() => failures.length === 1);
+      await waitFor(() => failureMessages(published.events).length === 1);
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      prompt.reject(new Error('prompt submit failed after stream loss'));
-      expect(await outcome).toMatchObject({ message: 'prompt submit failed after stream loss' });
+      promptRequest.reject(new Error('prompt submit failed after stream loss'));
+      expect(await outcome).toMatchObject({ message: 'OpenCode event stream ended' });
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(unhandled).toEqual([]);
     } finally {
@@ -716,19 +834,18 @@ describe('OpenCodeRuntime abort', () => {
       subscribe,
       { sseRetryDelayMs: 1_000 },
     );
-    const failures = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-
-    await start(runtime);
+    const firstPublished = await start(runtime, { runId: 'run-first' });
     firstStream.close();
-    await waitFor(() => failures.length === 1);
+    await waitFor(() => failureMessages(firstPublished.events).length === 1);
 
+    const successorPublished = collectOperation('run-successor');
     const successor = runtime.runTurn({
       command: 'successor',
       agentSessionId: 'session-1',
       chatId: 'chat-1',
       projectPath: '/repo',
       permissionMode: 'default',
+      operation: successorPublished.operation,
     });
     const successorOutcome = successor.then(
       () => null,
@@ -736,7 +853,7 @@ describe('OpenCodeRuntime abort', () => {
     );
     await waitFor(() => promptAsync.mock.calls.length === 2);
     secondStream.close();
-    await waitFor(() => failures.length === 2);
+    await waitFor(() => failureMessages(successorPublished.events).length === 1);
     expect(await successorOutcome).toMatchObject({ message: 'OpenCode event stream ended' });
 
     runtime.shutdown();
@@ -763,6 +880,7 @@ describe('OpenCodeRuntime abort', () => {
       global: { event: mock(() => Promise.resolve({ stream: neverEndingStream() })) },
       session: {
         create: mock(() => Promise.resolve({ data: { id: 'replacement-session' } })),
+        prompt: mock((_input, options) => pendingUntilAborted(options.signal)),
         promptAsync: mock(() => Promise.resolve({})),
         abort: mock(() => Promise.resolve({ data: true })),
       },
@@ -774,6 +892,7 @@ describe('OpenCodeRuntime abort', () => {
           global: { event: firstSubscribe },
           session: {
             create: mock(() => Promise.resolve({ data: { id: 'session-1' } })),
+            prompt: mock((_input, options) => pendingUntilAborted(options.signal)),
             promptAsync: mock(() => Promise.resolve({})),
             abort: mock(() => Promise.resolve({ data: true })),
           },
@@ -789,12 +908,9 @@ describe('OpenCodeRuntime abort', () => {
       sseRetryDelayMs: 1,
       unavailableRetryMs: 5,
     });
-    const failures = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-
-    await start(runtime);
+    const published = await start(runtime);
     firstStream.close();
-    await waitFor(() => failures.length === 1);
+    await waitFor(() => failureMessages(published.events).length === 1);
     await waitFor(() => firstClose.mock.calls.length === 1);
     await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -812,97 +928,41 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => prompt.promise),
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
     );
-    const failures = [];
-    runtime.onFailed((_chatId, message, metadata) => failures.push({ message, metadata }));
-
-    await start(runtime, { clientRequestId: 'req-a', turnId: 'turn-a' });
+    const published = await start(runtime, {
+      runId: 'run-a',
+    });
     eventStream.close();
-    await waitFor(() => failures.length === 1);
+    await waitFor(() => failureMessages(published.events).length === 1);
 
     expect(runtime.isRunning('session-1')).toBe(false);
-    expect(failures).toEqual([{
-      message: 'OpenCode event stream ended',
-      metadata: expect.objectContaining({ clientRequestId: 'req-a', turnId: 'turn-a' }),
+    expect(terminalEvents(published.events)).toEqual([{
+      type: 'run-ended',
+      runId: 'run-a',
+      outcome: 'failed',
+      error: { code: 'PROVIDER_FAILURE', message: 'OpenCode event stream ended' },
     }]);
 
     prompt.reject(new Error('late prompt cancellation'));
     await Promise.resolve();
     await Promise.resolve();
-    expect(failures).toHaveLength(1);
+    expect(terminalEvents(published.events)).toHaveLength(1);
     runtime.shutdown();
   });
 
-  it('fails a running turn on session.error before a later idle can claim success', async () => {
+  it('fails a running turn on its named assistant error', async () => {
     const eventStream = createEventStream();
     const promptAsync = mock(() => Promise.resolve({}));
     const runtime = createRuntime(
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const messages = [];
-    const failures = [];
-    const finishes = [];
-    runtime.onMessages((_chatId, emitted, metadata) => messages.push({ emitted, metadata }));
-    runtime.onFailed((_chatId, message, metadata) => failures.push({ message, metadata }));
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime, { clientRequestId: 'req-a', turnId: 'turn-a' });
+    const published = await start(runtime, {
+      runId: 'run-a',
+    });
     eventStream.push(envelope({
       id: 'evt_0001',
-      type: 'session.error',
-      properties: {
-        sessionID: 'session-1',
-        error: { name: 'ProviderError', data: { message: 'provider said no' } },
-      },
-    }));
-    await waitFor(() => failures.length === 1);
-
-    eventStream.push(envelope({
-      id: 'evt_0002',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
-    }));
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(runtime.isRunning('session-1')).toBe(false);
-    expect(failures).toEqual([{
-      message: 'provider said no',
-      metadata: expect.objectContaining({ clientRequestId: 'req-a', turnId: 'turn-a' }),
-    }]);
-    expect(messages).toHaveLength(1);
-    expect(messages[0].emitted[0]).toMatchObject({ type: 'error', content: 'provider said no' });
-    expect(messages[0].metadata).toMatchObject({ clientRequestId: 'req-a', turnId: 'turn-a' });
-    expect(finishes).toEqual([]);
-
-    eventStream.close();
-    runtime.shutdown();
-  });
-
-  it('continues through automatic compaction after a recoverable context overflow', async () => {
-    const eventStream = createEventStream();
-    const promptAsync = mock(() => Promise.resolve({}));
-    const runtime = createRuntime(
-      mock(() => Promise.resolve({ data: true })),
-      promptAsync,
-      mock(() => Promise.resolve({ stream: eventStream.stream() })),
-    );
-    const messages = [];
-    const failures = [];
-    const finishes = [];
-    runtime.onMessages((_chatId, emitted) => messages.push(...emitted));
-    runtime.onFailed((_chatId, message) => failures.push(message));
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
-    eventStream.push(envelope({
-      id: 'evt_0001',
-      type: 'message.updated',
-      properties: { sessionID: 'session-1', info: { id: 'user-a', role: 'user' } },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0002',
       type: 'message.part.updated',
       properties: {
         sessionID: 'session-1',
@@ -914,86 +974,30 @@ describe('OpenCodeRuntime abort', () => {
         },
       },
     }));
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0002',
+      messageId: 'assistant-error',
+      parentId: 'user-a',
+      error: { name: 'ProviderError', data: { message: 'provider said no' } },
+      finish: 'error',
+    }));
+    await waitFor(() => failureMessages(published.events).length === 1);
+
     eventStream.push(envelope({
       id: 'evt_0003',
-      type: 'message.updated',
-      properties: {
-        sessionID: 'session-1',
-        info: { id: 'assistant-a', role: 'assistant', parentID: 'user-a' },
-      },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0004',
-      type: 'session.error',
-      properties: {
-        sessionID: 'session-1',
-        error: { name: 'ContextOverflowError', data: { message: 'context overflow' } },
-      },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0005',
-      type: 'message.updated',
-      properties: { sessionID: 'session-1', info: { id: 'compaction-user', role: 'user' } },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0006',
-      type: 'message.part.updated',
-      properties: {
-        sessionID: 'session-1',
-        part: { id: 'compact-part', messageID: 'compaction-user', type: 'compaction', auto: true },
-      },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0007',
-      type: 'message.updated',
-      properties: { sessionID: 'session-1', info: { id: 'continue-user', role: 'user' } },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0008',
-      type: 'message.part.updated',
-      properties: {
-        sessionID: 'session-1',
-        part: {
-          id: 'continue-part',
-          messageID: 'continue-user',
-          type: 'text',
-          text: 'Continue',
-          synthetic: true,
-        },
-      },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0009',
-      type: 'session.compacted',
-      properties: { sessionID: 'session-1' },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0010',
-      type: 'message.updated',
-      properties: {
-        sessionID: 'session-1',
-        info: { id: 'assistant-b', role: 'assistant', parentID: 'continue-user' },
-      },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0011',
-      type: 'message.part.updated',
-      properties: {
-        sessionID: 'session-1',
-        part: { id: 'answer', messageID: 'assistant-b', type: 'text', text: 'recovered' },
-      },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0012',
       type: 'session.status',
       properties: { sessionID: 'session-1', status: { type: 'idle' } },
     }));
+    await Promise.resolve();
+    await Promise.resolve();
 
-    await waitFor(() => finishes.length === 1);
-    expect(messages).toEqual([
-      expect.objectContaining({ type: 'assistant-message', content: 'recovered' }),
+    expect(runtime.isRunning('session-1')).toBe(false);
+    expect(failureMessages(published.events)).toEqual(['provider said no']);
+    expect(publishedMessages(published.events)).toMatchObject([
+      { type: 'error', content: 'provider said no' },
     ]);
-    expect(failures).toEqual([]);
+    expect(terminalEvents(published.events)).toHaveLength(1);
+
     eventStream.close();
     runtime.shutdown();
   });
@@ -1005,13 +1009,9 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const failures = [];
-    const finishes = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
+    const published = await start(runtime);
     eventStream.push(envelope({
       id: 'evt_0001',
       type: 'message.updated',
@@ -1038,23 +1038,17 @@ describe('OpenCodeRuntime abort', () => {
         info: { id: 'assistant-a', role: 'assistant', parentID: 'user-a' },
       },
     }));
-    eventStream.push(envelope({
-      id: 'evt_0004',
-      type: 'session.error',
-      properties: {
-        sessionID: 'session-1',
-        error: { name: 'ContextOverflowError', data: { message: 'cannot compact' } },
-      },
-    }));
-    eventStream.push(envelope({
-      id: 'evt_0005',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0004',
+      messageId: 'assistant-a',
+      parentId: 'user-a',
+      error: { name: 'ContextOverflowError', data: { message: 'cannot compact' } },
+      finish: 'error',
     }));
 
-    await waitFor(() => failures.length === 1);
-    expect(failures).toEqual(['cannot compact']);
-    expect(finishes).toEqual([]);
+    await waitFor(() => failureMessages(published.events).length === 1);
+    expect(failureMessages(published.events)).toEqual(['cannot compact']);
+    expect(terminalEvents(published.events)).toHaveLength(1);
     eventStream.close();
     runtime.shutdown();
   });
@@ -1066,20 +1060,21 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const failures = [];
     const unhandled = [];
     const onUnhandledRejection = (reason) => unhandled.push(reason);
-    runtime.onFailed((_chatId, message) => failures.push(message));
     process.on('unhandledRejection', onUnhandledRejection);
 
     try {
+      const published = collectOperation('run-session-error');
       const turn = runtime.runTurn({
         command: 'hello',
         agentSessionId: 'session-1',
         chatId: 'chat-1',
         projectPath: '/repo',
         permissionMode: 'default',
+        operation: published.operation,
       });
       const outcome = turn.then(
         () => null,
@@ -1089,15 +1084,27 @@ describe('OpenCodeRuntime abort', () => {
 
       eventStream.push(envelope({
         id: 'evt_0001',
-        type: 'session.error',
+        type: 'message.part.updated',
         properties: {
           sessionID: 'session-1',
-          error: { name: 'ProviderError', data: { message: 'truncated stream' } },
+          part: {
+            id: promptAsync.mock.calls[0][0].parts[0].id,
+            messageID: 'user-a',
+            type: 'text',
+            text: 'hello',
+          },
         },
+      }));
+      eventStream.push(completedAssistantEnvelope({
+        eventId: 'evt_0002',
+        messageId: 'assistant-error',
+        parentId: 'user-a',
+        error: { name: 'ProviderError', data: { message: 'truncated stream' } },
+        finish: 'error',
       }));
 
       expect(await outcome).toMatchObject({ message: 'truncated stream' });
-      expect(failures).toEqual(['truncated stream']);
+      expect(failureMessages(published.events)).toEqual(['truncated stream']);
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(unhandled).toEqual([]);
     } finally {
@@ -1113,10 +1120,7 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({})),
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
     );
-    const failures = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-
-    await start(runtime);
+    const published = await start(runtime);
     await expect(runtime.abort('session-1')).resolves.toBe(true);
     eventStream.push(envelope({
       id: 'evt_0001',
@@ -1129,12 +1133,12 @@ describe('OpenCodeRuntime abort', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(failures).toEqual([]);
+    expect(failureMessages(published.events)).toEqual([]);
     eventStream.close();
     runtime.shutdown();
   });
 
-  it('ignores late events for a stream-failed session while a successor turn still works', async () => {
+  it('retains a stream-failed turn through idle purging until successor quiescence', async () => {
     const firstStream = createEventStream();
     const secondStream = createEventStream();
     const streams = [firstStream, secondStream];
@@ -1145,40 +1149,56 @@ describe('OpenCodeRuntime abort', () => {
       return Promise.resolve({ stream: stream.stream() });
     });
     const promptAsync = mock(() => Promise.resolve({}));
-    const abort = mock(() => Promise.resolve({ data: true }));
+    const quiescence = deferred();
+    const abort = mock(() => quiescence.promise);
     const runtime = createRuntime(
       abort,
       promptAsync,
       subscribe,
+      {
+        sseRetryDelayMs: 1,
+        turnPrompt: promptThrough(secondStream, promptAsync),
+      },
     );
-    const messages = [];
-    const failures = [];
-    const finishes = [];
-    runtime.onMessages((_chatId, emitted, metadata) => messages.push({ emitted, metadata }));
-    runtime.onFailed((_chatId, message) => failures.push(message));
-    runtime.onFinished((_chatId, _exitCode, metadata) => finishes.push(metadata));
-
-    await start(runtime, { clientRequestId: 'req-a', turnId: 'turn-a' });
+    const firstPublished = await start(runtime, {
+      runId: 'run-a',
+    });
     firstStream.close();
-    await waitFor(() => failures.length === 1);
+    await waitFor(() => failureMessages(firstPublished.events).length === 1);
     expect(runtime.isRunning('session-1')).toBe(false);
 
+    const originalSetInterval = globalThis.setInterval;
+    const originalDateNow = Date.now;
+    let purgeIdleSessions;
+    try {
+      globalThis.setInterval = mock((callback) => {
+        purgeIdleSessions = callback;
+        return 1;
+      });
+      const idleSince = Date.now();
+      Date.now = mock(() => idleSince + 31 * 60 * 1000);
+      runtime.startPurgeTimer();
+      purgeIdleSessions();
+    } finally {
+      Date.now = originalDateNow;
+      globalThis.setInterval = originalSetInterval;
+    }
+
+    const successorPublished = collectOperation('run-b');
     const successor = runtime.runTurn({
       command: 'successor',
       agentSessionId: 'session-1',
       chatId: 'chat-1',
       projectPath: '/repo',
       permissionMode: 'default',
-      clientRequestId: 'req-b',
-      turnId: 'turn-b',
+      operation: successorPublished.operation,
     });
-    await waitFor(() => promptAsync.mock.calls.length === 2);
+    await waitFor(() => abort.mock.calls.length === 1);
     expect(abort).toHaveBeenCalledTimes(1);
-    expect(abort.mock.invocationCallOrder[0]).toBeLessThan(
-      promptAsync.mock.invocationCallOrder[1],
-    );
+    expect(promptAsync).toHaveBeenCalledTimes(1);
 
-    // Late output from the retired turn carries its old provider identity and is dropped.
+    // The replacement stream belongs to the same provider process. Named content retains the
+    // original publisher until the held provider abort retires that operation source.
     secondStream.push(envelope({
       id: 'evt_0001',
       type: 'message.updated',
@@ -1229,13 +1249,18 @@ describe('OpenCodeRuntime abort', () => {
         error: { name: 'ProviderError', data: { message: 'retired turn failure' } },
       },
     }));
-    await Promise.resolve();
-    await Promise.resolve();
+    await waitFor(() => publishedMessages(firstPublished.events).length === 1);
 
-    expect(runtime.isRunning('session-1')).toBe(true);
-    expect(messages).toEqual([]);
-    expect(finishes).toEqual([]);
-    expect(failures).toHaveLength(1);
+    expect(runtime.isRunning('session-1')).toBe(false);
+    expect(publishedMessages(firstPublished.events)[0].content).toBe('stale');
+    expect(terminalEvents(successorPublished.events)).toEqual([]);
+    expect(failureMessages(firstPublished.events)).toHaveLength(1);
+
+    quiescence.resolve({ data: true });
+    await waitFor(() => promptAsync.mock.calls.length === 2);
+    expect(abort.mock.invocationCallOrder[0]).toBeLessThan(
+      promptAsync.mock.invocationCallOrder[1],
+    );
 
     secondStream.push(envelope({
       id: 'evt_0007',
@@ -1274,19 +1299,22 @@ describe('OpenCodeRuntime abort', () => {
         part: { id: 'part-b', messageID: 'assistant-b', type: 'text', text: 'current' },
       },
     }));
-    secondStream.push(envelope({
-      id: 'evt_0011',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    secondStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0011',
+      messageId: 'assistant-b',
+      parentId: 'user-b',
     }));
 
+    await waitFor(() => publishedMessages(successorPublished.events).length === 1);
+    await waitFor(() => terminalEvents(successorPublished.events).length === 1);
     await expect(successor).resolves.toBeUndefined();
-    expect(messages).toHaveLength(1);
-    expect(messages[0].emitted[0].content).toBe('current');
-    expect(messages[0].metadata).toMatchObject({ clientRequestId: 'req-b', turnId: 'turn-b' });
-    expect(finishes).toEqual([
-      expect.objectContaining({ clientRequestId: 'req-b', turnId: 'turn-b' }),
-    ]);
+    expect(publishedMessages(firstPublished.events)).toMatchObject([{ content: 'stale' }]);
+    expect(publishedMessages(successorPublished.events)).toMatchObject([{ content: 'current' }]);
+    expect(terminalEvents(successorPublished.events)).toEqual([{
+      type: 'run-ended',
+      runId: 'run-b',
+      outcome: 'finished',
+    }]);
 
     secondStream.close();
     runtime.shutdown();
@@ -1299,23 +1327,19 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => Promise.resolve({ data: true })),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const failures = [];
-    const finishes = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
+    const firstPublished = await start(runtime, { runId: 'run-a' });
     await expect(runtime.abort('session-1')).resolves.toBe(true);
 
+    const successorPublished = collectOperation('run-b');
     const successor = runtime.runTurn({
       command: 'successor',
       agentSessionId: 'session-1',
       chatId: 'chat-1',
       projectPath: '/repo',
       permissionMode: 'default',
-      clientRequestId: 'req-b',
-      turnId: 'turn-b',
+      operation: successorPublished.operation,
     });
     await waitFor(() => promptAsync.mock.calls.length === 2);
 
@@ -1330,7 +1354,8 @@ describe('OpenCodeRuntime abort', () => {
     }));
     await Promise.resolve();
     await Promise.resolve();
-    expect(failures).toEqual([]);
+    expect(failureMessages(firstPublished.events)).toEqual([]);
+    expect(failureMessages(successorPublished.events)).toEqual([]);
     expect(runtime.isRunning('session-1')).toBe(true);
 
     eventStream.push(envelope({
@@ -1370,21 +1395,24 @@ describe('OpenCodeRuntime abort', () => {
         part: { id: 'part-b', messageID: 'assistant-b', type: 'text', text: 'current' },
       },
     }));
-    eventStream.push(envelope({
-      id: 'evt_0006',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0006',
+      messageId: 'assistant-b',
+      parentId: 'user-b',
     }));
 
     await expect(successor).resolves.toBeUndefined();
-    expect(failures).toEqual([]);
-    expect(finishes).toHaveLength(1);
+    expect(failureMessages(successorPublished.events)).toEqual([]);
+    // One terminal for the aborted turn and one for the successor; the late
+    // unwind mints nothing extra.
+    expect(terminalEvents(firstPublished.events)).toHaveLength(1);
+    expect(terminalEvents(successorPublished.events)).toHaveLength(1);
 
     eventStream.close();
     runtime.shutdown();
   });
 
-  it('does not finish the turn when the abort unwind idle arrives before the abort resolves', async () => {
+  it('does not finish the turn when its named completion arrives before abort resolves', async () => {
     const eventStream = createEventStream();
     const promptAsync = mock(() => Promise.resolve({}));
     const acknowledged = deferred();
@@ -1392,11 +1420,9 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => acknowledged.promise),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const finishes = [];
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
+    const published = await start(runtime);
     eventStream.push(envelope({
       id: 'evt_0001',
       type: 'message.part.updated',
@@ -1414,34 +1440,27 @@ describe('OpenCodeRuntime abort', () => {
 
     const aborting = runtime.abort('session-1');
     await Promise.resolve();
-    eventStream.push(envelope({
-      id: 'evt_0002',
-      type: 'message.updated',
-      properties: {
-        sessionID: 'session-1',
-        info: { id: 'assistant-a', role: 'assistant', parentID: 'user-a' },
-      },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0002',
+      messageId: 'assistant-a',
+      parentId: 'user-a',
     }));
-    eventStream.push(envelope({
-      id: 'evt_0003',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
-    }));
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
 
-    expect(finishes).toEqual([]);
+    expect(terminalEvents(published.events)).toEqual([]);
     expect(runtime.isRunning('session-1')).toBe(true);
 
     acknowledged.resolve({ data: true });
     await expect(aborting).resolves.toBe(true);
-    expect(finishes).toEqual([]);
+    // The acknowledged stop emits exactly one terminal; the skipped unwind
+    // idle adds none.
+    expect(terminalEvents(published.events)).toHaveLength(1);
     expect(runtime.isRunning('session-1')).toBe(false);
     eventStream.close();
     runtime.shutdown();
   });
 
-  it('replays a skipped abort unwind idle when the provider rejects the abort', async () => {
+  it('replays a deferred named completion when the provider rejects the abort', async () => {
     const eventStream = createEventStream();
     const promptAsync = mock(() => Promise.resolve({}));
     const acknowledged = deferred();
@@ -1449,11 +1468,9 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => acknowledged.promise),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const finishes = [];
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
+    const published = await start(runtime);
     eventStream.push(envelope({
       id: 'evt_0001',
       type: 'message.part.updated',
@@ -1471,32 +1488,23 @@ describe('OpenCodeRuntime abort', () => {
 
     const aborting = runtime.abort('session-1');
     await Promise.resolve();
-    eventStream.push(envelope({
-      id: 'evt_0002',
-      type: 'message.updated',
-      properties: {
-        sessionID: 'session-1',
-        info: { id: 'assistant-a', role: 'assistant', parentID: 'user-a' },
-      },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0002',
+      messageId: 'assistant-a',
+      parentId: 'user-a',
     }));
-    eventStream.push(envelope({
-      id: 'evt_0003',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
-    }));
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(finishes).toEqual([]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(terminalEvents(published.events)).toEqual([]);
 
     acknowledged.resolve({ error: { message: 'abort rejected' } });
     await expect(aborting).resolves.toBe(false);
-    expect(finishes).toEqual(['finished']);
+    expect(terminalEvents(published.events)).toHaveLength(1);
     expect(runtime.isRunning('session-1')).toBe(false);
     eventStream.close();
     runtime.shutdown();
   });
 
-  it('preserves a pending context-overflow failure when a rejected abort replays idle', async () => {
+  it('preserves a named provider failure when a rejected abort releases it', async () => {
     const eventStream = createEventStream();
     const promptAsync = mock(() => Promise.resolve({}));
     const acknowledged = deferred();
@@ -1504,13 +1512,9 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => acknowledged.promise),
       promptAsync,
       mock(() => Promise.resolve({ stream: eventStream.stream() })),
+      { turnPrompt: promptThrough(eventStream, promptAsync) },
     );
-    const failures = [];
-    const finishes = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-    runtime.onFinished(() => finishes.push('finished'));
-
-    await start(runtime);
+    const published = await start(runtime);
     eventStream.push(envelope({
       id: 'evt_0001',
       type: 'message.part.updated',
@@ -1532,31 +1536,21 @@ describe('OpenCodeRuntime abort', () => {
         info: { id: 'assistant-a', role: 'assistant', parentID: 'user-a' },
       },
     }));
-    eventStream.push(envelope({
-      id: 'evt_0003',
-      type: 'session.error',
-      properties: {
-        sessionID: 'session-1',
-        error: { name: 'ContextOverflowError', data: { message: 'cannot compact' } },
-      },
-    }));
-    await Promise.resolve();
-
     const aborting = runtime.abort('session-1');
     await Promise.resolve();
-    eventStream.push(envelope({
-      id: 'evt_0004',
-      type: 'session.status',
-      properties: { sessionID: 'session-1', status: { type: 'idle' } },
+    eventStream.push(completedAssistantEnvelope({
+      eventId: 'evt_0003',
+      messageId: 'assistant-a',
+      parentId: 'user-a',
+      error: { name: 'ContextOverflowError', data: { message: 'cannot compact' } },
+      finish: 'error',
     }));
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(failures).toEqual([]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(failureMessages(published.events)).toEqual([]);
 
     acknowledged.resolve({ error: { message: 'abort rejected' } });
     await expect(aborting).resolves.toBe(false);
-    expect(failures).toEqual(['cannot compact']);
-    expect(finishes).toEqual([]);
+    expect(failureMessages(published.events)).toEqual(['cannot compact']);
     expect(runtime.isRunning('session-1')).toBe(false);
     eventStream.close();
     runtime.shutdown();
@@ -1574,41 +1568,13 @@ describe('OpenCodeRuntime abort', () => {
       mock(() => new Promise(() => {})),
       subscribe,
     );
-    const failures = [];
-    runtime.onFailed((_chatId, message) => failures.push(message));
-
-    await start(runtime);
+    const published = await start(runtime);
     subscriptionOptions.onSseError(new Error('socket reset'));
     eventStream.close();
-    await waitFor(() => failures.length === 1);
+    await waitFor(() => failureMessages(published.events).length === 1);
 
-    expect(failures).toEqual(['socket reset']);
+    expect(failureMessages(published.events)).toEqual(['socket reset']);
     expect(subscribe).toHaveBeenCalledTimes(1);
     runtime.shutdown();
-  });
-});
-
-describe('openCodeSessionError', () => {
-  it('extracts the provider data message, falling back to the error name', () => {
-    expect(openCodeSessionError({
-      type: 'session.error',
-      properties: {
-        sessionID: 'session-1',
-        error: { name: 'ProviderError', data: { message: '  model exploded  ' } },
-      },
-    })).toBe('model exploded');
-    expect(openCodeSessionError({
-      type: 'session.error',
-      properties: { sessionID: 'session-1', error: { name: 'ProviderError' } },
-    })).toBe('ProviderError');
-    expect(openCodeSessionError({
-      type: 'session.error',
-      properties: { sessionID: 'session-1' },
-    })).toBe('OpenCode session failed');
-  });
-
-  it('ignores non-error events', () => {
-    expect(openCodeSessionError({ type: 'session.status', properties: {} })).toBeNull();
-    expect(openCodeSessionError({ type: 'message.updated', properties: {} })).toBeNull();
   });
 });

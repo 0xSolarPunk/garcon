@@ -2,12 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
 import {
 	ConversationScrollController,
-	LIVE_HISTORY_PRUNE_IDLE_MS,
 	type ConversationScrollState,
 } from '../conversation-scroll-controller.svelte';
 import type { ConversationFeedMutationClock } from '../conversation-feed-mutations';
 import type { ConversationViewportPort } from '../conversation-viewport-port';
+import { ActiveTranscriptState } from '../active-transcript-state.svelte.js';
+import { AssistantMessage } from '$shared/chat-types';
+import type { TranscriptMessage } from '$shared/chat-view';
 import { mountInitialBottomRestoreEffect } from './conversation-scroll-controller-effect-harness.svelte';
+
+const RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS = 180_000;
 
 function mutationClock(
 	dataRevision = 0,
@@ -21,7 +25,6 @@ function mutationClock(
 			'live-append': 0,
 			'history-earlier': historyEarlierRevision,
 			'history-later': 0,
-			'history-pruned': 0,
 			replacement: 0,
 			'presentation-structure': 0,
 		},
@@ -36,13 +39,10 @@ function scrollState(
 	overrides: Partial<ConversationScrollState> = {},
 ): MutableConversationScrollState {
 	return {
-		canAutoFillEarlier: false,
 		canLoadEarlier: false,
-		canLoadLater: false,
 		displayMessageCount: 1,
 		feedMutationClock: mutationClock(),
-		generationId: 'generation-1',
-		hasExpandedLiveHistory: false,
+		transcriptViewId: 'generation-1',
 		hasLaterMessages: false,
 		isLoadingMessages: false,
 		isUserScrolledUp: false,
@@ -56,11 +56,32 @@ function scrollState(
 			earlier: { status: 'idle', error: null },
 			later: { status: 'idle', error: null },
 		},
-		pruneLoadedHistoryAtLiveEnd: vi.fn(() => false),
 		revealEarlierLoadedRows: vi.fn(() => false),
 		windowRevision: 0,
 		...overrides,
 	};
+}
+
+function expandedTranscriptState(): ActiveTranscriptState {
+	const chat = new ActiveTranscriptState();
+	const messages = (firstOrdinal: number, lastOrdinal: number): TranscriptMessage[] =>
+		Array.from({ length: lastOrdinal - firstOrdinal + 1 }, (_, index) => {
+			const ordinal = firstOrdinal + index;
+			return {
+				ordinal,
+				message: new AssistantMessage('2026-08-16T00:00:00.000Z', `message-${ordinal}`),
+			};
+		});
+	chat.replaceGeneration('chat-1', 'generation-1', messages(1, 200), {
+		lastOrdinal: 200,
+		pageOldestOrdinal: 1,
+		nextBeforeOrdinal: null,
+		hasMore: false,
+	});
+	chat.applyMessages('chat-1', 'generation-1', messages(201, 250), 201, 250);
+	chat.visibleMessageCount = 250;
+	chat.isUserScrolledUp = true;
+	return chat;
 }
 
 interface FakeViewport extends ConversationViewportPort {
@@ -129,6 +150,7 @@ class ResizeObserverStub {
 function controllerFixture(
 	options: {
 		state?: Partial<ConversationScrollState>;
+		chatState?: ConversationScrollState;
 		viewport?: FakeViewport;
 		scroller?: Partial<HTMLDivElement>;
 		queue?: Partial<HTMLDivElement>;
@@ -136,7 +158,7 @@ function controllerFixture(
 	} = {},
 ) {
 	const viewport = options.viewport ?? fakeViewport();
-	const state = scrollState(options.state);
+	const state = (options.chatState ?? scrollState(options.state)) as MutableConversationScrollState;
 	const scroller =
 		options.scroller instanceof HTMLDivElement
 			? options.scroller
@@ -184,145 +206,10 @@ describe('ConversationScrollController', () => {
 		expect(controller.isPinnedToBottom).toBe(true);
 	});
 
-	it('prunes expanded history only after continuously following the live end', async () => {
-		vi.useFakeTimers();
-		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
-		const fixture = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
-			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
-		});
-
-		fixture.controller.scrollToBottom();
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 1);
-		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
-
-		await vi.advanceTimersByTimeAsync(1);
-		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
-	});
-
-	it('restarts the prune delay after fresh bottom-edge input', async () => {
-		vi.useFakeTimers();
-		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
-		const fixture = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
-			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
-		});
-		fixture.controller.scrollToBottom();
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 60_000);
-
-		fixture.controller.noteUserScrollIntent('later');
-		await vi.advanceTimersByTimeAsync(60_000);
-		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
-
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 60_000);
-		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
-	});
-
-	it('requires a fresh full delay after leaving and returning to live follow', async () => {
-		vi.useFakeTimers();
-		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
-		const fixture = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
-			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
-		});
-		fixture.controller.scrollToBottom();
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS / 2);
-
-		fixture.controller.setPinnedToBottom(false);
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS);
-		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
-
-		fixture.controller.setPinnedToBottom(true);
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS - 1);
-		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
-		await vi.advanceTimersByTimeAsync(1);
-		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
-	});
-
-	it('keeps the prune deadline across pinned live appends and rechecks physical ownership', async () => {
-		vi.useFakeTimers();
-		let atEnd = false;
-		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
-		const fixture = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => atEnd) }),
-			state: { hasExpandedLiveHistory: true, pruneLoadedHistoryAtLiveEnd },
-		});
-		fixture.controller.scrollToBottom();
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS / 2);
-		fixture.state.feedMutationClock = mutationClock(1);
-		fixture.controller.reconcilePinnedProjection();
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS / 2);
-
-		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
-		atEnd = true;
-		await vi.advanceTimersByTimeAsync(9_999);
-		expect(pruneLoadedHistoryAtLiveEnd).not.toHaveBeenCalled();
-		await vi.advanceTimersByTimeAsync(1);
-		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
-	});
-
-	it('starts the prune delay when pinned live growth expands a bounded window', async () => {
-		vi.useFakeTimers();
-		const pruneLoadedHistoryAtLiveEnd = vi.fn(() => true);
-		const fixture = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
-			state: { hasExpandedLiveHistory: false, pruneLoadedHistoryAtLiveEnd },
-		});
-		fixture.controller.scrollToBottom();
-		expect(vi.getTimerCount()).toBe(0);
-
-		fixture.state.hasExpandedLiveHistory = true;
-		fixture.state.feedMutationClock = mutationClock(1);
-		fixture.controller.reconcilePinnedProjection();
-		await vi.advanceTimersByTimeAsync(LIVE_HISTORY_PRUNE_IDLE_MS);
-
-		expect(pruneLoadedHistoryAtLiveEnd).toHaveBeenCalledOnce();
-	});
-
-	it('cancels pending history pruning for chat switches, hidden viewports, and destruction', () => {
-		vi.useFakeTimers();
-		const state = {
-			hasExpandedLiveHistory: true,
-			pruneLoadedHistoryAtLiveEnd: vi.fn(() => true),
-		};
-		const first = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
-			state,
-		});
-		first.controller.scrollToBottom();
-		expect(vi.getTimerCount()).toBe(1);
-		first.controller.prepareInitialBottomRestore('chat-2');
-		expect(vi.getTimerCount()).toBe(0);
-
-		const second = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
-			state,
-		});
-		second.controller.scrollToBottom();
-		second.controller.setViewportVisible(false);
-		expect(vi.getTimerCount()).toBe(0);
-
-		const third = controllerFixture({
-			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
-			state,
-		});
-		third.controller.scrollToBottom();
-		third.controller.destroy();
-		expect(vi.getTimerCount()).toBe(0);
-	});
-
 	it('cancels pending layout work before recording every user gesture', () => {
 		const { controller, viewport } = controllerFixture();
 		controller.noteUserScrollIntent('earlier');
 		expect(viewport.cancelForUserIntent).toHaveBeenCalledWith('earlier');
-	});
-
-	it('returns the viewport suppression decision for a scrollbar drag', () => {
-		const cancelForUserIntent = vi.fn(() => true);
-		const { controller } = controllerFixture({ viewport: fakeViewport({ cancelForUserIntent }) });
-
-		expect(controller.noteUserScrollIntent('earlier', 'scrollbar-drag')).toBe(true);
-		expect(cancelForUserIntent).toHaveBeenCalledWith('earlier', 'scrollbar-drag');
 	});
 
 	it('requires fresh downward intent to repin inside the later threshold', () => {
@@ -344,6 +231,90 @@ describe('ConversationScrollController', () => {
 		controller.handleScroll();
 		expect(state.isUserScrolledUp).toBe(false);
 		expect(controller.isPinnedToBottom).toBe(true);
+	});
+
+	it('[TLV5-UX.17-WEB-UNIT-01] retains both loaded edges while an earlier page request is active', async () => {
+		vi.useFakeTimers();
+		await vi.advanceTimersByTimeAsync(1);
+		const chatState = expandedTranscriptState();
+		chatState.hasEarlierMessages = true;
+		const expectedEntries = chatState.entries.map((entry) => [
+			entry.ordinal,
+			(entry.message as AssistantMessage).content,
+		]);
+		let resolvePage!: () => void;
+		vi.spyOn(chatState, 'loadEarlierPage').mockImplementation(
+			() => new Promise<'loaded'>((resolve) => {
+				resolvePage = () => resolve('loaded');
+			}),
+		);
+		const fixture = controllerFixture({
+			chatState,
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+		});
+		fixture.controller.setPinnedToBottom(false);
+		fixture.controller.noteUserScrollIntent('later');
+		fixture.controller.handleScroll();
+
+		const pageRequest = fixture.controller.requestPage('earlier', 'button');
+		await vi.advanceTimersByTimeAsync(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
+
+		expect(chatState.entries.map((entry) => [
+			entry.ordinal,
+			(entry.message as AssistantMessage).content,
+		])).toEqual(expectedEntries);
+		resolvePage();
+		await pageRequest;
+		expect(chatState.entries.map((entry) => entry.ordinal)).toEqual(
+			expectedEntries.map(([ordinal]) => ordinal),
+		);
+	});
+
+	it('[TLV5-UX.17-WEB-UNIT-02] retains both loaded edges while the viewport owns a programmatic scroll', async () => {
+		vi.useFakeTimers();
+		await vi.advanceTimersByTimeAsync(1);
+		const chatState = expandedTranscriptState();
+		const expectedOrdinals = chatState.entries.map((entry) => entry.ordinal);
+		let ownsScrollPosition = false;
+		const fixture = controllerFixture({
+			chatState,
+			viewport: fakeViewport({
+				isAtEnd: vi.fn(() => true),
+				ownsScrollPosition: vi.fn(() => ownsScrollPosition),
+			}),
+		});
+		fixture.controller.setPinnedToBottom(false);
+		fixture.controller.noteUserScrollIntent('later');
+		fixture.controller.handleScroll();
+		ownsScrollPosition = true;
+
+		await vi.advanceTimersByTimeAsync(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
+
+		expect(chatState.entries.map((entry) => entry.ordinal)).toEqual(expectedOrdinals);
+	});
+
+	it('[TLV5-UX.17-WEB-UNIT-03] retains a bottom-pinned expanded interval beyond the retired prune delay', async () => {
+		vi.useFakeTimers();
+		await vi.advanceTimersByTimeAsync(1);
+		const chatState = expandedTranscriptState();
+		const expectedEntries = chatState.entries.map((entry) => [
+			entry.ordinal,
+			(entry.message as AssistantMessage).content,
+		]);
+		const fixture = controllerFixture({
+			chatState,
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+		});
+		fixture.controller.setPinnedToBottom(false);
+		fixture.controller.noteUserScrollIntent('later');
+		fixture.controller.handleScroll();
+
+		await vi.advanceTimersByTimeAsync(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
+
+		expect(chatState.entries.map((entry) => [
+			entry.ordinal,
+			(entry.message as AssistantMessage).content,
+		])).toEqual(expectedEntries);
 	});
 
 	it('does not repin from proximity without user intent', () => {
@@ -455,7 +426,7 @@ describe('ConversationScrollController', () => {
 		now.mockRestore();
 	});
 
-	it('does not page from a viewport-owned scroll inside the intent window', async () => {
+	it('[TLV5-UX.07-WEB-UNIT-02] does not page from a viewport-owned scroll inside the intent window', async () => {
 		const now = vi.spyOn(performance, 'now').mockReturnValue(100);
 		const loadEarlierPage = vi.fn(async () => 'exhausted' as const);
 		const fixture = controllerFixture({
@@ -505,7 +476,6 @@ describe('ConversationScrollController', () => {
 		const { controller, state } = controllerFixture({
 			viewport,
 			state: {
-				canLoadLater: true,
 				hasLaterMessages: true,
 				isUserScrolledUp: true,
 				loadLaterPage,
@@ -525,7 +495,7 @@ describe('ConversationScrollController', () => {
 		expect(state.isUserScrolledUp).toBe(true);
 	});
 
-	it('requires fresh directional intent for viewport-ahead prefetching', () => {
+	it('[TLV5-UX.07-WEB-UNIT-01] requires fresh directional intent for viewport-ahead prefetching', () => {
 		const loadEarlierPage = vi.fn(async () => 'exhausted' as const);
 		const { controller } = controllerFixture({
 			state: { canLoadEarlier: true, isUserScrolledUp: true, loadEarlierPage },
@@ -651,6 +621,46 @@ describe('ConversationScrollController', () => {
 		await vi.waitFor(() => expect(loadEarlierPage).toHaveBeenCalledTimes(2));
 	});
 
+	it('reaffirms matching user ownership after an active earlier page publishes geometry', async () => {
+		let resolveLayout!: (result: 'settled') => void;
+		const waitForLayout = vi.fn<ConversationViewportPort['waitForLayout']>(
+			() => new Promise<'settled'>((resolve) => (resolveLayout = resolve)),
+		);
+		const loadEarlierPage = vi.fn(async () => 'loaded' as const);
+		const invalidatePendingWindowNavigation = vi.fn();
+		const fixture = controllerFixture({
+			viewport: fakeViewport({ waitForLayout }),
+			state: {
+				canLoadEarlier: true,
+				invalidatePendingWindowNavigation,
+				loadEarlierPage,
+			},
+			scroller: { clientHeight: 400, scrollTop: 590 },
+		});
+
+		fixture.controller.noteUserScrollIntent('earlier');
+		const request = fixture.controller.requestPage('earlier', 'scroll');
+		await vi.waitFor(() => expect(waitForLayout).toHaveBeenCalledOnce());
+		expect(fixture.viewport.cancelForUserIntent).toHaveBeenCalledOnce();
+		fixture.viewport.cancelForUserIntent.mockClear();
+		const invalidationCount = invalidatePendingWindowNavigation.mock.calls.length;
+
+		fixture.scroller.scrollTop = 8_490;
+		fixture.controller.handleScroll();
+		expect(fixture.viewport.cancelForUserIntent).not.toHaveBeenCalled();
+
+		fixture.scroller.scrollTop = 8_484;
+		fixture.controller.handleScroll();
+		expect(fixture.viewport.cancelForUserIntent).toHaveBeenCalledOnce();
+		expect(fixture.viewport.cancelForUserIntent).toHaveBeenCalledWith('earlier');
+		expect(invalidatePendingWindowNavigation).toHaveBeenCalledTimes(invalidationCount);
+		expect(loadEarlierPage).toHaveBeenCalledOnce();
+
+		resolveLayout('settled');
+		await expect(request).resolves.toBe('loaded');
+		expect(loadEarlierPage).toHaveBeenCalledOnce();
+	});
+
 	it('does not chain an earlier page after its initiating intent expires', async () => {
 		const now = vi.spyOn(performance, 'now').mockReturnValue(100);
 		let resolveFirstPage!: (result: 'loaded') => void;
@@ -718,7 +728,7 @@ describe('ConversationScrollController', () => {
 		expect(state.isUserScrolledUp).toBe(true);
 	});
 
-	it('requires an explicit retry after a directional page failure', async () => {
+	it('[TLV5-UX.07-WEB-UNIT-03] requires an explicit retry after a directional page failure', async () => {
 		const loadEarlierPage = vi.fn(async () => 'loaded' as const);
 		const { controller, scroller } = controllerFixture({
 			state: {
@@ -748,7 +758,7 @@ describe('ConversationScrollController', () => {
 		const viewport = fakeViewport({ waitForLayout });
 		const { controller } = controllerFixture({
 			viewport,
-			state: { canLoadLater: true, loadLaterPage: vi.fn(async () => 'loaded' as const) },
+			state: { hasLaterMessages: true, loadLaterPage: vi.fn(async () => 'loaded' as const) },
 		});
 		expect(await controller.requestPage('later', 'button')).toBe('invalidated');
 	});
@@ -809,7 +819,7 @@ describe('ConversationScrollController', () => {
 		expect(
 			await controller.jumpToMessageRow({
 				chatId: 'chat-1',
-				generationId: 'generation-1',
+				transcriptViewId: 'generation-1',
 				rowId: 'generation-1:7',
 			}),
 		).toBe('completed');
@@ -832,7 +842,7 @@ describe('ConversationScrollController', () => {
 		expect(
 			await controller.jumpToMessageRow({
 				chatId: 'chat-1',
-				generationId: 'generation-2',
+				transcriptViewId: 'generation-2',
 				rowId: 'generation-2:1',
 			}),
 		).toBe('unavailable');
@@ -848,7 +858,7 @@ describe('ConversationScrollController', () => {
 		await expect(
 			controller.jumpToMessageRow({
 				chatId: 'chat-1',
-				generationId: 'generation-1',
+				transcriptViewId: 'generation-1',
 				rowId: 'generation-1:7',
 			}),
 		).resolves.toBe('cancelled');
@@ -866,7 +876,7 @@ describe('ConversationScrollController', () => {
 		await expect(
 			controller.jumpToMessageRow({
 				chatId: 'chat-1',
-				generationId: 'generation-1',
+				transcriptViewId: 'generation-1',
 				rowId: 'generation-1:7',
 			}),
 		).resolves.toBe('unavailable');
@@ -884,7 +894,7 @@ describe('ConversationScrollController', () => {
 		const viewport = fakeViewport({ measureViewportFill });
 		const { controller } = controllerFixture({
 			viewport,
-			state: { canAutoFillEarlier: true, canLoadEarlier: true, revealEarlierLoadedRows },
+			state: { canLoadEarlier: true, revealEarlierLoadedRows },
 		});
 		await controller.fillUnderfilledViewport();
 		expect(revealEarlierLoadedRows).toHaveBeenCalledOnce();
@@ -896,7 +906,7 @@ describe('ConversationScrollController', () => {
 			.fn<ConversationViewportPort['measureViewportFill']>()
 			.mockResolvedValueOnce('underfilled')
 			.mockResolvedValueOnce('overflow');
-		const state = { hasLaterMessages: true, canLoadLater: true };
+		const state = { hasLaterMessages: true };
 		const loadLaterPage = vi.fn(async () => {
 			state.hasLaterMessages = false;
 			return 'loaded' as const;
@@ -917,7 +927,7 @@ describe('ConversationScrollController', () => {
 		const loadEarlierPage = vi.fn(async () => 'loaded' as const);
 		const { controller } = controllerFixture({
 			viewport,
-			state: { canAutoFillEarlier: true, loadEarlierPage },
+			state: { canLoadEarlier: true, loadEarlierPage },
 		});
 		await controller.fillUnderfilledViewport();
 		expect(loadEarlierPage).not.toHaveBeenCalled();
@@ -932,7 +942,6 @@ describe('ConversationScrollController', () => {
 				),
 			}),
 			state: {
-				canAutoFillEarlier: true,
 				canLoadEarlier: true,
 				loadEarlierPage,
 				pageStates: {
@@ -956,7 +965,6 @@ describe('ConversationScrollController', () => {
 				),
 			}),
 			state: {
-				canAutoFillEarlier: true,
 				canLoadEarlier: true,
 				loadEarlierPage,
 				pageStates: {
@@ -993,14 +1001,14 @@ describe('ConversationScrollController', () => {
 		});
 		const { controller } = controllerFixture({
 			viewport,
-			state: { canAutoFillEarlier: true, canLoadEarlier: true, loadEarlierPage },
+			state: { canLoadEarlier: true, loadEarlierPage },
 		});
 
 		const fill = controller.fillUnderfilledViewport();
 		await vi.waitFor(() => expect(measureViewportFill).toHaveBeenCalledOnce());
 		const navigation = controller.jumpToMessageRow({
 			chatId: 'chat-1',
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			rowId: 'generation-1:7',
 		});
 		await vi.waitFor(() => expect(scrollToTarget).toHaveBeenCalledOnce());
@@ -1025,7 +1033,7 @@ describe('ConversationScrollController', () => {
 		const loadEarlierPage = vi.fn(async () => 'loaded' as const);
 		const { controller } = controllerFixture({
 			viewport: fakeViewport({ isAtEnd: vi.fn(() => true), measureViewportFill, scrollToTarget }),
-			state: { canAutoFillEarlier: true, canLoadEarlier: true, loadEarlierPage },
+			state: { canLoadEarlier: true, loadEarlierPage },
 		});
 
 		const navigation = controller.jumpToDomAnchor('tool-input-9');
@@ -1049,7 +1057,7 @@ describe('ConversationScrollController', () => {
 		});
 		const { controller, state } = controllerFixture({
 			viewport,
-			state: { canAutoFillEarlier: true, canLoadEarlier: true, loadEarlierPage },
+			state: { canLoadEarlier: true, loadEarlierPage },
 		});
 
 		await expect(controller.jumpToDomAnchor('tool-input-9')).resolves.toBe(true);
@@ -1188,7 +1196,7 @@ describe('ConversationScrollController', () => {
 		await expect(
 			controller.jumpToMessageRow({
 				chatId: 'chat-1',
-				generationId: 'generation-1',
+				transcriptViewId: 'generation-1',
 				rowId: 'generation-1:7',
 			}),
 		).resolves.toBe('completed');
@@ -1204,7 +1212,7 @@ describe('ConversationScrollController', () => {
 		controller.setViewportVisible(false);
 		const navigation = controller.jumpToMessageRow({
 			chatId: 'chat-1',
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			rowId: 'generation-1:7',
 		});
 		controller.setViewportVisible(true);
@@ -1324,14 +1332,39 @@ describe('ConversationScrollController', () => {
 		expect(fixture.viewport.scrollToStart).toHaveBeenCalledOnce();
 	});
 
-	it('navigates to latest without discarding the loaded transcript', async () => {
-		const navigateToWindow = vi.fn(async () => 'loaded' as const);
-		const { controller, viewport } = controllerFixture({
-			state: { hasLaterMessages: true, navigateToWindow },
+	it('navigates to latest without trimming the expanded interval', async () => {
+		const chatState = expandedTranscriptState();
+		chatState.hasLaterMessages = true;
+		const expectedOrdinals = chatState.entries.map((entry) => entry.ordinal);
+		const navigateToWindow = vi.spyOn(chatState, 'navigateToWindow').mockImplementation(async () => {
+			chatState.hasLaterMessages = false;
+			return 'loaded' as const;
 		});
+		const fixture = controllerFixture({
+			chatState,
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+		});
+		const { controller, viewport } = fixture;
 		await controller.scrollToLatest();
 		expect(navigateToWindow).toHaveBeenCalledWith('chat-1', 'latest');
 		expect(viewport.scrollToEnd).toHaveBeenCalledOnce();
+		expect(chatState.entries.map((entry) => entry.ordinal)).toEqual(expectedOrdinals);
+	});
+
+	it('scrolls to an already-loaded latest edge without trimming the expanded interval', async () => {
+		const chatState = expandedTranscriptState();
+		const expectedOrdinals = chatState.entries.map((entry) => entry.ordinal);
+		const navigateToWindow = vi.spyOn(chatState, 'navigateToWindow');
+		const { controller, viewport } = controllerFixture({
+			chatState,
+			viewport: fakeViewport({ isAtEnd: vi.fn(() => true) }),
+		});
+
+		await controller.scrollToLatest();
+
+		expect(navigateToWindow).not.toHaveBeenCalled();
+		expect(viewport.scrollToEnd).toHaveBeenCalledOnce();
+		expect(chatState.entries.map((entry) => entry.ordinal)).toEqual(expectedOrdinals);
 	});
 
 	it('finishes committed latest navigation when layout settling is superseded', async () => {

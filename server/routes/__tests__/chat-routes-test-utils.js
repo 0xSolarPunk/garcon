@@ -12,31 +12,6 @@ export function createRouteCommandLedger(label = 'chat-routes') {
   return new CommandLedger(path.join(os.tmpdir(), `garcon-${label}-ledger-${randomUUID()}`));
 }
 
-export function createRoutePendingInputs() {
-  return {
-    register: () => Promise.resolve(undefined),
-    reconcileRetainedHistory: () => Promise.resolve(undefined),
-    reconcileNativeHistory: () => Promise.resolve(undefined),
-    listForChat: () => [],
-    hasInFlightForChat: () => false,
-    clearChat: () => undefined,
-    discardChat: () => 0,
-    discard: () => false,
-  };
-}
-
-export function createRouteChatViews() {
-  return {
-    getOrCreatePage: () => Promise.resolve({
-      messages: [],
-      generationId: 'generation-1',
-      lastSeq: 0,
-      pageOldestSeq: 0,
-      hasMore: false,
-    }),
-  };
-}
-
 export function createRoutePathCache() {
   return {
     resolveProjectPath: mock(async (projectPath) => ({
@@ -61,7 +36,14 @@ export function createRouteChatListProjector({ registry, settings, metadata, age
         : null;
     },
   };
-  return new ChatListProjector({ registry, settings, metadata, processing, pathCache });
+  return new ChatListProjector({
+    registry,
+    settings,
+    metadata,
+    processing,
+    pathCache,
+    canReloadFromNativeHistory: () => false,
+  });
 }
 
 export function createRouteCommandService({
@@ -71,21 +53,24 @@ export function createRouteCommandService({
   metadata,
   agents,
   commandLedger,
-  pendingInputs,
 	handoffs,
 	pathCache,
 	chatListProjector,
   forkChatFileCopy: forkChatFileCopyOverride,
   ownership,
+  transientFeeds,
 }) {
+  const transcripts = {
+    currentView: () => null,
+    highWatermark: () => ({ viewId: 'view-1', ordinal: 0 }),
+    rowsThrough: () => [],
+    initializeChat: () => ({ viewId: 'view-2' }),
+    deleteChat: () => undefined,
+  };
   return new ChatCommandService({
     chats: registry,
     queue,
-    chatViews: {
-      getNativeHistoryLastSeq: () => null,
-      getCursor: () => null,
-    },
-    idleReconciler: { ensureReconciled: async () => undefined },
+    transcripts,
     settings,
     recentTitleIcons: {
       getRecentIcons: () => [],
@@ -93,7 +78,7 @@ export function createRouteCommandService({
     metadata,
     agents,
     ledger: commandLedger,
-    pendingInputs,
+    transientFeeds: transientFeeds ?? { validateAction: () => undefined },
 	handoffs: handoffs ?? {
 		resolveTarget: async ({ handoff }) => ({
 			agentId: handoff.target.agentId,
@@ -113,6 +98,12 @@ export function createRouteCommandService({
 			prepare: async () => undefined,
 			compensate: async () => undefined,
 		}),
+		seedContinuationLedger: ({ sourceChatId, targetChatId }) => {
+			const watermark = transcripts.highWatermark(sourceChatId);
+			transcripts.initializeChat(targetChatId, [], 1);
+			return watermark;
+		},
+		deleteContinuationLedger: (chatId) => transcripts.deleteChat(chatId),
 	},
     fileMentions: { resolve: async (command) => command },
     ownership: ownership ?? {
@@ -121,8 +112,6 @@ export function createRouteCommandService({
         registry.removeChat(chatId);
         return true;
       },
-      abandonedTransferCleanups: () => [],
-      retryRetainedTransferCleanups: async () => ({ retried: [], abandoned: [] }),
     },
     chatIds: new ChatIdAllocator(registry),
 	pathCache: pathCache ?? createRoutePathCache(),
@@ -156,5 +145,6 @@ export function createRouteCommandService({
 		},
 	},
     forkChatFileCopy: forkChatFileCopyOverride ?? forkChatFileCopy,
+    transcripts,
   });
 }

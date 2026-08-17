@@ -39,6 +39,7 @@ function snapshot(overrides: Partial<ChatSnapshotResponse> = {}): ChatSnapshotRe
       thinkingMode: 'high',
       projectPath: '/work/project',
       tags: ['cli', 'review'],
+      canReloadFromNativeHistory: true,
       activity: { createdAt: TIMESTAMP, lastActivityAt: TIMESTAMP },
     },
     processingPhase: 'running',
@@ -46,7 +47,6 @@ function snapshot(overrides: Partial<ChatSnapshotResponse> = {}): ChatSnapshotRe
       serverInstanceId: 'instance-1',
       queue: {
         entries: [],
-        dispatchingEntryId: null,
         steeringEntryId: null,
         recentlyDispatched: [],
         pause: null,
@@ -55,14 +55,21 @@ function snapshot(overrides: Partial<ChatSnapshotResponse> = {}): ChatSnapshotRe
       version: 0,
       updatedAt: null,
     },
-    pendingUserInputs: [],
     transcript: {
       availability: 'available',
-      generationId: 'generation-1',
-      messages: [{ seq: 1, message: new AssistantMessage(TIMESTAMP, 'Working') }],
-      lastSeq: 1,
-      pageOldestSeq: 1,
+      transcriptViewId: 'view-1',
+      messages: [{ ordinal: 1, message: new AssistantMessage(TIMESTAMP, 'Working') }],
+      lastOrdinal: 1,
+      pageOldestOrdinal: 1,
+      pageNewestOrdinal: 1,
       hasMore: false,
+    },
+    transientFeed: {
+      serverInstanceId: 'instance-1',
+      chatId: CHAT_ID,
+      transcriptViewId: 'view-1',
+      transientRevision: 0,
+      rows: [],
     },
     ...overrides,
   };
@@ -97,8 +104,7 @@ describe('chat status', () => {
       'project path: /work/project',
       'tags: cli, review',
       'queue: 0',
-      'pending inputs: 0',
-      'transcript: generation generation-1, last seq 1, showing 1',
+      'transcript: view view-1, last ordinal 1, showing 1',
       '',
       `[1] ${TIMESTAMP} assistant-message`,
       'Working',
@@ -119,7 +125,6 @@ describe('chat status', () => {
             createdAt: TIMESTAMP,
             updatedAt: TIMESTAMP,
           }],
-          dispatchingEntryId: 'dispatching-1',
           steeringEntryId: 'steering-1',
           pause: { id: 'pause-1', kind: 'manual', pausedAt: TIMESTAMP },
         },
@@ -134,7 +139,6 @@ describe('chat status', () => {
 
     expect(value).toContain('status: idle');
     expect(value).toContain('queue: 1');
-    expect(value).toContain('queue dispatching: dispatching-1');
     expect(value).toContain('queue steering: steering-1');
     expect(value).toContain('queue paused: manual');
     expect(value).toContain('transcript: unavailable (TRANSCRIPT_UNAVAILABLE, retryable: yes)');
@@ -158,23 +162,24 @@ describe('chat status', () => {
     const value = formatChatStatus(snapshot({
       transcript: {
         availability: 'available',
-        generationId: 'generation-1',
+        transcriptViewId: 'view-1',
         messages: [{
-          seq: 1,
+          ordinal: 1,
           message: new UserMessage(TIMESTAMP, 'Review', [{
             data: 'data:image/png;base64,secret',
             name: 'image.png',
             mimeType: 'image/png',
           }]),
         }, {
-          seq: 2,
+          ordinal: 2,
           message: new ToolResultMessage(TIMESTAMP, 'tool-1', {
             data: 'ordinary-data',
             preview: 'data:image/png;base64,secret',
           }, false),
         }],
-        lastSeq: 2,
-        pageOldestSeq: 1,
+        lastOrdinal: 2,
+        pageOldestOrdinal: 1,
+        pageNewestOrdinal: 2,
         hasMore: false,
       },
     }));
@@ -189,10 +194,11 @@ describe('chat status', () => {
     const value = formatChatStatus(snapshot({
       transcript: {
         availability: 'available',
-        generationId: 'generation-1',
-        messages: [{ seq: 1, message: new AssistantMessage(TIMESTAMP, 'x'.repeat(5_000)) }],
-        lastSeq: 1,
-        pageOldestSeq: 1,
+        transcriptViewId: 'view-1',
+        messages: [{ ordinal: 1, message: new AssistantMessage(TIMESTAMP, 'x'.repeat(5_000)) }],
+        lastOrdinal: 1,
+        pageOldestOrdinal: 1,
+        pageNewestOrdinal: 1,
         hasMore: true,
       },
     }));

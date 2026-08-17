@@ -30,6 +30,7 @@ function makeChat(overrides: Partial<ChatSessionRecord>): ChatSessionRecord {
 		isProcessing: false,
 		processingPhase: null,
 		isUnread: false,
+		canReloadFromNativeHistory: false,
 		status: 'running',
 		tags: [],
 		...overrides,
@@ -211,11 +212,12 @@ describe('SidebarSearchStore', () => {
 					results: [
 						{
 							chatId: 'c1',
+							transcriptViewId: 'view-1',
 							score: 1,
 							matchedMessageCount: 1,
 							snippets: [
 								{
-									messageOrdinal: 2,
+									ordinal: 2,
 									role: 'assistant',
 									timestamp: null,
 									text: 'needle appears in the transcript',
@@ -277,6 +279,7 @@ describe('SidebarSearchStore', () => {
 			});
 			store.transcriptSearchResults = [{
 				chatId: 'c1',
+				transcriptViewId: 'view-1',
 				score: 1,
 				matchedMessageCount: 1,
 				snippets: [],
@@ -419,6 +422,7 @@ describe('SidebarSearchStore', () => {
 					results: [
 						{
 							chatId: 'c1',
+							transcriptViewId: 'view-1',
 							score: 1,
 							matchedMessageCount: 1,
 							snippets: [],
@@ -511,11 +515,12 @@ describe('SidebarSearchStore', () => {
 					results: [
 						{
 							chatId: 'c2',
+							transcriptViewId: 'view-2',
 							score: 1,
 							matchedMessageCount: 1,
 							snippets: [
 								{
-									messageOrdinal: 4,
+									ordinal: 4,
 									role: 'user',
 									timestamp: null,
 									text: 'needle was only in the chat body',
@@ -549,6 +554,7 @@ describe('SidebarSearchStore', () => {
 					results: [
 						{
 							chatId: 'c1',
+							transcriptViewId: 'view-1',
 							score: 1,
 							matchedMessageCount: 1,
 							snippets: [],
@@ -591,11 +597,12 @@ describe('SidebarSearchStore', () => {
 					results: [
 						{
 							chatId: 'c2',
+							transcriptViewId: 'view-2',
 							score: 1,
 							matchedMessageCount: 1,
 							snippets: [
 								{
-									messageOrdinal: 4,
+									ordinal: 4,
 									role: 'user',
 									timestamp: null,
 									text: 'needle was only in the chat body',
@@ -802,5 +809,91 @@ describe('SidebarSearchStore', () => {
 			expect(store.savedSearches.map((search) => search.id)).toEqual(['s1', 's2', 's3']);
 			expect(notifyError).toHaveBeenCalledWith('Failed to reorder saved searches.');
 		});
+	});
+});
+
+describe('openTranscriptResult', () => {
+	function resultFor(chatId: string) {
+		return {
+			chatId,
+			transcriptViewId: 'view-1',
+			score: 1,
+			matchedMessageCount: 1,
+			snippets: [{
+				ordinal: 4,
+				role: 'assistant' as const,
+				text: 'needle',
+				highlights: [],
+				timestamp: '2026-01-01T00:00:00.000Z',
+			}],
+		};
+	}
+
+	function navigationStore(overrides: Partial<SidebarSearchStoreDeps> = {}) {
+		const store = createSidebarSearchStore({
+			getChats: () => [makeChat({ id: 'chat-1' })],
+			getSelectedChatId: () => null,
+			getTranscriptSearchEnabled: () => true,
+			notifyError: vi.fn(),
+			...overrides,
+		});
+		store.transcriptSearchResults = [resultFor('chat-1')];
+		return store;
+	}
+
+	it('resolves the view-qualified snippet and opens at its seq', async () => {
+		const navigate = vi.fn(async () => ({ chatId: 'chat-1', ordinal: 4 }));
+		const store = navigationStore({ navigateToSearchResult: navigate });
+		const opened = vi.fn();
+
+		await store.openTranscriptResult('chat-1', opened);
+
+		expect(navigate).toHaveBeenCalledWith({
+			chatId: 'chat-1',
+			transcriptViewId: 'view-1',
+			ordinal: 4,
+		});
+		expect(opened).toHaveBeenCalledWith('chat-1', 4);
+	});
+
+	it('removes a stale result, requeries, and opens without a seq', async () => {
+		const navigate = vi.fn(async () => {
+			throw new ApiError(409, 'stale', 'SEARCH_RESULT_STALE');
+		});
+		const search = vi.fn(async () => ({
+			query: 'needle',
+			results: [],
+			total: 0,
+			index: {
+				indexedChatCount: 1,
+				pendingChatCount: 0,
+				failedChatCount: 0,
+				unsupportedChatCount: 0,
+			},
+		}));
+		const store = navigationStore({
+			navigateToSearchResult: navigate,
+			searchChatTranscripts: search,
+		});
+		store.transcriptSearchQuery = 'needle';
+		const opened = vi.fn();
+
+		await store.openTranscriptResult('chat-1', opened);
+
+		expect(store.transcriptSearchResults).toEqual([]);
+		expect(opened).toHaveBeenCalledWith('chat-1', null);
+		expect(search).toHaveBeenCalled();
+	});
+
+	it('opens a chat without a transcript snippet directly', async () => {
+		const navigate = vi.fn();
+		const store = navigationStore({ navigateToSearchResult: navigate });
+		store.transcriptSearchResults = [];
+		const opened = vi.fn();
+
+		await store.openTranscriptResult('chat-1', opened);
+
+		expect(navigate).not.toHaveBeenCalled();
+		expect(opened).toHaveBeenCalledWith('chat-1', null);
 	});
 });

@@ -32,7 +32,10 @@ export class QueueCommands {
   async submitQueueEntryCreate(input: QueueEntryCreateCommandRequest): Promise<QueueEntryCommandResponse> {
     this.support.requireChat(input.chatId);
     this.support.assertContent(input.content);
-    return this.support.withChatMutationLock(input.chatId, () => this.submitQueueEntryCreateLocked(input));
+    return this.support.withChatMutationLock(input.chatId, async () => {
+      await this.support.assertCurrentTranscriptView(input.chatId, input.transcriptViewId);
+      return this.submitQueueEntryCreateLocked(input);
+    });
   }
 
   async submitQueueEntryReplace(input: QueueEntryReplaceCommandRequest): Promise<QueueEntryCommandResponse> {
@@ -220,6 +223,7 @@ export class QueueCommands {
     this.support.requireChat(input.chatId);
     this.support.assertContent(input.content);
     return this.support.withChatMutationLock(input.chatId, async () => {
+      await this.support.assertCurrentTranscriptView(input.chatId, input.transcriptViewId);
       const content = input.content;
       const preparedEntryId = crypto.randomUUID();
       const turnId = crypto.randomUUID();
@@ -227,7 +231,12 @@ export class QueueCommands {
         commandType: 'goal-control',
         chatId: input.chatId,
         clientRequestId: this.support.requireClientRequestId(input.clientRequestId),
-        payload: { chatId: input.chatId, content },
+        payload: {
+          chatId: input.chatId,
+          transcriptViewId: input.transcriptViewId,
+          clientMessageId: input.clientMessageId,
+          content,
+        },
         entryId: preparedEntryId,
         turnId,
       });
@@ -237,23 +246,13 @@ export class QueueCommands {
           this.support.throwRecordedExecutionFailure(ledger.record);
         }
         if (ledger.record.status === 'accepted') {
-          const outcome = await this.deps.queue.recoverAcceptedGoalControl({
-            command: {
-              key: ledger.record.key,
-              chatId: input.chatId,
-              clientRequestId: ledger.record.clientRequestId,
-              turnId: ledger.record.turnId ?? turnId,
-              entryId: ledger.record.entryId ?? preparedEntryId,
-            },
-            content,
-            settlement: this.support.settlement,
-          });
           return {
             ...commandResultFromRecord(ledger.record, 'duplicate'),
             commandType: 'goal-control',
-            delivery: outcome.delivery,
-            ...(outcome.entryId ? { entryId: outcome.entryId } : {}),
-            control: toClientChatExecutionControlState(outcome.control),
+            delivery: 'active',
+            control: toClientChatExecutionControlState(
+              await this.deps.queue.readChatExecutionControl(input.chatId),
+            ),
           };
         }
         return {
@@ -276,6 +275,8 @@ export class QueueCommands {
           entryId: ledger.record.entryId ?? preparedEntryId,
         },
         content,
+        clientMessageId: input.clientMessageId,
+        transcriptViewId: input.transcriptViewId,
         settlement: this.support.settlement,
       });
       return {
@@ -297,6 +298,9 @@ export class QueueCommands {
       if (!session) {
         throw new CommandValidationError('SESSION_NOT_FOUND', 'Session not found', 404);
       }
+      const transcriptViewId = input.transcriptViewId
+        ?? await this.deps.agents.currentTranscriptViewId(chatId);
+      await this.support.assertCurrentTranscriptView(chatId, transcriptViewId);
       const busy = this.deps.queue.ownsExecution(chatId);
       const control = await this.deps.queue.readChatExecutionControl(chatId);
       const queueBlocksDirectRun = control.entries.length > 0
@@ -309,11 +313,14 @@ export class QueueCommands {
           chatId,
           content: command,
           clientRequestId: input.clientRequestId,
+          clientMessageId: input.clientMessageId,
+          transcriptViewId,
         });
         return { type: 'queued', chatId, entryId: result.entryId };
       }
       await this.support.submitHttpRun({
         chatId,
+        transcriptViewId,
         command,
         clientRequestId: input.clientRequestId,
         clientMessageId: input.clientMessageId,
@@ -337,7 +344,13 @@ export class QueueCommands {
       commandType: 'queue-entry-create',
       chatId: input.chatId,
       clientRequestId: this.support.requireClientRequestId(input.clientRequestId),
-      payload: { chatId: input.chatId, content },
+      payload: {
+        chatId: input.chatId,
+        transcriptViewId: input.transcriptViewId,
+        clientMessageId: input.clientMessageId,
+        excludedResendOrdinals: input.excludedResendOrdinals,
+        content,
+      },
       entryId: preparedEntryId,
     });
     this.support.throwOnConflict(ledger, 'clientRequestId was reused with different payload');
@@ -360,6 +373,9 @@ export class QueueCommands {
         entryId: ledger.record.entryId ?? preparedEntryId,
       },
       content,
+      clientMessageId: input.clientMessageId,
+      transcriptViewId: input.transcriptViewId,
+      excludedResendOrdinals: input.excludedResendOrdinals,
       settlement: this.support.settlement,
     });
     return {

@@ -67,12 +67,44 @@ describe('agent architecture boundaries', () => {
     }
   });
 
-  test('keeps the common toolkit independent of providers and core', () => {
+  test('[TLV5-L12.02-STATIC-01] keeps the common toolkit independent of providers and core', () => {
     for (const file of walk('server-agents/common/src')) {
       const source = readFileSync(file, 'utf8');
       for (const packageName of providerPackages) expect(source, file).not.toContain(packageName);
       expect(source, file).not.toMatch(/(?:^|['"])\.{1,2}\/.*server\//m);
     }
+  });
+
+  test('routes transcript events through concrete operation publishers', () => {
+    expect(existsSync('server-agents/common/src/execution/run-tracker.ts')).toBe(false);
+
+    const productionSources = walk('server-agents').filter((file) => !file.includes('__tests__'));
+    for (const file of productionSources) {
+      const source = readFileSync(file, 'utf8');
+      expect(source, file).not.toMatch(/\bAgentRunTracker\b|execution\/run-tracker|subscribeRuntimeEvents/);
+    }
+
+    const executionAdapters = productionSources.filter((file) =>
+      readFileSync(file, 'utf8').includes('implements AgentRuntimeExecution'));
+    expect(executionAdapters.length).toBeGreaterThan(0);
+    for (const file of executionAdapters) {
+      const source = readFileSync(file, 'utf8');
+      expect(source, file).toContain('AgentRuntimePublisher');
+      expect(source, file).not.toMatch(/\.on(?:Messages|Finished|Failed)\s*\(/);
+    }
+  });
+
+  test('stops handoff recovery before graceful shutdown drains dependencies', () => {
+    const source = readFileSync('server/server.ts', 'utf8');
+    const shutdownStart = source.indexOf('const shutdown = async () =>');
+    const handoffStop = source.indexOf('handoffs.shutdown()', shutdownStart);
+    const executionAbort = source.indexOf('abortRunningSessionsWithTimeout({', shutdownStart);
+    const ledgerClose = source.indexOf('transcriptLedger.close()', shutdownStart);
+
+    expect(shutdownStart).toBeGreaterThanOrEqual(0);
+    expect(handoffStop).toBeGreaterThan(shutdownStart);
+    expect(handoffStop).toBeLessThan(executionAbort);
+    expect(handoffStop).toBeLessThan(ledgerClose);
   });
 
   test('forwards canonical controls through every single-query integration', () => {
@@ -86,7 +118,7 @@ describe('agent architecture boundaries', () => {
     }
   });
 
-  test('keeps generic server modules out of provider implementation paths', () => {
+  test('[TLV5-L12.01-STATIC-01] keeps generic server modules out of provider implementation paths', () => {
     for (const root of ['server/chats', 'server/routes', 'server/ws']) {
       for (const file of walk(root)) {
         if (file.includes('__tests__')) continue;

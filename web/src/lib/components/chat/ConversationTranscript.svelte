@@ -7,7 +7,6 @@
 	import type { ConversationMessageChatContext } from '$lib/chat/transcript/conversation-message-context.js';
 	import {
 		buildConversationFeedRenderModel,
-		conversationFeedItemLayout,
 		filterHiddenToolRenderItems,
 	} from '$lib/chat/transcript/conversation-feed-items.js';
 	import type { HideableToolType } from '$lib/stores/local-settings.svelte';
@@ -27,8 +26,15 @@
 		pendingPermissionRequests?: PendingPermissionRequest[];
 		chatContext?: ConversationMessageChatContext | null;
 		textScale?: number;
-		onPermissionDecision?: (permissionRequestId: string, decision: PermissionDecision) => void;
-		onExitPlanMode?: (permissionRequestId: string, choice: string, plan: string) => void;
+		onPermissionDecision?: (
+			permissionOccurrenceId: string,
+			decision: PermissionDecision,
+		) => void;
+		onExitPlanMode?: (
+			permissionOccurrenceId: string,
+			choice: string,
+			plan: string,
+		) => void;
 		onForkChat?: (upToSeq?: number) => void;
 		onGenerateTitleFromMessage?: (message: string, messageSeq?: number) => void | Promise<void>;
 		canForkAtMessageNow?: boolean;
@@ -50,11 +56,7 @@
 	}: Props = $props();
 
 	const renderModel = $derived(buildConversationFeedRenderModel(rows));
-	const renderItems = $derived(
-		filterHiddenToolRenderItems(renderModel.items, hiddenToolTypes).filter(
-			(item) => conversationFeedItemLayout(item) !== 'hidden',
-		),
-	);
+	const renderItems = $derived(filterHiddenToolRenderItems(renderModel.items, hiddenToolTypes));
 </script>
 
 <div

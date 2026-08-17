@@ -8,21 +8,20 @@ import { createNativeSeedReceipt } from '@garcon/common/transcript-seed';
 import {
   AgentIntegrationError,
   attachNativeMessageSource,
-  computeAgentTranscriptRevision,
-  computeAgentTranscriptRevisions,
   getNativeMessageRevisionSource,
-  type AgentForkOutcome,
-  type AgentForkRequest,
-  type AgentTranscript,
+  type AgentNativeForkOutcome,
+  type AgentNativeForkRequest,
 } from '@garcon/server-agent-interface';
+import type { AgentNativeEvidenceSource } from '../../native-session/evidence-source.js';
 import { createPathNativeSessionCodec } from '../../native-session/path-native-session.js';
-import { createJsonlForking, type JsonlForkingOptions } from '../jsonl-forking.js';
+import type { ForkTranscriptEntryContext } from '../fork-jsonl.js';
+import { createJsonlNativeForking } from '../jsonl-forking.js';
 
 const roots: string[] = [];
 const sourceAgentSessionId = '11111111-1111-1111-1111-111111111111';
 const timestamp = '2026-07-20T00:00:00.000Z';
 
-function materializedSession(outcome: AgentForkOutcome) {
+function materializedSession(outcome: AgentNativeForkOutcome) {
   expect(outcome.kind).toBe('materialized');
   if (outcome.kind !== 'materialized') throw new Error('Expected a materialized fork');
   return outcome.session;
@@ -48,10 +47,7 @@ async function createFixture() {
   const sourcePath = path.join(root, 'source.jsonl');
   await writeFile(sourcePath, sourceContent());
   const nativeSessions = createPathNativeSessionCodec('test');
-  const controls: {
-    afterSourceLoad?: () => void;
-    transcriptFailure?: unknown;
-  } = {};
+  const controls: { verificationFailure?: unknown } = {};
   const loadMessages = async (nativePath: string): Promise<ChatMessage[]> => {
     const content = await readFile(nativePath, 'utf8');
     const messages: ChatMessage[] = [];
@@ -73,24 +69,18 @@ async function createFixture() {
     }
     return messages;
   };
-  const transcript = {
+  const nativeEvidence = {
     async resolveNativeSession({ chat }) {
       return chat.nativeSession;
     },
     async load({ chat }) {
       const native = nativeSessions.decode(chat.nativeSession);
-      if (native.path === sourcePath && controls.transcriptFailure) {
-        throw controls.transcriptFailure;
+      if (native.path !== sourcePath && controls.verificationFailure) {
+        throw controls.verificationFailure;
       }
-      const messages = await loadMessages(native.path!);
-      if (native.path === sourcePath) {
-        const mutate = controls.afterSourceLoad;
-        controls.afterSourceLoad = undefined;
-        mutate?.();
-      }
-      return { messages, revision: computeAgentTranscriptRevision(messages) };
+      return { messages: await loadMessages(native.path!) };
     },
-  } satisfies Pick<AgentTranscript, 'load' | 'resolveNativeSession'>;
+  } satisfies Pick<AgentNativeEvidenceSource, 'load' | 'resolveNativeSession'>;
   const sourceMessages = await loadMessages(sourcePath);
   const settings = { ownerId: 'test', schemaVersion: 1, values: {} } as const;
   const sourceNativeSession = nativeSessions.encode({
@@ -98,6 +88,9 @@ async function createFixture() {
     agentSessionId: sourceAgentSessionId,
     modelEndpointId: null,
   });
+  const selectedSource = getNativeMessageRevisionSource(sourceMessages[1]);
+  if (!selectedSource) throw new Error('Fixture message is missing native metadata');
+  const providerMeta = { ...selectedSource };
   const request = {
     chatId: 'target-chat',
     projectPath: root,
@@ -106,16 +99,9 @@ async function createFixture() {
     thinkingMode: 'none',
     settings,
     endpoint: null,
-    operation: {
-      commandType: 'fork-run',
-      clientRequestId: null,
-      clientMessageId: null,
-      turnId: 'turn-1',
-    },
     admission: {
       signal: new AbortController().signal,
-      markStarted() {},
-      markAbortable() {},
+      async markStarted() {},
     },
     source: {
       chatId: 'source-chat',
@@ -128,20 +114,12 @@ async function createFixture() {
       nativeSeedReceipt: null,
       settings,
     },
-    point: {
-      messageSequence: 2,
-      archivedMessageCount: 0,
-      sourceRevision: {
-        nativePrefix: computeAgentTranscriptRevisions(sourceMessages, 2).prefix,
-        carryOver: 'carry-over',
-      },
-    },
-  } satisfies AgentForkRequest;
+    providerMeta,
+  } satisfies AgentNativeForkRequest;
   const options = {
-    supportsWhileRunning: true,
-    transcript,
+    nativeEvidence,
     nativeSessions,
-    rewriteEntry(entry, context) {
+    rewriteEntry(entry: unknown, context: ForkTranscriptEntryContext) {
       const record = entry as Record<string, unknown>;
       if (record.type === 'session') {
         return { ...record, sessionId: context.targetAgentSessionId };
@@ -151,7 +129,7 @@ async function createFixture() {
       }
       return entry;
     },
-  } satisfies JsonlForkingOptions;
+  };
   return {
     root,
     sourcePath,
@@ -160,15 +138,29 @@ async function createFixture() {
     nativeSessions,
     controls,
     request,
+    providerMeta,
     options,
-    forking: createJsonlForking(options),
+    forking: createJsonlNativeForking(options),
   };
 }
 
-describe('createJsonlForking message validation', () => {
+describe('createJsonlNativeForking provider positions', () => {
+  it('forks through the ledger row selected by provider metadata', async () => {
+    const fixture = await createFixture();
+
+    const session = materializedSession(await fixture.forking.fork(fixture.request));
+    const messages = await fixture.loadMessages(
+      fixture.nativeSessions.decode(session.nativeSession).path!,
+    );
+    expect(messages.map((message) => (message as UserMessage).content)).toEqual([
+      'first',
+      'second',
+    ]);
+  });
+
   it('persists the provider-supplied target path immediately', async () => {
     const fixture = await createFixture();
-    const forking = createJsonlForking({
+    const forking = createJsonlNativeForking({
       ...fixture.options,
       createTargetPath(input) {
         return path.join(fixture.root, `provider-${input.targetAgentSessionId}.jsonl`);
@@ -197,9 +189,6 @@ describe('createJsonlForking message validation', () => {
     const forkedMessages = await fixture.loadMessages(forkedPath);
 
     expect(forkedMessages).toEqual(fixture.sourceMessages);
-    expect(getNativeMessageRevisionSource(forkedMessages[0])?.byteOffset).not.toBe(
-      getNativeMessageRevisionSource(fixture.sourceMessages[0])?.byteOffset,
-    );
     expect(forkedMessages).not.toContainEqual(
       expect.objectContaining({ content: 'appended while running' }),
     );
@@ -207,11 +196,10 @@ describe('createJsonlForking message validation', () => {
 
   it('retargets a receipt only when the fork preserves its recorded prefix', async () => {
     const fixture = await createFixture();
-    const prefix = 'first';
     const receipt = createNativeSeedReceipt({
       agentSessionId: sourceAgentSessionId,
       placement: 'user-prefix',
-      prefix,
+      prefix: 'first',
     });
     const source = { ...fixture.request.source, nativeSeedReceipt: receipt };
 
@@ -219,7 +207,7 @@ describe('createJsonlForking message validation', () => {
       ...fixture.request,
       source,
     }));
-    const rewritingFork = createJsonlForking({
+    const rewritingFork = createJsonlNativeForking({
       ...fixture.options,
       rewriteEntry(entry, context) {
         const rewritten = fixture.options.rewriteEntry?.(entry, context) ?? entry;
@@ -232,7 +220,7 @@ describe('createJsonlForking message validation', () => {
     const removed = materializedSession(await rewritingFork.fork({
       ...fixture.request,
       source,
-      point: null,
+      providerMeta: null,
     }));
 
     expect(preserved.nativeSeedReceipt).toEqual({
@@ -241,23 +229,13 @@ describe('createJsonlForking message validation', () => {
     });
     expect(removed.nativeSeedReceipt).toBeNull();
   });
+});
 
-  it('rejects a rendered message mutation before the snapshot', async () => {
-    const fixture = await createFixture();
-    await writeFile(
-      fixture.sourcePath,
-      (await readFile(fixture.sourcePath, 'utf8')).replace('first', 'changed'),
-    );
-
-    await expect(fixture.forking.fork(fixture.request)).rejects.toMatchObject({
-      code: 'SOURCE_REVISION_CHANGED',
-    });
-  });
-
-  it('rejects a non-rendered entry mutation while copying', async () => {
+describe('createJsonlNativeForking prefix protection', () => {
+  it('rejects a retained-prefix mutation observed while copying', async () => {
     const fixture = await createFixture();
     let mutated = false;
-    const forking = createJsonlForking({
+    const forking = createJsonlNativeForking({
       ...fixture.options,
       rewriteEntry(entry) {
         const record = entry as Record<string, unknown>;
@@ -275,58 +253,54 @@ describe('createJsonlForking message validation', () => {
     });
   });
 
-  it('rejects a non-rendered entry mutation in the transcript-to-snapshot gap', async () => {
+  it('rejects a selected row that cannot be found in native history', async () => {
     const fixture = await createFixture();
     const filesBeforeFork = await readdir(fixture.root);
-    fixture.controls.afterSourceLoad = () =>
-      writeFileSync(fixture.sourcePath, sourceContent('changed in snapshot gap'));
 
-    await expect(fixture.forking.fork(fixture.request)).rejects.toMatchObject({
-      code: 'SOURCE_REVISION_CHANGED',
-      retryable: true,
+    await expect(fixture.forking.fork({
+      ...fixture.request,
+      providerMeta: { entryId: 'missing' },
+    })).rejects.toMatchObject({
+      code: 'TRANSCRIPT_UNAVAILABLE',
+      details: { nativeForkReason: 'not-settled' },
     });
     expect(await readdir(fixture.root)).toEqual(filesBeforeFork);
   });
-});
 
-describe('createJsonlForking error propagation', () => {
-  it('preserves provider transcript failures', async () => {
+  it('propagates verification read failures and removes the fork target', async () => {
     const fixture = await createFixture();
+    const filesBeforeFork = await readdir(fixture.root);
     const failure = new AgentIntegrationError(
       'PROVIDER_FAILURE',
       'Provider transcript read failed',
       true,
     );
-    fixture.controls.transcriptFailure = failure;
+    fixture.controls.verificationFailure = failure;
 
-    await expect(fixture.forking.fork(fixture.request)).rejects.toBe(failure);
-  });
-
-  it('rejects an archived count outside the selected sequence', async () => {
-    const fixture = await createFixture();
-    await expect(
-      fixture.forking.fork({
-        ...fixture.request,
-        point: {
-          ...fixture.request.point!,
-          archivedMessageCount: fixture.request.point!.messageSequence + 1,
-        },
-      }),
-    ).rejects.toMatchObject({ code: 'TRANSCRIPT_UNAVAILABLE' });
+    const receipt = createNativeSeedReceipt({
+      agentSessionId: sourceAgentSessionId,
+      placement: 'user-prefix',
+      prefix: 'first',
+    });
+    await expect(fixture.forking.fork({
+      ...fixture.request,
+      source: { ...fixture.request.source, nativeSeedReceipt: receipt },
+    })).rejects.toBe(failure);
+    expect(await readdir(fixture.root)).toEqual(filesBeforeFork);
   });
 });
 
-describe('createJsonlForking empty native prefixes', () => {
+describe('createJsonlNativeForking empty native prefixes', () => {
   it('leaves a whole-session fork without a source session unmaterialized', async () => {
     const fixture = await createFixture();
-    const forking = createJsonlForking({
+    const forking = createJsonlNativeForking({
       ...fixture.options,
       allowUnmaterializedWholeSession: true,
     });
 
     const result = await forking.fork({
       ...fixture.request,
-      point: null,
+      providerMeta: null,
       source: {
         ...fixture.request.source,
         agentSessionId: null,
@@ -340,7 +314,7 @@ describe('createJsonlForking empty native prefixes', () => {
 
   it('rejects a whole-session fork whose recorded session has no transcript path', async () => {
     const fixture = await createFixture();
-    const forking = createJsonlForking({
+    const forking = createJsonlNativeForking({
       ...fixture.options,
       allowUnmaterializedWholeSession: true,
     });
@@ -352,7 +326,7 @@ describe('createJsonlForking empty native prefixes', () => {
 
     await expect(forking.fork({
       ...fixture.request,
-      point: null,
+      providerMeta: null,
       source: {
         ...fixture.request.source,
         nativeSession,
@@ -360,41 +334,5 @@ describe('createJsonlForking empty native prefixes', () => {
     })).rejects.toMatchObject({
       code: 'TRANSCRIPT_UNAVAILABLE',
     });
-  });
-
-  it('preserves provider metadata without adding rendered messages', async () => {
-    const fixture = await createFixture();
-    await writeFile(
-      fixture.sourcePath,
-      [
-        JSON.stringify({ type: 'session', sessionId: sourceAgentSessionId }),
-        JSON.stringify({ type: 'provider_context', cwd: fixture.root }),
-        '',
-      ].join('\n'),
-    );
-    const request = {
-      ...fixture.request,
-      point: {
-        messageSequence: 1,
-        archivedMessageCount: 1,
-        sourceRevision: {
-          nativePrefix: computeAgentTranscriptRevisions([], 0).prefix,
-          carryOver: 'carry-over',
-        },
-      },
-    } satisfies AgentForkRequest;
-
-    const forked = materializedSession(await fixture.forking.fork(request));
-    const forkedPath = fixture.nativeSessions.decode(forked.nativeSession).path!;
-    const entries = (await readFile(forkedPath, 'utf8'))
-      .trimEnd()
-      .split('\n')
-      .map((line) => JSON.parse(line));
-
-    expect(entries).toEqual([
-      { type: 'session', sessionId: forked.agentSessionId },
-      { type: 'provider_context', cwd: fixture.root },
-    ]);
-    await expect(fixture.loadMessages(forkedPath)).resolves.toEqual([]);
   });
 });

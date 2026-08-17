@@ -11,32 +11,35 @@ import type { JsonObject } from './json.js';
 import type { AgentCommandImage } from './ws-requests.js';
 import type { ApiProtocol } from './api-providers.js';
 import type { ChatExecutionControlState } from './chat-execution-control.js';
+import { parseChatTransientControlAction, type ChatTransientControlAction } from './chat-transient-feed.js';
 import type { HttpErrorResponse } from './http-error.js';
 import type { ChatListEntry } from './chat-list.js';
 import type { ErrorCode } from './error-codes.js';
 import { normalizeTags } from './tags.js';
-import { InvalidChatIdError, parseChatId } from './chat-id.js';
 import type { ChatStopOutcome } from './chat-types.js';
-import type { RepairHistoryAcceptNativeRequest } from './chat-history-repair.js';
+import {
+  CommandRequestValidationError,
+  optionalNonEmptyString,
+  optionalNullableString,
+  optionalRecord,
+  optionalString,
+  requestRecord,
+  requiredChatId,
+  requiredCommandCorrelationId,
+  requiredContent,
+  requiredQueueEntryId,
+  requiredString,
+} from './command-request-validation.js';
 
-export type {
-  RepairHistoryAcceptNativeRequest,
-  RepairHistoryAcceptNativeResponse,
-} from './chat-history-repair.js';
+export {
+  COMMAND_CORRELATION_ID_MAX_BYTES,
+  QUEUE_ENTRY_ID_MAX_BYTES,
+  CommandRequestValidationError,
+  isCommandCorrelationIdWithinLimit,
+  isQueueEntryIdWithinLimit,
+} from './command-request-validation.js';
 
 export type CommandStatus = 'accepted' | 'duplicate';
-
-export const COMMAND_CORRELATION_ID_MAX_BYTES = 256;
-export const QUEUE_ENTRY_ID_MAX_BYTES = 128;
-const utf8Encoder = new TextEncoder();
-
-export function isCommandCorrelationIdWithinLimit(value: string): boolean {
-  return utf8Encoder.encode(value).byteLength <= COMMAND_CORRELATION_ID_MAX_BYTES;
-}
-
-export function isQueueEntryIdWithinLimit(value: string): boolean {
-  return utf8Encoder.encode(value).byteLength <= QUEUE_ENTRY_ID_MAX_BYTES;
-}
 
 export type CommandErrorCode = Extract<
   ErrorCode,
@@ -66,6 +69,7 @@ export type CommandErrorCode = Extract<
   | 'EXPLICIT_BYPASS_REQUIRED'
   | 'INCOMPLETE_EXECUTION_CONFIG'
   | 'STALE_CHAT_OWNERSHIP'
+  | 'OWNERSHIP_TRANSFER_PENDING'
   | 'AGENT_HANDOFF_REQUIRES_IDLE'
   | 'SOURCE_TRANSCRIPT_UNAVAILABLE'
   | 'CARRYOVER_HISTORY_UNAVAILABLE'
@@ -75,8 +79,7 @@ export type CommandErrorCode = Extract<
   | 'SOURCE_REVISION_CHANGED'
   | 'TRANSCRIPT_UNAVAILABLE'
   | 'TRANSCRIPT_NOT_YET_PERSISTED'
-  | 'MESSAGE_NOT_IN_NATIVE_HISTORY'
-  | 'STALE_VIEW_GENERATION'
+  | 'STALE_TRANSCRIPT_VIEW'
   | 'PROJECT_PATH_UPDATE_UNSUPPORTED'
   | 'CHAT_NOT_IDLE'
   | 'PROJECT_PATH_OUTSIDE_BASE'
@@ -117,8 +120,11 @@ export interface ForkChatResponse {
 export interface ForkChatCommandRequest {
   sourceChatId: string;
   chatId: string;
-  upToSeq?: number;
-  generationId?: string;
+  upToOrdinal?: number;
+  // Consent to a handoff fork when the request cannot be forked natively. The client sets it
+  // only after asking the user, so an unconfirmed request surfaces the refusal instead.
+  allowHandoffFork?: boolean;
+  transcriptViewId?: string;
 }
 
 export interface DeleteChatCommandRequest {
@@ -155,6 +161,8 @@ export interface AgentRunCommandRequest {
   clientRequestId: string;
   clientMessageId: string;
   chatId: string;
+  transcriptViewId: string;
+  excludedResendOrdinals?: number[];
   command: string;
   images?: AgentCommandImage[];
   permissionMode?: PermissionMode;
@@ -192,6 +200,7 @@ export interface ForkRunCommandRequest {
   sourceChatId: string;
   chatId: string;
   command: string;
+  allowHandoffFork?: boolean;
   images?: AgentCommandImage[];
   permissionMode?: PermissionMode;
   thinkingMode?: ThinkingMode;
@@ -204,7 +213,10 @@ export interface ForkRunCommandRequest {
 
 export interface QueueEntryCreateCommandRequest {
   clientRequestId: string;
+  clientMessageId: string;
   chatId: string;
+  transcriptViewId: string;
+  excludedResendOrdinals?: number[];
   content: string;
 }
 
@@ -249,6 +261,7 @@ export interface SteerCommandRequest {
   clientRequestId: string;
   clientMessageId: string;
   chatId: string;
+  transcriptViewId: string;
   content: string;
 }
 
@@ -260,8 +273,8 @@ export interface SteerCommandResponse extends CommandAcceptedResponse {
 
 export interface QueueEntrySteerCommandRequest {
   clientRequestId: string;
-  clientMessageId: string;
   chatId: string;
+  transcriptViewId: string;
   entryId: string;
   expectedRevision: number;
   expectedReorderRevision: number;
@@ -283,7 +296,9 @@ export interface QueueEntrySteerErrorResponse extends HttpErrorResponse {
 
 export interface GoalControlCommandRequest {
   clientRequestId: string;
+  clientMessageId: string;
   chatId: string;
+  transcriptViewId: string;
   content: string;
 }
 
@@ -338,12 +353,12 @@ export interface PermissionDecisionPayload {
   alwaysAllow?: boolean;
   response?: Record<string, unknown>;
 }
-
 export interface PermissionDecisionCommandRequest extends PermissionDecisionPayload {
   clientRequestId: string;
   chatId: string;
-  permissionRequestId: string;
+  permissionOccurrenceId: string;
   alwaysAllow: boolean;
+  control: ChatTransientControlAction;
 }
 
 export interface AgentStopCommandRequest {
@@ -423,13 +438,6 @@ export interface ProjectPathPatchResponse {
 
 export interface RunningChatsResponse {
   sessions: Record<string, Array<{ id: string; [key: string]: unknown }>>;
-}
-
-export class CommandRequestValidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'CommandRequestValidationError';
-  }
 }
 
 export function parseStartChatCommandRequest(value: unknown): StartChatCommandRequest {
@@ -518,6 +526,8 @@ export function parseAgentRunCommandRequest(value: unknown): AgentRunCommandRequ
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
     clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     chatId: requiredChatId(body, 'chatId'),
+    transcriptViewId: requiredString(body, 'transcriptViewId'),
+    ...(optionalResendOrdinals(body.excludedResendOrdinals) ?? {}),
     command: contentOrImages(body, 'command', images),
     ...(images === undefined ? {} : { images }),
     ...(permissionMode === undefined ? {} : { permissionMode }),
@@ -581,15 +591,14 @@ export function parseForkRunCommandRequest(value: unknown): ForkRunCommandReques
   const images = optionalImages(body.images);
   const agentSettings = optionalAgentSettings(body.agentSettings, 'agentSettings');
   const model = optionalString(body, 'model');
-  if (optionalGenerationId(body) !== undefined) {
-    throw new CommandRequestValidationError('generationId requires upToSeq');
-  }
+  const allowHandoffFork = parseHandoffForkConsent(body);
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
     clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     sourceChatId: requiredChatId(body, 'sourceChatId'),
     chatId: requiredChatId(body, 'chatId'),
     command: contentOrImages(body, 'command', images),
+    ...(allowHandoffFork ? { allowHandoffFork: true } : {}),
     ...(images === undefined ? {} : { images }),
     permissionMode: body.permissionMode === undefined
       ? undefined
@@ -607,48 +616,68 @@ export function parseForkRunCommandRequest(value: unknown): ForkRunCommandReques
 
 export function parseForkChatCommandRequest(value: unknown): ForkChatCommandRequest {
   const body = requestRecord(value);
-  const upToSeq = body.upToSeq;
-  const generationId = optionalGenerationId(body);
-  if (upToSeq !== undefined && (!Number.isSafeInteger(upToSeq) || Number(upToSeq) <= 0)) {
-    throw new CommandRequestValidationError('upToSeq must be a positive integer');
+  const upToOrdinal = body.upToOrdinal;
+  const transcriptViewId = optionalNonEmptyString(body, 'transcriptViewId');
+  if (
+    upToOrdinal !== undefined
+    && (!Number.isSafeInteger(upToOrdinal) || Number(upToOrdinal) <= 0)
+  ) {
+    throw new CommandRequestValidationError('upToOrdinal must be a positive integer');
   }
-  if (generationId !== undefined && upToSeq === undefined) {
-    throw new CommandRequestValidationError('generationId requires upToSeq');
+  if (transcriptViewId !== undefined && upToOrdinal === undefined) {
+    throw new CommandRequestValidationError('transcriptViewId requires upToOrdinal');
   }
+  if (upToOrdinal !== undefined && transcriptViewId === undefined) {
+    throw new CommandRequestValidationError('upToOrdinal requires transcriptViewId');
+  }
+  const allowHandoffFork = parseHandoffForkConsent(body);
   return {
     sourceChatId: requiredChatId(body, 'sourceChatId'),
     chatId: requiredChatId(body, 'chatId'),
-    ...(upToSeq === undefined ? {} : { upToSeq: Number(upToSeq) }),
-    ...(generationId === undefined ? {} : { generationId }),
+    ...(upToOrdinal === undefined ? {} : { upToOrdinal: Number(upToOrdinal) }),
+    ...(allowHandoffFork ? { allowHandoffFork: true } : {}),
+    ...(transcriptViewId === undefined ? {} : { transcriptViewId }),
   };
+}
+
+function parseHandoffForkConsent(body: Record<string, unknown>): true | undefined {
+  const consent = body.allowHandoffFork;
+  if (consent !== undefined && typeof consent !== 'boolean') {
+    throw new CommandRequestValidationError('allowHandoffFork must be a boolean');
+  }
+  return consent === true ? true : undefined;
 }
 
 export function parseDeleteChatCommandRequest(value: unknown): DeleteChatCommandRequest {
   return { chatId: requiredChatId(requestRecord(value), 'chatId') };
 }
 
-export function parseRepairHistoryAcceptNativeRequest(
-  value: unknown,
-): RepairHistoryAcceptNativeRequest {
-  const body = requestRecord(value);
-  if (body.action !== 'accept-native') {
-    throw new CommandRequestValidationError('action must be accept-native');
-  }
-  return {
-    action: 'accept-native',
-    chatId: requiredChatId(body, 'chatId'),
-    expectedCarryOverRevision: requiredString(body, 'expectedCarryOverRevision'),
-    expectedAgentOwnershipEpoch: requiredString(body, 'expectedAgentOwnershipEpoch'),
-  };
-}
-
 export function parseQueueEntryCreateCommandRequest(value: unknown): QueueEntryCreateCommandRequest {
   const body = requestRecord(value);
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
+    clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     chatId: requiredChatId(body, 'chatId'),
+    transcriptViewId: requiredString(body, 'transcriptViewId'),
+    ...(optionalResendOrdinals(body.excludedResendOrdinals) ?? {}),
     content: requiredContent(body, 'content'),
   };
+}
+
+function optionalResendOrdinals(value: unknown): { excludedResendOrdinals: number[] } | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) {
+    throw new CommandRequestValidationError('excludedResendOrdinals must be an array');
+  }
+  const ordinals = [...new Set(value.map((ordinal) => {
+    if (!Number.isSafeInteger(ordinal) || Number(ordinal) < 1) {
+      throw new CommandRequestValidationError(
+        'excludedResendOrdinals must contain positive integers',
+      );
+    }
+    return Number(ordinal);
+  }))].sort((left, right) => left - right);
+  return ordinals.length > 0 ? { excludedResendOrdinals: ordinals } : undefined;
 }
 
 export function parseQueueEntryReplaceCommandRequest(value: unknown): QueueEntryReplaceCommandRequest {
@@ -720,6 +749,7 @@ export function parseSteerCommandRequest(value: unknown): SteerCommandRequest {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
     clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     chatId: requiredChatId(body, 'chatId'),
+    transcriptViewId: requiredString(body, 'transcriptViewId'),
     content: requiredContent(body, 'content'),
   };
 }
@@ -739,8 +769,8 @@ export function parseQueueEntrySteerCommandRequest(value: unknown): QueueEntrySt
   }
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
-    clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     chatId: requiredChatId(body, 'chatId'),
+    transcriptViewId: requiredString(body, 'transcriptViewId'),
     entryId: requiredQueueEntryId(body, 'entryId'),
     expectedRevision: Number(body.expectedRevision),
     expectedReorderRevision: Number(body.expectedReorderRevision),
@@ -751,7 +781,9 @@ export function parseGoalControlCommandRequest(value: unknown): GoalControlComma
   const body = requestRecord(value);
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
+    clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     chatId: requiredChatId(body, 'chatId'),
+    transcriptViewId: requiredString(body, 'transcriptViewId'),
     content: requiredContent(body, 'content'),
   };
 }
@@ -770,19 +802,26 @@ export function parseQueueResumeRequest(value: unknown): QueueResumeRequest {
 
 export function parsePermissionDecisionCommandRequest(value: unknown): PermissionDecisionCommandRequest {
   const body = requestRecord(value);
-  if (typeof body.allow !== 'boolean') {
-    throw new CommandRequestValidationError('allow must be a boolean');
-  }
-  if (typeof body.alwaysAllow !== 'boolean') {
-    throw new CommandRequestValidationError('alwaysAllow must be a boolean');
-  }
+  if (typeof body.allow !== 'boolean') throw new CommandRequestValidationError('allow must be a boolean');
+  if (typeof body.alwaysAllow !== 'boolean') throw new CommandRequestValidationError('alwaysAllow must be a boolean');
   const response = optionalRecord(body.response, 'response');
+  const control = parseChatTransientControlAction(body.control);
+  if (!control) throw new CommandRequestValidationError('control is invalid');
+  const chatId = requiredChatId(body, 'chatId');
+  const permissionOccurrenceId = requiredString(body, 'permissionOccurrenceId');
+  if (
+    control.chatId !== chatId
+    || control.permissionOccurrenceId !== permissionOccurrenceId
+  ) {
+    throw new CommandRequestValidationError('control does not match the permission request');
+  }
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
-    chatId: requiredChatId(body, 'chatId'),
-    permissionRequestId: requiredString(body, 'permissionRequestId'),
+    chatId,
+    permissionOccurrenceId,
     allow: body.allow,
     alwaysAllow: body.alwaysAllow,
+    control,
     ...(response === undefined ? {} : { response }),
   };
 }
@@ -819,61 +858,6 @@ export function parseProjectPathPatchRequest(value: unknown): ProjectPathPatchRe
   };
 }
 
-function requestRecord(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new CommandRequestValidationError('request body must be an object');
-  }
-  return value as Record<string, unknown>;
-}
-
-function requiredString(body: Record<string, unknown>, field: string): string {
-  const value = body[field];
-  if (typeof value !== 'string' || !value.trim()) {
-    throw new CommandRequestValidationError(`${field} is required`);
-  }
-  return value.trim();
-}
-
-function requiredCommandCorrelationId(body: Record<string, unknown>, field: string): string {
-  const value = requiredString(body, field);
-  if (!isCommandCorrelationIdWithinLimit(value)) {
-    throw new CommandRequestValidationError(
-      `${field} must be at most ${COMMAND_CORRELATION_ID_MAX_BYTES} bytes`,
-    );
-  }
-  return value;
-}
-
-function requiredQueueEntryId(body: Record<string, unknown>, field: string): string {
-  const value = requiredString(body, field);
-  if (!isQueueEntryIdWithinLimit(value)) {
-    throw new CommandRequestValidationError(
-      `${field} must be at most ${QUEUE_ENTRY_ID_MAX_BYTES} bytes`,
-    );
-  }
-  return value;
-}
-
-function requiredChatId(body: Record<string, unknown>, field: string): string {
-  const value = requiredString(body, field);
-  try {
-    return parseChatId(value);
-  } catch (error) {
-    if (!(error instanceof InvalidChatIdError)) throw error;
-    throw new CommandRequestValidationError(
-      `${field} must be a valid 16-digit Unix-microsecond timestamp`,
-    );
-  }
-}
-
-function requiredContent(body: Record<string, unknown>, field: string): string {
-  const value = body[field];
-  if (typeof value !== 'string' || !value.trim()) {
-    throw new CommandRequestValidationError(`${field} is required`);
-  }
-  return value;
-}
-
 function contentOrImages(
   body: Record<string, unknown>,
   field: string,
@@ -882,30 +866,6 @@ function contentOrImages(
   const value = typeof body[field] === 'string' ? body[field] : '';
   if (!value.trim() && (!images || images.length === 0)) {
     throw new CommandRequestValidationError(`${field} or images are required`);
-  }
-  return value;
-}
-
-function optionalString(
-  body: Record<string, unknown>,
-  field: string,
-  trim = true,
-): string | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'string') {
-    throw new CommandRequestValidationError(`${field} must be a string`);
-  }
-  return trim ? value.trim() : value;
-}
-
-function optionalNonEmptyString(
-  body: Record<string, unknown>,
-  field: string,
-): string | undefined {
-  const value = optionalString(body, field);
-  if (value !== undefined && value.length === 0) {
-    throw new CommandRequestValidationError(`${field} must not be empty`);
   }
   return value;
 }
@@ -924,26 +884,6 @@ function optionalThinkingMode(value: unknown): ThinkingMode | undefined {
     throw new CommandRequestValidationError('thinkingMode is invalid');
   }
   return value;
-}
-
-function optionalGenerationId(body: Record<string, unknown>): string | undefined {
-  const generationId = optionalString(body, 'generationId');
-  if (generationId !== undefined && generationId.length === 0) {
-    throw new CommandRequestValidationError('generationId must not be empty');
-  }
-  return generationId;
-}
-
-function optionalNullableString(
-  body: Record<string, unknown>,
-  field: string,
-): string | null | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return value;
-  if (typeof value !== 'string') {
-    throw new CommandRequestValidationError(`${field} must be a string or null`);
-  }
-  return value.trim();
 }
 
 function optionalApiProtocol(value: unknown): ApiProtocol | null | undefined {
@@ -986,12 +926,4 @@ function optionalImages(value: unknown): AgentCommandImage[] | undefined {
       ...(image.mimeType === undefined ? {} : { mimeType: image.mimeType }),
     };
   });
-}
-
-function optionalRecord(value: unknown, field: string): Record<string, unknown> | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'object' || Array.isArray(value)) {
-    throw new CommandRequestValidationError(`${field} must be an object`);
-  }
-  return value as Record<string, unknown>;
 }

@@ -77,8 +77,13 @@ export type PendingViewChat = {
 };
 
 export interface PendingPermissionRequest {
-	permissionRequestId: string;
+	permissionOccurrenceId: string;
 	requestedTool: import('$shared/chat-types').ToolUseChatMessage;
 	chatId?: string | null;
 	receivedAt?: Date;
+	control?: import('$shared/chat-transient-feed').ChatTransientControlAction;
+	transcript?: {
+		transcriptViewId: string;
+		afterOrdinal: number;
+	};
 }

@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { randomBytes } from 'node:crypto';
+import { join } from 'node:path';
 import { parseServerRuntimeProbe } from '../../../common/server-runtime.js';
-import type { ChatViewMessage } from '../../../common/chat-view.js';
+import type { TranscriptMessage } from '../../../common/chat-view.js';
+import {
+  AssistantMessage,
+  BashToolUseMessage,
+} from '../../../common/chat-types.js';
+import type { LedgerRowDraft } from '../../../server/ledger/contracts.js';
+import { TranscriptLedgerStore } from '../../../server/ledger/store.js';
 import { GarconApiError } from '../../support/garcon-client.js';
 import {
   assistantContents,
@@ -51,7 +58,7 @@ describe('persistence lifecycle', () => {
       const restored = await fixture.client.getMessages(chatId);
       expect(userContents(restored.messages)).toEqual(userContents(before.messages));
       expect(assistantContents(restored.messages)).toEqual(assistantContents(before.messages));
-      expect(restored.messages.map((entry) => entry.seq)).toEqual(before.messages.map((entry) => entry.seq));
+      expect(restored.messages.map((entry) => entry.ordinal)).toEqual(before.messages.map((entry) => entry.ordinal));
       expect((await fixture.client.reconnectState([])).processing).toEqual({
         outcome: 'snapshot',
         chats: [],
@@ -75,11 +82,155 @@ describe('persistence lifecycle', () => {
     });
   });
 
-  test('drops queue control and pending input state on restart', async () => {
+  test('builds direct context from every conversational row and no lifecycle rows', async () => {
+    await withIntegrationFixture('direct-context-ledger-fold', async (fixture) => {
+      const chatId = fixture.newChatId();
+      const initial = await fixture.client.startDirectChat({
+        chatId,
+        content: 'context-initial-user',
+        projectPath: fixture.dirs.project,
+        agent: fixture.directAgents.openAi,
+      });
+      await fixture.client.waitForTurnTerminal(chatId, initial.turnId);
+      const before = await fixture.client.getMessages(chatId);
+      const at = '2026-08-15T00:00:00.000Z';
+      const injected: LedgerRowDraft[] = [
+        {
+          kind: 'notice',
+          at,
+          message: 'context-notice-must-not-reach-provider',
+          detail: { action: 'reload-native-history' },
+          providerMeta: null,
+        },
+        {
+          kind: 'permission-requested',
+          at,
+          lifecycle: {
+            kind: 'requested',
+            permissionOccurrenceId: 'context-incarnation',
+            requestedTool: new BashToolUseMessage(at, 'context-tool', 'printf hidden'),
+            options: [],
+          },
+          providerMeta: null,
+        },
+        {
+          kind: 'provider-row',
+          at,
+          message: new AssistantMessage(at, 'context-late-provider-output'),
+          providerMeta: null,
+        },
+        {
+          kind: 'permission-cancelled',
+          at,
+          lifecycle: {
+            kind: 'cancelled',
+            permissionOccurrenceId: 'context-incarnation',
+            reason: 'run ended',
+          },
+          providerMeta: null,
+        },
+      ];
+
+      await fixture.restartGarcon({
+        beforeStart: async () => {
+          const store = new TranscriptLedgerStore(
+            join(fixture.dirs.workspace, 'transcript-ledgers'),
+          );
+          try {
+            const view = store.currentView(chatId);
+            if (view?.viewId !== before.transcriptViewId) {
+              throw new Error('The context fixture opened a different transcript view.');
+            }
+            store.append(chatId, view.viewId, injected);
+          } finally {
+            store.close();
+          }
+        },
+      });
+
+      const next = await fixture.client.runDirectChat({
+        chatId,
+        content: 'context-next-user',
+        agent: fixture.directAgents.openAi,
+      });
+      await fixture.client.waitForTurnTerminal(chatId, next.turnId);
+
+      expect(fixture.fakeProviders.openAi.requests().at(-1)?.body.messages).toEqual([
+        { role: 'user', content: 'context-initial-user' },
+        { role: 'assistant', content: 'echo:context-initial-user' },
+        { role: 'assistant', content: 'context-late-provider-output' },
+        { role: 'user', content: 'context-next-user' },
+      ]);
+      const transcript = await fixture.client.getMessages(chatId);
+      expect(transcript.messages.map((entry) => entry.message.type)).toEqual([
+        'user-message',
+        'assistant-message',
+        'transcript-notice',
+        'permission-request',
+        'assistant-message',
+        'permission-cancelled',
+        'user-message',
+        'assistant-message',
+      ]);
+      const ordinals = transcript.messages.map((entry) => entry.ordinal);
+      expect(ordinals).toEqual([...ordinals].sort((left, right) => left - right));
+      expect(new Set(ordinals).size).toBe(ordinals.length);
+    });
+  }, 20_000);
+
+  test('[TLV5-L04.04-SERVER-RESTART-01] deduplicates committed submissions after a crash restart', async () => {
+    await withIntegrationFixture('committed-submission-restart', async (fixture) => {
+      const chatId = fixture.newChatId();
+      const initial = await fixture.client.startDirectChat({
+        chatId,
+        content: 'idempotency-bootstrap',
+        projectPath: fixture.dirs.project,
+        agent: fixture.directAgents.openAi,
+      });
+      await fixture.client.waitForTurnTerminal(chatId, initial.turnId);
+
+      const request = fixture.client.directRunRequest({
+        chatId,
+        content: 'idempotency-committed',
+        agent: fixture.directAgents.openAi,
+        clientRequestId: crypto.randomUUID(),
+        clientMessageId: crypto.randomUUID(),
+      });
+      const committed = await fixture.client.runChat(request);
+      await fixture.client.waitForTurnTerminal(chatId, committed.turnId);
+      const beforeRestart = await fixture.client.getMessages(chatId);
+      const requestCount = fixture.fakeProviders.openAi.requests().length;
+
+      await fixture.crashAndRestartGarcon();
+      await fixture.client.runChat(request);
+
+      const afterRetry = await fixture.client.getMessages(chatId);
+      expect(afterRetry.messages).toEqual(beforeRestart.messages);
+      expect(countUserContent(afterRetry.messages, 'idempotency-committed')).toBe(1);
+      expect(fixture.fakeProviders.openAi.requests()).toHaveLength(requestCount);
+      expect((await fixture.client.reconnectState([])).processing).toEqual({
+        outcome: 'snapshot',
+        chats: [],
+      });
+
+      await expect(fixture.client.runChat({
+        ...request,
+        clientRequestId: crypto.randomUUID(),
+        command: 'idempotency-conflict',
+      })).rejects.toMatchObject({
+        status: 409,
+        body: { errorCode: 'IDEMPOTENCY_CONFLICT' },
+      });
+      expect((await fixture.client.getMessages(chatId)).messages).toEqual(beforeRestart.messages);
+      expect(fixture.fakeProviders.openAi.requests()).toHaveLength(requestCount);
+    });
+  });
+
+  test('[TLV5-L03.04-SERVER-RESTART-01] drops queue control and pending input state on restart', async () => {
     await withIntegrationFixture('ephemeral-queue-restart', async (fixture) => {
       const chatId = fixture.newChatId();
       const held = fixture.fakeProviders.openAi.holdNext({ lastUserText: 'ephemeral-active' });
-      const active = await fixture.client.startDirectChat({
+      await fixture.client.startDirectChat({
         chatId,
         content: 'ephemeral-active',
         projectPath: fixture.dirs.project,
@@ -105,15 +256,7 @@ describe('persistence lifecycle', () => {
       });
 
       const activeAborted = held.expectAbort();
-      await fixture.restartGarcon({
-        beforeStart: () => fixture.appendDirectOpenAiNativeMessage({
-          chatId,
-          role: 'assistant',
-          content: 'terminal persisted after disconnect',
-          clientRequestId: active.clientRequestId,
-          turnId: active.turnId,
-        }),
-      });
+      await fixture.restartGarcon();
       await activeAborted;
       held.releaseTruncatedStream();
 
@@ -132,7 +275,6 @@ describe('persistence lifecycle', () => {
           serverInstanceId: restartedInstanceId,
           queue: {
             entries: [],
-            dispatchingEntryId: null,
             steeringEntryId: null,
             recentlyDispatched: [],
             pause: null,
@@ -146,7 +288,6 @@ describe('persistence lifecycle', () => {
         serverInstanceId: restartedInstanceId,
         queue: {
           entries: [],
-          dispatchingEntryId: null,
           steeringEntryId: null,
           recentlyDispatched: [],
           pause: null,
@@ -155,12 +296,15 @@ describe('persistence lifecycle', () => {
         version: 0,
         updatedAt: null,
       });
-      const reloaded = await fixture.client.reloadChat(chatId);
-      expect(assistantContents(reloaded.messages)).toContain('terminal persisted after disconnect');
       const restored = await fixture.client.getMessages(chatId);
-      expect(restored.pendingUserInputs).toEqual([]);
+      expect(restored.resendCandidates).toEqual([
+        { ordinal: 1, content: 'ephemeral-active', attachmentNames: [] },
+      ]);
       expect(countUserContent(restored.messages, 'discard-on-restart')).toBe(0);
-      expect(assistantContents(restored.messages)).toContain('terminal persisted after disconnect');
+      expect(countUserContent(restored.messages, 'ephemeral-active')).toBe(1);
+      await expect(fixture.client.reloadChat(chatId)).rejects.toMatchObject({
+        response: { code: 'HISTORY_LOAD_FAILED' },
+      });
 
       const next = await fixture.client.runDirectChat({
         chatId,
@@ -168,9 +312,44 @@ describe('persistence lifecycle', () => {
         agent: fixture.directAgents.openAi,
       });
       await fixture.client.waitForTurnTerminal(chatId, next.turnId);
-      expect(fixture.fakeProviders.openAi.requests().at(-1)?.lastUserText).toBe('after-restart');
+      expect(fixture.fakeProviders.openAi.requests().at(-1)?.lastUserText).toBe(
+        'ephemeral-active\n\nafter-restart',
+      );
     });
   });
+
+  test('[TLV5-A07-SERVER-RESTART-01] recomputes unanswered resend candidates after every restart', async () => {
+    await withIntegrationFixture('ephemeral-resend-exclusion-restart', async (fixture) => {
+      const chatId = fixture.newChatId();
+      const prompt = 'resend-candidate-survives-client-opt-out';
+      const held = fixture.fakeProviders.openAi.holdNext({ lastUserText: prompt });
+      await fixture.client.startDirectChat({
+        chatId,
+        content: prompt,
+        projectPath: fixture.dirs.project,
+        agent: fixture.directAgents.openAi,
+      });
+      await held.received;
+
+      const aborted = held.expectAbort();
+      await fixture.restartGarcon();
+      await aborted;
+      held.releaseTruncatedStream();
+
+      const firstRestart = await fixture.client.getMessages(chatId);
+      expect(firstRestart.resendCandidates).toEqual([{
+        ordinal: 1,
+        content: prompt,
+        attachmentNames: [],
+      }]);
+
+      await fixture.restartGarcon();
+      const secondRestart = await fixture.client.getMessages(chatId);
+      expect(secondRestart.transcriptViewId).toBe(firstRestart.transcriptViewId);
+      expect(secondRestart.messages).toEqual(firstRestart.messages);
+      expect(secondRestart.resendCandidates).toEqual(firstRestart.resendCandidates);
+    });
+  }, 60_000);
 
   test('deletes a running chat without stale provider resurrection', async () => {
     await withIntegrationFixture('delete-running-chat', async (fixture) => {
@@ -215,7 +394,7 @@ describe('persistence lifecycle', () => {
       const sourceBefore = await fixture.client.getMessages(sourceChatId);
       const firstAssistantSeq = sourceBefore.messages.find((entry) => (
         entry.message.type === 'assistant-message'
-      ))!.seq;
+      ))!.ordinal;
 
       const fullChatId = fixture.newChatId();
       const boundedChatId = fixture.newChatId();
@@ -223,7 +402,8 @@ describe('persistence lifecycle', () => {
       expect((await fixture.client.forkChat({
         sourceChatId,
         chatId: boundedChatId,
-        upToSeq: firstAssistantSeq,
+        transcriptViewId: sourceBefore.transcriptViewId,
+        upToOrdinal: firstAssistantSeq,
       })).chat.id).toBe(boundedChatId);
 
       const fullRun = await fixture.client.runDirectChat({
@@ -265,9 +445,9 @@ describe('persistence lifecycle', () => {
   });
 });
 
-function conversationOf(messages: readonly ChatViewMessage[]) {
+function conversationOf(messages: readonly TranscriptMessage[]) {
   return messages.map((entry) => ({
-    seq: entry.seq,
+    seq: entry.ordinal,
     type: entry.message.type,
     content: 'content' in entry.message ? entry.message.content : null,
   }));

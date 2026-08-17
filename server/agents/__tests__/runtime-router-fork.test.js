@@ -1,13 +1,11 @@
 import { describe, expect, it, mock } from 'bun:test';
 import { UserMessage } from '../../../common/chat-types.js';
-import {
-  AgentIntegrationError,
-  computeAgentTranscriptRevision,
-  computeAgentTranscriptRevisions,
-} from '@garcon/server-agent-interface';
+import { AgentIntegrationError } from '@garcon/server-agent-interface';
 import { AgentRuntimeRouter } from '../runtime-router.ts';
+import { createRuntimeTranscriptFixture } from './runtime-router-test-fixture.js';
 
 function makeRouter(fork) {
+  const transcript = createRuntimeTranscriptFixture();
   const settings = { ownerId: 'test', schemaVersion: 1, values: {} };
   const entry = {
     id: 'source-chat',
@@ -48,13 +46,10 @@ function makeRouter(fork) {
     },
     settings: { parse: (value) => value },
     execution,
-    transcript: {
-      load: mock(async () => ({
-        messages,
-        revision: computeAgentTranscriptRevision(messages),
-      })),
+    forking: {
+      fork,
+      discard: mock(async () => undefined),
     },
-    forking: { fork, discard: mock(async () => undefined) },
   };
   const entries = new Map([['source-chat', entry]]);
   const registry = {
@@ -85,8 +80,9 @@ function makeRouter(fork) {
     },
     events: { trackTurn: mock(() => undefined), clearTurn: mock(() => undefined) },
     getCarryOverRevision: () => 'carry-1',
-    loadCarriedContext: async () => null,
-    getCarryOverMessageCount: async () => 0,
+    ledger: transcript.ledger,
+    hasPendingOwnershipTransfer: () => false,
+    adoption: transcript.adoption,
   });
   return { router, entry, entries, execution, messages, integration };
 }
@@ -100,25 +96,21 @@ describe('AgentRuntimeRouter forks', () => {
         nativeSession: { ownerId: 'test', schemaVersion: 1, value: { id: 'forked-session' } },
       },
     }));
-    const { router, entry, messages } = makeRouter(fork);
+    const { router, entry, integration } = makeRouter(fork);
 
     await router.forkAgentSession({
       sourceSession: entry,
       sourceChatId: 'source-chat',
       targetChatId: 'target-chat',
-      messageSequence: 1,
+      messageOrdinal: 1,
+      providerMeta: { entryId: 'native-entry-1', withinSourceOrdinal: 0 },
     });
 
     expect(fork).toHaveBeenCalledWith(expect.objectContaining({
-      point: {
-        messageSequence: 1,
-        archivedMessageCount: 0,
-        sourceRevision: {
-          nativePrefix: computeAgentTranscriptRevisions(messages, 1).prefix,
-          carryOver: 'carry-1',
-        },
-      },
+      providerMeta: { entryId: 'native-entry-1', withinSourceOrdinal: 0 },
+      source: expect.objectContaining({ chatId: 'source-chat' }),
     }));
+    expect(integration.forking).not.toHaveProperty('resolvePoint');
   });
 
   it('preserves a successful unmaterialized whole-session outcome', async () => {
@@ -132,7 +124,7 @@ describe('AgentRuntimeRouter forks', () => {
     });
     expect(outcome).toEqual({ kind: 'unmaterialized' });
 
-    expect(fork).toHaveBeenCalledWith(expect.objectContaining({ point: null }));
+    expect(fork).toHaveBeenCalledWith(expect.objectContaining({ providerMeta: null }));
 
     entries.set('target-chat', {
       ...entry,
@@ -149,6 +141,47 @@ describe('AgentRuntimeRouter forks', () => {
     expect(execution.resume).not.toHaveBeenCalled();
   });
 
+  it('falls back to carryover when native fidelity is unavailable', async () => {
+    const fork = mock(async () => {
+      throw new AgentIntegrationError(
+        'OPERATION_UNSUPPORTED',
+        'The native history cannot be forked',
+        false,
+      );
+    });
+    const { router, entry } = makeRouter(fork);
+
+    await expect(router.forkAgentSession({
+      sourceSession: entry,
+      sourceChatId: 'source-chat',
+      targetChatId: 'target-chat',
+    })).resolves.toBeNull();
+  });
+
+  it('reports a retryable refusal when the native transcript trails the ledger', async () => {
+    const fork = mock(async () => {
+      throw new AgentIntegrationError(
+        'TRANSCRIPT_UNAVAILABLE',
+        'The selected ledger row has no provider-native fork position',
+        true,
+        { nativeForkReason: 'not-settled' },
+      );
+    });
+    const { router, entry } = makeRouter(fork);
+
+    await expect(router.forkAgentSession({
+      sourceSession: entry,
+      sourceChatId: 'source-chat',
+      targetChatId: 'target-chat',
+      messageOrdinal: 1,
+      providerMeta: { lineNumber: 1 },
+    })).rejects.toMatchObject({
+      code: 'TRANSCRIPT_NOT_YET_PERSISTED',
+      status: 409,
+      retryable: true,
+    });
+  });
+
   it('maps a changed selected prefix to a retryable conflict', async () => {
     const fork = mock(async () => {
       throw new AgentIntegrationError(
@@ -163,7 +196,8 @@ describe('AgentRuntimeRouter forks', () => {
       sourceSession: entry,
       sourceChatId: 'source-chat',
       targetChatId: 'target-chat',
-      messageSequence: 1,
+      messageOrdinal: 1,
+      providerMeta: { lineNumber: 1 },
     })).rejects.toMatchObject({
       code: 'SOURCE_REVISION_CHANGED',
       status: 409,
@@ -171,42 +205,19 @@ describe('AgentRuntimeRouter forks', () => {
     });
   });
 
-  it('maps an unavailable point to a structured validation error', async () => {
-    const fork = mock(async () => null);
+  it('delegates a row with no native position instead of deciding for the integration', async () => {
+    const fork = mock(async () => ({ kind: 'unmaterialized' }));
     const { router, entry } = makeRouter(fork);
 
-    await expect(router.forkAgentSession({
+    await router.forkAgentSession({
       sourceSession: entry,
       sourceChatId: 'source-chat',
       targetChatId: 'target-chat',
-      messageSequence: 3,
-    })).rejects.toMatchObject({
-      code: 'TRANSCRIPT_UNAVAILABLE',
-      status: 422,
-      retryable: false,
+      messageOrdinal: 1,
     });
-    expect(fork).not.toHaveBeenCalled();
+
+    expect(fork).toHaveBeenCalledTimes(1);
+    expect(fork.mock.calls[0][0]).toMatchObject({ providerMeta: null });
   });
 
-  it('maps transcript-load failures before provider fork dispatch', async () => {
-    const fork = mock(async () => null);
-    const { router, entry, integration } = makeRouter(fork);
-    integration.transcript.load.mockRejectedValue(new AgentIntegrationError(
-      'TRANSCRIPT_UNAVAILABLE',
-      'Source transcript is missing',
-      false,
-    ));
-
-    await expect(router.forkAgentSession({
-      sourceSession: entry,
-      sourceChatId: 'source-chat',
-      targetChatId: 'target-chat',
-      messageSequence: 1,
-    })).rejects.toMatchObject({
-      code: 'TRANSCRIPT_UNAVAILABLE',
-      message: 'Chat transcript is unavailable.',
-      status: 422,
-      retryable: false,
-    });
-  });
 });

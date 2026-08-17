@@ -9,12 +9,20 @@ import {
 	type ThinkingMode,
 } from '$shared/chat-modes';
 import type { AgentSettingsEnvelope } from '$shared/agent-integration';
+import {
+	parseChatSnapshotResponse,
+	type ChatSnapshotResponse,
+} from '$shared/chat-snapshot';
 import type { ApiProtocol } from '$shared/api-providers';
 import {
-	isRequestedChatViewPage,
+	CHAT_MESSAGES_MAX_LIMIT,
+	isRelationallyValidBoundedTranscriptPage,
+	isRelationallyValidTranscriptPage,
 	parseChatHistoryState,
-	parseChatViewMessages,
+	parseResendCandidates,
+	parseTranscriptMessages,
 	type ChatHistoryResponse,
+	type TranscriptMessage,
 } from '$shared/chat-view';
 import type {
 	ChatListEntry,
@@ -25,7 +33,6 @@ import type {
 	SetLastSelectedChatRequest,
 	SetLastSelectedChatResponse,
 } from '$shared/chat-list';
-import { normalizePendingUserInput, type PendingUserInput } from '$shared/pending-user-input';
 import type {
 	AgentInterruptAndSendCommandRequest,
 	AgentInterruptAndSendResponse,
@@ -66,7 +73,12 @@ import type {
 	GenerateChatTitleRequest,
 	GenerateChatTitleResponse,
 } from '$shared/chat-title-contracts';
-import type { ChatSearchRequest, ChatSearchResponse } from '$shared/chat-search';
+import type {
+	ChatSearchNavigateRequest,
+	ChatSearchNavigateResponse,
+	ChatSearchRequest,
+	ChatSearchResponse,
+} from '$shared/chat-search';
 import type { ChatDetailsResponse } from '$shared/chat-details';
 import {
 	parseChatExecutionControlState,
@@ -231,6 +243,16 @@ export async function sendPermissionDecision(
 	return apiPost<CommandAcceptedResponse>('/api/v1/chats/permissions/decision', params);
 }
 
+export async function getChatSnapshot(
+	chatId: string,
+	messageLimit = 1,
+): Promise<ChatSnapshotResponse> {
+	const value = await apiGet<unknown>(
+		`/api/v1/chats/snapshot?chatId=${encodeURIComponent(chatId)}&limit=${messageLimit}`,
+	);
+	return parseChatSnapshotResponse(value);
+}
+
 export async function createQueuedInput(
 	params: QueueEntryCreateCommandRequest,
 ): Promise<QueueEntryCommandResponse> {
@@ -352,79 +374,129 @@ function requireNonEmptyString(value: unknown, fieldName: string): string {
 }
 
 function requireNonNegativeInteger(value: unknown, fieldName: string): number {
-	if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
 		throw new Error(`Invalid chat messages page: ${fieldName}`);
 	}
 	return value;
 }
 
 function requirePositiveInteger(value: unknown, fieldName: string): number {
-	if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
 		throw new Error(`Invalid chat messages page: ${fieldName}`);
 	}
 	return value;
 }
 
-function parsePendingUserInputs(value: unknown): PendingUserInput[] {
-	if (!Array.isArray(value)) {
-		throw new Error('Invalid chat messages page: pendingUserInputs');
-	}
-	const pendingInputs: PendingUserInput[] = [];
-	for (const item of value) {
-		const pendingInput = normalizePendingUserInput(item);
-		if (pendingInput === null) {
-			throw new Error('Invalid chat messages page: pendingUserInputs');
-		}
-		pendingInputs.push(pendingInput);
-	}
-	return pendingInputs;
+function requireNullablePositiveInteger(value: unknown, fieldName: string): number | null {
+	return value === null ? null : requirePositiveInteger(value, fieldName);
 }
 
-export async function getChatMessages(params: {
+export type ChatMessagesRequest = {
 	chatId: string;
 	limit?: number;
-	beforeSeq?: number;
-}): Promise<ChatHistoryResponse> {
-	const limit = params.limit ?? 50;
+} & (
+	| { beforeOrdinal?: undefined; transcriptViewId?: string }
+	| { beforeOrdinal: number; transcriptViewId: string }
+);
+
+interface ValidatedChatMessagesPage {
+	chatId: string;
+	transcriptViewId: string;
+	messages: TranscriptMessage[];
+	lastOrdinal: number;
+	pageOldestOrdinal: number;
+	pageNewestOrdinal: number;
+	nextBeforeOrdinal: number | null;
+	hasMore: boolean;
+	limit: number;
+}
+
+function invalidChatMessagesPage(reason: string): never {
+	throw new Error(`Invalid chat messages page: ${reason}`);
+}
+
+function validateChatMessagesPage(
+	request: ChatMessagesRequest,
+	page: ValidatedChatMessagesPage,
+): void {
+	if (page.chatId !== request.chatId) invalidChatMessagesPage('chatId does not match request');
+	const expectedLimit = Math.min(request.limit ?? 50, CHAT_MESSAGES_MAX_LIMIT);
+	if (page.limit !== expectedLimit) invalidChatMessagesPage('limit does not match request');
+	if (
+		request.transcriptViewId !== undefined
+		&& page.transcriptViewId !== request.transcriptViewId
+	) {
+		invalidChatMessagesPage('transcriptViewId does not match request');
+	}
+	const effectiveBefore = Math.min(
+		request.beforeOrdinal ?? page.lastOrdinal + 1,
+		page.lastOrdinal + 1,
+	);
+	if (page.pageNewestOrdinal !== effectiveBefore - 1) {
+		invalidChatMessagesPage('pageNewestOrdinal does not match the effective request boundary');
+	}
+	if (page.messages.length > page.limit) invalidChatMessagesPage('messages exceed limit');
+	if (!isRelationallyValidTranscriptPage(page)) {
+		invalidChatMessagesPage('ordinal relations are inconsistent');
+	}
+	if (!isRelationallyValidBoundedTranscriptPage(page, page.limit)) {
+		invalidChatMessagesPage('raw continuation does not match the bounded interval');
+	}
+}
+
+export async function getChatMessages(params: ChatMessagesRequest): Promise<ChatHistoryResponse> {
 	const query = new URLSearchParams({
 		chatId: params.chatId,
-		limit: String(limit),
+		limit: String(params.limit ?? 50),
 	});
-	if (params.beforeSeq !== undefined) query.set('beforeSeq', String(params.beforeSeq));
+	if (params.beforeOrdinal !== undefined) {
+		query.set('beforeOrdinal', String(params.beforeOrdinal));
+	}
+	if (params.transcriptViewId !== undefined) {
+		query.set('transcriptViewId', params.transcriptViewId);
+	}
 	const response = await apiGet<{
 		historyState?: unknown;
 		chatId?: unknown;
 		messages?: unknown;
-		generationId?: unknown;
-		lastSeq?: unknown;
-		pageOldestSeq?: unknown;
-		pendingUserInputs?: unknown;
+		transcriptViewId?: unknown;
+		lastOrdinal?: unknown;
+		pageOldestOrdinal?: unknown;
+		pageNewestOrdinal?: unknown;
+		nextBeforeOrdinal?: unknown;
+		resendCandidates?: unknown;
 		hasMore?: unknown;
 		limit?: unknown;
 	}>(`/api/v1/chats/messages?${query.toString()}`);
 	const historyState = parseChatHistoryState(response.historyState);
 	if (historyState === null) throw new Error('Invalid chat messages page: historyState');
 	const chatId = requireNonEmptyString(response.chatId, 'chatId');
-	if (historyState.kind === 'degraded') {
+	if (chatId !== params.chatId) invalidChatMessagesPage('chatId does not match request');
+	if (historyState.kind !== 'complete') {
 		if (!Array.isArray(response.messages) || response.messages.length !== 0) {
-			throw new Error('Invalid degraded chat history: messages');
+			throw new Error('Invalid unavailable chat history: messages');
 		}
 		for (const field of [
-			'generationId',
-			'lastSeq',
-			'pageOldestSeq',
-			'pendingUserInputs',
+			'transcriptViewId',
+			'lastOrdinal',
+			'pageOldestOrdinal',
+			'pageNewestOrdinal',
+			'nextBeforeOrdinal',
 			'hasMore',
 			'limit',
 		] as const) {
 			if (response[field] !== undefined) {
-				throw new Error(`Invalid degraded chat history: ${field}`);
+				throw new Error(`Invalid unavailable chat history: ${field}`);
 			}
 		}
 		return { historyState, chatId, messages: [] };
 	}
-	const messages = parseChatViewMessages(response.messages);
+	const messages = parseTranscriptMessages(response.messages);
 	if (messages === null) throw new Error('Invalid chat messages page: messages');
+	const resendCandidates = parseResendCandidates(response.resendCandidates);
+	if (resendCandidates === null) {
+		throw new Error('Invalid chat messages page: resendCandidates');
+	}
 	if (typeof response.hasMore !== 'boolean') {
 		throw new Error('Invalid chat messages page: hasMore');
 	}
@@ -432,23 +504,38 @@ export async function getChatMessages(params: {
 		historyState,
 		chatId,
 		messages,
-		generationId: requireNonEmptyString(response.generationId, 'generationId'),
-		lastSeq: requireNonNegativeInteger(response.lastSeq, 'lastSeq'),
-		pageOldestSeq: requireNonNegativeInteger(response.pageOldestSeq, 'pageOldestSeq'),
-		pendingUserInputs: parsePendingUserInputs(response.pendingUserInputs),
+		resendCandidates,
+		transcriptViewId: requireNonEmptyString(response.transcriptViewId, 'transcriptViewId'),
+		lastOrdinal: requireNonNegativeInteger(response.lastOrdinal, 'lastOrdinal'),
+		pageOldestOrdinal: requireNonNegativeInteger(response.pageOldestOrdinal, 'pageOldestOrdinal'),
+		pageNewestOrdinal: requireNonNegativeInteger(response.pageNewestOrdinal, 'pageNewestOrdinal'),
+		nextBeforeOrdinal: requireNullablePositiveInteger(
+			response.nextBeforeOrdinal,
+			'nextBeforeOrdinal',
+		),
 		hasMore: response.hasMore,
 		limit: requirePositiveInteger(response.limit, 'limit'),
 	};
-	if (page.chatId !== params.chatId) throw new Error('Invalid chat messages page: chatId');
-	if (
-		!isRequestedChatViewPage(
-			{ limit, beforeSeq: params.beforeSeq },
-			page,
-		)
-	) {
-		throw new Error('Invalid chat messages page: requested window');
-	}
+	validateChatMessagesPage(params, page);
 	return page;
+}
+
+// Resolves one search result to a browser ordinal under its composite content
+// epoch. A stale result rejects with SEARCH_RESULT_STALE instead of scrolling
+// to a possibly reused ordinal.
+export async function navigateToSearchResult(
+	request: ChatSearchNavigateRequest,
+	options?: ApiFetchOptions,
+): Promise<ChatSearchNavigateResponse> {
+	const response = await apiPost<{ chatId?: unknown; ordinal?: unknown }>(
+		'/api/v1/chats/search/navigate',
+		request,
+		options,
+	);
+	return {
+		chatId: requireNonEmptyString(response.chatId, 'chatId'),
+		ordinal: requirePositiveInteger(response.ordinal, 'ordinal'),
+	};
 }
 
 export async function searchChatTranscripts(
@@ -526,8 +613,11 @@ export async function validateStart(
 export interface ForkChatParams {
 	sourceChatId: string;
 	chatId: string;
-	upToSeq?: number;
-	generationId?: string;
+	upToOrdinal?: number;
+	transcriptViewId?: string;
+	// Set only after the user confirms a handoff fork, so an unconfirmed request still
+	// surfaces the refusal the confirmation is asked about.
+	allowHandoffFork?: boolean;
 }
 
 /** Forks (clones) an existing chat session into a new chat. */

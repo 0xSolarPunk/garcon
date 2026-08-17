@@ -31,10 +31,11 @@ describe('historicalAskUserQuestion', () => {
 			),
 		);
 
-		expect(reconstructed.request.permissionRequestId).toBe('ask-user-question-question-1');
+		expect(reconstructed.request.permissionOccurrenceId).toBe('ask-user-question-question-1');
 		expect(reconstructed.terminal).toEqual({
 			state: 'resolved',
 			allowed: true,
+			permissionOccurrenceId: 'ask-user-question-question-1',
 			selectedQuestionOptions: { mode: ['careful'] },
 		});
 	});
@@ -56,6 +57,7 @@ describe('historicalAskUserQuestion', () => {
 		expect(reconstructed.terminal).toEqual({
 			state: 'resolved',
 			allowed: false,
+			permissionOccurrenceId: 'ask-user-question-question-1',
 			reason: 'The user did not answer the questions.',
 		});
 	});

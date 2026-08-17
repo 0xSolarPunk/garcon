@@ -65,7 +65,6 @@ describe('chats API contract', () => {
 			serverInstanceId: 'server-instance-test',
 			queue: {
 				entries: [],
-				dispatchingEntryId: null,
 				steeringEntryId: null,
 				recentlyDispatched: [],
 				pause: null,
@@ -98,6 +97,7 @@ describe('chats API contract', () => {
 			isProcessing: true,
 			processingPhase: 'running',
 			isUnread: false,
+			canReloadFromNativeHistory: false,
 		};
 	}
 
@@ -134,6 +134,7 @@ describe('chats API contract', () => {
 					isProcessing: false,
 					processingPhase: null,
 					isUnread: false,
+					canReloadFromNativeHistory: false,
 				},
 			],
 			total: 1,
@@ -388,6 +389,7 @@ describe('chats API contract', () => {
 			clientRequestId: 'req-1',
 			clientMessageId: 'msg-1',
 			chatId: 'c-1',
+			transcriptViewId: 'view-1',
 			command: 'hello',
 			permissionMode: 'default',
 			thinkingMode: 'none',
@@ -426,12 +428,14 @@ describe('chats API contract', () => {
 			clientRequestId: 'req-normal',
 			clientMessageId: 'msg-normal',
 			chatId: 'c-1',
+			transcriptViewId: 'view-1',
 			command: 'normal',
 		});
 		await runChat({
 			clientRequestId: 'req-handoff',
 			clientMessageId: 'msg-handoff',
 			chatId: 'c-1',
+			transcriptViewId: 'view-1',
 			command: 'handoff',
 			handoff: {
 				expectedAgentOwnershipEpoch: 'epoch-1',
@@ -470,6 +474,7 @@ describe('chats API contract', () => {
 				clientRequestId: 'req-handoff',
 				clientMessageId: 'msg-handoff',
 				chatId: 'c-1',
+				transcriptViewId: 'view-1',
 				command: 'handoff',
 				handoff: {
 					expectedAgentOwnershipEpoch: 'epoch-1',
@@ -499,6 +504,7 @@ describe('chats API contract', () => {
 			sourceChatId: 'c-1',
 			chatId: 'c-2',
 			command: 'continue',
+			allowHandoffFork: true,
 			permissionMode: 'default',
 			thinkingMode: 'none',
 			agentSettings: CLAUDE_SETTINGS,
@@ -514,6 +520,7 @@ describe('chats API contract', () => {
 			sourceChatId: 'c-1',
 			chatId: 'c-2',
 			command: 'continue',
+			allowHandoffFork: true,
 		});
 	});
 
@@ -552,17 +559,29 @@ describe('chats API contract', () => {
 		await sendPermissionDecision({
 			clientRequestId: 'req-perm',
 			chatId: 'c-1',
-			permissionRequestId: 'perm-1',
+			permissionOccurrenceId: 'incarnation-1',
+			control: {
+				serverInstanceId: 'server-instance-test',
+				chatId: 'c-1',
+				runId: 'turn-1',
+				permissionOccurrenceId: 'incarnation-1',
+			},
 			allow: true,
 			alwaysAllow: false,
 			response: { outcome: { outcome: 'accepted' } },
 		});
 
 		expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/chats/permissions/decision');
-		expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+			expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
 			clientRequestId: 'req-perm',
 			chatId: 'c-1',
-			permissionRequestId: 'perm-1',
+			permissionOccurrenceId: 'incarnation-1',
+			control: {
+				serverInstanceId: 'server-instance-test',
+				chatId: 'c-1',
+				runId: 'turn-1',
+				permissionOccurrenceId: 'incarnation-1',
+			},
 			allow: true,
 			alwaysAllow: false,
 			response: { outcome: { outcome: 'accepted' } },
@@ -651,14 +670,18 @@ describe('chats API contract', () => {
 
 		await createQueuedInput({
 			clientRequestId: 'req-queue',
+			clientMessageId: 'message-queue',
 			chatId: 'c/1',
+			transcriptViewId: 'view-1',
 			content: 'queue this',
 		});
 		expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/chats/queue/entries');
 		expect(fetchMock.mock.calls[1][1].method).toBe('POST');
-		expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+			expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
 			clientRequestId: 'req-queue',
+			clientMessageId: 'message-queue',
 			chatId: 'c/1',
+			transcriptViewId: 'view-1',
 			content: 'queue this',
 		});
 
@@ -717,7 +740,9 @@ describe('chats API contract', () => {
 
 		await submitGoalControl({
 			clientRequestId: 'req-goal',
+			clientMessageId: 'message-goal',
 			chatId: 'c/1',
+			transcriptViewId: 'view-1',
 			content: '/goal pause',
 		});
 		expect(fetchMock.mock.calls[5][0]).toBe('/api/v1/chats/goal-control');
@@ -727,6 +752,7 @@ describe('chats API contract', () => {
 			clientRequestId: 'req-steer',
 			clientMessageId: 'message-steer',
 			chatId: 'c/1',
+			transcriptViewId: 'view-1',
 			content: 'steer now',
 		});
 		expect(fetchMock.mock.calls[6][0]).toBe('/api/v1/chats/steer');
@@ -735,6 +761,7 @@ describe('chats API contract', () => {
 			clientRequestId: 'req-steer',
 			clientMessageId: 'message-steer',
 			chatId: 'c/1',
+			transcriptViewId: 'view-1',
 			content: 'steer now',
 		});
 
@@ -773,8 +800,8 @@ describe('chats API contract', () => {
 		await expect(
 			steerQueuedEntry({
 				clientRequestId: 'request-queue-steer',
-				clientMessageId: 'message-queue-steer',
 				chatId: 'c/1',
+				transcriptViewId: 'view-1',
 				entryId: 'entry/1',
 				expectedRevision: 3,
 				expectedReorderRevision: 7,
@@ -785,8 +812,8 @@ describe('chats API contract', () => {
 		expect(fetchMock.mock.calls[0][1].method).toBe('POST');
 		expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
 			clientRequestId: 'request-queue-steer',
-			clientMessageId: 'message-queue-steer',
 			chatId: 'c/1',
+			transcriptViewId: 'view-1',
 			entryId: 'entry/1',
 			expectedRevision: 3,
 			expectedReorderRevision: 7,
@@ -814,8 +841,8 @@ describe('chats API contract', () => {
 		await expect(
 			steerQueuedEntry({
 				clientRequestId: 'request-queue-steer',
-				clientMessageId: 'message-queue-steer',
 				chatId: 'c-1',
+				transcriptViewId: 'view-1',
 				entryId: 'entry-1',
 				expectedRevision: 3,
 				expectedReorderRevision: 7,
@@ -836,8 +863,8 @@ describe('chats API contract', () => {
 		};
 		const request = {
 			clientRequestId: 'request-queue-steer',
-			clientMessageId: 'message-queue-steer',
 			chatId: 'c-1',
+			transcriptViewId: 'view-1',
 			entryId: 'entry-1',
 			expectedRevision: 3,
 			expectedReorderRevision: 7,
@@ -880,6 +907,8 @@ describe('chats API contract', () => {
 	it('settings, model, project path, and history helpers use REST endpoints', async () => {
 		fetchMock.mockImplementation((url: string) => {
 			const requestUrl = new URL(url, 'http://garcon.local');
+			const beforeOrdinal = requestUrl.searchParams.get('beforeOrdinal');
+			const pageNewestOrdinal = beforeOrdinal === null ? 0 : Number(beforeOrdinal) - 1;
 			return Promise.resolve(
 				jsonResponse(
 					url.startsWith('/api/v1/chats/messages')
@@ -887,10 +916,12 @@ describe('chats API contract', () => {
 								historyState: { kind: 'complete' },
 								chatId: requestUrl.searchParams.get('chatId'),
 								messages: [],
-								generationId: 'generation-1',
-								lastSeq: 0,
-								pageOldestSeq: 0,
-								pendingUserInputs: [],
+								transcriptViewId: 'view-1',
+								lastOrdinal: pageNewestOrdinal,
+								pageOldestOrdinal: 0,
+								pageNewestOrdinal,
+								nextBeforeOrdinal: null,
+								resendCandidates: [],
 								hasMore: false,
 								limit: 50,
 							}
@@ -925,14 +956,19 @@ describe('chats API contract', () => {
 			projectPath: '/workspace/repo-worktree',
 		});
 
-		const messages = await getChatMessages({ chatId: 'c/1', limit: 50, beforeSeq: 20 });
+		const messages = await getChatMessages({
+			chatId: 'c/1',
+			limit: 50,
+			beforeOrdinal: 20,
+			transcriptViewId: 'view-1',
+		});
 		expect(fetchMock.mock.calls[3][0]).toBe(
-			'/api/v1/chats/messages?chatId=c%2F1&limit=50&beforeSeq=20',
+			'/api/v1/chats/messages?chatId=c%2F1&limit=50&beforeOrdinal=20&transcriptViewId=view-1',
 		);
 		expect(fetchMock.mock.calls[3][1].method ?? 'GET').toBe('GET');
 		expect(messages).toMatchObject({
 			historyState: { kind: 'complete' },
-			generationId: 'generation-1',
+			transcriptViewId: 'view-1',
 		});
 
 		await getChatMessages({ chatId: 'c/2' });
@@ -944,20 +980,24 @@ describe('chats API contract', () => {
 			historyState: { kind: 'complete' },
 			chatId: 'c-1',
 			messages: [],
-			generationId: 'generation-1',
-			lastSeq: 0,
-			pageOldestSeq: 0,
-			pendingUserInputs: [],
+			transcriptViewId: 'view-1',
+			lastOrdinal: 0,
+			pageOldestOrdinal: 0,
+			pageNewestOrdinal: 0,
+			nextBeforeOrdinal: null,
+			resendCandidates: [],
 			hasMore: false,
 			limit: 20,
 		};
 
 		const cases: Array<[string, Record<string, unknown>]> = [
 			['chatId', { chatId: '' }],
-			['generationId', { generationId: '' }],
-			['lastSeq', { lastSeq: '0' }],
-			['pageOldestSeq', { pageOldestSeq: -1 }],
-			['pendingUserInputs', { pendingUserInputs: [{ clientRequestId: 'req-1' }] }],
+			['transcriptViewId', { transcriptViewId: '' }],
+			['lastOrdinal', { lastOrdinal: '0' }],
+			['pageOldestOrdinal', { pageOldestOrdinal: -1 }],
+			['pageNewestOrdinal', { pageNewestOrdinal: -1 }],
+			['nextBeforeOrdinal', { nextBeforeOrdinal: undefined }],
+			['resendCandidates', { resendCandidates: [{ ordinal: 1 }] }],
 			['hasMore', { hasMore: 'false' }],
 			['limit', { limit: 0 }],
 		];
@@ -967,6 +1007,213 @@ describe('chats API contract', () => {
 
 			await expect(getChatMessages({ chatId: 'c-1' })).rejects.toThrow(fieldName);
 		}
+	});
+
+	it('[TLV5-PAGE.09-WEB-CONTRACT-01] accepts an all-hidden raw page with a strict continuation', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({
+			historyState: { kind: 'complete' },
+			chatId: 'c-1',
+			messages: [],
+			transcriptViewId: 'view-1',
+			lastOrdinal: 300,
+			pageOldestOrdinal: 0,
+			pageNewestOrdinal: 250,
+			nextBeforeOrdinal: 201,
+			resendCandidates: [],
+			hasMore: true,
+			limit: 50,
+		}));
+
+		await expect(getChatMessages({
+			chatId: 'c-1',
+			transcriptViewId: 'view-1',
+			beforeOrdinal: 251,
+			limit: 50,
+		})).resolves.toMatchObject({
+			messages: [],
+			pageNewestOrdinal: 250,
+			nextBeforeOrdinal: 201,
+			hasMore: true,
+		});
+	});
+
+	it('[TLV5-PAGE.08-WEB-CONTRACT-01] accepts a server-clamped raw interval ceiling', async () => {
+		fetchMock.mockResolvedValueOnce(jsonResponse({
+			historyState: { kind: 'complete' },
+			chatId: 'c-1',
+			messages: [],
+			transcriptViewId: 'view-1',
+			lastOrdinal: 250,
+			pageOldestOrdinal: 0,
+			pageNewestOrdinal: 250,
+			nextBeforeOrdinal: 201,
+			resendCandidates: [],
+			hasMore: true,
+			limit: 50,
+		}));
+
+		await expect(getChatMessages({
+			chatId: 'c-1',
+			transcriptViewId: 'view-1',
+			beforeOrdinal: 999,
+			limit: 50,
+		})).resolves.toMatchObject({
+			lastOrdinal: 250,
+			pageNewestOrdinal: 250,
+			nextBeforeOrdinal: 201,
+			hasMore: true,
+		});
+	});
+
+	it('[TLV5-PAGE.10-WEB-CONTRACT-01] rejects malformed or stalled raw continuations', async () => {
+		const validPage = {
+			historyState: { kind: 'complete' },
+			chatId: 'c-1',
+			messages: [],
+			transcriptViewId: 'view-1',
+			lastOrdinal: 300,
+			pageOldestOrdinal: 0,
+			pageNewestOrdinal: 250,
+			nextBeforeOrdinal: 201,
+			resendCandidates: [],
+			hasMore: true,
+			limit: 50,
+		};
+		const request = {
+			chatId: 'c-1',
+			transcriptViewId: 'view-1',
+			beforeOrdinal: 251,
+			limit: 50,
+		} satisfies Parameters<typeof getChatMessages>[0];
+
+		for (const patch of [
+			{ nextBeforeOrdinal: null },
+			{ nextBeforeOrdinal: null, hasMore: false },
+			{ nextBeforeOrdinal: 0 },
+			{ nextBeforeOrdinal: 2 },
+			{ nextBeforeOrdinal: 251 },
+			{ nextBeforeOrdinal: 201, hasMore: false },
+		]) {
+			fetchMock.mockResolvedValueOnce(jsonResponse({ ...validPage, ...patch }));
+			await expect(getChatMessages(request)).rejects.toThrow('Invalid chat messages page');
+		}
+	});
+
+	it('[TLV5-PAGE.01-WEB-CONTRACT-01] qualifies transcript page requests by view and validates the response against the request', async () => {
+		const message = (ordinal: number, content: string) => ({
+			ordinal,
+			message: {
+				type: 'assistant-message',
+				timestamp: '2026-08-15T00:00:00.000Z',
+				content,
+			},
+		});
+		const validPage = {
+			historyState: { kind: 'complete' },
+			chatId: 'c-1',
+			messages: [message(40, 'earlier'), message(49, 'later')],
+			transcriptViewId: 'view-1',
+			lastOrdinal: 100,
+			pageOldestOrdinal: 40,
+			pageNewestOrdinal: 49,
+			nextBeforeOrdinal: 30,
+			resendCandidates: [],
+			hasMore: true,
+			limit: 20,
+		};
+		const request = {
+			chatId: 'c-1',
+			transcriptViewId: 'view-1',
+			limit: 20,
+			beforeOrdinal: 50,
+		} satisfies Parameters<typeof getChatMessages>[0];
+		fetchMock.mockResolvedValueOnce(jsonResponse(validPage));
+
+		await getChatMessages(request);
+
+		expect(fetchMock.mock.calls[0][0]).toBe(
+			'/api/v1/chats/messages?chatId=c-1&limit=20&beforeOrdinal=50&transcriptViewId=view-1',
+		);
+
+		const invalidResponses = [
+			{ ...validPage, chatId: 'another-chat' },
+			{ ...validPage, transcriptViewId: 'another-view' },
+			{ ...validPage, limit: 19 },
+			{ ...validPage, pageNewestOrdinal: 50 },
+			{ ...validPage, pageOldestOrdinal: 51, pageNewestOrdinal: 49 },
+			{ ...validPage, lastOrdinal: 48 },
+			{ ...validPage, messages: [message(49, 'later'), message(40, 'earlier')] },
+			{ ...validPage, messages: [message(40, 'first'), message(40, 'duplicate')] },
+			{ ...validPage, messages: [message(40, 'earlier'), message(50, 'outside range')] },
+			{ ...validPage, messages: [message(41, 'wrong lower bound'), message(49, 'later')] },
+			{ ...validPage, pageOldestOrdinal: 0 },
+			{ ...validPage, messages: [], pageOldestOrdinal: 40 },
+		];
+		for (const response of invalidResponses) {
+			fetchMock.mockResolvedValueOnce(jsonResponse(response));
+			await expect(getChatMessages(request)).rejects.toThrow('Invalid chat messages page');
+		}
+	});
+
+	it('qualifies a newest-page refresh when the caller already owns a transcript view', async () => {
+		const validPage = {
+			historyState: { kind: 'complete' },
+			chatId: 'c-1',
+			messages: [],
+			transcriptViewId: 'view-1',
+			lastOrdinal: 0,
+			pageOldestOrdinal: 0,
+			pageNewestOrdinal: 0,
+			nextBeforeOrdinal: null,
+			resendCandidates: [],
+			hasMore: false,
+			limit: 20,
+		};
+		const request = {
+			chatId: 'c-1',
+			limit: 20,
+			transcriptViewId: 'view-1',
+		} satisfies Parameters<typeof getChatMessages>[0];
+		fetchMock.mockResolvedValueOnce(jsonResponse(validPage));
+
+		await getChatMessages(request);
+
+		expect(fetchMock.mock.calls[0][0]).toBe(
+			'/api/v1/chats/messages?chatId=c-1&limit=20&transcriptViewId=view-1',
+		);
+
+		fetchMock.mockResolvedValueOnce(
+			jsonResponse({ ...validPage, transcriptViewId: 'replacement-view' }),
+		);
+		await expect(getChatMessages(request)).rejects.toThrow(
+			'transcriptViewId does not match request',
+		);
+	});
+
+	it('accepts the server-clamped effective page limit', async () => {
+		fetchMock.mockResolvedValueOnce(
+			jsonResponse({
+				historyState: { kind: 'complete' },
+				chatId: 'c-1',
+				messages: [],
+				transcriptViewId: 'view-1',
+				lastOrdinal: 0,
+				pageOldestOrdinal: 0,
+				pageNewestOrdinal: 0,
+				nextBeforeOrdinal: null,
+				resendCandidates: [],
+				hasMore: false,
+				limit: 200,
+			}),
+		);
+
+		await expect(getChatMessages({ chatId: 'c-1', limit: 999_999 })).resolves.toMatchObject({
+			chatId: 'c-1',
+			limit: 200,
+		});
+		expect(fetchMock.mock.calls[0][0]).toBe(
+			'/api/v1/chats/messages?chatId=c-1&limit=999999',
+		);
 	});
 
 	it('accepts degraded history only without sequence metadata', async () => {
@@ -1001,10 +1248,10 @@ describe('chats API contract', () => {
 				},
 				chatId: 'c-1',
 				messages: [],
-				lastSeq: 0,
+				lastOrdinal: 0,
 			}),
 		);
-		await expect(getChatMessages({ chatId: 'c-1' })).rejects.toThrow('lastSeq');
+		await expect(getChatMessages({ chatId: 'c-1' })).rejects.toThrow('lastOrdinal');
 	});
 
 	it('deleteChat sends chatId in the JSON body', async () => {
@@ -1167,7 +1414,7 @@ describe('chats API contract', () => {
 		});
 	});
 
-	it('forkChat sends an optional generation-bound message cutoff', async () => {
+	it('forkChat sends an optional view-bound message cutoff', async () => {
 		fetchMock.mockResolvedValue(
 			jsonResponse({ success: true, sourceChatId: '1', chatId: '2', agentId: 'codex' }),
 		);
@@ -1175,16 +1422,39 @@ describe('chats API contract', () => {
 		await forkChat({
 			sourceChatId: '1',
 			chatId: '2',
-			upToSeq: 7,
-			generationId: 'generation-1',
+			upToOrdinal: 7,
+			transcriptViewId: 'view-1',
 		});
 
 		const [, opts] = fetchMock.mock.calls[0];
 		expect(JSON.parse(opts.body)).toEqual({
 			sourceChatId: '1',
 			chatId: '2',
-			upToSeq: 7,
-			generationId: 'generation-1',
+			upToOrdinal: 7,
+			transcriptViewId: 'view-1',
+		});
+	});
+
+	it('forkChat sends handoff-fork consent only when the user has given it', async () => {
+		fetchMock.mockResolvedValue(
+			jsonResponse({ success: true, sourceChatId: '1', chatId: '2', agentId: 'codex' }),
+		);
+
+		await forkChat({
+			sourceChatId: '1',
+			chatId: '2',
+			upToOrdinal: 7,
+			transcriptViewId: 'view-1',
+			allowHandoffFork: true,
+		});
+
+		const [, opts] = fetchMock.mock.calls[0];
+		expect(JSON.parse(opts.body)).toEqual({
+			sourceChatId: '1',
+			chatId: '2',
+			upToOrdinal: 7,
+			transcriptViewId: 'view-1',
+			allowHandoffFork: true,
 		});
 	});
 

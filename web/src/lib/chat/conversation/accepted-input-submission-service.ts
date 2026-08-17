@@ -35,6 +35,11 @@ export interface PreparedAcceptedInput<T> {
 	submit(): Promise<T>;
 }
 
+export interface PreparedForkInput extends PreparedAcceptedInput<ForkRunCommandResponse> {
+	clientMessageId: string;
+	submitWithHandoffFork(): Promise<ForkRunCommandResponse>;
+}
+
 type InputFactory<T> = T | (() => T);
 
 export interface AcceptedInputTransport {
@@ -73,17 +78,29 @@ export class AcceptedInputSubmissionService {
 		return this.#messageSubmission(input, (request) => this.transport.run(request));
 	}
 
-	fork(input: Omit<ForkRunCommandRequest, 'clientRequestId' | 'clientMessageId'>) {
-		return this.#messageSubmission(input, (request) => this.transport.fork(request));
+	fork(
+		input: Omit<ForkRunCommandRequest, 'clientRequestId' | 'clientMessageId'>,
+	): PreparedForkInput {
+		const clientRequestId = this.createId();
+		const clientMessageId = this.createId();
+		const request = { ...input, clientRequestId, clientMessageId };
+		const handoffRequest = { ...request, allowHandoffFork: true };
+		return {
+			clientRequestId,
+			clientMessageId,
+			submit: () => submitIdempotentCommand(() => this.transport.fork(request)),
+			submitWithHandoffFork: () => submitIdempotentCommand(
+				() => this.transport.fork(handoffRequest),
+			),
+		};
 	}
 
 	selfHandoff(input: Omit<SelfHandoffRunCommandRequest, 'clientRequestId' | 'clientMessageId'>) {
 		return this.#messageSubmission(input, (request) => this.transport.selfHandoff(request));
 	}
 
-	enqueue(input: Omit<QueueEntryCreateCommandRequest, 'clientRequestId'>) {
-		const request = { ...input, clientRequestId: this.createId() };
-		return this.#prepared(request, () => this.transport.enqueue(request));
+	enqueue(input: Omit<QueueEntryCreateCommandRequest, 'clientRequestId' | 'clientMessageId'>) {
+		return this.#messageSubmission(input, (request) => this.transport.enqueue(request));
 	}
 
 	steer(input: Omit<SteerCommandRequest, 'clientRequestId' | 'clientMessageId'>) {
@@ -91,14 +108,14 @@ export class AcceptedInputSubmissionService {
 	}
 
 	steerQueuedEntry(
-		input: Omit<QueueEntrySteerCommandRequest, 'clientRequestId' | 'clientMessageId'>,
+		input: Omit<QueueEntrySteerCommandRequest, 'clientRequestId'>,
 	) {
-		return this.#messageSubmission(input, (request) => this.transport.steerQueuedEntry(request));
+		const request = { ...input, clientRequestId: this.createId() };
+		return this.#prepared(request, () => this.transport.steerQueuedEntry(request));
 	}
 
-	goalControl(input: Omit<GoalControlCommandRequest, 'clientRequestId'>) {
-		const request = { ...input, clientRequestId: this.createId() };
-		return this.#prepared(request, () => this.transport.goalControl(request));
+	goalControl(input: Omit<GoalControlCommandRequest, 'clientRequestId' | 'clientMessageId'>) {
+		return this.#messageSubmission(input, (request) => this.transport.goalControl(request));
 	}
 
 	#messageSubmission<T extends object, R>(

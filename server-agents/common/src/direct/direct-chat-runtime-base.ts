@@ -3,27 +3,18 @@ import {
   normalizeThinkingMode,
   type ThinkingMode,
 } from '@garcon/common/chat-modes';
-import { AssistantMessage } from '@garcon/common/chat-types';
-import type { SharedModelOption } from '@garcon/common/models';
+import { AssistantMessage, type ChatMessage } from '@garcon/common/chat-types';
 import {
   assertDirectExecutionOpen,
-  directEventMetadata,
   markDirectExecutionStarted,
   type DirectResumeRequest,
   type DirectStartedSession,
   type DirectStartRequest,
 } from './runtime-types.js';
-import { AgentEventEmitterRuntime } from '@garcon/server-agent-common/shared/event-emitter-runtime';
-import type { RuntimeEventMetadata } from '@garcon/server-agent-common/shared/event-emitter-runtime';
 import type { AgentAttachment } from '@garcon/common/agent-execution';
 import { IdleSessionPurger } from '@garcon/server-agent-common/shared/idle-session-purger';
-import { attachNativeMessageSource } from '@garcon/server-agent-common/shared/native-message-source';
-import {
-  DirectSessionStore,
-  type DirectConversationMessage,
-  type DirectMessageIdentity,
-} from './session-store.js';
-import { directMessageNativeSource } from './direct-message-native-source.js';
+import type { AgentRuntimeOperation } from '@garcon/server-agent-common/execution/runtime-events';
+import { runtimeRows } from '@garcon/server-agent-common/execution/runtime-events';
 
 const DEFAULT_MAX_MESSAGES_PER_SESSION = 200;
 
@@ -39,30 +30,20 @@ export interface DirectRuntimeSession<TMessage> {
   thinkingMode: ThinkingMode;
   startTime: number;
   lastActivityAt: number;
-  eventMetadata: RuntimeEventMetadata;
-}
-
-export interface DirectUserTurn<TMessage> {
-  message: TMessage;
-  persistedContent: string;
+  operation: AgentRuntimeOperation;
 }
 
 export interface DirectChatRuntimeBaseConfig {
-  runtimeId: string;
   runtimeLabel: string;
   defaultModel: string;
-  fallbackModels: SharedModelOption[];
-  getSessionDir: () => string;
-  getSessionFilePath: (sessionId: string) => string;
   maxMessagesPerSession?: number;
 }
 
 export abstract class DirectChatRuntimeBase<
   TMessage,
   TConfig extends DirectChatRuntimeBaseConfig,
-> extends AgentEventEmitterRuntime {
+> {
   protected readonly config: TConfig;
-  readonly #sessionStore: DirectSessionStore;
   readonly #maxMessagesPerSession: number;
   #sessions = new Map<string, DirectRuntimeSession<TMessage>>();
   #idlePurger = new IdleSessionPurger<DirectRuntimeSession<TMessage>>({
@@ -75,27 +56,22 @@ export abstract class DirectChatRuntimeBase<
   });
 
   protected constructor(config: TConfig) {
-    super();
     this.config = config;
-    this.#sessionStore = new DirectSessionStore({
-      getSessionDir: config.getSessionDir,
-      getSessionFilePath: config.getSessionFilePath,
-    });
     this.#maxMessagesPerSession = config.maxMessagesPerSession ?? DEFAULT_MAX_MESSAGES_PER_SESSION;
   }
 
-  protected abstract buildUserTurn(command: string, images?: readonly AgentAttachment[]): DirectUserTurn<TMessage>;
+  protected abstract buildUserMessage(command: string, images?: readonly AgentAttachment[]): TMessage;
 
   protected abstract buildAssistantMessage(content: string): TMessage;
 
-  protected abstract persistedToMessage(message: DirectConversationMessage): TMessage;
+  protected abstract contextMessage(message: ChatMessage): TMessage | null;
 
   protected abstract streamSession(session: DirectRuntimeSession<TMessage>): Promise<string>;
 
   async startSession(request: DirectStartRequest): Promise<DirectStartedSession> {
     assertDirectExecutionOpen(request);
     const sessionId = crypto.randomUUID();
-    const userTurn = this.buildUserTurn(request.command, request.images);
+    const userMessage = this.buildUserMessage(request.command, request.images);
     const now = Date.now();
     const session: DirectRuntimeSession<TMessage> = {
       abortController: null,
@@ -104,36 +80,27 @@ export abstract class DirectChatRuntimeBase<
       id: sessionId,
       isFinalizing: false,
       isRunning: false,
-      messages: [userTurn.message],
+      messages: [...this.#contextMessages(request.priorContext), userMessage],
       model: request.model || this.config.defaultModel,
       thinkingMode: normalizeThinkingMode(request.thinkingMode),
       startTime: now,
       lastActivityAt: now,
-      eventMetadata: directEventMetadata(request, 'chat-start'),
+      operation: request.operation,
     };
 
-    await this.#sessionStore.append(
-      sessionId,
-      'user',
-      userTurn.persistedContent,
-      this.#turnIdentity(request),
-    );
     assertDirectExecutionOpen(request);
     this.#sessions.set(sessionId, session);
-    this.emitSessionCreated(request.chatId);
-    void this.#runTurnInternal(session, this.#turnIdentity(request), request).catch(() => undefined);
-    request.onAbortable?.();
+    const started = { agentSessionId: sessionId };
+    request.onSessionActivated?.(started);
+    void this.#runTurnInternal(session, request).catch(() => undefined);
 
-    return {
-      agentSessionId: sessionId,
-      nativePath: this.config.getSessionFilePath(sessionId),
-    };
+    return started;
   }
 
   async runTurn(request: DirectResumeRequest): Promise<void> {
     assertDirectExecutionOpen(request);
     const session = this.#sessions.get(request.agentSessionId)
-      ?? await this.#hydrateSession(request.agentSessionId, request);
+      ?? this.#hydrateSession(request.agentSessionId, request);
     assertDirectExecutionOpen(request);
 
     if (session.isRunning) {
@@ -143,36 +110,20 @@ export abstract class DirectChatRuntimeBase<
       session.model = request.model;
     }
     session.thinkingMode = normalizeThinkingMode(request.thinkingMode);
-    session.eventMetadata = directEventMetadata(request);
+    session.operation = request.operation;
 
-    const userTurn = this.buildUserTurn(request.command, request.images);
-    const turnIdentity = this.#turnIdentity(request);
+    const userMessage = this.buildUserMessage(request.command, request.images);
     this.#markSessionRunning(session);
-    request.onAbortable?.();
     try {
-      const prepared = await this.#sessionStore.prepareUserTurn(
-        session.id,
-        userTurn.persistedContent,
-        turnIdentity,
-      );
       assertDirectExecutionOpen(request);
-      if (prepared === 'appended') {
-        if (session.messages.length >= this.#maxMessagesPerSession) {
-          const first = session.messages[0];
-          session.messages = [first, ...session.messages.slice(-(this.#maxMessagesPerSession - 2))];
-        }
-        session.messages.push(userTurn.message);
-      } else {
-        await this.#refreshSessionMessages(session);
+      session.messages = this.#contextMessages(request.priorContext);
+      if (session.messages.length >= this.#maxMessagesPerSession) {
+        session.messages = session.messages.slice(-(this.#maxMessagesPerSession - 1));
       }
+      session.messages.push(userMessage);
 
       session.chatId = request.chatId;
-      if (prepared === 'turn-complete') {
-        this.#markSessionIdle(session);
-        this.emitFinished(session.chatId, 0, session.eventMetadata);
-        return;
-      }
-      await this.#runTurnInternal(session, turnIdentity, request);
+      await this.#runTurnInternal(session, request);
     } catch (error: unknown) {
       this.#markSessionIdle(session);
       throw error;
@@ -183,6 +134,7 @@ export abstract class DirectChatRuntimeBase<
     const session = this.#sessions.get(agentSessionId);
     if (!session?.isRunning || session.isFinalizing) return false;
 
+    this.#sessions.delete(agentSessionId);
     session.aborted = true;
     session.abortController?.abort();
     return true;
@@ -202,10 +154,6 @@ export abstract class DirectChatRuntimeBase<
       }));
   }
 
-  async getModels(): Promise<SharedModelOption[]> {
-    return this.config.fallbackModels;
-  }
-
   startPurgeTimer(): void {
     this.#idlePurger.start();
   }
@@ -220,15 +168,10 @@ export abstract class DirectChatRuntimeBase<
     this.#sessions.clear();
   }
 
-  async #hydrateSession(
+  #hydrateSession(
     sessionId: string,
     request: DirectResumeRequest,
-  ): Promise<DirectRuntimeSession<TMessage>> {
-    const messages = await this.#sessionStore.read(sessionId);
-    if (!messages) {
-      throw new Error(`Cannot hydrate ${this.config.runtimeLabel} session without persisted messages: ${sessionId}`);
-    }
-
+  ): DirectRuntimeSession<TMessage> {
     const now = Date.now();
     const session: DirectRuntimeSession<TMessage> = {
       abortController: null,
@@ -237,40 +180,28 @@ export abstract class DirectChatRuntimeBase<
       id: sessionId,
       isFinalizing: false,
       isRunning: false,
-      messages: messages.map((message) => this.persistedToMessage(message)),
+      messages: this.#contextMessages(request.priorContext),
       model: request.model || this.config.defaultModel,
       thinkingMode: normalizeThinkingMode(request.thinkingMode),
       startTime: now,
       lastActivityAt: now,
-      eventMetadata: directEventMetadata(request),
+      operation: request.operation,
     };
     this.#sessions.set(sessionId, session);
     return session;
   }
 
-  async #refreshSessionMessages(session: DirectRuntimeSession<TMessage>): Promise<void> {
-    const messages = await this.#sessionStore.read(session.id);
-    if (!messages) {
-      throw new Error(`Cannot refresh ${this.config.runtimeLabel} session without persisted messages: ${session.id}`);
-    }
-    session.messages = messages.map((message) => this.persistedToMessage(message));
-  }
-
-  #turnIdentity(
-    request: Pick<DirectStartRequest, 'clientRequestId' | 'clientMessageId' | 'turnId'>,
-  ): DirectMessageIdentity {
-    return {
-      ...(request.clientRequestId ? { clientRequestId: request.clientRequestId } : {}),
-      ...(request.clientMessageId ? { clientMessageId: request.clientMessageId } : {}),
-      ...(request.turnId ? { turnId: request.turnId } : {}),
-    };
+  #contextMessages(messages: readonly ChatMessage[] | undefined): TMessage[] {
+    return (messages ?? []).flatMap((message) => {
+      const translated = this.contextMessage(message);
+      return translated ? [translated] : [];
+    });
   }
 
   #markSessionIdle(session: DirectRuntimeSession<TMessage>): void {
     if (!session.isRunning) return;
     session.isRunning = false;
     session.lastActivityAt = Date.now();
-    this.emitProcessing(session.chatId, false);
   }
 
   #markSessionRunning(session: DirectRuntimeSession<TMessage>): void {
@@ -279,62 +210,56 @@ export abstract class DirectChatRuntimeBase<
     session.isFinalizing = false;
     session.aborted = false;
     session.lastActivityAt = Date.now();
-    this.emitProcessing(session.chatId, true);
   }
 
   async #runTurnInternal(
     session: DirectRuntimeSession<TMessage>,
-    turnIdentity: DirectMessageIdentity,
     request: Pick<DirectStartRequest, 'executionAdmission'>,
   ): Promise<void> {
-    const eventMetadata = session.eventMetadata;
+    const operation = session.operation;
     this.#markSessionRunning(session);
     if (session.aborted) {
-      this.#finishAbortedTurn(session, eventMetadata);
+      this.#finishAbortedTurn(session, operation);
       return;
     }
 
     try {
-      markDirectExecutionStarted(request);
+      if (request.executionAdmission) await markDirectExecutionStarted(request);
       const response = await this.streamSession(session);
-      if (session.aborted) {
-        this.#finishAbortedTurn(session, eventMetadata);
-        return;
-      }
 
       if (!response.trim()) {
         this.#markSessionIdle(session);
-        this.emitFailed(
-          session.chatId,
-          `Empty response from ${this.config.runtimeLabel}`,
-          eventMetadata,
-        );
+        operation.publish({
+          type: 'run-ended',
+          runId: operation.runId,
+          outcome: 'failed',
+          error: {
+            code: 'PROVIDER_FAILURE',
+            message: `Empty response from ${this.config.runtimeLabel}`,
+          },
+        });
         return;
       }
 
       session.isFinalizing = true;
-      await this.#sessionStore.append(
-        session.id,
-        'assistant',
-        response,
-        turnIdentity,
-      );
       session.messages.push(this.buildAssistantMessage(response));
-      const liveMessage = attachNativeMessageSource(
-        new AssistantMessage(new Date().toISOString(), response),
-        directMessageNativeSource({ role: 'assistant', turnId: turnIdentity.turnId }),
-      );
-      this.emitMessages(session.chatId, [liveMessage], eventMetadata);
+      const liveMessage = new AssistantMessage(new Date().toISOString(), response);
+      operation.publish({ type: 'rows', rows: runtimeRows([liveMessage]) });
       this.#markSessionIdle(session);
-      this.emitFinished(session.chatId, 0, eventMetadata);
+      operation.publish({ type: 'run-ended', runId: operation.runId, outcome: 'finished' });
     } catch (error: unknown) {
       if (session.aborted) {
-        this.#finishAbortedTurn(session, eventMetadata);
+        this.#finishAbortedTurn(session, operation);
         return;
       }
       this.#markSessionIdle(session);
       const failure = error instanceof Error ? error : new Error(String(error));
-      this.emitFailed(session.chatId, failure.message, eventMetadata);
+      operation.publish({
+        type: 'run-ended',
+        runId: operation.runId,
+        outcome: 'failed',
+        error: { code: 'PROVIDER_FAILURE', message: failure.message },
+      });
       throw failure;
     } finally {
       session.isFinalizing = false;
@@ -344,9 +269,9 @@ export abstract class DirectChatRuntimeBase<
 
   #finishAbortedTurn(
     session: DirectRuntimeSession<TMessage>,
-    eventMetadata: RuntimeEventMetadata,
+    operation: AgentRuntimeOperation,
   ): void {
     this.#markSessionIdle(session);
-    this.emitFinished(session.chatId, 0, eventMetadata);
+    operation.publish({ type: 'run-ended', runId: operation.runId, outcome: 'finished' });
   }
 }

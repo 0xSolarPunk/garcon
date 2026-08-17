@@ -67,10 +67,6 @@ export async function snapshotJsonlSource(sourcePath: string): Promise<JsonlSour
   return { content: await fs.readFile(sourcePath) };
 }
 
-export function jsonlSourceLineCount(snapshot: JsonlSourceSnapshot, sourcePath: string): number {
-  return normalizeJsonl(snapshot.content.toString('utf8'), sourcePath).lineCount;
-}
-
 export async function forkJsonlTranscript(request: ForkJsonlRequest): Promise<ForkJsonlOutcome> {
   const targetAgentSessionId = crypto.randomUUID();
   const lineCount = request.cutoffLine === 0 ? (request.leadingLineCount ?? 0) : request.cutoffLine;
@@ -92,12 +88,11 @@ export async function forkJsonlTranscript(request: ForkJsonlRequest): Promise<Fo
   };
   const projectedEntries = selected.entries.map((entry) => {
     if (!request.rewriteEntry) return entry.value;
+    const retainedMessageCount = request.retainedMessageCounts?.get(entry.lineNumber);
     return request.rewriteEntry(entry.value, {
       ...context,
-      ...(request.retainedMessageCounts
-        ? {
-            retainedMessageCount: request.retainedMessageCounts.get(entry.lineNumber) ?? 0,
-          }
+      ...(retainedMessageCount !== undefined
+        ? { retainedMessageCount }
         : {}),
     });
   });

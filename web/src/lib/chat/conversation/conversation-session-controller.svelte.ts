@@ -1,21 +1,13 @@
-// Chat session controller. Owns chat lifecycle transitions, message
-// submission, permission decisions, queue control, and mode persistence.
-// No direct DOM access -- all viewport operations are delegated via
-// callback functions supplied through the deps interface.
+// Owns chat lifecycle, submission, permission, queue, and mode transitions.
+// Delegates all viewport operations through the dependency interface.
 
-import {
-	sendPermissionDecision,
-	stopChat,
-	interruptAndSendChat,
-} from '$lib/api/chats.js';
-import { ApiError } from '$lib/api/client.js';
+import { getChatSnapshot, interruptAndSendChat, stopChat } from '$lib/api/chats.js';
 import {
 	isStopSatisfied,
 	type ChatImage,
 	type ChatStopOutcome,
 } from '$shared/chat-types';
 import { createClientCommandId } from '$lib/chat/conversation/client-command-id.js';
-import { CommandOutcomeUnknownError } from '$lib/chat/conversation/idempotent-command.js';
 import {
 	INITIAL_VISIBLE_MESSAGES,
 	type ActiveTranscriptPort,
@@ -48,6 +40,8 @@ import {
 import { ConversationSlashCommandService } from '$lib/chat/conversation/conversation-slash-command-service.js';
 import { ConversationQueueController } from '$lib/chat/conversation/conversation-queue-controller.svelte.js';
 import { ConversationSettingsController } from '$lib/chat/conversation/conversation-settings-controller.svelte.js';
+import { HandoffForkConfirmationState } from './handoff-fork-confirmation.svelte.js';
+import { ConversationPermissionService } from './conversation-permission-service.js';
 import { AcceptedInputSubmissionService } from '$lib/chat/conversation/accepted-input-submission-service.js';
 import type { ConversationSubmissionOutcome } from '$lib/chat/conversation/conversation-submission-outcome.js';
 import { classifySubmission } from '$lib/chat/conversation/submission-classifier.js';
@@ -78,11 +72,13 @@ type SessionTranscriptState = Pick<
 	| 'isUserScrolledUp'
 	| 'activateChat'
 	| 'appendLocalNotice'
-	| 'clearPendingUserInput'
+	| 'clearOptimisticUserInput'
+	| 'markOptimisticUserInputDelivered'
 	| 'clearLocalNotices'
 	| 'loadMessages'
-	| 'updatePendingUserInputDeliveryStatus'
-	| 'upsertPendingUserInput'
+	| 'upsertOptimisticUserInput'
+	| 'excludedResendOrdinals'
+	| 'clearResendExclusions'
 > & {
 	transcriptCache: Pick<ChatTranscriptCache, 'markValidated'>;
 };
@@ -132,17 +128,17 @@ type SessionConversationUiState = Pick<
 	ConversationUiPort,
 	| 'pendingPermissionRequests'
 	| 'previousPermissionMode'
-	| 'clearPendingPermissionRequests'
+	| 'activateTransientFeed'
 	| 'getExecutionControl'
 	| 'setExecutionControlFromLiveUpdate'
 	| 'setExecutionControlFromRefresh'
 	| 'isExecutionControlSocketInstanceConfirmed'
 	| 'setPendingPermissionRequests'
 	| 'setPreviousPermissionMode'
+	| 'setTransientFeedFromSnapshot'
 >;
 
 type SessionStartupCoordinator = Pick<StartupCoordinator, 'beginLocalStartup' | 'completeStartup'>;
-
 interface DirectAdmissionBarrier {
 	settled: Promise<void>;
 	release: () => void;
@@ -227,14 +223,6 @@ export interface SessionControllerDeps {
 	scrollToBottom: () => void;
 }
 
-function isExecutionControlAdmissionConflict(error: unknown): boolean {
-	return (
-		error instanceof ApiError &&
-		error.retryable &&
-		error.errorCode === 'SESSION_BUSY'
-	);
-}
-
 export class ConversationSessionController {
 	#lastChatId: string | null = null;
 	#pendingDirectAdmissions = $state.raw<ReadonlyMap<string, DirectAdmissionBarrier>>(new Map());
@@ -243,7 +231,9 @@ export class ConversationSessionController {
 	readonly #acceptedInputs: AcceptedInputSubmissionService;
 	readonly #queue: ConversationQueueController;
 	readonly #settings: ConversationSettingsController;
+	readonly #permissions: ConversationPermissionService;
 	readonly #executionDraft: ConversationExecutionDraftState;
+	readonly #handoffForkConfirmation = new HandoffForkConfirmationState();
 
 	constructor(private deps: SessionControllerDeps) {
 		this.#executionDraft = new ConversationExecutionDraftState({
@@ -256,6 +246,7 @@ export class ConversationSessionController {
 		this.#slashCommands = new ConversationSlashCommandService({
 			...deps,
 			refetchTranscript: (chatId) => this.#loadChat(chatId),
+			confirmHandoffFork: () => this.#handoffForkConfirmation.ask(),
 		}, this.#acceptedInputs);
 		this.#agentSwitch = new ConversationAgentSwitchService({
 			sessions: deps.sessions,
@@ -274,6 +265,13 @@ export class ConversationSessionController {
 			get lifecycle() { return deps.lifecycle; },
 			get conversationUi() { return deps.conversationUi; },
 			get acceptedInputs() { return acceptedInputs; },
+		});
+		const queue = this.#queue;
+		this.#permissions = new ConversationPermissionService({
+			deps,
+			acceptedInputs,
+			get queue() { return queue; },
+			executionModelSelection: () => this.#executionModelSelection(),
 		});
 		this.#settings = new ConversationSettingsController({
 			get sessions() { return deps.sessions; },
@@ -338,7 +336,7 @@ export class ConversationSessionController {
 		deps.composerState.clearImages();
 		if (currentChatId) deps.lifecycle.clearTurnStatus(currentChatId);
 		deps.lifecycle.setCurrentChatId(null);
-		deps.conversationUi.clearPendingPermissionRequests();
+		deps.conversationUi.activateTransientFeed(null);
 		deps.setIsViewportPinnedToBottom(true);
 		deps.setInitialBottomRestorePending(null);
 	}
@@ -382,7 +380,7 @@ export class ConversationSessionController {
 		deps.composerState.clearImages();
 		const previousChatId = deps.lifecycle.currentChatId;
 		if (previousChatId) deps.lifecycle.clearTurnStatus(previousChatId);
-		deps.conversationUi.clearPendingPermissionRequests();
+		deps.conversationUi.activateTransientFeed(chatId);
 		deps.setIsViewportPinnedToBottom(true);
 
 		const activeSelection = this.#executionDraft.activate(chatId);
@@ -473,6 +471,7 @@ export class ConversationSessionController {
 			this.#requestBottomRestore(chatId);
 		}
 
+		const initialSnapshotPromise = getChatSnapshot(chatId, 1).catch(() => null);
 		await deps.chatState.loadMessages(chatId, {
 			minimumLimit: minimumMessageLimit,
 		});
@@ -488,6 +487,16 @@ export class ConversationSessionController {
 		) {
 			deps.readReceiptOutbox.enqueue(chatId, record.lastActivityAt);
 			deps.sessions.patchLastReadAt(chatId, record.lastActivityAt);
+		}
+
+		const initialSnapshot = await initialSnapshotPromise;
+		if (
+			deps.sessions.selectedChatId === chatId &&
+			initialSnapshot?.chat.id === chatId &&
+			initialSnapshot.transcript.availability === 'available' &&
+			initialSnapshot.transcript.transcriptViewId === deps.chatState.getCursor().transcriptViewId
+		) {
+			deps.conversationUi.setTransientFeedFromSnapshot(initialSnapshot.transientFeed);
 		}
 	}
 
@@ -737,8 +746,12 @@ export class ConversationSessionController {
 	// both the in-chat Fork button and the bare `/fork` command. For agents that
 	// support it the server snapshots the transcript up to the last completed
 	// turn, so this works while the source chat is still processing.
-	forkChat(sourceChatId: string, upToSeq?: number): Promise<void> {
-		return this.#slashCommands.forkChat(sourceChatId, upToSeq);
+	get handoffForkConfirmation(): HandoffForkConfirmationState {
+		return this.#handoffForkConfirmation;
+	}
+
+	forkChat(sourceChatId: string, upToOrdinal?: number): Promise<void> {
+		return this.#slashCommands.forkChat(sourceChatId, upToOrdinal);
 	}
 
 	handleAbort(): Promise<void> {
@@ -791,116 +804,19 @@ export class ConversationSessionController {
 			});
 	}
 
-	handlePermissionDecision(permissionRequestId: string, decision: PermissionDecisionPayload): void {
-		const { deps } = this;
-		const chatId = deps.sessions.selectedChatId || deps.lifecycle.currentChatId;
-		if (!chatId) return;
-		void sendPermissionDecision({
-			clientRequestId: createClientCommandId(),
-			chatId,
-			permissionRequestId,
-			allow: decision.allow,
-			alwaysAllow: Boolean(decision.alwaysAllow),
-			response: decision.response,
-		})
-			.then(() => {
-				deps.conversationUi.setPendingPermissionRequests(
-					deps.conversationUi.pendingPermissionRequests.filter(
-						(r) => r.permissionRequestId !== permissionRequestId,
-					),
-				);
-			})
-			.catch((error) => {
-				deps.chatState.appendLocalNotice(
-					'error',
-					m.chat_notice_failed_permission_decision({ detail: errorDetail(error) }),
-				);
-			});
+	handlePermissionDecision(
+		permissionOccurrenceId: string,
+		decision: PermissionDecisionPayload,
+	): void {
+		this.#permissions.handlePermissionDecision(permissionOccurrenceId, decision);
 	}
 
-	handleExitPlanMode(permissionRequestId: string, choice: string, plan: string): void {
-		const { deps } = this;
-		deps.conversationUi.setPendingPermissionRequests(
-			deps.conversationUi.pendingPermissionRequests.filter(
-				(r) => r.permissionRequestId !== permissionRequestId,
-			),
-		);
-
-		const chatId = deps.sessions.selectedChatId || deps.lifecycle.currentChatId;
-		const path = deps.sessions.selectedChat?.projectPath;
-
-		const buildApprovalMessage = () =>
-			`User has approved your plan. You can now start coding. Start with updating your todo list if applicable\n\n## Approved Plan:\n${plan}`;
-
-		const resumeWithApproval = (mode: PermissionMode) => {
-			deps.conversationUi.setPreviousPermissionMode(null);
-			deps.agentState.permissionMode = mode;
-			if (!chatId || !path) return;
-			const selection = this.#executionModelSelection();
-
-			const submission = this.#acceptedInputs.run({
-				chatId,
-				command: buildApprovalMessage(),
-				permissionMode: mode,
-				thinkingMode: deps.agentState.thinkingMode,
-				agentSettings: deps.agentState.agentSettings,
-				model: selection.model,
-				apiProviderId: selection.apiProviderId,
-				modelEndpointId: selection.modelEndpointId,
-				modelProtocol: selection.modelProtocol,
-			});
-			void submission
-				.submit()
-				.then(() => {
-					deps.lifecycle.beginTurn(chatId);
-				})
-				.catch(async (error) => {
-					if (isExecutionControlAdmissionConflict(error)) {
-						await this.#queue.settleControlRefresh(this.#queue.startControlRefresh(chatId));
-					}
-					deps.chatState.appendLocalNotice(
-						'error',
-						error instanceof CommandOutcomeUnknownError
-							? m.chat_notice_delivery_outcome_unconfirmed()
-							: m.chat_notice_failed_resume_plan({ detail: errorDetail(error) }),
-					);
-				});
-		};
-
-		switch (choice) {
-			case 'bypass-new': {
-				const restoreMode = deps.conversationUi.previousPermissionMode || 'default';
-				deps.conversationUi.setPreviousPermissionMode(null);
-				deps.agentState.permissionMode = restoreMode;
-
-				const planMessage = `Implement the following plan:\n\n${plan}`;
-				deps.appShell.openNewChatDialog({ prefill: planMessage });
-				break;
-			}
-			case 'bypass':
-				resumeWithApproval('bypassPermissions');
-				break;
-			case 'approve-edits':
-				resumeWithApproval('acceptEdits');
-				break;
-			case 'deny': {
-				if (chatId) {
-					void sendPermissionDecision({
-						clientRequestId: createClientCommandId(),
-						chatId,
-						permissionRequestId,
-						allow: false,
-						alwaysAllow: false,
-					}).catch((error) => {
-						deps.chatState.appendLocalNotice(
-							'error',
-							m.chat_notice_failed_deny_permission({ detail: errorDetail(error) }),
-						);
-					});
-				}
-				break;
-			}
-		}
+	handleExitPlanMode(
+		permissionOccurrenceId: string,
+		choice: string,
+		plan: string,
+	): void {
+		this.#permissions.handleExitPlanMode(permissionOccurrenceId, choice, plan);
 	}
 
 	handleQueuePause(): Promise<void> {

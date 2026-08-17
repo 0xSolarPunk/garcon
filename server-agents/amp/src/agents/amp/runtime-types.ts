@@ -1,9 +1,9 @@
 import type { PermissionMode, ThinkingMode } from '@garcon/common/chat-modes';
-import type { AgentOperationIdentity } from '@garcon/server-agent-interface';
+import type { AgentRuntimeOperation } from '@garcon/server-agent-common/execution/runtime-events';
 
 export interface AmpExecutionAdmission {
   readonly signal: AbortSignal;
-  markStarted(): void;
+  markStarted(): Promise<void>;
 }
 
 export interface AmpExecutionRequest {
@@ -12,14 +12,13 @@ export interface AmpExecutionRequest {
   readonly model: string;
   readonly permissionMode: PermissionMode;
   readonly thinkingMode: ThinkingMode;
-  readonly clientRequestId?: string;
-  readonly turnId?: string;
+  readonly operation: AgentRuntimeOperation;
   readonly executionAdmission?: AmpExecutionAdmission;
-  readonly onAbortable?: () => void;
 }
 
 export interface AmpStartRequest extends AmpExecutionRequest {
   readonly command: string;
+  readonly onSessionActivated?: (session: AmpStartedSession) => void;
 }
 
 export interface AmpResumeRequest extends AmpStartRequest {
@@ -37,20 +36,9 @@ export function assertAmpExecutionOpen(
   request.executionAdmission?.signal.throwIfAborted();
 }
 
-export function markAmpExecutionStarted(
+export async function markAmpExecutionStarted(
   request: { readonly executionAdmission?: AmpExecutionAdmission },
-): void {
+): Promise<void> {
   assertAmpExecutionOpen(request);
-  request.executionAdmission?.markStarted();
-}
-
-export function ampEventMetadata(
-  request: Pick<AmpExecutionRequest, 'clientRequestId' | 'turnId'>,
-  commandType?: AgentOperationIdentity['commandType'],
-) {
-  return Object.freeze({
-    ...(request.clientRequestId ? { clientRequestId: request.clientRequestId } : {}),
-    ...(commandType ? { commandType } : {}),
-    ...(request.turnId ? { turnId: request.turnId } : {}),
-  });
+  await request.executionAdmission?.markStarted();
 }

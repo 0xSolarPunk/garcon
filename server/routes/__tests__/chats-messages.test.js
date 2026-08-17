@@ -1,4 +1,7 @@
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { AgentIntegrationError } from '@garcon/server-agent-interface';
 import { TRANSCRIPT_TEMPORARILY_UNAVAILABLE_MESSAGE } from '../../lib/domain-error.js';
 
@@ -13,42 +16,60 @@ mock.module('../../chats/fork-chat.js', () => ({
 }));
 
 import createChatRoutes from '../chats.js';
-import { createRouteChatListProjector, createRouteCommandLedger, createRouteCommandService, createRoutePathCache } from './chat-routes-test-utils.js';
-import { ChatViewStore } from '../../chats/chat-view-store.js';
-import { PendingUserInputService } from '../../chats/pending-user-input-service.js';
-import { ChatNativeReloader } from '../../chats/chat-native-reload.js';
-import { ChatProcessErrorRecovery } from '../../chats/chat-process-error-recovery.js';
-import { AssistantMessage, UserMessage } from '../../../common/chat-types.js';
-import { CarryOverHistoryUnavailableError } from '../../chats/carryover-transcript-store.ts';
+import { TranscriptHistoryUnavailableError } from '../../chats/errors.js';
+import { TranscriptAdoptionService } from '../../ledger/adoption.ts';
+import { TranscriptLedgerService } from '../../ledger/service.ts';
+import { TranscriptLedgerStore } from '../../ledger/store.ts';
 import {
-  historyPage,
-  snapshotLoader,
-  transcriptLoader,
-  transcriptSnapshot,
-} from '../../chats/__tests__/chat-transcript-test-helpers.js';
+  createRouteChatListProjector,
+  createRouteCommandLedger,
+  createRouteCommandService,
+  createRoutePathCache,
+} from './chat-routes-test-utils.js';
+
+const CHAT_ID = '1783725900000200';
+
+function completeQueue() {
+  return {
+    serverInstanceId: 'server-instance-test',
+    entries: [],
+    recentlyDispatched: [],
+    appliedCommands: [],
+    pause: null,
+    reorderRevision: 0,
+    version: 0,
+    updatedAt: null,
+  };
+}
 
 function createRoutesFixture(overrides = {}) {
+  const entry = {
+    id: CHAT_ID,
+    agentId: 'claude',
+    agentSessionId: 'provider-session-123',
+    nativeSession: null,
+    agentOwnershipEpoch: 'epoch-1',
+    carryOverSegments: [],
+    carryOverMigrationQuarantine: null,
+    nativeSeedReceipt: null,
+    projectPath: '/tmp/project',
+    tags: [],
+    model: 'opus',
+    permissionMode: 'default',
+    thinkingMode: 'none',
+    agentSettingsById: {},
+  };
   const registry = overrides.registry ?? {
-    getChat: mock(() => ({
-      id: '123',
-      agentId: 'claude',
-      agentSessionId: 'provider-session-123',
-      agentOwnershipEpoch: 'epoch-1',
-      carryOverSegments: [],
-      carryOverMigrationQuarantine: null,
-      nativeSeedReceipt: null,
-      projectPath: '/tmp/project',
-      nativePath: '/tmp/session.jsonl',
-    })),
+    getChat: mock((chatId) => chatId === CHAT_ID ? entry : null),
     addChat: mock(() => true),
     updateChat: mock(() => null),
     removeChat: mock(() => true),
-    listAllChats: mock(() => ({})),
+    listAllChats: mock(() => ({ [CHAT_ID]: entry })),
   };
   const settings = {
-    getPinnedChatIds: mock(async () => []),
-    getNormalChatIds: mock(async () => []),
-    getArchivedChatIds: mock(async () => []),
+    getPinnedChatIds: mock(() => []),
+    getNormalChatIds: mock(() => []),
+    getArchivedChatIds: mock(() => []),
     getChatName: mock(() => null),
     recordChatStartup: mock(async () => undefined),
     ensureInNormal: mock(async () => undefined),
@@ -56,37 +77,15 @@ function createRoutesFixture(overrides = {}) {
     removeSessionName: mock(async () => undefined),
     togglePin: mock(async () => ({ isPinned: true })),
     toggleArchive: mock(async () => ({ isArchived: true })),
-  reorderChat: mock(async () => ({
-    success: true,
-    response: { success: true, chatId: 'chat', orderGroup: 'normal', changed: true },
-  })),
+    reorderChat: mock(async () => ({
+      success: true,
+      response: { success: true, chatId: CHAT_ID, orderGroup: 'normal', changed: true },
+    })),
   };
   const queue = {
+    readChatExecutionControl: mock(async () => completeQueue()),
+    ownsExecution: mock(() => false),
     deleteChatQueueFile: mock(async () => undefined),
-    submit: mock(async () => undefined),
-    registerPendingUserInput: mock(async () => undefined),
-    reserveDirectTurn: mock((chatId) => ({
-      chatId,
-      reservationId: 'reservation-1',
-      executionAdmission: {
-        signal: new AbortController().signal,
-        markStarted() {},
-      },
-    })),
-    releaseDirectTurn: mock(async () => undefined),
-    completeDirectTurn: mock(async () => undefined),
-    failDirectTurn: mock(async () => undefined),
-    runReservedTurn: mock(async () => undefined),
-    abortForChatDeletion: mock(async () => true),
-    triggerDrain: mock(async () => undefined),
-	    readChatExecutionControl: mock(async () => ({ entries: [], recentlyDispatched: [], pause: null, reorderRevision: 0, version: 0, updatedAt: null })),
-	    createChatQueueEntry: mock(async () => ({ entry: { id: 'entry-1' }, queue: { entries: [], recentlyDispatched: [], pause: null, reorderRevision: 0, version: 1, updatedAt: null } })),
-	    replaceChatQueueEntry: mock(async () => ({ entry: { id: 'entry-1' }, queue: { entries: [], recentlyDispatched: [], pause: null, reorderRevision: 0, version: 1, updatedAt: null } })),
-	    deleteChatQueueEntry: mock(async () => ({ entryId: 'entry-1', queue: { entries: [], recentlyDispatched: [], pause: null, reorderRevision: 0, version: 2, updatedAt: null } })),
-	    deliverGoalControlInput: mock(async () => false),
-	    clearChatQueue: mock(async () => ({ entries: [], recentlyDispatched: [], pause: null, reorderRevision: 0, version: 2, updatedAt: null })),
-	    pauseChatQueue: mock(async () => ({ entries: [], recentlyDispatched: [], pause: null, reorderRevision: 0, version: 2, updatedAt: null })),
-	    resumeChatQueue: mock(async () => ({ entries: [], recentlyDispatched: [], pause: null, reorderRevision: 0, version: 3, updatedAt: null })),
   };
   const pathCache = createRoutePathCache();
   const metadata = {
@@ -95,19 +94,21 @@ function createRoutesFixture(overrides = {}) {
     addNewChatMetadata: mock(() => undefined),
   };
   const chatViews = overrides.chatViews ?? {
-    getOrCreatePage: mock(async (_chatId, limit, beforeSeq) => ({
+    page: mock(async (_chatId, limit, beforeOrdinal) => ({
+      transcriptViewId: 'view-1',
       messages: [],
-      generationId: 'generation-1',
-      lastSeq: 0,
-      pageOldestSeq: 0,
+      lastOrdinal: 12,
+      pageOldestOrdinal: beforeOrdinal ?? 0,
+      pageNewestOrdinal: 12,
       hasMore: false,
       limit,
     })),
-    reconcileNativeSnapshot: mock(async () => undefined),
   };
   const agents = {
     hasAgent: mock(() => true),
     supportsFork: mock(() => true),
+    supportsForkAtMessage: mock(() => true),
+    supportsForkWhileRunning: mock(() => true),
     supportsImages: mock(() => true),
     isAgentSessionRunning: mock(() => false),
     getRunningSessions: mock(() => ({ claude: [] })),
@@ -116,29 +117,25 @@ function createRoutesFixture(overrides = {}) {
     runSingleQuery: mock(async () => 'title'),
     resolvePermission: mock(() => undefined),
     updateSessionSettings: mock(async () => undefined),
-  };
-  const pendingInputs = overrides.pendingInputs ?? {
-    register: mock(async () => undefined),
-    reconcileRetainedHistory: mock(async () => undefined),
-    reconcileNativeHistory: mock(async () => undefined),
-    listForChat: mock(() => []),
-    listForTransport: mock(() => []),
-    hasInFlightForChat: mock(() => false),
-    clearChat: mock(() => undefined),
+    resendCandidates: mock(() => [{ ordinal: 11, content: 'Try again', attachmentNames: [] }]),
   };
   const commandLedger = createRouteCommandLedger('chats-messages');
-  const chatListProjector = createRouteChatListProjector({ registry, settings, metadata, agents, pathCache });
-  const searchIndex = overrides.searchIndex;
-  const notifyHistoryChanged = overrides.notifyHistoryChanged ?? mock(() => undefined);
+  const chatListProjector = createRouteChatListProjector({
+    registry,
+    settings,
+    metadata,
+    agents,
+    pathCache,
+  });
   const routes = createChatRoutes({
     registry,
     settings,
     queue,
+    processing: overrides.processing ?? { phase: mock(() => null) },
     pathCache,
     metadata,
     chatViews,
     agents,
-    pendingInputs,
     chatListProjector,
     commandService: createRouteCommandService({
       registry,
@@ -147,134 +144,167 @@ function createRoutesFixture(overrides = {}) {
       metadata,
       agents,
       commandLedger,
-      pendingInputs,
       pathCache,
       chatListProjector,
       ownership: overrides.ownership,
     }),
-    ...(searchIndex === undefined ? {} : { searchIndex }),
-    notifyHistoryChanged,
   });
 
-  return {
-    chatViews,
-    pendingInputs,
-    registry,
-    routes,
-    searchIndex,
-    notifyHistoryChanged,
-  };
+  return { agents, chatViews, routes };
 }
 
 describe('GET /api/v1/chats/messages', () => {
-  it('clamps pagination parameters before reading history', async () => {
-    const { chatViews, pendingInputs, routes } = createRoutesFixture();
-    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123&limit=999999&beforeSeq=10');
+  it('clamps view-qualified pagination before reading the ledger', async () => {
+    const { agents, chatViews, routes } = createRoutesFixture();
+    const url = new URL(
+      `http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}`
+      + '&limit=999999&beforeOrdinal=10&transcriptViewId=view-1',
+    );
 
     const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
+    await expect(response.json()).resolves.toEqual({
       historyState: { kind: 'complete' },
-      chatId: '123',
-      generationId: 'generation-1',
+      chatId: CHAT_ID,
+      transcriptViewId: 'view-1',
       messages: [],
-      lastSeq: 0,
-      pageOldestSeq: 0,
+      lastOrdinal: 12,
+      pageOldestOrdinal: 10,
+      pageNewestOrdinal: 12,
       hasMore: false,
+      resendCandidates: [{ ordinal: 11, content: 'Try again', attachmentNames: [] }],
       limit: 200,
-      pendingUserInputs: [],
     });
-    expect(pendingInputs.reconcileRetainedHistory).toHaveBeenCalledWith('123');
-    expect(chatViews.getOrCreatePage).toHaveBeenCalledWith('123', 200, 10);
+    expect(chatViews.page).toHaveBeenCalledWith(CHAT_ID, 200, 10, 'view-1');
+    expect(agents.resendCandidates).toHaveBeenCalledWith(CHAT_ID);
   });
 
-  it('rejects a reader page that does not exactly match the requested sequence window', async () => {
-    const pendingInputs = {
-      reconcileRetainedHistory: mock(async () => undefined),
-      listForTransport: mock(() => []),
-    };
-    const { routes } = createRoutesFixture({
-      chatViews: {
-        getOrCreatePage: mock(async () => ({
-          generationId: 'generation-1',
-          messages: [
-            { seq: 2, message: new AssistantMessage('2026-08-13T00:00:02.000Z', 'two') },
-            { seq: 1, message: new AssistantMessage('2026-08-13T00:00:01.000Z', 'one') },
-          ],
-          lastSeq: 2,
-          pageOldestSeq: 2,
-          hasMore: true,
-        })),
-        reconcileNativeSnapshot: mock(async () => undefined),
-      },
-      pendingInputs,
-    });
-    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123&limit=2');
+  it('requires a transcript view for every earlier-page cursor', async () => {
+    const { chatViews, routes } = createRoutesFixture();
+    const url = new URL(
+      `http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}&beforeOrdinal=10`,
+    );
 
     const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
 
-    expect(response.status).toBe(500);
-    expect(pendingInputs.reconcileRetainedHistory).not.toHaveBeenCalled();
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      errorCode: 'VALIDATION_FAILED',
+    });
+    expect(chatViews.page).not.toHaveBeenCalled();
   });
 
-  it('returns degraded carryover history without claiming sequence metadata', async () => {
-    const { pendingInputs, routes } = createRoutesFixture({
-      chatViews: {
-        getOrCreatePage: mock(async () => {
-          throw new CarryOverHistoryUnavailableError({
-            cause: new Error('private storage detail'),
-          });
-        }),
-        reconcileNativeSnapshot: mock(async () => undefined),
-      },
+  it('suppresses resend candidates while the chat is processing', async () => {
+    const { agents, routes } = createRoutesFixture({
+      processing: { phase: mock(() => 'running') },
     });
-    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123');
+    const url = new URL(`http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}`);
 
     const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
-    const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(body).toEqual({
-      historyState: {
-        kind: 'degraded',
-        errorCode: 'CARRYOVER_HISTORY_UNAVAILABLE',
-        retryable: false,
-      },
-      chatId: '123',
-      messages: [],
-    });
-    expect(pendingInputs.reconcileRetainedHistory).not.toHaveBeenCalled();
+    expect((await response.json()).resendCandidates).toEqual([]);
+    expect(agents.resendCandidates).not.toHaveBeenCalled();
   });
 
-  it('rejects invalid beforeSeq values', async () => {
+  it('rejects invalid beforeOrdinal values', async () => {
     const { chatViews, routes } = createRoutesFixture();
-    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123&beforeSeq=abc');
+    const url = new URL(
+      `http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}&beforeOrdinal=abc`,
+    );
 
     const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
     const body = await response.json();
 
     expect(response.status).toBe(400);
     expect(body.errorCode).toBe('VALIDATION_FAILED');
-    expect(body.error).toBe('beforeSeq must be a positive integer');
-    expect(chatViews.getOrCreatePage).not.toHaveBeenCalled();
+    expect(body.error).toBe('beforeOrdinal must be a positive integer');
+    expect(chatViews.page).not.toHaveBeenCalled();
   });
 
-  it('returns a retryable transcript error instead of an empty successful page', async () => {
-    const failure = new AgentIntegrationError(
-      'TRANSCRIPT_UNAVAILABLE',
-      'Cannot open /home/private/.codex/sessions/rollout-secret.jsonl',
-      true,
+  it('rejects invalid limit values instead of silently defaulting them', async () => {
+    const { chatViews, routes } = createRoutesFixture();
+    const url = new URL(
+      `http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}&limit=not-a-number`,
     );
-    const { pendingInputs, routes } = createRoutesFixture({
+
+    const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).errorCode).toBe('VALIDATION_FAILED');
+    expect(chatViews.page).not.toHaveBeenCalled();
+  });
+
+  it('rejects a page from a transcript view other than the requested view', async () => {
+    const { routes } = createRoutesFixture();
+    const url = new URL(
+      `http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}`
+      + '&limit=20&beforeOrdinal=10&transcriptViewId=requested-view',
+    );
+
+    const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(body.errorCode).toBe('STALE_TRANSCRIPT_VIEW');
+  });
+
+  it('rejects a newest-page refresh from a replaced transcript view', async () => {
+    const { routes } = createRoutesFixture();
+    const url = new URL(
+      `http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}`
+      + '&limit=20&transcriptViewId=requested-view',
+    );
+
+    const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(body.errorCode).toBe('STALE_TRANSCRIPT_VIEW');
+  });
+
+  it('returns a typed fenced-ledger state instead of an empty complete page', async () => {
+    const { routes } = createRoutesFixture({
       chatViews: {
-        getOrCreatePage: mock(async () => {
-          throw failure;
+        page: mock(async () => {
+          throw new TranscriptHistoryUnavailableError({
+            kind: 'degraded',
+            errorCode: 'LEDGER_FENCED',
+            retryable: true,
+          });
         }),
-        reconcileNativeSnapshot: mock(async () => undefined),
       },
     });
-    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123');
+    const url = new URL(`http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}`);
+
+    const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      historyState: {
+        kind: 'degraded',
+        errorCode: 'LEDGER_FENCED',
+        retryable: true,
+      },
+      chatId: CHAT_ID,
+      messages: [],
+    });
+  });
+
+  it('sanitizes a retryable adoption failure', async () => {
+    const { routes } = createRoutesFixture({
+      chatViews: {
+        page: mock(async () => {
+          throw new AgentIntegrationError(
+            'TRANSCRIPT_UNAVAILABLE',
+            'Cannot open /home/private/.codex/sessions/rollout-secret.jsonl',
+            true,
+          );
+        }),
+      },
+    });
+    const url = new URL(`http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}`);
 
     const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
 
@@ -285,308 +315,134 @@ describe('GET /api/v1/chats/messages', () => {
       errorCode: 'TRANSCRIPT_UNAVAILABLE',
       retryable: true,
     });
-    expect(pendingInputs.reconcileRetainedHistory).not.toHaveBeenCalled();
   });
 
-  it('bounds native full loads across repeated reads with an unresolved conflicting echo', async () => {
-    const history = [
-      new AssistantMessage('2026-06-01T00:00:00.000Z', 'history-1'),
-      new AssistantMessage('2026-06-01T00:00:01.000Z', 'history-2'),
-    ];
-    const nativeMessages = [
-      ...history,
-      new UserMessage(
-        '2026-06-01T00:00:02.000Z',
-        'pending',
-        undefined,
-        { clientRequestId: 'req-native', turnId: 'turn-native' },
-      ),
-    ];
-    const loadAll = mock(async () => nativeMessages);
-    const loadPage = mock(async (limit, offset) => historyPage(nativeMessages, limit, offset));
-    const views = new ChatViewStore(() => false, { messageLimit: 2 });
-    const pendingInputs = new PendingUserInputService({
-      loadNativeMessages: loadAll,
-      getRetainedHistoryMessages: (chatId) => views.getRetainedHistoryMessages(chatId),
-      hasCompleteHistory: (chatId) => views.getLoadedMessages(chatId) !== null,
-    });
-    await pendingInputs.register('123', 'pending', {
-      clientRequestId: 'req-live',
-      turnId: 'turn-live',
-      createdAt: '2026-06-01T00:00:02.000Z',
-      images: [{
-        name: 'large.png',
-        mimeType: 'image/png',
-        data: `data:image/png;base64,${'a'.repeat(20_000)}`,
-      }],
-    });
-    await views.appendAfterEnsuringGeneration(
-      '123',
-      transcriptLoader(async () => history),
-      [new UserMessage(
-        '2026-06-01T00:00:02.000Z',
-        'pending',
-        undefined,
-        { clientRequestId: 'req-live', turnId: 'turn-live', deliveryStatus: 'accepted' },
-      )],
-    );
-    await pendingInputs.reconcileNativeHistory('123');
-    const chatViews = {
-      getOrCreatePage: (chatId, limit, beforeSeq) => views.getOrCreatePage(
-        chatId,
-        { loadAll: snapshotLoader(loadAll), loadPage },
-        limit,
-        beforeSeq,
-      ),
-    };
-    const { routes } = createRoutesFixture({ chatViews, pendingInputs });
-    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123&limit=2');
-
-    for (let request = 0; request < 3; request += 1) {
-      const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
-      expect(response.status).toBe(200);
-      const payload = await response.json();
-      expect(payload).toMatchObject({
-        pendingUserInputs: [{ clientRequestId: 'req-live' }],
-      });
-      expect(payload.pendingUserInputs[0]).not.toHaveProperty('images');
-    }
-
-    expect(loadAll).toHaveBeenCalledTimes(1);
-    expect(loadPage).not.toHaveBeenCalled();
-  });
-
-  it('serves unmatched inputs as unconfirmed after process-error native replacement', async () => {
-    const nativeMessages = [new UserMessage(
-      '2026-06-01T00:00:00.100Z',
-      'persisted before failure',
-      undefined,
-      { clientRequestId: 'req-persisted' },
-    )];
-    const loadAll = mock(async () => nativeMessages);
-    const views = new ChatViewStore(() => false);
-    const pendingInputs = new PendingUserInputService({
-      loadNativeMessages: loadAll,
-      getRetainedHistoryMessages: (chatId) => views.getRetainedHistoryMessages(chatId),
-      hasCompleteHistory: (chatId) => views.getLoadedMessages(chatId) !== null,
-    });
-    await pendingInputs.register('123', 'persisted before failure', {
-      clientRequestId: 'req-persisted',
-      createdAt: '2026-06-01T00:00:00.000Z',
-    });
-    await pendingInputs.register('123', 'not persisted before failure', {
-      clientRequestId: 'req-failed',
-      createdAt: '2026-06-01T00:00:01.000Z',
-      images: [{
-        name: 'failure.png',
-        mimeType: 'image/png',
-        data: `data:image/png;base64,${'b'.repeat(20_000)}`,
-      }],
-    });
-    await views.appendAfterEnsuringGeneration('123', transcriptLoader(async () => []), [
-      new UserMessage(
-        '2026-06-01T00:00:00.000Z',
-        'persisted before failure',
-        undefined,
-        { clientRequestId: 'req-persisted', deliveryStatus: 'accepted' },
-      ),
-      new UserMessage(
-        '2026-06-01T00:00:01.000Z',
-        'not persisted before failure',
-        undefined,
-        { clientRequestId: 'req-failed', deliveryStatus: 'accepted' },
-      ),
-    ]);
-    const recovery = new ChatProcessErrorRecovery(
-      views,
-      new ChatNativeReloader(
-        views,
-        { loadSnapshot: async () => transcriptSnapshot(await loadAll()) },
-        () => false,
-      ),
-      pendingInputs,
-    );
-
-    await expect(recovery.recover('123', 'provider crashed')).resolves.toMatchObject({
-      kind: 'generation-reset',
-    });
-
-    const chatViews = {
-      getOrCreatePage: (chatId, limit, beforeSeq) => views.getOrCreatePage(
-        chatId,
-        { loadAll: snapshotLoader(loadAll) },
-        limit,
-        beforeSeq,
-      ),
-    };
-    const { routes } = createRoutesFixture({ chatViews, pendingInputs });
-    const url = new URL('http://localhost/api/v1/chats/messages?chatId=123&limit=20');
-    const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
-    const payload = await response.json();
-
-    expect(response.status).toBe(200);
-    expect(payload.messages.map((entry) => entry.message.content)).toEqual([
-      'persisted before failure',
-      'provider crashed',
-    ]);
-    expect(payload.pendingUserInputs).toEqual([expect.objectContaining({
-      clientRequestId: 'req-failed',
-      content: 'not persisted before failure',
-      deliveryStatus: 'unconfirmed',
-    })]);
-    expect(payload.pendingUserInputs[0]).not.toHaveProperty('images');
-    expect(loadAll).toHaveBeenCalledTimes(1);
-  });
-
-});
-
-describe('POST /api/v1/chats/repair-history', () => {
-  const chatId = '1783725900000200';
-  const carryOverRevision = 'carry-v1:0';
-
-  function request(body) {
-    const url = new URL('http://localhost/api/v1/chats/repair-history');
-    return {
-      url,
-      request: new Request(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      }),
-    };
-  }
-
-  it('clears only the fenced receipt and invalidates search', async () => {
+  it('[TLV5-ADOPT.10-SOURCE-FAILURE-ROUTE-UNIT-01] keeps adoption source failures content-free through route logging and response', async () => {
+    const transcriptSentinel = 'PRIVATE_TRANSCRIPT_SENTINEL_9e806c88';
+    const root = await mkdtemp(join(tmpdir(), 'garcon-adoption-source-privacy-'));
+    const store = new TranscriptLedgerStore(root);
+    const ledger = new TranscriptLedgerService(store);
+    const warnings = [];
     const entry = {
-      id: chatId,
-      agentId: 'claude',
-      agentSessionId: 'provider-session-123',
-      agentOwnershipEpoch: 'epoch-1',
-      carryOverSegments: [],
-      carryOverMigrationQuarantine: null,
-      nativeSeedReceipt: {
-        agentSessionId: 'provider-session-123',
-        placement: 'user-prefix',
-        format: 'v2-xml',
-        sha256: 'a'.repeat(64),
-        codeUnitLength: 10,
+      agentId: 'test-provider',
+      agentSessionId: null,
+      nativeSession: null,
+      nativeSeedReceipt: null,
+      agentOwnershipEpoch: 'owner-1',
+      agentSettingsById: {
+        'test-provider': { ownerId: 'test-provider', schemaVersion: 1, values: {} },
       },
       projectPath: '/tmp/project',
+      model: 'model',
+      permissionMode: 'default',
+      thinkingMode: 'medium',
+      carryOverSegments: [],
+      carryOverMigrationQuarantine: null,
     };
-    const registry = {
-      getChat: mock(() => entry),
-      addChat: mock(() => true),
-      updateChat: mock(async () => ({ ...entry, nativeSeedReceipt: null })),
-      removeChat: mock(() => true),
-      listAllChats: mock(() => ({})),
-    };
-    const searchIndex = { catalogMayHaveChanged: mock(() => undefined) };
-    const { notifyHistoryChanged, routes } = createRoutesFixture({ registry, searchIndex });
-    const input = request({
-      action: 'accept-native',
-      chatId,
-      expectedCarryOverRevision: carryOverRevision,
-      expectedAgentOwnershipEpoch: 'epoch-1',
-    });
-
-    const response = await routes['/api/v1/chats/repair-history'].POST(input.request, input.url);
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({
-      success: true,
-      action: 'accept-native',
-      chatId,
-      receiptCleared: true,
-    });
-    expect(registry.updateChat).toHaveBeenCalledWith(
-      chatId,
-      { nativeSeedReceipt: null },
-      { flush: true },
+    const sourceError = Object.assign(
+      new SyntaxError(`Invalid provider row containing ${transcriptSentinel}`),
+      { code: 'LEGACY_JSON_PARSE_FAILED' },
     );
-    expect(searchIndex.catalogMayHaveChanged).toHaveBeenCalledWith(chatId);
-    expect(notifyHistoryChanged).toHaveBeenCalledWith(chatId);
-  });
-
-  it('rejects a stale carryover revision or ownership epoch without mutation', async () => {
-    const updateChat = mock(async () => null);
-    const registry = {
-      getChat: mock(() => ({
-        id: chatId,
-        agentId: 'claude',
-        agentOwnershipEpoch: 'epoch-2',
-        carryOverSegments: [],
-        carryOverMigrationQuarantine: null,
-        nativeSeedReceipt: null,
-      })),
-      addChat: mock(() => true),
-      updateChat,
-      removeChat: mock(() => true),
-      listAllChats: mock(() => ({})),
+    const adoption = new TranscriptAdoptionService({
+      ledger,
+      registry: {
+        getChat: (chatId) => chatId === CHAT_ID ? entry : null,
+        updateChat: () => entry,
+      },
+      integrations: {
+        require: () => ({
+          descriptor: { id: 'test-provider' },
+          settings: {
+            defaults: () => entry.agentSettingsById['test-provider'],
+            parse: (value) => value,
+          },
+          legacyHistoryImport: {
+            async *load() {
+              throw sourceError;
+            },
+          },
+          nativeHistoryImport: null,
+        }),
+      },
+      getCarryOverRevision: () => 'carryover-1',
+      loadFrozenPrefix: async () => [],
+      logger: { warn: (message, fields) => warnings.push([message, fields]) },
+    });
+    let propagatedError;
+    const chatViews = {
+      page: mock(async () => {
+        try {
+          return await adoption.ensure(CHAT_ID);
+        } catch (error) {
+          propagatedError = error;
+          throw error;
+        }
+      }),
     };
-    const { routes } = createRoutesFixture({ registry });
-    const input = request({
-      action: 'accept-native',
-      chatId,
-      expectedCarryOverRevision: 'carry-v5:stale',
-      expectedAgentOwnershipEpoch: 'epoch-1',
+    const routeLogMessage = `sessions: error reading messages for ${CHAT_ID}:`;
+    const originalConsoleError = console.error;
+    const routeError = spyOn(console, 'error').mockImplementation((...args) => {
+      if (args[1] !== routeLogMessage) originalConsoleError(...args);
     });
 
-    const response = await routes['/api/v1/chats/repair-history'].POST(input.request, input.url);
+    try {
+      const { routes } = createRoutesFixture({ chatViews });
+      const url = new URL(`http://localhost/api/v1/chats/messages?chatId=${CHAT_ID}`);
+      const response = await routes['/api/v1/chats/messages'].GET(new Request(url), url);
+      const body = await response.json();
+      const sourceRouteErrors = routeError.mock.calls.filter((args) => args[1] === routeLogMessage);
+      const observedSurfaces = {
+        warnings,
+        propagatedError: {
+          name: propagatedError?.name,
+          code: propagatedError?.code,
+          message: propagatedError?.message,
+          retryable: propagatedError?.retryable,
+          details: propagatedError?.details,
+        },
+        routeErrors: sourceRouteErrors,
+        response: body,
+      };
 
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toMatchObject({
-      success: false,
-      errorCode: 'STALE_CHAT_OWNERSHIP',
-      retryable: true,
-    });
-    expect(updateChat).not.toHaveBeenCalled();
-  });
-
-  it('retries abandoned transfer releases and reports content-free records', async () => {
-    const retriedRecord = {
-      operationId: 'op-1',
-      chatId: 'chat-a',
-      source: { agentId: 'claude' },
-      lastErrorCode: null,
-    };
-    const unresolvedRecord = {
-      operationId: 'op-2',
-      chatId: 'chat-b',
-      source: { agentId: 'codex' },
-      lastErrorCode: 'SOURCE_UNAVAILABLE',
-    };
-    const ownership = {
-      delete: mock(async () => true),
-      abandonedTransferCleanups: mock(() => [unresolvedRecord]),
-      retryRetainedTransferCleanups: mock(async () => ({
-        retried: [retriedRecord, unresolvedRecord],
-        unresolved: [unresolvedRecord],
-      })),
-    };
-    const { routes } = createRoutesFixture({ ownership });
-    const input = request({ action: 'retry-abandoned-release' });
-
-    const response = await routes['/api/v1/chats/repair-history'].POST(input.request, input.url);
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({
-      success: true,
-      action: 'retry-abandoned-release',
-      retried: [
-        { chatId: 'chat-a', agentId: 'claude', lastErrorCode: null },
-        { chatId: 'chat-b', agentId: 'codex', lastErrorCode: 'SOURCE_UNAVAILABLE' },
-      ],
-      unresolved: [{ chatId: 'chat-b', agentId: 'codex', lastErrorCode: 'SOURCE_UNAVAILABLE' }],
-    });
-    expect(ownership.retryRetainedTransferCleanups).toHaveBeenCalledTimes(1);
-  });
-
-  it('rejects an unknown repair-history action', async () => {
-    const { routes } = createRoutesFixture();
-    const input = request({ action: 'rewrite-history', chatId });
-
-    const response = await routes['/api/v1/chats/repair-history'].POST(input.request, input.url);
-
-    expect(response.status).toBe(400);
+      expect(JSON.stringify(observedSurfaces)).not.toContain(transcriptSentinel);
+      expect(warnings).toEqual([[
+        'Transcript adoption source failed.',
+        {
+          chatId: CHAT_ID,
+          provider: 'test-provider',
+          phase: 'legacy-history-import',
+          reason: 'LEGACY_JSON_PARSE_FAILED',
+        },
+      ]]);
+      expect(propagatedError).toBeInstanceOf(AgentIntegrationError);
+      expect(propagatedError?.cause).toBeUndefined();
+      expect(observedSurfaces.propagatedError).toEqual({
+        name: 'AgentIntegrationError',
+        code: 'TRANSCRIPT_UNAVAILABLE',
+        message: 'Transcript adoption source failed',
+        retryable: true,
+        details: {
+          provider: 'test-provider',
+          phase: 'legacy-history-import',
+        },
+      });
+      expect(sourceRouteErrors).toEqual([[
+        '[routes:chats]',
+        routeLogMessage,
+        'Transcript adoption source failed',
+      ]]);
+      expect(response.status).toBe(503);
+      expect(body).toMatchObject({
+        success: false,
+        error: TRANSCRIPT_TEMPORARILY_UNAVAILABLE_MESSAGE,
+        errorCode: 'TRANSCRIPT_UNAVAILABLE',
+        retryable: true,
+      });
+      expect(ledger.currentView(CHAT_ID)).toBeNull();
+    } finally {
+      routeError.mockRestore();
+      ledger.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

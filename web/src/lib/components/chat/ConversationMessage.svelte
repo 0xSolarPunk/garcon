@@ -15,7 +15,6 @@
 	import type {
 		ChatMessage,
 		ToolUseChatMessage,
-		UserMessageDeliveryStatus,
 	} from '$shared/chat-types';
 	import type { PermissionDecisionPayload } from '$shared/chat-command-contracts';
 	import type { SessionAgentId } from '$lib/types/app';
@@ -58,6 +57,8 @@
 
 	interface Props {
 		message: ChatMessage;
+		/** Marks a submitted message whose request has not come back yet. */
+		awaitingDelivery?: boolean;
 		rowId?: string;
 		anchorId?: string;
 		index: number;
@@ -66,11 +67,16 @@
 		toolResultRowId?: string;
 		pairedToolUse?: ToolUseChatMessage;
 		permissionTerminal?: PermissionTerminalState;
+		permissionActionable?: boolean;
 		onPermissionDecision?: (
-			permissionRequestId: string,
+			permissionOccurrenceId: string,
 			decision: PermissionDecisionPayload & { message?: string },
 		) => void;
-		onExitPlanMode?: (permissionRequestId: string, choice: string, plan: string) => void;
+		onExitPlanMode?: (
+			permissionOccurrenceId: string,
+			choice: string,
+			plan: string,
+		) => void;
 		agentId: SessionAgentId | string;
 		showThinking?: boolean;
 		chatContext?: ConversationMessageChatContext | null;
@@ -79,13 +85,17 @@
 		onGenerateTitleFromMessage?: (message: string, messageSeq?: number) => void | Promise<void>;
 		canForkAtMessageNow?: boolean;
 		disclosureState?: ConversationDisclosureStatePort;
-		permissionDraft?: (permissionRequestId: string) => PermissionQuestionDraft;
-		onPermissionDraftChange?: (permissionRequestId: string, draft: PermissionQuestionDraft) => void;
+		permissionDraft?: (permissionOccurrenceId: string) => PermissionQuestionDraft;
+		onPermissionDraftChange?: (
+			permissionOccurrenceId: string,
+			draft: PermissionQuestionDraft,
+		) => void;
 		acquireTransientActivity?: (close: () => void) => () => void;
 	}
 
 	let {
 		message,
+		awaitingDelivery = false,
 		rowId,
 		anchorId,
 		index,
@@ -94,6 +104,7 @@
 		toolResultRowId,
 		pairedToolUse,
 		permissionTerminal,
+		permissionActionable = false,
 		onPermissionDecision,
 		onExitPlanMode,
 		agentId,
@@ -151,31 +162,18 @@
 	);
 	const exitPlanPermissionRequest = $derived(
 		asToolUse?.type === 'exit-plan-mode-tool-use'
-			? new PermissionRequestMessage(message.timestamp, `plan-exit-${asToolUse.toolId}`, asToolUse)
+			? new PermissionRequestMessage(
+					message.timestamp,
+					`plan-exit-${asToolUse.toolId}`,
+					asToolUse,
+				)
 			: null,
 	);
 	const historicalQuestion = $derived.by(() => {
 		if (!(asToolResult && pairedToolUse instanceof AskUserQuestionToolUseMessage)) return null;
 		return historicalAskUserQuestion(pairedToolUse, asToolResult);
 	});
-	const userDeliveryStatus = $derived(asUser?.metadata?.deliveryStatus ?? null);
-
 	function ignorePermissionDecision(): void {}
-
-	function deliveryTitle(status: UserMessageDeliveryStatus | null): string {
-		switch (status) {
-			case 'submitting':
-				return m.chat_message_delivery_sending();
-			case 'unconfirmed':
-				return m.chat_message_delivery_unconfirmed();
-			case 'failed':
-				return m.chat_message_delivery_failed();
-			default:
-				return '';
-		}
-	}
-
-	const userDeliveryTitle = $derived(deliveryTitle(userDeliveryStatus));
 
 	const showNonAssistantHeader = $derived(message instanceof ErrorMessage);
 
@@ -536,23 +534,13 @@
 				<div
 					class="user-message-accessory-rail relative w-3.5 shrink-0 [@media(hover:hover)_and_(pointer:fine)]:w-7"
 				>
-					{@render floatingMessageMenuButton('bottom-0 right-0')}
-					{#if userDeliveryStatus === 'submitting' || userDeliveryStatus === 'unconfirmed' || userDeliveryStatus === 'failed'}
-						<span
-							class={cn(
-								'user-message-delivery-indicator absolute left-1/2 top-1/2 inline-flex size-3.5 -translate-x-1/2 -translate-y-1/2 items-center justify-center',
-								userDeliveryStatus === 'failed' && 'text-status-error-foreground',
-								userDeliveryStatus === 'unconfirmed' && 'text-status-warning-muted-foreground',
-							)}
-							title={userDeliveryTitle}
-							aria-label={userDeliveryTitle}
-						>
-							{#if userDeliveryStatus === 'submitting'}
-								<LoaderCircle class="size-3.5 animate-spin" />
-							{:else}
-								<CircleAlert class="size-3" />
-							{/if}
-						</span>
+					{#if awaitingDelivery}
+						<LoaderCircle
+							class="absolute bottom-0 right-0 size-3.5 animate-spin text-muted-foreground"
+							aria-label={m.chat_message_delivery_sending()}
+						/>
+					{:else}
+						{@render floatingMessageMenuButton('bottom-0 right-0')}
 					{/if}
 				</div>
 			</div>
@@ -584,14 +572,20 @@
 						<PermissionRequestRow
 							request={exitPlanPermissionRequest}
 							terminal={permissionTerminal}
+							actionable={permissionActionable}
 							onDecision={onPermissionDecision ?? ignorePermissionDecision}
 							{onExitPlanMode}
 							{chatContext}
-							draft={permissionDraft?.(exitPlanPermissionRequest.permissionRequestId)}
+							draft={permissionDraft?.(
+								exitPlanPermissionRequest.permissionOccurrenceId,
+							)}
 							{acquireTransientActivity}
 							onDraftChange={onPermissionDraftChange
 								? (draft) =>
-										onPermissionDraftChange(exitPlanPermissionRequest.permissionRequestId, draft)
+										onPermissionDraftChange(
+											exitPlanPermissionRequest.permissionOccurrenceId,
+											draft,
+										)
 								: undefined}
 						/>
 					{:else if historicalQuestion}
@@ -714,17 +708,23 @@
 						/>
 					{:else if asAgentSwitch}
 						<AgentSwitchRow message={asAgentSwitch} />
-					{:else if asPermissionRequest && onPermissionDecision}
+					{:else if asPermissionRequest}
 						<PermissionRequestRow
 							request={asPermissionRequest}
 							terminal={permissionTerminal}
-							onDecision={onPermissionDecision}
+							actionable={permissionActionable}
+							onDecision={onPermissionDecision ?? ignorePermissionDecision}
 							{onExitPlanMode}
 							{chatContext}
-							draft={permissionDraft?.(asPermissionRequest.permissionRequestId)}
+							draft={permissionDraft?.(
+								asPermissionRequest.permissionOccurrenceId,
+							)}
 							{acquireTransientActivity}
 							onDraftChange={onPermissionDraftChange
-								? (draft) => onPermissionDraftChange(asPermissionRequest.permissionRequestId, draft)
+								? (draft) => onPermissionDraftChange(
+										asPermissionRequest.permissionOccurrenceId,
+										draft,
+									)
 								: undefined}
 						/>
 					{/if}

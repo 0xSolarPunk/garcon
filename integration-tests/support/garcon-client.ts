@@ -44,6 +44,11 @@ import type {
 } from '../../common/chat-list.js';
 import type { ChatSearchRequest, ChatSearchResponse } from '../../common/chat-search.js';
 import {
+  parseChatSnapshotResponse,
+  type ChatSnapshotResponse,
+} from '../../common/chat-snapshot.js';
+import type { TransientFeedRow } from '../../common/chat-transient-feed.js';
+import {
   parseReorderChatResponse,
   type ReorderChatRequest,
   type ReorderChatResponse,
@@ -62,16 +67,22 @@ import {
   parseChatExecutionControlState,
 	type ChatExecutionControlState,
 } from '../../common/chat-execution-control.js';
-import { parseChatViewMessages, type ChatViewMessage } from '../../common/chat-view.js';
-import { normalizePendingUserInput, type PendingUserInput } from '../../common/pending-user-input.js';
+import {
+  parseResendCandidates,
+  parseTranscriptMessages,
+  type ResendCandidate,
+  type TranscriptMessage,
+} from '../../common/chat-view.js';
 import type {
   RemoteSettingsSnapshot,
   UpdateRemoteSettingsInput,
 } from '../../common/settings.js';
 import {
+  ChatTransientFeedMutationMessage,
   parseServerWsMessage,
   type AgentRunFailedMessage,
   type AgentRunFinishedMessage,
+  type ChatMessagesMessage,
   type ChatReloadedMessage,
   type ChatProcessingUpdatedMessage,
   type ChatSubscribedMessage,
@@ -141,11 +152,13 @@ export interface DirectHandoffInput extends DirectRunInput {
 
 export interface ChatMessagesPage {
   chatId: string;
-  messages: ChatViewMessage[];
-  generationId: string;
-  lastSeq: number;
-  pageOldestSeq: number;
-  pendingUserInputs: PendingUserInput[];
+  messages: TranscriptMessage[];
+  transcriptViewId: string;
+  lastOrdinal: number;
+  pageOldestOrdinal: number;
+  pageNewestOrdinal: number;
+  nextBeforeOrdinal: number | null;
+  resendCandidates: ResendCandidate[];
   hasMore: boolean;
   limit: number;
 }
@@ -179,6 +192,8 @@ export interface GarconTestClientOptions {
   redactSensitiveDiagnostics?: boolean;
 }
 
+export type CommittedUserInputMessage = ChatMessagesMessage;
+
 const WEB_SOCKET_OPEN = 1;
 const WEB_SOCKET_CLOSED = 3;
 const SAFE_DIAGNOSTIC_STRING_KEYS = new Set([
@@ -194,6 +209,18 @@ const SAFE_DIAGNOSTIC_STRING_KEYS = new Set([
   'timestamp',
   'type',
 ]);
+
+// A typed deferred or degraded history response; tests assert on the state
+// instead of a transport failure.
+export class UnavailableChatHistoryError extends Error {
+  constructor(
+    readonly chatId: string,
+    readonly historyState: { kind: 'deferred' | 'degraded'; errorCode?: string; retryable?: boolean },
+  ) {
+    super(`Chat ${chatId} history is ${historyState.kind}`);
+    this.name = 'UnavailableChatHistoryError';
+  }
+}
 
 export class GarconApiError extends Error {
   constructor(
@@ -533,8 +560,14 @@ export class GarconTestClient {
     };
   }
 
-  runChat(request: AgentRunCommandRequest): Promise<AgentTurnCommandResponse> {
-    return this.post<AgentTurnCommandResponse>('/api/v1/chats/run', request);
+  async runChat(
+    request: Omit<AgentRunCommandRequest, 'transcriptViewId'>
+      & { transcriptViewId?: string },
+  ): Promise<AgentTurnCommandResponse> {
+    return this.post<AgentTurnCommandResponse>('/api/v1/chats/run', {
+      ...request,
+      transcriptViewId: request.transcriptViewId ?? await this.#currentTranscriptViewId(request.chatId),
+    });
   }
 
   runDirectChat(input: DirectRunInput): Promise<CommandAcceptedResponse> {
@@ -568,7 +601,7 @@ export class GarconTestClient {
     });
   }
 
-  directRunRequest(input: DirectRunInput): AgentRunCommandRequest {
+  directRunRequest(input: DirectRunInput): Omit<AgentRunCommandRequest, 'transcriptViewId'> {
     return {
       clientRequestId: input.clientRequestId ?? crypto.randomUUID(),
       clientMessageId: input.clientMessageId ?? crypto.randomUUID(),
@@ -592,13 +625,49 @@ export class GarconTestClient {
     return this.post<ForkRunCommandResponse>('/api/v1/chats/fork-run', request);
   }
 
-  sendPermissionDecision(
-    request: PermissionDecisionCommandRequest,
+  async sendPermissionDecision(
+    request: Omit<PermissionDecisionCommandRequest, 'control'> & {
+      readonly control?: PermissionDecisionCommandRequest['control'];
+    },
   ): Promise<CommandAcceptedResponse> {
+    const control = request.control ?? await this.#permissionControl(
+      request.chatId,
+      request.permissionOccurrenceId,
+    );
     return this.post<CommandAcceptedResponse>(
       '/api/v1/chats/permissions/decision',
-      request,
+      { ...request, control },
     );
+  }
+
+  async getChatSnapshot(chatId: string, messageLimit = 1): Promise<ChatSnapshotResponse> {
+    const query = new URLSearchParams({ chatId, limit: String(messageLimit) });
+    return parseChatSnapshotResponse(
+      await this.get<unknown>(`/api/v1/chats/snapshot?${query}`),
+    );
+  }
+
+  async #permissionControl(
+    chatId: string,
+    permissionOccurrenceId: string,
+  ): Promise<PermissionDecisionCommandRequest['control']> {
+    const snapshot = await this.getChatSnapshot(chatId, 0);
+    const rows = snapshot.transientFeed.rows.filter((candidate) => (
+      candidate.permissionOccurrenceId === permissionOccurrenceId
+      && candidate.message.type === 'permission-request'
+    ));
+    if (rows.length !== 1) {
+      throw new Error(
+        `Expected one transient permission for ${permissionOccurrenceId}, found ${rows.length}`,
+      );
+    }
+    const row = rows[0]!;
+    return {
+      serverInstanceId: snapshot.transientFeed.serverInstanceId,
+      chatId,
+      runId: row.runId,
+      permissionOccurrenceId: row.permissionOccurrenceId,
+    };
   }
 
   updateProjectPath(request: ProjectPathPatchRequest): Promise<ProjectPathPatchResponse> {
@@ -635,24 +704,47 @@ export class GarconTestClient {
     return this.post<MarkChatsReadResponse>('/api/v1/chats/read', request);
   }
 
-  enqueue(request: QueueEntryCreateCommandRequest): Promise<QueueEntryCommandResponse> {
-    return this.post<QueueEntryCommandResponse>('/api/v1/chats/queue/entries', request);
+  async enqueue(
+    request: Omit<QueueEntryCreateCommandRequest, 'transcriptViewId' | 'clientMessageId'>
+      & { transcriptViewId?: string; clientMessageId?: string },
+  ): Promise<QueueEntryCommandResponse> {
+    return this.post<QueueEntryCommandResponse>('/api/v1/chats/queue/entries', {
+      ...request,
+      clientMessageId: request.clientMessageId ?? crypto.randomUUID(),
+      transcriptViewId: request.transcriptViewId ?? await this.#currentTranscriptViewId(request.chatId),
+    });
   }
 
   submitGoalControl(request: GoalControlCommandRequest): Promise<GoalControlCommandResponse> {
     return this.post<GoalControlCommandResponse>('/api/v1/chats/goal-control', request);
   }
 
-  steer(request: SteerCommandRequest): Promise<SteerCommandResponse> {
-    return this.post<SteerCommandResponse>('/api/v1/chats/steer', request);
+  async steer(
+    request: Omit<SteerCommandRequest, 'transcriptViewId'> & { transcriptViewId?: string },
+  ): Promise<SteerCommandResponse> {
+    return this.post<SteerCommandResponse>('/api/v1/chats/steer', {
+      ...request,
+      transcriptViewId: request.transcriptViewId ?? await this.#currentTranscriptViewId(request.chatId),
+    });
   }
 
-  steerQueued(request: QueueEntrySteerCommandRequest): Promise<QueueEntrySteerCommandResponse> {
-    return this.post<QueueEntrySteerCommandResponse>('/api/v1/chats/queue/entries/steer', request);
+  async steerQueued(
+    request: Omit<QueueEntrySteerCommandRequest, 'transcriptViewId'>
+      & { transcriptViewId?: string; clientMessageId?: string },
+  ): Promise<QueueEntrySteerCommandResponse> {
+    const { clientMessageId: _legacyClientMessageId, ...command } = request;
+    return this.post<QueueEntrySteerCommandResponse>('/api/v1/chats/queue/entries/steer', {
+      ...command,
+      transcriptViewId: request.transcriptViewId ?? await this.#currentTranscriptViewId(request.chatId),
+    });
   }
 
   enqueueNew(chatId: string, content: string): Promise<QueueEntryCommandResponse> {
     return this.enqueue({ chatId, content, clientRequestId: crypto.randomUUID() });
+  }
+
+  async #currentTranscriptViewId(chatId: string): Promise<string> {
+    return (await this.getMessages(chatId, { limit: 1 })).transcriptViewId;
   }
 
   replaceQueued(request: QueueEntryReplaceCommandRequest): Promise<QueueEntryCommandResponse> {
@@ -696,30 +788,51 @@ export class GarconTestClient {
     return control;
   }
 
-  async getMessages(chatId: string, options: { limit?: number; beforeSeq?: number } = {}): Promise<ChatMessagesPage> {
+  async getMessages(
+    chatId: string,
+    options: { limit?: number } & (
+      | { beforeOrdinal?: undefined; transcriptViewId?: never }
+      | { beforeOrdinal: number; transcriptViewId: string }
+    ) = {},
+  ): Promise<ChatMessagesPage> {
     const query = new URLSearchParams({
       chatId,
       limit: String(options.limit ?? 100),
     });
-    if (options.beforeSeq !== undefined) query.set('beforeSeq', String(options.beforeSeq));
-    const response = await this.get<Record<string, unknown>>(`/api/v1/chats/messages?${query}`);
-    const messages = parseChatViewMessages(response.messages);
-    if (!messages) throw new Error(`Invalid messages response: ${JSON.stringify(response)}`);
-    if (!Array.isArray(response.pendingUserInputs)) {
-      throw new Error(`Invalid pendingUserInputs response: ${JSON.stringify(response)}`);
+    if (options.beforeOrdinal !== undefined) {
+      query.set('beforeOrdinal', String(options.beforeOrdinal));
+      query.set('transcriptViewId', options.transcriptViewId);
     }
-    const pendingUserInputs = response.pendingUserInputs.map(normalizePendingUserInput);
-    if (pendingUserInputs.some((input) => input === null)) {
-      throw new Error(`Invalid pending user input: ${JSON.stringify(response.pendingUserInputs)}`);
+    const response = await this.get<Record<string, unknown>>(`/api/v1/chats/messages?${query}`);
+    const historyState = response.historyState as { kind?: unknown } | undefined;
+    if (historyState && historyState.kind !== 'complete') {
+      throw new UnavailableChatHistoryError(
+        requiredString(response.chatId, 'chatId'),
+        historyState as UnavailableChatHistoryError['historyState'],
+      );
+    }
+    const messages = parseTranscriptMessages(response.messages);
+    if (!messages) throw new Error(`Invalid messages response: ${JSON.stringify(response)}`);
+    const resendCandidates = parseResendCandidates(response.resendCandidates);
+    if (!resendCandidates) {
+      throw new Error(`Invalid resend candidates response: ${JSON.stringify(response)}`);
     }
     if (typeof response.hasMore !== 'boolean') throw new Error('Invalid messages response: hasMore');
+    const nextBeforeOrdinal = response.nextBeforeOrdinal === null
+      ? null
+      : positiveInteger(response.nextBeforeOrdinal, 'nextBeforeOrdinal');
+    if (response.hasMore !== (nextBeforeOrdinal !== null)) {
+      throw new Error('Invalid messages response: hasMore/nextBeforeOrdinal');
+    }
     return {
       chatId: requiredString(response.chatId, 'chatId'),
       messages,
-      generationId: requiredString(response.generationId, 'generationId'),
-      lastSeq: nonNegativeInteger(response.lastSeq, 'lastSeq'),
-      pageOldestSeq: nonNegativeInteger(response.pageOldestSeq, 'pageOldestSeq'),
-      pendingUserInputs: pendingUserInputs as PendingUserInput[],
+      transcriptViewId: requiredString(response.transcriptViewId, 'transcriptViewId'),
+      lastOrdinal: nonNegativeInteger(response.lastOrdinal, 'lastOrdinal'),
+      pageOldestOrdinal: nonNegativeInteger(response.pageOldestOrdinal, 'pageOldestOrdinal'),
+      pageNewestOrdinal: nonNegativeInteger(response.pageNewestOrdinal, 'pageNewestOrdinal'),
+      nextBeforeOrdinal,
+      resendCandidates,
       hasMore: response.hasMore,
       limit: positiveInteger(response.limit, 'limit'),
     };
@@ -752,18 +865,33 @@ export class GarconTestClient {
 
   async subscribe(
     chatId: string,
-    generationId: string,
-    afterSeq: number,
+    transcriptViewId: string,
+    afterOrdinal: number,
+    throughOrdinal?: number,
   ): Promise<ChatSubscribedMessage> {
     const clientRequestId = crypto.randomUUID();
     const afterIndex = this.markEvents();
-    this.sendWs(new ChatSubscribeRequest(clientRequestId, chatId, generationId, afterSeq));
-    return await this.waitForEvent(
-      (message): message is ChatSubscribedMessage =>
-        message.type === 'chat-subscribed' && message.clientRequestId === clientRequestId,
+    const request = new ChatSubscribeRequest(
+      clientRequestId,
+      chatId,
+      transcriptViewId,
+      afterOrdinal,
+      throughOrdinal,
+    );
+    this.sendWs(request);
+    const outcome = await this.waitForEvent(
+      (message): message is ChatSubscribedMessage | ClientRequestErrorMessage =>
+        (message.type === 'chat-subscribed' && message.clientRequestId === clientRequestId)
+        || (
+          message.type === 'client-request-error'
+          && message.clientRequestId === clientRequestId
+          && message.requestType === 'chat-subscribe'
+        ),
       `chat-subscribed ${clientRequestId}`,
       { afterIndex },
     );
+    if (outcome.type === 'client-request-error') throw new GarconWsRequestError(outcome);
+    return outcome;
   }
 
   async reloadChat(chatId: string): Promise<ChatReloadedMessage> {
@@ -800,6 +928,22 @@ export class GarconTestClient {
     );
   }
 
+  async waitForCommittedUserInput(
+    chatId: string,
+    content: string,
+    options: { afterIndex?: number; timeoutMs?: number } = {},
+  ): Promise<CommittedUserInputMessage> {
+    return await this.waitForEvent(
+      (message): message is CommittedUserInputMessage =>
+        message.type === 'chat-messages'
+        && message.chatId === chatId
+        && message.messages.some((entry) =>
+          entry.message.type === 'user-message' && entry.message.content === content),
+      `committed user input ${content}`,
+      options,
+    );
+  }
+
   async waitForTurnTerminal(
     chatId: string,
     turnId?: string,
@@ -813,6 +957,40 @@ export class GarconTestClient {
       `${chatId} terminal turn ${turnId ?? '(any)'}`,
       options,
     );
+  }
+
+  async waitForSessionStopped(
+    chatId: string,
+    options: { afterIndex?: number; timeoutMs?: number } = {},
+  ): Promise<void> {
+    await this.waitForEvent(
+      (message): message is ServerWsMessage => message.type === 'chat-session-stopped'
+        && (message as { chatId?: string }).chatId === chatId,
+      `${chatId} chat-session-stopped`,
+      options,
+    );
+  }
+
+  async waitForTransientPermission(
+    chatId: string,
+    predicate: (row: TransientFeedRow) => boolean = () => true,
+    options: { afterIndex?: number; timeoutMs?: number } = {},
+  ): Promise<TransientFeedRow> {
+    const event = await this.waitForEvent(
+      (message): message is ChatTransientFeedMutationMessage => (
+        message instanceof ChatTransientFeedMutationMessage
+        && message.chatId === chatId
+        && message.mutation.kind === 'upsert'
+        && message.mutation.row.message.type === 'permission-request'
+        && predicate(message.mutation.row)
+      ),
+      `${chatId} transient permission`,
+      options,
+    );
+    if (event.mutation.kind !== 'upsert') {
+      throw new Error('Transient permission event lost its upsert mutation');
+    }
+    return event.mutation.row;
   }
 
   async waitForEvent<T extends ServerWsMessage>(

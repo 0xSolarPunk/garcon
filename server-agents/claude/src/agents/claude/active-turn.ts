@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { CompactionTrigger } from '@garcon/common/chat-types';
-import type { RuntimeEventMetadata } from '@garcon/server-agent-common/shared/event-emitter-runtime';
+import type { AgentRuntimeOperation } from '@garcon/server-agent-common/execution/runtime-events';
 import { ClaudeTurnState } from './cli-protocol.js';
 import { ClaudeTurnSteeringState } from './steering.js';
 
@@ -18,8 +18,8 @@ export class ClaudeActiveTurn {
   #interruptRequestFailed = false;
 
   constructor(
-    readonly eventMetadata: RuntimeEventMetadata,
     backgroundTaskCount: number,
+    readonly operation: AgentRuntimeOperation,
   ) {
     this.protocol = new ClaudeTurnState(
       crypto.randomUUID(),

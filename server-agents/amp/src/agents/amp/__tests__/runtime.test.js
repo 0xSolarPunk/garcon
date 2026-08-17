@@ -2,9 +2,28 @@ import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 
 import { AmpCliRuntime, runSingleQuery } from '../amp-cli.js';
 
+function noopOperation(runId = 'run-default') {
+  return { runId, publish() {} };
+}
+
+function collectOperation(runId, onPublish = () => undefined) {
+  const events = [];
+  return {
+    events,
+    operation: {
+      runId,
+      publish: (event) => {
+        events.push(event);
+        onPublish(event);
+      },
+    },
+  };
+}
+
 function createFakeProc() {
   const encoder = new TextEncoder();
   let stdoutController;
+  let stderrController;
   let resolveExited;
   let closed = false;
 
@@ -16,7 +35,7 @@ function createFakeProc() {
 
   const stderr = new ReadableStream({
     start(controller) {
-      controller.close();
+      stderrController = controller;
     },
   });
 
@@ -34,10 +53,17 @@ function createFakeProc() {
     pushJson(message) {
       stdoutController.enqueue(encoder.encode(JSON.stringify(message) + '\n'));
     },
+    pushRaw(line) {
+      stdoutController.enqueue(encoder.encode(`${line}\n`));
+    },
+    pushStderr(line) {
+      stderrController.enqueue(encoder.encode(`${line}\n`));
+    },
     close(exitCode = 0) {
       if (closed) return;
       closed = true;
       stdoutController.close();
+      stderrController.close();
       resolveExited(exitCode);
     },
     kill() {
@@ -103,11 +129,13 @@ describe('AmpCliRuntime lifecycle', () => {
     const provider = new AmpCliRuntime();
     const threadId = 'T-11111111-1111-1111-1111-111111111111';
     let runningWhenFinished;
-    const finished = new Promise((resolve) => {
-      provider.onFinished(() => {
+    let resolveFinished;
+    const finished = new Promise((resolve) => { resolveFinished = resolve; });
+    const observed = collectOperation('run-start', (event) => {
+      if (event.type === 'run-ended') {
         runningWhenFinished = provider.isRunning(threadId);
-        resolve();
-      });
+        resolveFinished();
+      }
     });
     const createThreadProc = createFakeCommandProc(`${threadId}\n`);
     const proc = createFakeProc();
@@ -120,6 +148,7 @@ describe('AmpCliRuntime lifecycle', () => {
       model: 'default',
       permissionMode: 'default',
       thinkingMode: 'none',
+      operation: observed.operation,
     });
 
     const started = await startedPromise;
@@ -139,6 +168,42 @@ describe('AmpCliRuntime lifecycle', () => {
     expect(runningWhenFinished).toBe(false);
   });
 
+  it('keeps malformed output and stderr content out of diagnostics', async () => {
+    const privateContent = 'private-amp-transcript-content';
+    const diagnostics = [];
+    const provider = new AmpCliRuntime({
+      logger: {
+        debug(...args) { diagnostics.push(args); },
+        info(...args) { diagnostics.push(args); },
+        warn(...args) { diagnostics.push(args); },
+        error(...args) { diagnostics.push(args); },
+      },
+    });
+    const threadId = 'T-51515151-5151-5151-5151-515151515151';
+    const proc = createFakeProc();
+    spawnMock
+      .mockReturnValueOnce(createFakeCommandProc(`${threadId}\n`))
+      .mockReturnValueOnce(proc);
+
+    await provider.startSession({
+      command: 'hello',
+      chatId: 'chat-private-diagnostics',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: noopOperation('run-private-diagnostics'),
+    });
+    proc.pushRaw(`{${privateContent}`);
+    proc.pushStderr(privateContent);
+    proc.pushJson({ type: 'result', is_error: false });
+    proc.close(0);
+    await proc.exited;
+    await Bun.sleep(10);
+
+    expect(JSON.stringify(diagnostics)).not.toContain(privateContent);
+  });
+
   it('kills and rolls back a process whose prompt write fails synchronously', async () => {
     const provider = new AmpCliRuntime();
     const threadId = 'T-12121212-1212-1212-1212-121212121212';
@@ -147,10 +212,7 @@ describe('AmpCliRuntime lifecycle', () => {
     proc.stdin.write = () => {
       throw new Error('stdin failed');
     };
-    const processing = [];
-    const failures = [];
-    provider.onProcessing((_chatId, running) => processing.push(running));
-    provider.onFailed((_chatId, message, metadata) => failures.push({ message, metadata }));
+    const observed = collectOperation('run-write-failure');
     spawnMock.mockReturnValueOnce(createThreadProc).mockReturnValueOnce(proc);
 
     await expect(provider.startSession({
@@ -160,28 +222,137 @@ describe('AmpCliRuntime lifecycle', () => {
       model: 'default',
       permissionMode: 'default',
       thinkingMode: 'none',
-      clientRequestId: 'req-write-failure',
-      turnId: 'turn-write-failure',
+      operation: observed.operation,
     })).rejects.toThrow('stdin failed');
 
     expect(proc.killed).toBe(true);
     expect(provider.isRunning(threadId)).toBe(false);
-    expect(processing).toEqual([true, false]);
-    expect(failures).toEqual([{
-      message: 'Amp spawn failed: stdin failed',
-      metadata: expect.objectContaining({
-        clientRequestId: 'req-write-failure',
-        turnId: 'turn-write-failure',
-      }),
+    expect(observed.events).toEqual([{
+      type: 'run-ended',
+      runId: 'run-write-failure',
+      outcome: 'failed',
+      error: { code: 'PROVIDER_FAILURE', message: 'Amp spawn failed: stdin failed' },
     }]);
+  });
+
+  it('[TLV5-L07.07-AMP-UNIT-01] retires an established source only after a fresh session starts successfully', async () => {
+    const provider = new AmpCliRuntime();
+    const firstThreadId = 'T-13131313-1313-1313-1313-131313131313';
+    const failedThreadId = 'T-14141414-1414-1414-1414-141414141414';
+    const replacementThreadId = 'T-15151515-1515-1515-1515-151515151515';
+    const firstProc = createFakeProc();
+    const failedProc = createFakeProc();
+    failedProc.stdin.write = () => {
+      throw new Error('replacement stdin failed');
+    };
+    const replacementProc = createFakeProc();
+    spawnMock
+      .mockReturnValueOnce(createFakeCommandProc(`${firstThreadId}\n`))
+      .mockReturnValueOnce(firstProc)
+      .mockReturnValueOnce(createFakeCommandProc(`${failedThreadId}\n`))
+      .mockReturnValueOnce(failedProc)
+      .mockReturnValueOnce(createFakeCommandProc(`${replacementThreadId}\n`))
+      .mockReturnValueOnce(replacementProc);
+    const first = collectOperation('run-established');
+
+    await provider.startSession({
+      command: 'first',
+      chatId: 'chat-replacement',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: first.operation,
+    });
+    firstProc.pushJson({ type: 'result', is_error: false });
+    await Promise.resolve();
+
+    await expect(provider.startSession({
+      command: 'failed replacement',
+      chatId: 'chat-replacement',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: noopOperation('run-failed-replacement'),
+    })).rejects.toThrow('replacement stdin failed');
+    expect(firstProc.killed).toBe(false);
+
+    firstProc.pushJson({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'survives failed replacement' }] },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(JSON.stringify(first.events)).toContain('survives failed replacement');
+
+    await provider.startSession({
+      command: 'successful replacement',
+      chatId: 'chat-replacement',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: noopOperation('run-successful-replacement'),
+    });
+    expect(firstProc.killed).toBe(true);
+    const retiredEventCount = first.events.length;
+    await Promise.resolve();
+    expect(first.events).toHaveLength(retiredEventCount);
+
+    replacementProc.pushJson({ type: 'result', is_error: false });
+    replacementProc.close(0);
+    await Promise.resolve();
+    provider.shutdown();
+  });
+
+  it('rejects a native thread collision without disturbing the original chat', async () => {
+    const provider = new AmpCliRuntime();
+    const threadId = 'T-16161616-1616-1616-1616-161616161616';
+    const firstProc = createFakeProc();
+    spawnMock
+      .mockReturnValueOnce(createFakeCommandProc(`${threadId}\n`))
+      .mockReturnValueOnce(firstProc)
+      .mockReturnValueOnce(createFakeCommandProc(`${threadId}\n`));
+    const first = collectOperation('run-chat-a');
+    const colliding = collectOperation('run-chat-b');
+
+    await provider.startSession({
+      command: 'chat A',
+      chatId: 'chat-a',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: first.operation,
+    });
+    await expect(provider.startSession({
+      command: 'chat B',
+      chatId: 'chat-b',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: colliding.operation,
+    })).rejects.toThrow(/already bound to another chat/);
+
+    firstProc.pushJson({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'belongs only to chat A' }] },
+    });
+    firstProc.pushJson({ type: 'result', is_error: false });
+    firstProc.close(0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(JSON.stringify(first.events)).toContain('belongs only to chat A');
+    expect(colliding.events).toEqual([]);
+    provider.shutdown();
   });
 
   it('marks aborted sessions safely and allows a later resume on the same thread', async () => {
     const provider = new AmpCliRuntime();
-    const failed = mock();
-    const messages = mock();
-    provider.onFailed(failed);
-    provider.onMessages(messages);
+    const resumed = collectOperation('run-resume');
 
     const threadId = 'T-22222222-2222-2222-2222-222222222222';
     const createThreadProc = createFakeCommandProc(`${threadId}\n`);
@@ -199,6 +370,7 @@ describe('AmpCliRuntime lifecycle', () => {
       model: 'default',
       permissionMode: 'default',
       thinkingMode: 'none',
+      operation: noopOperation('run-first'),
     });
 
     const started = await startedPromise;
@@ -214,6 +386,7 @@ describe('AmpCliRuntime lifecycle', () => {
       model: 'default',
       permissionMode: 'default',
       thinkingMode: 'none',
+      operation: resumed.operation,
     });
 
     secondProc.pushJson({
@@ -231,23 +404,18 @@ describe('AmpCliRuntime lifecycle', () => {
 
     await resumedTurn;
 
-    expect(failed).not.toHaveBeenCalled();
-    expect(messages).toHaveBeenCalledTimes(1);
-    expect(messages.mock.calls[0][0]).toBe('chat-2');
-    expect(messages.mock.calls[0][1][0].content).toBe('resumed output');
+    expect(resumed.events.map((event) => event.type)).toEqual(['rows', 'run-ended']);
+    expect(resumed.events[0].rows[0].message.content).toBe('resumed output');
   });
 
-  it('ignores trailing output from a prior process after its successor starts', async () => {
+  it('[TLV5-L07.06-AMP-UNIT-01] routes trailing output from a prior process through its original operation', async () => {
     const provider = new AmpCliRuntime();
-    const messages = mock();
-    provider.onMessages(messages);
-    const terminals = [];
     let resolveFirstFinished;
     const firstFinished = new Promise((resolve) => { resolveFirstFinished = resolve; });
-    provider.onFinished((_chatId, _exitCode, metadata) => {
-      terminals.push(metadata);
-      if (terminals.length === 1) resolveFirstFinished();
+    const first = collectOperation('run-a', (event) => {
+      if (event.type === 'run-ended') resolveFirstFinished();
     });
+    const second = collectOperation('run-b');
 
     const threadId = 'T-33333333-3333-3333-3333-333333333333';
     const createThreadProc = createFakeCommandProc(`${threadId}\n`);
@@ -265,8 +433,7 @@ describe('AmpCliRuntime lifecycle', () => {
       model: 'default',
       permissionMode: 'default',
       thinkingMode: 'none',
-      clientRequestId: 'req-a',
-      turnId: 'turn-a',
+      operation: first.operation,
     });
     firstProc.pushJson({ type: 'result', is_error: false });
     await firstFinished;
@@ -280,8 +447,7 @@ describe('AmpCliRuntime lifecycle', () => {
       model: 'default',
       permissionMode: 'default',
       thinkingMode: 'none',
-      clientRequestId: 'req-b',
-      turnId: 'turn-b',
+      operation: second.operation,
     }).then(() => { secondSettled = true; });
 
     firstProc.pushJson({
@@ -296,12 +462,9 @@ describe('AmpCliRuntime lifecycle', () => {
     await Promise.resolve();
 
     expect(secondSettled).toBe(false);
-    expect(messages).not.toHaveBeenCalled();
-    expect(terminals).toEqual([{
-      clientRequestId: 'req-a',
-      commandType: 'chat-start',
-      turnId: 'turn-a',
-    }]);
+    expect(first.events.map((event) => event.type)).toEqual(['run-ended', 'rows']);
+    expect(JSON.stringify(first.events)).toContain('stale output');
+    expect(second.events).toEqual([]);
 
     secondProc.pushJson({
       type: 'assistant',
@@ -313,15 +476,95 @@ describe('AmpCliRuntime lifecycle', () => {
     secondProc.close(0);
     await secondTurn;
 
-    expect(messages).toHaveBeenCalledTimes(1);
-    expect(messages.mock.calls[0][1][0].content).toBe('current output');
-    expect(terminals).toEqual([
-      {
-        clientRequestId: 'req-a',
-        commandType: 'chat-start',
-        turnId: 'turn-a',
+    expect(second.events.map((event) => event.type)).toEqual(['rows', 'run-ended']);
+    expect(second.events[0].rows[0].message.content).toBe('current output');
+    expect(JSON.stringify(second.events)).toContain('current output');
+    expect(JSON.stringify(second.events)).not.toContain('stale output');
+  });
+
+  it('[TLV5-L07.08-AMP-UNIT-01] contains a closed prior publisher without disturbing the current turn', async () => {
+    const warnings = [];
+    let resolveWarning;
+    const warningObserved = new Promise((resolve) => { resolveWarning = resolve; });
+    const provider = new AmpCliRuntime({
+      logger: {
+        debug() {},
+        info() {},
+        warn(message, details) {
+          warnings.push({ message, details });
+          resolveWarning();
+        },
+        error() {},
       },
-      { clientRequestId: 'req-b', turnId: 'turn-b' },
-    ]);
+    });
+    const firstProc = createFakeProc();
+    const secondProc = createFakeProc();
+    const threadId = 'T-44444444-4444-4444-4444-444444444444';
+    spawnMock
+      .mockReturnValueOnce(createFakeCommandProc(`${threadId}\n`))
+      .mockReturnValueOnce(firstProc)
+      .mockReturnValueOnce(secondProc);
+    let firstClosed = false;
+    const firstEvents = [];
+    let resolveFirstTerminal;
+    const firstTerminal = new Promise((resolve) => { resolveFirstTerminal = resolve; });
+    const second = collectOperation('run-current');
+
+    await provider.startSession({
+      command: 'first',
+      chatId: 'chat-closed-publisher',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: {
+        runId: 'run-stale',
+        publish(event) {
+          if (firstClosed) throw new Error('Transcript producer sink is closed');
+          firstEvents.push(event);
+          if (event.type === 'run-ended') resolveFirstTerminal();
+        },
+      },
+    });
+    firstProc.pushJson({ type: 'result', is_error: false });
+    await firstTerminal;
+    firstClosed = true;
+
+    const secondTurn = provider.runTurn({
+      command: 'second',
+      agentSessionId: threadId,
+      chatId: 'chat-closed-publisher',
+      projectPath: '/proj',
+      model: 'default',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+      operation: second.operation,
+    });
+    firstProc.pushJson({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'rejected stale output' }] },
+    });
+    await warningObserved;
+    secondProc.pushJson({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'accepted current output' }] },
+    });
+    secondProc.pushJson({ type: 'result', is_error: false });
+    secondProc.close(0);
+    await secondTurn;
+
+    expect(firstEvents.map((event) => event.type)).toEqual(['run-ended']);
+    expect(second.events.map((event) => event.type)).toEqual(['rows', 'run-ended']);
+    expect(second.events[0].rows[0].message.content).toBe('accepted current output');
+    expect(warnings).toContainEqual({
+      message: 'Amp publisher rejected an event.',
+      details: expect.objectContaining({
+        eventType: 'rows',
+        error: 'Transcript producer sink is closed',
+      }),
+    });
+
+    firstProc.close(0);
+    provider.shutdown();
   });
 });

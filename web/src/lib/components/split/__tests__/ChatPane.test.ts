@@ -1,38 +1,46 @@
-import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import ChatPaneTestHost from './ChatPaneTestHost.svelte';
-import { AssistantMessage, BashToolUseMessage, UserMessage } from '$shared/chat-types';
-import { chatDraftStorageKey } from '$lib/utils/local-persistence';
+	import { describe, expect, it, vi } from 'vitest';
+	import { fireEvent, render, screen } from '@testing-library/svelte';
+	import ChatPaneTestHost from './ChatPaneTestHost.svelte';
+	import { AssistantMessage, BashToolUseMessage, UserMessage } from '$shared/chat-types';
+	import { chatDraftStorageKey } from '$lib/utils/local-persistence';
 
 vi.mock('$lib/api/chats.js', () => ({
 	getChatMessages: vi.fn(() =>
 		Promise.resolve({
 			historyState: { kind: 'complete' },
 			chatId: 'chat-1',
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			messages: [
 				{
-					seq: 1,
-					message: new UserMessage('2026-05-01T00:00:00.000Z', 'Unfocused user question'),
+					ordinal: 1,
+					message: new UserMessage(
+						'2026-05-01T00:00:00.000Z',
+						'Unfocused user question',
+					),
 				},
-				{
-					seq: 2,
-					message: new AssistantMessage('2026-05-01T00:00:01.000Z', 'Unfocused assistant answer'),
-				},
-				{
-					seq: 3,
-					message: new BashToolUseMessage('2026-05-01T00:00:02.000Z', 'tool-1', 'pwd'),
-				},
-				{
-					seq: 4,
-					message: new BashToolUseMessage('2026-05-01T00:00:03.000Z', 'tool-2', 'rg split'),
-				},
-			],
-			pendingUserInputs: [],
-			lastSeq: 4,
-			pageOldestSeq: 1,
-			hasMore: false,
-			limit: 50,
+					{
+						ordinal: 2,
+						message: new AssistantMessage(
+							'2026-05-01T00:00:01.000Z',
+							'Unfocused assistant answer',
+						),
+					},
+					{
+						ordinal: 3,
+						message: new BashToolUseMessage('2026-05-01T00:00:02.000Z', 'tool-1', 'pwd'),
+					},
+					{
+						ordinal: 4,
+						message: new BashToolUseMessage('2026-05-01T00:00:03.000Z', 'tool-2', 'rg split'),
+					},
+				],
+				resendCandidates: [],
+				lastOrdinal: 4,
+				pageOldestOrdinal: 1,
+				pageNewestOrdinal: 4,
+				nextBeforeOrdinal: null,
+				hasMore: false,
+				limit: 50,
 		}),
 	),
 }));
@@ -40,7 +48,7 @@ vi.mock('$lib/api/chats.js', () => ({
 describe('ChatPane', () => {
 	it('shows chat history with a pane-local composer when unfocused', async () => {
 		const onFocus = vi.fn();
-		const { container } = render(ChatPaneTestHost, { isFocused: false, onFocus });
+		render(ChatPaneTestHost, { isFocused: false, onFocus });
 
 		const focusTarget = screen.getByRole('button', {
 			name: 'Focus chat composer for Pane Test Chat',
@@ -50,17 +58,12 @@ describe('ChatPane', () => {
 		expect(await screen.findByText('Unfocused user question')).toBeTruthy();
 		expect(await screen.findByText('Unfocused assistant answer')).toBeTruthy();
 		expect(screen.getByRole('log').dataset.workspaceScrollRegion).toBe('contextual');
-		await waitFor(() =>
-			expect(
-				[...container.querySelectorAll('[data-chat-bash-command]')].map(
-					(command) => command.textContent,
-				),
-			).toEqual(['$ pwd', '$ rg split']),
-		);
-		expect(screen.queryByText('2 commands')).toBeNull();
-		expect(
-			screen.getByRole('textbox', { name: 'Focus chat composer for Pane Test Chat' }),
-		).toBeTruthy();
+		// Bash rows render individually now, so each command keeps its own stable row.
+		expect(await screen.findByText('pwd')).toBeTruthy();
+		expect(await screen.findByText('rg split')).toBeTruthy();
+		expect(await screen.findByText('pwd')).toBeTruthy();
+		expect(await screen.findByText('rg split')).toBeTruthy();
+		expect(screen.getByRole('textbox', { name: 'Focus chat composer for Pane Test Chat' })).toBeTruthy();
 
 		await fireEvent.click(focusTarget);
 
@@ -127,7 +130,12 @@ describe('ChatPane', () => {
 	it('hides Bash commands in the preview when command execution is hidden', async () => {
 		render(ChatPaneTestHost, {
 			isFocused: false,
-			hiddenToolTypes: ['bash-tool-use', 'exec-tool-use', 'wait-tool-use', 'write-stdin-tool-use'],
+			hiddenToolTypes: [
+				'bash-tool-use',
+				'exec-tool-use',
+				'wait-tool-use',
+				'write-stdin-tool-use',
+			],
 		});
 
 		expect(await screen.findByText('Unfocused assistant answer')).toBeTruthy();

@@ -25,6 +25,7 @@ function snapshot(overrides = {}) {
       carryOverRevision: 'carry-v1:0',
       projectPath: '/work/project',
       tags: ['cli', 'review'],
+      canReloadFromNativeHistory: true,
       activity: { createdAt: TIMESTAMP, lastActivityAt: TIMESTAMP },
     },
     processingPhase: 'running',
@@ -32,7 +33,6 @@ function snapshot(overrides = {}) {
       serverInstanceId: 'instance-1',
       queue: {
         entries: [],
-        dispatchingEntryId: null,
         steeringEntryId: null,
         recentlyDispatched: [],
         pause: null,
@@ -41,15 +41,21 @@ function snapshot(overrides = {}) {
       version: 0,
       updatedAt: null,
     },
-    pendingUserInputs: [],
+    transientFeed: {
+      serverInstanceId: 'instance-1',
+      chatId: CHAT_ID,
+      transcriptViewId: 'view-1',
+      transientRevision: 0,
+      rows: [],
+    },
     transcript: {
       availability: 'available',
-      generationId: 'generation-1',
+      transcriptViewId: 'view-1',
       messages: [{
-        seq: 4,
+        ordinal: 4,
         message: { type: 'assistant-message', timestamp: TIMESTAMP, content: 'Working' },
       }, {
-        seq: 5,
+        ordinal: 5,
         message: {
           type: 'bash-tool-use',
           timestamp: TIMESTAMP,
@@ -57,9 +63,11 @@ function snapshot(overrides = {}) {
           command: 'bun test',
         },
       }],
-      lastSeq: 5,
-      pageOldestSeq: 4,
-      hasMore: true,
+      lastOrdinal: 5,
+      pageOldestOrdinal: 4,
+      pageNewestOrdinal: 5,
+      nextBeforeOrdinal: null,
+      hasMore: false,
     },
     ...overrides,
   };
@@ -70,7 +78,12 @@ describe('chat snapshot contract', () => {
     expect(parseChatSnapshotResponse(snapshot())).toMatchObject({
       chat: { id: CHAT_ID, tags: ['cli', 'review'] },
       processingPhase: 'running',
-      transcript: { availability: 'available', lastSeq: 5 },
+      transcript: {
+        availability: 'available',
+        lastOrdinal: 5,
+        nextBeforeOrdinal: null,
+        hasMore: false,
+      },
     });
     expect(parseChatSnapshotResponse(snapshot({
       transcript: {
@@ -96,17 +109,37 @@ describe('chat snapshot contract', () => {
     }))).toThrow('cannot be not-requested');
   });
 
-  test('accepts opaque producer cursor metadata', () => {
+  test('accepts a newest snapshot whose committed range contains only hidden rows', () => {
     expect(parseChatSnapshotResponse(snapshot({
       transcript: {
         availability: 'available',
-        generationId: 'generation-2',
+        transcriptViewId: 'view-2',
         messages: [],
-        lastSeq: 42,
-        pageOldestSeq: 17,
+        lastOrdinal: 42,
+        pageOldestOrdinal: 0,
+        pageNewestOrdinal: 42,
+        nextBeforeOrdinal: 33,
         hasMore: true,
       },
-    })).transcript).toMatchObject({ lastSeq: 42, pageOldestSeq: 17, hasMore: true });
+      transientFeed: {
+        ...snapshot().transientFeed,
+        transcriptViewId: 'view-2',
+      },
+    })).transcript).toMatchObject({
+      lastOrdinal: 42,
+      pageOldestOrdinal: 0,
+      nextBeforeOrdinal: 33,
+      hasMore: true,
+    });
+  });
+
+  test('requires transcript and transient state to share one transcript view', () => {
+    expect(() => parseChatSnapshotResponse(snapshot({
+      transientFeed: {
+        ...snapshot().transientFeed,
+        transcriptViewId: 'view-2',
+      },
+    }))).toThrow('views differ');
   });
 
   test.each([
@@ -123,17 +156,27 @@ describe('chat snapshot contract', () => {
     ['message count', (value) => ({ ...value, messageLimit: 1 })],
     ['message cursor', (value) => ({
       ...value,
-      transcript: { ...value.transcript, lastSeq: 4 },
+        transcript: { ...value.transcript, lastOrdinal: 4 },
     })],
-    ['pending input chat', (value) => ({
+    ['message lower bound', (value) => ({
       ...value,
-      pendingUserInputs: [{
-        chatId: '1785337200123457',
-        clientRequestId: 'request-1',
-        content: 'Continue',
-        createdAt: TIMESTAMP,
-        deliveryStatus: 'accepted',
-      }],
+      transcript: { ...value.transcript, pageOldestOrdinal: 3 },
+    })],
+    ['message upper bound', (value) => ({
+      ...value,
+      transcript: { ...value.transcript, pageNewestOrdinal: 4 },
+    })],
+    ['newest page cursor', (value) => ({
+      ...value,
+      transcript: { ...value.transcript, pageNewestOrdinal: 6 },
+    })],
+    ['empty page metadata', (value) => ({
+      ...value,
+      transcript: {
+        ...value.transcript,
+        messages: [],
+        pageOldestOrdinal: 4,
+      },
     })],
     ['tags', (value) => ({ ...value, chat: { ...value.chat, tags: ['review', 'cli'] } })],
     ['protocol', (value) => ({
@@ -147,6 +190,10 @@ describe('chat snapshot contract', () => {
     ['carryover revision', (value) => ({
       ...value,
       chat: { ...value.chat, carryOverRevision: null },
+    })],
+    ['reload capability', (value) => ({
+      ...value,
+      chat: { ...value.chat, canReloadFromNativeHistory: 'yes' },
     })],
     ['timestamp', (value) => ({ ...value, observedAt: 'not-a-time' })],
   ])('rejects invalid %s data', (_label, mutate) => {

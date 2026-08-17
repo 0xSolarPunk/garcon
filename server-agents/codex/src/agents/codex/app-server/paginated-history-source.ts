@@ -1,16 +1,10 @@
 import type { ChatMessage } from '@garcon/common/chat-types';
-import {
-  AgentIntegrationError,
-  type AgentTranscriptPage,
-  type AgentTranscriptPreview,
-} from '@garcon/server-agent-interface';
+import { AgentIntegrationError } from '@garcon/server-agent-interface';
 import {
   attachNativeMessageSource,
   getNativeMessageSource,
 } from '@garcon/server-agent-common/shared/native-message-source';
-import { transcriptRevision } from '@garcon/server-agent-common/lib/transcript-revision';
 import type { CodexHistoryProfile } from '../history-profile.js';
-import { pageFromMessages } from '../history-loader.js';
 import { CodexAppServerClient } from './client.js';
 import { convertCodexAppServerItem } from './converter.js';
 import { loadPaginatedUserMessageEvidence } from './paginated-user-message-evidence.js';
@@ -132,37 +126,6 @@ export class PaginatedCodexHistorySource {
     }
   }
 
-  async loadPage(
-    page: { readonly limit: number; readonly offset: number },
-    signal: AbortSignal,
-  ): Promise<AgentTranscriptPage | null> {
-    if (!validPage(page)) return null;
-    return pageFromMessages(await this.load(signal), page.limit, page.offset);
-  }
-
-  async preview(signal: AbortSignal): Promise<AgentTranscriptPreview | null> {
-    const messages = await this.load(signal);
-    const conversational = messages.filter(
-      (message) =>
-        message.type === 'user-message' || message.type === 'assistant-message',
-    );
-    const first = conversational[0];
-    if (!first || typeof first.content !== 'string') return null;
-    const last = conversational[conversational.length - 1] ?? first;
-    const lastActivity = [...messages]
-      .reverse()
-      .find((message) => typeof message.timestamp === 'string');
-    return {
-      firstMessage: first.content,
-      lastMessage: typeof last.content === 'string' ? last.content : first.content,
-      createdAt: this.profile.createdAt,
-      lastActivity: lastActivity?.timestamp ?? this.profile.createdAt,
-    };
-  }
-
-  async revision(signal: AbortSignal): Promise<string> {
-    return transcriptRevision(await this.load(signal));
-  }
 }
 
 function mergeTurnEvidence(
@@ -281,19 +244,6 @@ function codexTimestamp(value: number | null, fallback: string): string {
   const milliseconds = value < 100_000_000_000 ? value * 1_000 : value;
   const timestamp = new Date(milliseconds);
   return Number.isNaN(timestamp.getTime()) ? fallback : timestamp.toISOString();
-}
-
-function validPage(page: {
-  readonly limit: number;
-  readonly offset: number;
-}): boolean {
-  return (
-    Number.isSafeInteger(page.limit) &&
-    page.limit > 0 &&
-    Number.isSafeInteger(page.offset) &&
-    page.offset >= 0 &&
-    page.offset <= Number.MAX_SAFE_INTEGER - page.limit
-  );
 }
 
 function upstreamRequestId(message: ChatMessage): string | null {

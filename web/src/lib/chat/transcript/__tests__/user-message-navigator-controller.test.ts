@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AssistantMessage, UserMessage, type ChatMessage } from '$shared/chat-types';
-import type { ChatViewMessage } from '$shared/chat-view';
+import type { TranscriptMessage } from '$shared/chat-view';
 import { ActiveTranscriptState } from '../active-transcript-state.svelte.js';
 import {
 	UserMessageNavigatorController,
@@ -10,8 +10,8 @@ import {
 
 const TS = '2026-07-22T00:00:00.000Z';
 
-function entry(seq: number, message: ChatMessage): ChatViewMessage {
-	return { seq, message };
+function entry(ordinal: number, message: ChatMessage): TranscriptMessage {
+	return { ordinal, message };
 }
 
 function user(
@@ -34,12 +34,14 @@ function deferred<T>() {
 	return { promise, resolve };
 }
 
-function setup(messages: ChatViewMessage[] = [entry(1, user('first'))]) {
+function setup(messages: TranscriptMessage[] = [entry(1, user('first'))]) {
 	const transcript = new ActiveTranscriptState();
 	transcript.replaceGeneration('chat-1', 'generation-1', messages, {
-		lastSeq: messages.at(-1)?.seq ?? 0,
-		pageOldestSeq: messages[0]?.seq ?? 0,
-		hasMore: (messages[0]?.seq ?? 1) > 1,
+		lastOrdinal: messages.at(-1)?.ordinal ?? 0,
+		pageOldestOrdinal: messages[0]?.ordinal ?? 0,
+		pageNewestOrdinal: messages.at(-1)?.ordinal ?? 0,
+		nextBeforeOrdinal: null,
+		hasMore: false,
 	});
 	let selectedChatId: string | null = 'chat-1';
 	const reloadTranscript = vi.fn(async () => undefined);
@@ -86,8 +88,8 @@ describe('UserMessageNavigatorController', () => {
 		controller.openForActiveChat();
 
 		expect(controller.items).toEqual([
-			expect.objectContaining({ id: 'generation-1:3', seq: 3, content: 'second' }),
-			expect.objectContaining({ id: 'generation-1:1', seq: 1, content: 'first' }),
+			expect.objectContaining({ id: 'generation-1:3', ordinal: 3, content: 'second' }),
+			expect.objectContaining({ id: 'generation-1:1', ordinal: 1, content: 'first' }),
 		]);
 	});
 
@@ -96,7 +98,8 @@ describe('UserMessageNavigatorController', () => {
 		const { controller, transcript, restoreLatestTranscript } = setup([
 			entry(1, user('early prompt')),
 		]);
-		transcript.lastSeq = 100;
+		transcript.lastOrdinal = 100;
+		transcript.hasLaterMessages = true;
 		restoreLatestTranscript.mockImplementationOnce(async () => {
 			const restored = await pendingRestore.promise;
 			if (restored) {
@@ -104,7 +107,6 @@ describe('UserMessageNavigatorController', () => {
 					entry(99, user('recent prompt')),
 					entry(100, assistant('recent response')),
 				];
-				transcript.oldestSeq = 99;
 				transcript.hasEarlierMessages = true;
 			}
 			return restored;
@@ -120,20 +122,20 @@ describe('UserMessageNavigatorController', () => {
 		expect(controller.items.map((item) => item.content)).toEqual(['recent prompt']);
 	});
 
-	it('includes pending and failed user rows with attachment metadata', () => {
+	it('includes optimistic user rows with attachment metadata', () => {
 		const { controller, transcript } = setup();
-		transcript.upsertPendingUserInput({
+		transcript.upsertOptimisticUserInput({
 			chatId: 'chat-1',
-			clientRequestId: 'request-1',
+			clientMessageId: 'message-1',
 			content: '',
 			createdAt: '2026-07-22T00:00:02.000Z',
-			deliveryStatus: 'failed',
-			attachments: [{ name: 'context.pdf', mimeType: 'application/pdf' }],
+			delivery: 'pending',
+			images: [{ name: 'context.pdf', mimeType: 'application/pdf', data: '' }],
 		});
 		controller.openForActiveChat();
 
 		expect(controller.items[0]).toMatchObject({
-			id: 'pending:request-1',
+			id: 'optimistic:message-1',
 			content: '',
 			attachmentCount: 1,
 		});
@@ -223,13 +225,15 @@ describe('UserMessageNavigatorController', () => {
 		controller.openForActiveChat();
 		expect(controller.isInitialLoading).toBe(true);
 		transcript.replaceGeneration('chat-1', 'generation-1', [], {
-			lastSeq: 0,
-			pageOldestSeq: 0,
+			lastOrdinal: 0,
+			pageOldestOrdinal: 0,
+			pageNewestOrdinal: 0,
+			nextBeforeOrdinal: null,
 			hasMore: false,
 		});
 		controller.reconcileActiveTranscript('chat-1', 'generation-1');
 
-		expect(controller.openedGenerationId).toBe('generation-1');
+		expect(controller.openedTranscriptViewId).toBe('generation-1');
 		expect(controller.isInitialLoading).toBe(false);
 	});
 
@@ -252,16 +256,15 @@ describe('UserMessageNavigatorController', () => {
 		expect(controller.items).toEqual([]);
 	});
 
-	it('jumps to a pending draft row before a transcript generation is established', async () => {
+	it('jumps to an optimistic input before a transcript view is established', async () => {
 		const transcript = new ActiveTranscriptState();
 		transcript.activateChat('chat-1');
-		transcript.upsertPendingUserInput({
+		transcript.upsertOptimisticUserInput({
 			chatId: 'chat-1',
-			clientRequestId: 'request-1',
+			clientMessageId: 'message-1',
 			content: 'First message',
 			createdAt: TS,
-			deliveryStatus: 'submitting',
-			attachments: [],
+			delivery: 'pending',
 		});
 		const jumpToRow = vi.fn(async () => 'completed' as const);
 		const controller = new UserMessageNavigatorController({
@@ -278,8 +281,8 @@ describe('UserMessageNavigatorController', () => {
 
 		expect(jumpToRow).toHaveBeenCalledWith({
 			chatId: 'chat-1',
-			generationId: '',
-			rowId: 'pending:request-1',
+			transcriptViewId: '',
+			rowId: 'optimistic:message-1',
 		});
 		expect(controller.open).toBe(false);
 	});
@@ -311,7 +314,7 @@ describe('UserMessageNavigatorController', () => {
 
 		controller.openForActiveChat();
 
-		expect(controller.openedGenerationId).toBe('generation-1');
+		expect(controller.openedTranscriptViewId).toBe('generation-1');
 		expect(controller.isInitialLoading).toBe(false);
 		expect(controller.items).toHaveLength(1);
 	});
@@ -329,7 +332,7 @@ describe('UserMessageNavigatorController', () => {
 
 		expect(jumpToRow).toHaveBeenCalledWith({
 			chatId: 'chat-1',
-			generationId: 'generation-1',
+			transcriptViewId: 'generation-1',
 			rowId: 'generation-1:1',
 		});
 		expect(controller.open).toBe(false);
@@ -396,13 +399,13 @@ describe('UserMessageNavigatorController', () => {
 		expect(loadOlderMessages).toHaveBeenCalledTimes(2);
 	});
 
-	it('closes when an established transcript generation changes', () => {
+	it('closes when an established transcript view changes', () => {
 		const { controller } = setup();
 		controller.openForActiveChat();
 
 		controller.reconcileActiveTranscript('chat-1', 'generation-2');
 
 		expect(controller.open).toBe(false);
-		expect(controller.openedGenerationId).toBeNull();
+		expect(controller.openedTranscriptViewId).toBeNull();
 	});
 });

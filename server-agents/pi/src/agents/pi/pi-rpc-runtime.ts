@@ -5,13 +5,15 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import {
   ErrorMessage,
-  ToolResultMessage,
+  type ChatMessage,
 } from '@garcon/common/chat-types';
 import { isArtificialNativePath } from '@garcon/server-agent-common/chats/artificial-native-path';
+import {
+  runtimeRows,
+  type AgentRuntimeEvent,
+} from '@garcon/server-agent-common/execution/runtime-events';
 import { errorMessage } from '@garcon/server-agent-common/lib/errors';
-import { normalizeToolResultContent } from '@garcon/server-agent-common/shared/normalize-util';
 import { IdleSessionPurger } from '@garcon/server-agent-common/shared/idle-session-purger';
-import { AgentEventEmitterRuntime } from '@garcon/server-agent-common/shared/event-emitter-runtime';
 import type {
   AgentLogger,
   AgentSteerRequest,
@@ -22,8 +24,9 @@ import { AgentIntegrationError } from '@garcon/server-agent-interface';
 import type { PiConfig } from '../../config.js';
 import {
   buildPiCliEnv,
+  buildPiRpcSpawnCommand,
   mapThinkingMode,
-  PI_READ_ONLY_TOOLS,
+  pipePiStderr,
   requireExplicitPiModel,
 } from './pi-cli.js';
 import {
@@ -43,82 +46,30 @@ import {
 import {
   assertPiExecutionOpen,
   markPiExecutionStarted,
-  piEventMetadata,
   type PiResumeRequest,
   type PiStartedSession,
   type PiStartRequest,
 } from './runtime-types.js';
-import {
-  canonicalExistingPiSessionPath,
-  resolvePiConfiguredSessionDir,
-} from './pi-session-paths.js';
+import { canonicalExistingPiSessionPath } from './pi-session-paths.js';
 import { convertPiMessage } from './message-converter.js';
 import { terminatePiProcess } from './pi-process-lifecycle.js';
-import { convertPiToolUse } from './tool-use-converter.js';
+import type {
+  CapturedPiSteerTarget,
+  PiActiveTurn,
+  PiPromptDispatch,
+  PiRetireOptions,
+  PiRpcSession,
+  PiSteerSubmission,
+} from './pi-rpc-session-state.js';
 
 export interface PiModelReader {
   getModels(): Promise<Array<{ value: string; label: string; supportsImages?: boolean }>>;
 }
 
-type PiRpcSessionState = 'starting' | 'idle' | 'prompting' | 'active' | 'retiring';
-
-interface PiSteerSubmission {
-  readonly input: string;
-  accepted: boolean;
-  delivered: boolean;
-  persisted: boolean;
-}
-
-interface PiActiveTurn {
-  turnId: string | undefined;
-  stopRequested: boolean;
-  settleObserved: boolean;
-  completion: 'pending' | 'finished' | 'failed' | 'stopped' | 'shutdown';
-  failureMessage: string | null;
-  readonly steerSubmissions: Set<PiSteerSubmission>;
-  steeringQueue: readonly string[];
-  settle(): void;
-}
-
-interface PiRpcSession {
-  generation: number;
-  state: PiRpcSessionState;
-  id: string;
-  chatId: string;
-  nativePath: string | null;
-  model: string;
-  thinking: string | undefined;
-  process: ReturnType<typeof Bun.spawn> | null;
-  client: PiRpcClient | null;
-  turn: PiActiveTurn | null;
-  deliveryReservations: number;
-  pendingFinish: (() => void) | null;
-  startTime: number;
-  lastActivityAt: number;
-  eventMetadata: ReturnType<typeof piEventMetadata>;
-  exitPromise: Promise<void> | null;
-}
-
-interface CapturedPiSteerTarget {
-  session: PiRpcSession;
-  generation: number;
-  turn: PiActiveTurn;
-}
-
-interface PiRetireOptions {
-  readonly turnOutcome?: 'failed' | 'stopped' | 'shutdown' | 'preserve';
-  readonly failureMessage?: string;
-}
-
-interface PiPromptDispatch {
-  readonly accepted: Promise<void>;
-  readonly settle: Promise<void>;
-}
-
 const READY_TIMEOUT_MS = 60_000;
 const STEER_RESPONSE_TIMEOUT_MS = 15_000;
 
-export class PiRpcRuntime extends AgentEventEmitterRuntime {
+export class PiRpcRuntime {
   readonly #config: PiConfig;
   readonly #logger: AgentLogger;
   readonly #models: PiModelReader;
@@ -138,7 +89,6 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
       readonly maxIdleMs?: number;
     };
   }) {
-    super();
     this.#config = options.config;
     this.#logger = options.logger;
     this.#models = options.models;
@@ -170,11 +120,12 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
       assertPiExecutionOpen(request);
       this.#assertAcceptingOperations();
       this.#sessions.set(session.id, session);
-      this.emitSessionCreated(session.chatId);
-      const dispatch = this.#dispatchPrompt(session, request, prompt);
+      const started = { agentSessionId: session.id, nativePath: session.nativePath };
+      request.onSessionActivated?.(started);
+      const dispatch = await this.#dispatchPrompt(session, request, prompt);
       // Initial session identity must bind before an unbounded prompt preflight can wedge.
       void dispatch.accepted.catch(() => undefined);
-      return { agentSessionId: session.id, nativePath: session.nativePath };
+      return started;
     } catch (error) {
       if (session) {
         await this.#retireAndLog(session, 'initial turn failed', {
@@ -237,9 +188,8 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
       this.#assertAcceptingOperations();
       if (spawned) this.#sessions.set(request.agentSessionId, session);
       session.chatId = request.chatId;
-      session.eventMetadata = piEventMetadata(request);
       session.lastActivityAt = Date.now();
-      const dispatch = this.#dispatchPrompt(session, request, prompt);
+      const dispatch = await this.#dispatchPrompt(session, request, prompt);
       this.#launchingSessionIds.delete(request.agentSessionId);
       await dispatch.accepted;
       await dispatch.settle;
@@ -372,7 +322,7 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
       }
       this.#logger.debug('Pi steering accepted', {
         chatId: captured.session.chatId,
-        turnId: captured.turn.turnId ?? null,
+        runId: captured.turn.operation.runId,
         sessionId: captured.session.id.slice(0, 8),
       });
       return { kind: 'accepted' };
@@ -470,16 +420,14 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
     this.#assertAcceptingOperations();
     const model = requireExplicitPiModel(request.model);
     const thinking = mapThinkingMode(request.thinkingMode);
-    const args = ['--mode', 'rpc', '--model', model];
-    if (thinking) args.push('--thinking', thinking);
-    if (request.permissionMode === 'plan') {
-      args.push('--tools', PI_READ_ONLY_TOOLS.join(','));
-    }
-    const configuredSessionDir = resolvePiConfiguredSessionDir(request.projectPath, this.#config);
-    if (configuredSessionDir) args.push('--session-dir', configuredSessionDir);
-    if (resume) args.push('--session', resume.nativePath);
-
-    const proc = Bun.spawn([this.#config.binary(), ...args], {
+    const proc = Bun.spawn(buildPiRpcSpawnCommand({
+      config: this.#config,
+      model,
+      thinking,
+      permissionMode: request.permissionMode,
+      projectPath: request.projectPath,
+      resumePath: resume?.nativePath ?? null,
+    }), {
       cwd: request.projectPath,
       env: buildPiCliEnv(request.envOverrides),
       stdin: 'pipe',
@@ -503,7 +451,6 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
       pendingFinish: null,
       startTime: now,
       lastActivityAt: now,
-      eventMetadata: piEventMetadata(request, resume ? undefined : 'chat-start'),
       exitPromise: null,
     };
     this.#liveSessions.add(session);
@@ -521,13 +468,12 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
           });
         }
       },
-      onMalformed: (line) => this.#logger.warn('Pi emitted malformed RPC JSON', {
+      onMalformed: () => this.#logger.warn('Pi emitted malformed RPC JSON', {
         sessionId: session.id,
-        line: line.slice(0, 120),
       }),
     });
     session.client = client;
-    void this.#pipeStderr(session, proc);
+    void pipePiStderr(this.#logger, session.id, proc);
     void client.exited
       .then((code) => this.#handleExit(session, generation, code))
       .catch((error) => {
@@ -621,11 +567,11 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
     session.state = 'idle';
   }
 
-  #dispatchPrompt(
+  async #dispatchPrompt(
     session: PiRpcSession,
     request: PiStartRequest | PiResumeRequest,
     prompt: PreparedPiRpcPrompt,
-  ): PiPromptDispatch {
+  ): Promise<PiPromptDispatch> {
     const client = session.client;
     if (!client) throw new Error('Pi session has no RPC client');
     let resolveSettle!: () => void;
@@ -633,7 +579,7 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
       resolveSettle = resolve;
     });
     const turn: PiActiveTurn = {
-      turnId: request.turnId,
+      operation: request.operation,
       stopRequested: false,
       settleObserved: false,
       completion: 'pending',
@@ -643,20 +589,16 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
       settle: resolveSettle,
     };
     assertPiExecutionOpen(request);
-    markPiExecutionStarted(request);
+    if (request.executionAdmission) await markPiExecutionStarted(request);
     session.turn = turn;
     session.state = 'prompting';
     session.startTime = Date.now();
     session.lastActivityAt = session.startTime;
-    this.#emitLifecycle(session, 'processing-started', () => {
-      this.emitProcessing(session.chatId, true);
-    });
     const response = client.sendUnbounded({
       type: 'prompt',
       message: prompt.message,
       ...(prompt.images.length > 0 ? { images: prompt.images } : {}),
     });
-    request.onAbortable?.();
     return {
       accepted: this.#awaitPromptAcceptance(session, turn, response),
       settle,
@@ -711,6 +653,13 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
     }
 
     if (type === 'message_end') {
+      const turn = session.turn;
+      if (!turn) {
+        this.#logger.warn('Ignoring Pi message without an active turn', {
+          sessionId: session.id,
+        });
+        return;
+      }
       const message = event.message as unknown;
       const role = message && typeof message === 'object'
         ? (message as Record<string, unknown>).role
@@ -719,12 +668,8 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
         this.#observeSteeringPersistence(session, message);
         return;
       }
-      const messages = convertPiMessage(message, {
-        includeToolCalls: false,
-        includeToolResults: false,
-        includeUser: false,
-      });
-      if (messages.length > 0) this.emitMessages(session.chatId, messages, session.eventMetadata);
+      const messages = convertPiMessage(message, { includeUser: false });
+      if (messages.length > 0) this.#publishMessages(session, turn, messages);
 
       const stopReason = message && typeof message === 'object'
         ? (message as Record<string, unknown>).stopReason
@@ -733,41 +678,10 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
         const errorMessage = message && typeof message === 'object'
           ? (message as Record<string, unknown>).errorMessage
           : null;
-        this.emitMessages(session.chatId, [
+        this.#publishMessages(session, turn, [
           new ErrorMessage(timestamp, typeof errorMessage === 'string' ? errorMessage : 'Pi turn failed.'),
-        ], session.eventMetadata);
+        ]);
       }
-      return;
-    }
-
-    if (type === 'tool_execution_start') {
-      this.emitMessages(session.chatId, [
-        convertPiToolUse(
-          timestamp,
-          typeof event.toolCallId === 'string' ? event.toolCallId : '',
-          typeof event.toolName === 'string' ? event.toolName : 'Unknown',
-          event.args,
-        ),
-      ], session.eventMetadata);
-      return;
-    }
-
-    if (type === 'tool_execution_end') {
-      const result = event.result && typeof event.result === 'object'
-        ? event.result as Record<string, unknown>
-        : event.result;
-      this.emitMessages(session.chatId, [
-        new ToolResultMessage(
-          timestamp,
-          typeof event.toolCallId === 'string' ? event.toolCallId : '',
-          normalizeToolResultContent(
-            result && typeof result === 'object' && 'content' in result
-              ? (result as Record<string, unknown>).content
-              : result,
-          ),
-          Boolean(event.isError),
-        ),
-      ], session.eventMetadata);
       return;
     }
 
@@ -805,7 +719,9 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
     const persisted = Array.from(turn.steerSubmissions).find(
       (submission) => submission.delivered && !submission.persisted && submission.input === input,
     );
-    if (persisted) persisted.persisted = true;
+    if (persisted) {
+      persisted.persisted = true;
+    }
   }
 
   #handleSettle(session: PiRpcSession): void {
@@ -823,14 +739,19 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
   #finishSettle(session: PiRpcSession): void {
     const turn = session.turn;
     if (!turn) return;
+    const steeringUnresolved = this.#hasUnresolvedSteering(turn);
+    this.#completeTurn(session, turn, 'finished');
+    if (steeringUnresolved) {
+      this.#retireInBackground(session, 'steering remained uncertain at settle');
+    }
+  }
+
+  #hasUnresolvedSteering(turn: PiActiveTurn): boolean {
     const hasUnpersistedSteer = Array.from(turn.steerSubmissions).some(
       (submission) => submission.accepted && !submission.persisted,
     );
     const hasQueuedSteering = turn.steeringQueue.length > 0;
-    this.#completeTurn(session, turn, 'finished');
-    if (hasUnpersistedSteer || hasQueuedSteering) {
-      this.#retireInBackground(session, 'steering remained uncertain at settle');
-    }
+    return hasUnpersistedSteer || hasQueuedSteering;
   }
 
   #handleExit(session: PiRpcSession, generation: number, code: number): void {
@@ -864,20 +785,27 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
     if (session.turn === turn) session.turn = null;
     session.pendingFinish = null;
     session.lastActivityAt = Date.now();
-    this.#emitLifecycle(session, 'processing-finished', () => {
-      this.emitProcessing(session.chatId, false);
-    });
     if (outcome === 'finished') {
-      this.#emitLifecycle(session, 'turn-finished', () => {
-        this.emitFinished(session.chatId, 0, session.eventMetadata);
+      this.#publishTurnEvent(session, turn, {
+        type: 'run-ended',
+        runId: turn.operation.runId,
+        outcome: 'finished',
+      });
+    } else if (outcome === 'stopped') {
+      this.#publishTurnEvent(session, turn, {
+        type: 'run-ended',
+        runId: turn.operation.runId,
+        outcome: 'finished',
       });
     } else if (outcome === 'failed') {
-      this.#emitLifecycle(session, 'turn-failed', () => {
-        this.emitFailed(
-          session.chatId,
-          failureMessage ?? 'Pi turn failed before completion',
-          session.eventMetadata,
-        );
+      this.#publishTurnEvent(session, turn, {
+        type: 'run-ended',
+        runId: turn.operation.runId,
+        outcome: 'failed',
+        error: {
+          code: 'PROVIDER_FAILURE',
+          message: failureMessage ?? 'Pi turn failed before completion',
+        },
       });
     }
     turn.settle();
@@ -886,19 +814,30 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
     }
   }
 
-  #emitLifecycle(session: PiRpcSession, event: string, emit: () => void): void {
+  #publishMessages(
+    session: PiRpcSession,
+    turn: PiActiveTurn,
+    messages: ChatMessage[],
+  ): void {
+    this.#publishTurnEvent(session, turn, {
+      type: 'rows',
+      rows: runtimeRows(messages),
+    });
+  }
+
+  #publishTurnEvent(
+    session: PiRpcSession,
+    turn: PiActiveTurn,
+    event: AgentRuntimeEvent,
+  ): void {
     try {
-      emit();
+      turn.operation.publish(event);
     } catch (error) {
-      try {
-        this.#logger.error('Pi lifecycle event handling failed', {
-          sessionId: session.id,
-          event,
-          error: errorMessage(error),
-        });
-      } catch {
-        // Lifecycle completion must not depend on a logger implementation.
-      }
+      this.#logger.warn('Pi publisher rejected an event', {
+        sessionId: session.id,
+        eventType: event.type,
+        error: errorMessage(error),
+      });
     }
   }
 
@@ -971,27 +910,4 @@ export class PiRpcRuntime extends AgentEventEmitterRuntime {
     });
   }
 
-  async #pipeStderr(session: PiRpcSession, proc: ReturnType<typeof Bun.spawn>): Promise<void> {
-    const stderr = proc.stderr;
-    if (!stderr) return;
-    const decoder = new TextDecoder();
-    let buffer = '';
-    try {
-      const reader = (stderr as ReadableStream<Uint8Array>).getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          if (line.trim()) this.#logger.info('Pi stderr output', { sessionId: session.id, line });
-        }
-      }
-      buffer += decoder.decode();
-      if (buffer.trim()) this.#logger.info('Pi stderr output', { sessionId: session.id, line: buffer });
-    } catch {
-      // Stream closed.
-    }
-  }
 }

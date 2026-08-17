@@ -3,37 +3,31 @@ import type {
   AgentHandoffRequest,
 } from '../../common/chat-command-contracts.js';
 import type { AgentCatalogEntry } from '../../common/agents.js';
-import {
-  renderCarriedContext,
-  sanitizeRecordedCarriedContext,
-} from '../../common/transcript-seed.js';
 import type { ApiProviderEndpointResolver } from '../api-providers/endpoint-resolver.js';
 import type { DirectInputPreparationContext } from '../chat-execution/types.js';
-import type { AgentOwnershipJournal } from '../chats/agent-ownership-journal.js';
-import {
-  CarryOverTranscriptError,
-  type CarryOverTranscriptStore,
-  type PreparedCarryOverSegment,
-} from '../chats/carryover-transcript-store.js';
 import type {
-  CarryOverSegmentRef,
-  ChatRegistryEntry,
-  IChatRegistry,
-} from '../chats/store.js';
-import {
-  carryOverRevision,
-  emptyEraId,
-  handoffSegmentId,
-  reconcileArchivedTail,
-} from '../chats/carryover-segments.js';
+  AgentHandoffIntent,
+  AgentOwnershipJournal,
+} from '../chats/agent-ownership-journal.js';
+import type { ChatRegistryEntry, IChatRegistry } from '../chats/store.js';
 import { DomainError } from '../lib/domain-error.js';
 import { createLogger } from '../lib/log.js';
 import type { IntegrationRegistry } from './integration-registry.js';
-import { toAgentChatReference } from './integration-chat-reference.js';
 import type { ResolvedAgentHandoffTarget } from './agent-handoff-types.js';
-import type { SettledNativeCaptureService } from './settled-native-capture.js';
+import type { TranscriptLedgerService } from '../ledger/service.js';
+import type { LedgerAgentSwitchRow, TranscriptWatermark } from '../ledger/contracts.js';
+import { frozenConversationDrafts } from '../ledger/projection.js';
 
 const logger = createLogger('agents:handoff');
+const MAX_RECOVERY_RETRY_DELAY_MS = 1_000;
+const INITIAL_RECOVERY_RETRY_DELAY_MS = 25;
+
+type HandoffRecoveryStep = 'ledger-boundary' | 'registry' | 'journal' | 'producer' | 'fenced';
+
+interface PendingHandoffRecovery {
+  readonly intent: AgentHandoffIntent;
+  step: HandoffRecoveryStep;
+}
 
 export interface AgentHandoffPreparation {
   readonly operation: 'agent-handoff';
@@ -42,6 +36,11 @@ export interface AgentHandoffPreparation {
 }
 
 export class AgentHandoffService {
+  readonly #recoveries = new Map<string, PendingHandoffRecovery>();
+  readonly #activeRecoveryAttempts = new Map<string, Promise<void>>();
+  readonly #recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #shutdownController = new AbortController();
+
   constructor(private readonly deps: {
     readonly registry: IChatRegistry;
     readonly integrations: IntegrationRegistry;
@@ -49,139 +48,40 @@ export class AgentHandoffService {
     readonly catalog: {
       getAgentCatalogEntry(agentId: string): Promise<AgentCatalogEntry | null>;
     };
-    readonly carryOver: CarryOverTranscriptStore;
-    readonly settledCapture: SettledNativeCaptureService;
     readonly ownership: AgentOwnershipJournal;
+    readonly ledger: TranscriptLedgerService;
+    readonly reopenProducer: (chatId: string) => void;
     readonly onCommitted?: (chatId: string) => void | Promise<void>;
   }) {}
 
-  // Archives a chat's live provider era into immutable segments and returns the
-  // refs a continuation should inherit. Shared with `/handoff`, which continues
-  // under the same agent in a new chat rather than switching owner in place, so
-  // both paths capture the source identically and only differ in what they do
-  // with the result. The caller owns the returned handle and must release or
-  // discard it, exactly as the in-place handoff does around its commit.
-  async captureContinuationSegments(input: {
-    readonly chatId: string;
-    readonly source: ChatRegistryEntry;
-    readonly target: { readonly agentId: string; readonly model: string };
-    readonly operationId: string;
-    readonly clientRequestId: string;
-    readonly signal: AbortSignal;
-  }): Promise<{
-    readonly segments: readonly CarryOverSegmentRef[];
-    readonly prepared: PreparedCarryOverSegment | null;
-    // Re-asserts that the provider transcript still matches what was captured.
-    // Resolves immediately when the source had no session to capture.
-    assertUnchanged(signal: AbortSignal): Promise<void>;
-  }> {
-    const source = input.source;
-    const integration = this.deps.integrations.get(source.agentId);
-    if (!integration) {
-      throw new DomainError(
-        'SOURCE_TRANSCRIPT_UNAVAILABLE',
-        'The source agent integration is unavailable.',
-        422,
-      );
-    }
-    await this.deps.carryOver.assertAvailable(source.carryOverSegments, input.signal);
-    const reference = toAgentChatReference(
-      integration,
-      input.chatId,
-      source,
-      this.deps.carryOver.revision(
-        source.carryOverSegments,
-        source.carryOverMigrationQuarantine,
-      ),
-    );
-    const snapshot = source.agentSessionId
-      ? await this.deps.settledCapture.loadStable({
-          chatId: input.chatId,
-          integration,
-          reference,
-          signal: input.signal,
-        })
-      : null;
-    const sanitized = sanitizeRecordedCarriedContext({
-      messages: snapshot?.messages ?? [],
-      receipt: source.nativeSeedReceipt,
-      agentSessionId: source.agentSessionId,
-    });
-    if (sanitized.kind === 'mismatch') {
-      throw new DomainError(
-        'CONTEXT_ENVELOPE_MISMATCH',
-        'The recorded carried-context envelope does not match this native session.',
-        422,
-      );
-    }
+  shutdown(): void {
+    if (this.#shutdownController.signal.aborted) return;
+    this.#shutdownController.abort(new Error('Agent handoff service shut down'));
+    for (const timer of this.#recoveryTimers.values()) clearTimeout(timer);
+    this.#recoveryTimers.clear();
+  }
 
-    const capturedAt = new Date().toISOString();
-    let segments = reconcileArchivedTail(
-      source.carryOverSegments,
-      { agentId: source.agentId, model: source.model },
-      () => emptyEraId(input.chatId, input.operationId),
-      capturedAt,
-    );
-    const segmentId = handoffSegmentId(input.chatId, input.clientRequestId);
-    const trailingHandoff = { agentId: input.target.agentId, model: input.target.model };
-    let prepared: PreparedCarryOverSegment | null = null;
-    if (sanitized.messages.length > 0) {
-      prepared = await this.deps.carryOver.prepareSegment({
-        operationId: input.operationId,
-        id: segmentId,
-        seedSanitation: sanitized.kind,
-        messages: sanitized.messages,
-        signal: input.signal,
-      });
-      // Ownership of the handle only reaches the caller on success, so anything
-      // that throws between here and the return has to discard it itself. A
-      // committed-but-abandoned segment stays writer-rooted for the process
-      // lifetime, so it is never swept, and a retry deriving the same
-      // deterministic id then collides with it.
-      try {
-        await prepared.commit();
-        const ref: CarryOverSegmentRef = {
-          id: prepared.id,
-          agentId: source.agentId,
-          model: source.model,
-          capturedAt,
-          storedMessageCount: prepared.messageCount,
-          visibleMessageCount: prepared.messageCount,
-          trailingHandoff,
-        };
-        await this.deps.carryOver.verifySegment(ref, input.signal);
-        segments = [...segments, ref];
-      } catch (error) {
-        await prepared.discard().catch(() => undefined);
-        throw error;
-      }
-    } else if (source.agentSessionId || segments.length > 0) {
-      segments = [
-        ...segments,
-        {
-          id: segmentId,
-          agentId: source.agentId,
-          model: source.model,
-          capturedAt,
-          storedMessageCount: 0,
-          visibleMessageCount: 0,
-          trailingHandoff,
-        },
-      ];
+  seedContinuationLedger(input: {
+    readonly sourceChatId: string;
+    readonly targetChatId: string;
+  }): TranscriptWatermark {
+    if (this.deps.ledger.currentView(input.targetChatId)) {
+      throw new DomainError(
+        'IDEMPOTENCY_CONFLICT',
+        `Session already exists: ${input.targetChatId}`,
+        409,
+      );
     }
-    return {
-      segments,
-      prepared,
-      assertUnchanged: async (signal) => {
-        if (!snapshot) return;
-        await this.deps.settledCapture.assertRevision({
-          integration,
-          reference,
-          expectedRevision: snapshot.revision,
-          signal,
-        });
-      },
-    };
+    const watermark = this.deps.ledger.highWatermark(input.sourceChatId);
+    const rows = frozenConversationDrafts(
+      this.deps.ledger.rowsThrough(input.sourceChatId, watermark),
+    );
+    this.deps.ledger.initializeChat(input.targetChatId, rows, rows.length + 1);
+    return watermark;
+  }
+
+  deleteContinuationLedger(chatId: string): void {
+    this.deps.ledger.deleteChat(chatId);
   }
 
   async resolveTarget(input: {
@@ -196,7 +96,6 @@ export class AgentHandoffService {
         409,
       );
     }
-    assertCarryOverAvailable(input.chat);
     const requested = input.handoff.target;
     if (requested.agentId === input.chat.agentId) {
       throw new DomainError(
@@ -310,115 +209,223 @@ export class AgentHandoffService {
     const submittedTargetHash = handoffTargetHash(input.handoff);
     const sourceSnapshot = cloneRegistryEntry(input.source);
     const sourceFence = ownershipFence(sourceSnapshot);
-    let preparedSegment: PreparedCarryOverSegment | null = null;
-    let intentStarted = false;
-    let registryCommitted = false;
-    let targetFence: OwnershipFence | null = null;
+    let completed = false;
 
     return {
       operation: 'agent-handoff',
       prepare: async (context) => {
+        this.#shutdownController.signal.throwIfAborted();
+        let decisionAttempted = false;
+        let producerClosed = false;
         try {
-          assertCarryOverAvailable(sourceSnapshot);
-          const existing = this.deps.ownership.findHandoff(input.chatId, input.clientRequestId);
+          this.#requireUnchangedSource(input.chatId, sourceFence);
+          const existing = this.deps.ownership.findHandoff(
+            input.chatId,
+            input.clientRequestId,
+          );
           if (existing) {
-            if (existing.submittedTargetHash !== submittedTargetHash) {
-              throw new DomainError(
-                'IDEMPOTENCY_CONFLICT',
-                'clientRequestId was reused with a different handoff target.',
-                409,
-              );
-            }
-            intentStarted = true;
-            targetFence = {
-              agentId: existing.target.execution.agentId,
-              agentOwnershipEpoch: existing.target.agentOwnershipEpoch,
-              agentSessionId: null,
-              carryOverRevision: carryOverRevision(existing.target.carryOverSegments),
-            };
-            await this.deps.carryOver.assertAvailable(
-              existing.target.carryOverSegments,
-              context.signal,
-            );
-            if (existing.target.carryOverSegments.length > 0) {
-              const tail = await this.deps.carryOver.loadProjectionSource({
-                refs: existing.target.carryOverSegments,
-                signal: context.signal,
-              });
-              renderCarriedContext(tail);
-            }
-            context.assertAdmissionActive();
-            await this.deps.ownership.commitHandoff(
-              existing.operationId,
-              context.assertAdmissionActive,
-            );
-            registryCommitted = true;
+            assertMatchingHandoff(existing, submittedTargetHash);
+            await this.#rollForwardPersistedHandoff(existing);
+            completed = true;
             await this.#notifyCommitted(input.chatId);
             return;
           }
 
-          this.#requireUnchangedSource(input.chatId, sourceFence);
-          const source = sourceSnapshot;
-          const captured = await this.captureContinuationSegments({
-            chatId: input.chatId,
-            source,
-            target: { agentId: input.target.agentId, model: input.target.model },
-            operationId,
-            clientRequestId: input.clientRequestId,
-            signal: context.signal,
-          });
-          preparedSegment = captured.prepared;
-          const targetSegments = captured.segments;
-
-          if (targetSegments.length > 0) {
-            const tail = await this.deps.carryOver.loadProjectionSource({
-              refs: targetSegments,
-              signal: context.signal,
-            });
-            renderCarriedContext(tail);
+          context.assertAdmissionActive();
+          this.deps.ledger.closeProducer(input.chatId);
+          producerClosed = true;
+          const watermark = this.deps.ledger.highWatermark(input.chatId);
+          const checkpoint = this.deps.ledger.checkpointForHandoff(input.chatId);
+          if (checkpoint.viewId !== watermark.viewId || checkpoint.ordinal !== watermark.ordinal) {
+            throw new Error('Transcript changed while the handoff checkpoint was captured');
           }
-          const intent = await this.deps.ownership.beginHandoff({
+          this.#requireUnchangedSource(input.chatId, sourceFence);
+          context.assertAdmissionActive();
+          decisionAttempted = true;
+          const intent = await this.deps.ownership.decideHandoff({
             operationId,
             clientRequestId: input.clientRequestId,
             submittedTargetHash,
             chatId: input.chatId,
-            source,
+            source: sourceSnapshot,
             target: input.target,
-            targetCarryOverSegments: targetSegments,
+            targetAgentOwnershipEpoch: crypto.randomUUID(),
+            watermark,
           });
-          targetFence = {
-            agentId: intent.target.execution.agentId,
-            agentOwnershipEpoch: intent.target.agentOwnershipEpoch,
-            agentSessionId: null,
-            carryOverRevision: carryOverRevision(intent.target.carryOverSegments),
-          };
-          intentStarted = true;
-          await captured.assertUnchanged(context.signal);
-          this.#requireUnchangedSource(input.chatId, sourceFence);
-          context.assertAdmissionActive();
-          await this.deps.ownership.commitHandoff(operationId, context.assertAdmissionActive);
-          registryCommitted = true;
-          preparedSegment?.releaseRoot();
+          await this.#rollForwardPersistedHandoff(intent);
+          completed = true;
           await this.#notifyCommitted(input.chatId);
         } catch (error) {
-          throw mapCarryOverError(error);
+          const retained = this.deps.ownership.findHandoff(
+            input.chatId,
+            input.clientRequestId,
+          );
+          if (decisionAttempted && retained) {
+            assertMatchingHandoff(retained, submittedTargetHash);
+            await this.#rollForwardPersistedHandoff(retained);
+            completed = true;
+            await this.#notifyCommitted(input.chatId);
+            return;
+          }
+          if (producerClosed) this.deps.reopenProducer(input.chatId);
+          throw error;
         }
       },
       compensate: async () => {
-        if (registryCommitted) {
-          preparedSegment?.releaseRoot();
-          return;
-        }
-        if (intentStarted) await this.deps.ownership.compensateHandoff(operationId);
-        const current = this.deps.registry.getChat(input.chatId);
-        if (targetFence && matchesOwnershipFence(current, targetFence)) {
-          registryCommitted = true;
-          preparedSegment?.releaseRoot();
-          return;
-        }
-        await preparedSegment?.discard();
+        if (completed) return;
       },
     };
+  }
+
+  async recoverPendingHandoffs(): Promise<void> {
+    if (this.#shutdownController.signal.aborted) return;
+    await Promise.all(
+      this.deps.ownership.pendingHandoffs().map((intent) => {
+        let recovery = this.#recoveries.get(intent.operationId);
+        if (!recovery) {
+          recovery = { intent, step: 'ledger-boundary' };
+          this.#recoveries.set(intent.operationId, recovery);
+        }
+        return this.#recoverHandoff(recovery, 0);
+      }),
+    );
+  }
+
+  async #rollForwardPersistedHandoff(intent: AgentHandoffIntent): Promise<void> {
+    this.deps.ledger.closeProducer(intent.chatId);
+    await retryHandoffStep(
+      'ledger boundary recovery',
+      () => this.#applyLedgerBoundary(intent),
+      this.#shutdownController.signal,
+    );
+    await retryHandoffStep(
+      'registry recovery',
+      () => this.deps.ownership.applyHandoffDecision(intent.operationId),
+      this.#shutdownController.signal,
+    );
+    // The journal entry is the pending-ownership fence, and reopening the producer is a
+    // publication. Discharging the intent first keeps roll-forward from fencing itself.
+    await retryHandoffStep(
+      'journal recovery',
+      () => this.deps.ownership.completeHandoff(intent.operationId),
+      this.#shutdownController.signal,
+    );
+    await retryHandoffStep(
+      'producer recovery',
+      () => this.deps.reopenProducer(intent.chatId),
+      this.#shutdownController.signal,
+    );
+  }
+
+  #applyLedgerBoundary(intent: AgentHandoffIntent): void {
+    const markers = this.deps.ledger.rowsAfter(
+      intent.chatId,
+      intent.watermark.viewId,
+      intent.watermark.ordinal,
+    ).filter((row): row is LedgerAgentSwitchRow => row.kind === 'agent-switch');
+    if (markers.length > 1 || markers.some((marker) => !matchesSwitchMarker(marker, intent))) {
+      throw new HandoffBoundaryCorruptionError(intent.chatId);
+    }
+    const marker = markers[0]
+      ?? this.deps.ledger.appendAgentSwitch(intent.chatId, intent.watermark.viewId, {
+        fromAgentId: intent.source.agentId,
+        toAgentId: intent.target.execution.agentId,
+        fromModel: this.deps.registry.getChat(intent.chatId)?.model ?? null,
+        toModel: intent.target.execution.model ?? null,
+      });
+    this.deps.ledger.advanceContentStart(
+      intent.chatId,
+      intent.watermark.viewId,
+      marker.ordinal + 1,
+    );
+  }
+
+  #recoverHandoff(recovery: PendingHandoffRecovery, retryAttempt: number): Promise<void> {
+    if (this.#shutdownController.signal.aborted) return Promise.resolve();
+    const operationId = recovery.intent.operationId;
+    const active = this.#activeRecoveryAttempts.get(operationId);
+    if (active) return active;
+    if (recovery.step === 'fenced' || this.#recoveryTimers.has(operationId)) {
+      return Promise.resolve();
+    }
+    const attempt = this.#attemptHandoffRecovery(recovery, retryAttempt);
+    this.#activeRecoveryAttempts.set(operationId, attempt);
+    const clear = () => {
+      if (this.#activeRecoveryAttempts.get(operationId) === attempt) {
+        this.#activeRecoveryAttempts.delete(operationId);
+      }
+    };
+    void attempt.then(clear, clear);
+    return attempt;
+  }
+
+  async #attemptHandoffRecovery(
+    recovery: PendingHandoffRecovery,
+    retryAttempt: number,
+  ): Promise<void> {
+    const { intent } = recovery;
+    try {
+      while (recovery.step !== 'fenced') {
+        if (this.#shutdownController.signal.aborted) return;
+        switch (recovery.step) {
+          case 'ledger-boundary':
+            this.deps.ledger.closeProducer(intent.chatId);
+            this.#applyLedgerBoundary(intent);
+            recovery.step = 'registry';
+            break;
+          case 'registry':
+            await this.deps.ownership.applyHandoffDecision(intent.operationId);
+            recovery.step = 'journal';
+            break;
+          case 'journal':
+            await this.deps.ownership.completeHandoff(intent.operationId);
+            recovery.step = 'producer';
+            break;
+          case 'producer':
+            await this.deps.reopenProducer(intent.chatId);
+            this.#recoveries.delete(intent.operationId);
+            await this.#notifyCommitted(intent.chatId);
+            return;
+        }
+      }
+    } catch (error) {
+      logger.warn('Pending handoff recovery attempt failed', {
+        chatId: intent.chatId,
+        operationId: intent.operationId,
+        attempt: retryAttempt + 1,
+        code: error instanceof HandoffBoundaryCorruptionError
+          ? 'HANDOFF_BOUNDARY_CORRUPT'
+          : 'HANDOFF_RECOVERY_FAILED',
+      });
+      if (error instanceof HandoffBoundaryCorruptionError) {
+        recovery.step = 'fenced';
+        return;
+      }
+      if (this.#shutdownController.signal.aborted) return;
+      this.#scheduleHandoffRecovery(recovery, retryAttempt);
+    }
+  }
+
+  #scheduleHandoffRecovery(recovery: PendingHandoffRecovery, retryAttempt: number): void {
+    const operationId = recovery.intent.operationId;
+    if (this.#shutdownController.signal.aborted || this.#recoveryTimers.has(operationId)) return;
+    const delay = Math.min(
+      MAX_RECOVERY_RETRY_DELAY_MS,
+      INITIAL_RECOVERY_RETRY_DELAY_MS * 2 ** retryAttempt,
+    );
+    const timer = setTimeout(() => {
+      if (this.#recoveryTimers.get(operationId) !== timer) return;
+      this.#recoveryTimers.delete(operationId);
+      if (this.#shutdownController.signal.aborted) return;
+      const retry = () => {
+        void this.#recoverHandoff(recovery, retryAttempt + 1);
+      };
+      const active = this.#activeRecoveryAttempts.get(operationId);
+      if (active) void active.then(retry, retry);
+      else retry();
+    }, delay);
+    timer.unref?.();
+    this.#recoveryTimers.set(operationId, timer);
   }
 
   #requireUnchangedSource(chatId: string, expected: OwnershipFence): void {
@@ -445,22 +452,80 @@ export class AgentHandoffService {
   }
 }
 
+function assertMatchingHandoff(intent: AgentHandoffIntent, submittedTargetHash: string): void {
+  if (intent.submittedTargetHash === submittedTargetHash) return;
+  throw new DomainError(
+    'IDEMPOTENCY_CONFLICT',
+    'clientRequestId was reused with a different handoff target.',
+    409,
+  );
+}
+
+class HandoffBoundaryCorruptionError extends Error {
+  override readonly name = 'HandoffBoundaryCorruptionError';
+
+  constructor(chatId: string) {
+    super(`Durable agent-switch boundary conflicts with the pending handoff for ${chatId}`);
+  }
+}
+
+function matchesSwitchMarker(
+  marker: LedgerAgentSwitchRow,
+  intent: AgentHandoffIntent,
+): boolean {
+  return marker.detail.fromAgentId === intent.source.agentId
+    && marker.detail.toAgentId === intent.target.execution.agentId
+    && marker.detail.toModel === (intent.target.execution.model ?? null);
+}
+
+async function retryHandoffStep<T>(
+  label: string,
+  operation: () => T | Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  for (let attempts = 0; ; attempts += 1) {
+    signal.throwIfAborted();
+    try {
+      return await operation();
+    } catch (error) {
+      signal.throwIfAborted();
+      if (error instanceof HandoffBoundaryCorruptionError) throw error;
+      logger.warn('Decided handoff step will be retried', {
+        label,
+        attempts: attempts + 1,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      await waitForHandoffRetry(Math.min(1_000, 25 * 2 ** attempts), signal);
+    }
+  }
+}
+
+function waitForHandoffRetry(delay: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    }, delay);
+    timer.unref?.();
+    const abort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
 interface OwnershipFence {
   readonly agentId: string;
   readonly agentOwnershipEpoch: string;
-  readonly agentSessionId: string | null;
-  readonly carryOverRevision: string;
 }
 
 function ownershipFence(entry: ChatRegistryEntry): OwnershipFence {
   return {
     agentId: entry.agentId,
     agentOwnershipEpoch: entry.agentOwnershipEpoch,
-    agentSessionId: entry.agentSessionId,
-    carryOverRevision: carryOverRevision(
-      entry.carryOverSegments,
-      entry.carryOverMigrationQuarantine,
-    ),
   };
 }
 
@@ -469,12 +534,7 @@ function matchesOwnershipFence(
   expected: OwnershipFence,
 ): boolean {
   return entry?.agentId === expected.agentId
-    && entry.agentOwnershipEpoch === expected.agentOwnershipEpoch
-    && entry.agentSessionId === expected.agentSessionId
-    && carryOverRevision(
-      entry.carryOverSegments,
-      entry.carryOverMigrationQuarantine,
-    ) === expected.carryOverRevision;
+    && entry.agentOwnershipEpoch === expected.agentOwnershipEpoch;
 }
 
 function cloneRegistryEntry(entry: ChatRegistryEntry): ChatRegistryEntry {
@@ -516,29 +576,6 @@ function assertSupported(values: readonly string[], value: string, label: string
       422,
     );
   }
-}
-
-function assertCarryOverAvailable(entry: ChatRegistryEntry): void {
-  if (!entry.carryOverMigrationQuarantine) return;
-  throw new DomainError(
-    'CARRYOVER_HISTORY_UNAVAILABLE',
-    'Archived chat history is unavailable.',
-    422,
-    false,
-  );
-}
-
-function mapCarryOverError(error: unknown): unknown {
-  if (error instanceof CarryOverTranscriptError) {
-    return new DomainError(
-      'INTERNAL_ERROR',
-      'The archived chat history could not be prepared.',
-      500,
-      false,
-      { cause: error },
-    );
-  }
-  return error;
 }
 
 export function resolvedRunOptions(target: ResolvedAgentHandoffTarget): {

@@ -1,4 +1,4 @@
-import { compactChat, forkChat } from '$lib/api/chats.js';
+import { compactChat, forkChat, type ForkChatParams } from '$lib/api/chats.js';
 import { ApiError } from '$lib/api/client.js';
 import { scheduleChatPrompt } from '$lib/api/scheduled-prompts.js';
 import type { ChatImage } from '$shared/chat-types';
@@ -36,13 +36,16 @@ import {
 	prepareChatImages,
 } from '$lib/chat/conversation/conversation-submission-helpers.js';
 import { CommandOutcomeUnknownError } from '$lib/chat/conversation/idempotent-command.js';
-import { AcceptedInputSubmissionService } from '$lib/chat/conversation/accepted-input-submission-service.js';
+import {
+	AcceptedInputSubmissionService,
+	type PreparedForkInput,
+} from '$lib/chat/conversation/accepted-input-submission-service.js';
 import {
 	remapForkAtMessage,
 	selectForkAtMessage,
 	type ForkAtMessageSelection,
 } from '$lib/chat/actions/fork-at-message-action.js';
-import type { ChatViewMessage } from '$shared/chat-view';
+import type { TranscriptMessage } from '$shared/chat-view';
 import type { ConversationSubmissionOutcome } from './conversation-submission-outcome.js';
 import * as m from '$lib/paraglide/messages.js';
 import type { ReorderChatResponse } from '$shared/chat-order-contracts';
@@ -63,9 +66,9 @@ interface SlashCommandSessions {
 
 interface SlashCommandChatState {
 	activeChatId: string | null;
-	entries: readonly ChatViewMessage[];
+	entries: readonly TranscriptMessage[];
 	isUserScrolledUp: boolean;
-	getCursor(): { generationId: string; lastSeq: number };
+	getCursor(): { transcriptViewId: string; lastOrdinal: number };
 	appendLocalNotice(noticeType: LocalNoticeType, content: string): void;
 }
 
@@ -112,6 +115,9 @@ export interface ConversationSlashCommandDeps {
 	modelCatalog: SlashCommandModelCatalog;
 	navigation: { navigateToChat?(chatId: string): void };
 	refetchTranscript?: (chatId: string) => Promise<void>;
+	// Asks the user whether to continue when the provider cannot materialize a native fork.
+	// Without it the refusal reads as a plain failure.
+	confirmHandoffFork?: () => Promise<boolean>;
 	scrollToBottom(): void;
 }
 
@@ -606,6 +612,18 @@ export class ConversationSlashCommandService {
 		}
 	}
 
+	async #submitForkRunWithConfirmation(
+		submission: PreparedForkInput,
+	): Promise<Awaited<ReturnType<PreparedForkInput['submit']>> | null> {
+		try {
+			return await submission.submit();
+		} catch (error) {
+			if (!isHandoffForkConfirmationError(error) || !this.deps.confirmHandoffFork) throw error;
+			if (!(await this.deps.confirmHandoffFork())) return null;
+			return submission.submitWithHandoffFork();
+		}
+	}
+
 	async submitForkCommand(
 		sourceChatId: string,
 		sourceChat: ChatSessionRecord,
@@ -664,7 +682,11 @@ export class ConversationSlashCommandService {
 			modelProtocol: selection.modelProtocol,
 		});
 		try {
-			const response = await submission.submit();
+			const response = await this.#submitForkRunWithConfirmation(submission);
+			if (!response) {
+				this.#restoreComposer(sourceChatId, previousText, previousImages, clearComposer);
+				return 'rejected';
+			}
 			deps.sessions.upsertServerChat(response.chat);
 			deps.sessions.setSelectedChatId(response.chat.id);
 			deps.navigation.navigateToChat?.(response.chat.id);
@@ -687,14 +709,14 @@ export class ConversationSlashCommandService {
 		}
 	}
 
-	async forkChat(sourceChatId: string, upToSeq?: number): Promise<void> {
+	async forkChat(sourceChatId: string, upToOrdinal?: number): Promise<void> {
 		const sourceChat = this.deps.sessions.byId[sourceChatId];
 		if (!sourceChat || sourceChat.status === 'draft') {
 			this.deps.chatState.appendLocalNotice('error', m.chat_notice_cannot_fork_draft());
 			return;
 		}
 		try {
-			await this.#performForkOnly(sourceChatId, upToSeq);
+			await this.#performForkOnly(sourceChatId, upToOrdinal);
 		} catch (error) {
 			this.deps.chatState.appendLocalNotice(
 				'error',
@@ -703,21 +725,23 @@ export class ConversationSlashCommandService {
 		}
 	}
 
-	async #performForkOnly(sourceChatId: string, upToSeq?: number): Promise<void> {
+	// Resolves null when the user declines a handoff fork, so callers stay silent instead of
+	// reporting a failure.
+	async #performForkOnly(sourceChatId: string, upToOrdinal?: number): Promise<ChatListEntry | null> {
 		const chatId = createClientChatId();
-		const selection = upToSeq === undefined
+		const selection = upToOrdinal === undefined
 			? null
 			: selectForkAtMessage(
 				this.deps.chatState.entries,
-				this.deps.chatState.getCursor().generationId,
-				upToSeq,
+				this.deps.chatState.getCursor().transcriptViewId,
+				upToOrdinal,
 			);
-		if (upToSeq !== undefined && !selection) {
+		if (upToOrdinal !== undefined && !selection) {
 			throw new Error(m.chat_notice_fork_message_no_longer_available());
 		}
-		let result: Awaited<ReturnType<typeof forkChat>>;
+		let result: Awaited<ReturnType<typeof forkChat>> | null;
 		try {
-			result = await forkChat({
+			result = await this.#requestFork({
 				sourceChatId,
 				chatId,
 				...(selection ? forkPointParams(selection) : {}),
@@ -733,20 +757,35 @@ export class ConversationSlashCommandService {
 			}
 			const remapped = remapForkAtMessage(
 				this.deps.chatState.entries,
-				this.deps.chatState.getCursor().generationId,
+				this.deps.chatState.getCursor().transcriptViewId,
 				selection,
 			);
 			if (!remapped) throw error;
-			result = await forkChat({
+			result = await this.#requestFork({
 				sourceChatId,
 				chatId,
 				...forkPointParams(remapped),
 			});
 		}
+		if (!result) return null;
 		this.deps.sessions.upsertServerChat(result.chat);
 		this.deps.lifecycle.setCurrentChatId(result.chat.id);
 		this.deps.sessions.setSelectedChatId(result.chat.id);
 		this.deps.navigation.navigateToChat?.(result.chat.id);
+		return result.chat;
+	}
+
+	// The server refuses a fork it cannot materialize natively rather than silently downgrading, so
+	// the refusal doubles as the probe: the user decides, and consent repeats the same request.
+	// Returns null when the user declines, which is an answer rather than a failure.
+	async #requestFork(params: ForkChatParams): Promise<Awaited<ReturnType<typeof forkChat>> | null> {
+		try {
+			return await forkChat(params);
+		} catch (error) {
+			if (!isHandoffForkConfirmationError(error) || !this.deps.confirmHandoffFork) throw error;
+			if (!(await this.deps.confirmHandoffFork())) return null;
+			return forkChat({ ...params, allowHandoffFork: true });
+		}
 	}
 
 	async #submitForkOnlyCommand(
@@ -756,7 +795,10 @@ export class ConversationSlashCommandService {
 		restoreComposer: boolean,
 	): Promise<ConversationSubmissionOutcome> {
 		try {
-			await this.#performForkOnly(sourceChatId);
+			if (!(await this.#performForkOnly(sourceChatId))) {
+				this.#restoreComposer(sourceChatId, previousText, previousImages, restoreComposer);
+				return 'rejected';
+			}
 			return 'accepted';
 		} catch (error) {
 			this.#restoreComposer(sourceChatId, previousText, previousImages, restoreComposer);
@@ -782,26 +824,27 @@ export class ConversationSlashCommandService {
 }
 
 function forkPointParams(selection: ForkAtMessageSelection): {
-	upToSeq: number;
-	generationId: string;
+	upToOrdinal: number;
+	transcriptViewId: string;
 } {
 	return {
-		upToSeq: selection.seq,
-		generationId: selection.generationId,
+		upToOrdinal: selection.ordinal,
+		transcriptViewId: selection.transcriptViewId,
 	};
 }
 
 function isStaleForkPointError(error: unknown): error is ApiError {
 	return error instanceof ApiError
-		&& error.errorCode === 'STALE_VIEW_GENERATION';
+		&& error.errorCode === 'STALE_TRANSCRIPT_VIEW';
 }
 
-// A fork point the server could not resolve against native history is a recoverable state the
-// user can act on, so it reads as its own notice instead of a generic fork failure.
+function isHandoffForkConfirmationError(error: unknown): error is ApiError {
+	return error instanceof ApiError
+		&& error.errorCode === 'TRANSCRIPT_NOT_YET_PERSISTED';
+}
+
 function forkFailureNotice(error: unknown): string {
-	return error instanceof ApiError && error.errorCode === 'MESSAGE_NOT_IN_NATIVE_HISTORY'
-		? m.chat_notice_fork_message_not_in_native_history()
-		: m.chat_notice_failed_fork_chat({ detail: errorDetail(error) });
+	return m.chat_notice_failed_fork_chat({ detail: errorDetail(error) });
 }
 
 function moveChatNotice(boundary: 'top' | 'bottom', changed: boolean): string {

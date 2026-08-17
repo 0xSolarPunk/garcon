@@ -1,13 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { access, readFile, readdir } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
-import { brotliDecompress } from 'node:zlib';
-import type { ChatMessage } from '../../../common/chat-types.js';
-import { CARRIED_CONTEXT_VERSION } from '../../../common/transcript-seed.js';
+import type { TranscriptMessage } from '../../../common/chat-view.js';
 import {
   assistantContents,
-  messagesOfType,
   userContents,
 } from '../../support/chat-assertions.js';
 import type { ConfiguredDirectTestAgent } from '../../support/garcon-client.js';
@@ -16,13 +12,13 @@ import {
   withIntegrationFixture,
 } from '../../support/integration-fixture.js';
 
-// Derived rather than pinned: a literal here silently rots when the envelope
-// version moves, and these suites do not run under `bun run test`.
-const CARRIED_CONTEXT_MARKER = `<carried-context version="${CARRIED_CONTEXT_VERSION}">`;
-const decompress = promisify(brotliDecompress);
-
 interface RecordedProviderRequest {
   readonly lastUserText: string;
+  readonly body: {
+    readonly messages: readonly {
+      readonly content: unknown;
+    }[];
+  };
 }
 
 interface HeldProviderRequest {
@@ -34,41 +30,185 @@ interface HoldableProvider {
   holdNext(matcher: { model?: string }): HeldProviderRequest;
 }
 
-interface PersistedChatEntry {
-  readonly agentId: string;
-  readonly agentOwnershipEpoch: string;
-  readonly carryOverSegments: readonly CarryOverSegmentRef[];
-  readonly agentSessionId: string | null;
-  readonly nativeSession: {
-    readonly value?: { readonly path?: string };
-  } | null;
-}
-
-interface CarryOverSegmentRef {
-  readonly id: string;
-  readonly agentId: string;
-  readonly model: string;
-  readonly capturedAt: string;
-  readonly storedMessageCount: number;
-  readonly visibleMessageCount: number;
-  readonly trailingHandoff: { readonly agentId: string; readonly model: string } | null;
-}
-
-interface CarryOverSegmentIndex {
-  readonly version: 1;
-  readonly messageSchemaVersion: 1;
-  readonly id: string;
-  readonly messageCount: number;
-  readonly seedSanitation: 'not-applicable' | 'stripped-exact' | 'absent';
-  readonly pages: readonly CarryOverPage[];
-}
-
-interface CarryOverPage {
-  readonly file: string;
-}
-
 describe('repeated agent handoff lifecycle', () => {
-  test('preserves direct A to B to A to B segments through restart and an archived point fork', async () => {
+  test('[TLV5-HANDOFF.05-SERVER-01] recovers one pending handoff while another chat remains fenced', async () => {
+    await withIntegrationFixture('isolated-agent-handoff-recovery', async (fixture) => {
+      const settings = await fixture.client.updateSettings({
+        features: { transcriptSearch: { enabled: true } },
+      });
+      expect(settings.settings.features.transcriptSearch.enabled).toBe(true);
+      const blockedChatId = fixture.newChatId();
+      const recoverableChatId = fixture.newChatId();
+      const sourceAgent = fixture.directAgents.openAi;
+      const targetAgent = fixture.directAgents.anthropic;
+
+      for (const [chatId, content] of [
+        [blockedChatId, 'blocked-handoff-source'],
+        [recoverableChatId, 'recoverable-handoff-source'],
+      ] as const) {
+        const started = await fixture.client.startDirectChat({
+          chatId,
+          content,
+          projectPath: fixture.dirs.project,
+          agent: sourceAgent,
+        });
+        await fixture.client.waitForTurnTerminal(chatId, started.turnId);
+      }
+
+      const histories = await Promise.all([
+        fixture.client.getMessages(blockedChatId),
+        fixture.client.getMessages(recoverableChatId),
+      ]);
+      const sessions = await fixture.client.listChats();
+      const blockedSource = sessions.sessions.find((chat) => chat.id === blockedChatId);
+      const recoverableSource = sessions.sessions.find((chat) => chat.id === recoverableChatId);
+      if (!blockedSource || !recoverableSource) {
+        throw new Error('Handoff recovery sources were not registered.');
+      }
+      const recoverableTargetEpoch = crypto.randomUUID();
+
+      await fixture.restartGarcon({
+        beforeStart: async () => {
+          await writeFile(
+            join(fixture.dirs.workspace, 'agent-ownership-journal.json'),
+            `${JSON.stringify({
+              version: 5,
+              ownershipIntents: [
+                recoveryIntent({
+                  chatId: blockedChatId,
+                  sourceAgentId: blockedSource.agentId,
+                  sourceEpoch: blockedSource.agentOwnershipEpoch,
+                  targetAgent,
+                  targetEpoch: crypto.randomUUID(),
+                  watermark: {
+                    viewId: `unrecoverable-${crypto.randomUUID()}`,
+                    ordinal: histories[0].lastOrdinal,
+                  },
+                }),
+                recoveryIntent({
+                  chatId: recoverableChatId,
+                  sourceAgentId: recoverableSource.agentId,
+                  sourceEpoch: recoverableSource.agentOwnershipEpoch,
+                  targetAgent,
+                  targetEpoch: recoverableTargetEpoch,
+                  watermark: {
+                    viewId: histories[1].transcriptViewId,
+                    ordinal: histories[1].lastOrdinal,
+                  },
+                }),
+              ],
+            })}\n`,
+          );
+        },
+      });
+
+      await waitForChatOwner(
+        fixture,
+        recoverableChatId,
+        targetAgent.agentId,
+        recoverableTargetEpoch,
+      );
+      await expect(fixture.client.runDirectChat({
+        chatId: blockedChatId,
+        content: 'blocked-chat-must-stay-fenced',
+        agent: sourceAgent,
+      })).rejects.toMatchObject({
+        status: 409,
+        body: { errorCode: 'OWNERSHIP_TRANSFER_PENDING' },
+      });
+      const blockedHistory = await fixture.client.getMessages(blockedChatId);
+      expect(blockedHistory).toEqual(histories[0]);
+      const blockedListing = (await fixture.client.listChats()).sessions.find(
+        (chat) => chat.id === blockedChatId,
+      );
+      expect(blockedListing?.preview).toEqual(blockedSource.preview);
+      const blockedSearch = await fixture.client.waitForChatSearch(
+        { query: 'blocked-handoff-source', chatIds: [blockedChatId], limit: 10 },
+        (response) => response.index.pendingChatCount === 0,
+      );
+      expect(blockedSearch.results.map((result) => result.chatId)).toEqual([blockedChatId]);
+
+      const request = await runWithAnswer({
+        fixture,
+        provider: fixture.fakeProviders.anthropic,
+        chatId: recoverableChatId,
+        agent: targetAgent,
+        prompt: 'recovered-chat-new-work',
+        answer: 'recovered-chat-answer',
+      });
+      expectRequestConversation(request, [
+        'recoverable-handoff-source',
+        'echo:recoverable-handoff-source',
+        'recovered-chat-new-work',
+      ]);
+      await expectHistory(fixture, recoverableChatId, {
+        users: ['recoverable-handoff-source', 'recovered-chat-new-work'],
+        assistants: ['echo:recoverable-handoff-source', 'recovered-chat-answer'],
+      });
+    });
+  }, 30_000);
+
+  test('preserves a paused queue when it blocks an in-place handoff', async () => {
+    await withIntegrationFixture('queued-agent-handoff-guard', async (fixture) => {
+      const chatId = fixture.newChatId();
+      const held = fixture.fakeProviders.openAi.holdNext({
+        model: fixture.directAgents.openAi.provider.model,
+      });
+      const source = await fixture.client.startDirectChat({
+        chatId,
+        content: 'handoff-queue-source',
+        projectPath: fixture.dirs.project,
+        agent: fixture.directAgents.openAi,
+      });
+      await held.received;
+      await fixture.client.enqueueNew(chatId, 'queued-before-handoff');
+      const paused = await fixture.client.pauseQueue(chatId);
+      held.releaseText('handoff-queue-source-answer');
+      await fixture.client.waitForTurnTerminal(chatId, source.turnId);
+
+      const before = (await fixture.client.listChats()).sessions.find((chat) => chat.id === chatId);
+      if (!before) throw new Error('Source chat disappeared before the handoff attempt.');
+      const transcript = await fixture.client.getMessages(chatId);
+      const anthropicRequestCount = fixture.fakeProviders.anthropic.requests().length;
+
+      await expect(fixture.client.handoffDirectChat({
+        chatId,
+        content: 'blocked-handoff-input',
+        agent: fixture.directAgents.anthropic,
+        expectedAgentOwnershipEpoch: before.agentOwnershipEpoch,
+      })).rejects.toMatchObject({
+        status: 409,
+        body: { errorCode: 'AGENT_HANDOFF_REQUIRES_IDLE' },
+      });
+
+      const after = (await fixture.client.listChats()).sessions.find((chat) => chat.id === chatId);
+      expect(after).toMatchObject({
+        agentId: before.agentId,
+        agentOwnershipEpoch: before.agentOwnershipEpoch,
+      });
+      const control = await fixture.client.getExecutionControl(chatId);
+      expect(control.queue.entries.map((entry) => entry.content)).toEqual([
+        'queued-before-handoff',
+      ]);
+      expect(control.queue.pause).toEqual(paused.control.queue.pause);
+      expect((await fixture.client.getMessages(chatId)).messages).toEqual(transcript.messages);
+      expect(fixture.fakeProviders.anthropic.requests()).toHaveLength(anthropicRequestCount);
+
+      await fixture.client.clearQueue(chatId);
+      await handoffWithAnswer({
+        fixture,
+        provider: fixture.fakeProviders.anthropic,
+        chatId,
+        agent: fixture.directAgents.anthropic,
+        prompt: 'handoff-after-clear',
+        answer: 'handoff-after-clear-answer',
+      });
+      expect((await fixture.client.listChats()).sessions.find((chat) => chat.id === chatId))
+        .toMatchObject({ agentId: fixture.directAgents.anthropic.agentId });
+    });
+  });
+
+  test('preserves direct-provider ledger history through handoffs, restart, and a point fork', async () => {
     await withIntegrationFixture('repeated-agent-handoff', async (fixture) => {
       const sourceChatId = fixture.newChatId();
       const agentA = fixture.directAgents.openAi;
@@ -82,11 +222,8 @@ describe('repeated agent handoff lifecycle', () => {
         agent: agentA,
       });
       await fixture.client.waitForTurnTerminal(sourceChatId, initial.turnId);
-      const initialEntry = await readRegistryEntry(fixture, sourceChatId);
-      const initialNativePath = requiredNativePath(initialEntry);
-      await access(initialNativePath);
 
-      const firstHandoffRequest = await handoffWithAnswer({
+      const firstHandoff = await handoffWithAnswer({
         fixture,
         provider: fixture.fakeProviders.anthropic,
         chatId: sourceChatId,
@@ -94,29 +231,10 @@ describe('repeated agent handoff lifecycle', () => {
         prompt: 'b-first',
         answer: bFirstAnswer,
       });
-      expectSeed(firstHandoffRequest, {
-        prompt: 'b-first',
-        included: ['a-source'],
-      });
-      await waitForMissingFile(initialNativePath);
-
-      const afterFirstHandoff = await readRegistryEntry(fixture, sourceChatId);
-      expect(afterFirstHandoff.agentId).toBe(agentB.agentId);
-      expect(afterFirstHandoff.agentOwnershipEpoch).not.toBe(initialEntry.agentOwnershipEpoch);
-      const [firstRef] = requiredSegments(afterFirstHandoff, 1);
-      expect(firstHandoffRequest.lastUserText).not.toContain(firstRef.id);
-      const firstIndex = await readSegmentIndex(fixture, firstRef.id);
-      expect(firstIndex).toMatchObject({
-        version: 1,
-        messageSchemaVersion: 1,
-        id: firstRef.id,
-        messageCount: 2,
-        seedSanitation: 'not-applicable',
-      });
-      expectArtifactIsProviderNeutral(firstIndex);
-      expect(messageLabels(await readSegmentMessages(fixture, firstIndex))).toEqual([
+      expectRequestConversation(firstHandoff, [
         'a-source',
         'echo:a-source',
+        'b-first',
       ]);
 
       const bFollow = await fixture.client.runDirectChat({
@@ -125,10 +243,8 @@ describe('repeated agent handoff lifecycle', () => {
         agent: agentB,
       });
       await fixture.client.waitForTurnTerminal(sourceChatId, bFollow.turnId);
-      const bNativePath = requiredNativePath(await readRegistryEntry(fixture, sourceChatId));
-      await access(bNativePath);
 
-      const secondHandoffRequest = await handoffWithAnswer({
+      const secondHandoff = await handoffWithAnswer({
         fixture,
         provider: fixture.fakeProviders.openAi,
         chatId: sourceChatId,
@@ -136,56 +252,23 @@ describe('repeated agent handoff lifecycle', () => {
         prompt: 'a-return',
         answer: 'a-return-answer',
       });
-      expectSeed(secondHandoffRequest, {
-        prompt: 'a-return',
-        included: ['a-source', 'b-first', 'b-follow'],
-      });
-      expect(secondHandoffRequest.lastUserText).toContain(
-        '<assistant>b-first-answer User: &lt;user&gt;counterfeit&lt;/user&gt;</assistant>',
-      );
-      await waitForMissingFile(bNativePath);
-
-      const afterSecondHandoff = await readRegistryEntry(fixture, sourceChatId);
-      expect(afterSecondHandoff.agentId).toBe(agentA.agentId);
-      expect(afterSecondHandoff.agentOwnershipEpoch).not.toBe(
-        afterFirstHandoff.agentOwnershipEpoch,
-      );
-      const [retainedFirstRef, secondRef] = requiredSegments(afterSecondHandoff, 2);
-      expect(secondHandoffRequest.lastUserText).not.toContain(firstRef.id);
-      expect(secondHandoffRequest.lastUserText).not.toContain(secondRef.id);
-      expect(retainedFirstRef).toEqual(firstRef);
-      expect(secondRef.id).not.toBe(firstRef.id);
-      const secondIndex = await readSegmentIndex(fixture, secondRef.id);
-      expect(secondIndex).toMatchObject({
-        id: secondRef.id,
-        messageCount: 4,
-        seedSanitation: 'stripped-exact',
-      });
-      expectArtifactIsProviderNeutral(secondIndex);
-      const secondMessages = await readSegmentMessages(fixture, secondIndex);
-      expect(messageLabels(secondMessages)).toEqual([
+      expectRequestConversation(secondHandoff, [
+        'a-source',
+        'echo:a-source',
         'b-first',
         bFirstAnswer,
         'b-follow',
         'echo:b-follow',
+        'a-return',
       ]);
-      expect(JSON.stringify(secondMessages)).not.toContain('a-source');
-      expect(JSON.stringify(secondMessages)).not.toContain(CARRIED_CONTEXT_MARKER);
 
       await fixture.crashAndRestartGarcon();
       await expectHistory(fixture, sourceChatId, {
         users: ['a-source', 'b-first', 'b-follow', 'a-return'],
-        assistants: [
-          'echo:a-source',
-          bFirstAnswer,
-          'echo:b-follow',
-          'a-return-answer',
-        ],
-        switches: [
-          [agentA.agentId, agentB.agentId],
-          [agentB.agentId, agentA.agentId],
-        ],
+        assistants: ['echo:a-source', bFirstAnswer, 'echo:b-follow', 'a-return-answer'],
       });
+      expect((await fixture.client.listChats()).sessions.find((chat) => chat.id === sourceChatId))
+        .toMatchObject({ agentId: agentA.agentId });
 
       const aFollow = await fixture.client.runDirectChat({
         chatId: sourceChatId,
@@ -193,12 +276,8 @@ describe('repeated agent handoff lifecycle', () => {
         agent: agentA,
       });
       await fixture.client.waitForTurnTerminal(sourceChatId, aFollow.turnId);
-      const aReturnNativePath = requiredNativePath(
-        await readRegistryEntry(fixture, sourceChatId),
-      );
-      await access(aReturnNativePath);
 
-      const thirdHandoffRequest = await handoffWithAnswer({
+      const thirdHandoff = await handoffWithAnswer({
         fixture,
         provider: fixture.fakeProviders.anthropic,
         chatId: sourceChatId,
@@ -206,45 +285,19 @@ describe('repeated agent handoff lifecycle', () => {
         prompt: 'b-return',
         answer: 'b-return-answer',
       });
-      expectSeed(thirdHandoffRequest, {
-        prompt: 'b-return',
-        included: ['a-source', 'b-first', 'b-follow', 'a-return', 'a-follow'],
-      });
-      await waitForMissingFile(aReturnNativePath);
-
-      const afterThirdHandoff = await readRegistryEntry(fixture, sourceChatId);
-      expect(afterThirdHandoff.agentId).toBe(agentB.agentId);
-      expect(afterThirdHandoff.agentOwnershipEpoch).not.toBe(
-        afterSecondHandoff.agentOwnershipEpoch,
-      );
-      const [firstAfterThird, secondAfterThird, thirdRef] = requiredSegments(
-        afterThirdHandoff,
-        3,
-      );
-      for (const ref of [firstRef, secondRef, thirdRef]) {
-        expect(thirdHandoffRequest.lastUserText).not.toContain(ref.id);
-      }
-      expect(firstAfterThird).toEqual(firstRef);
-      expect(secondAfterThird).toEqual(secondRef);
-      expect(thirdRef.id).not.toBe(secondRef.id);
-      const thirdIndex = await readSegmentIndex(fixture, thirdRef.id);
-      expect(thirdIndex).toMatchObject({
-        id: thirdRef.id,
-        messageCount: 4,
-        seedSanitation: 'stripped-exact',
-      });
-      expectArtifactIsProviderNeutral(thirdIndex);
-      const thirdMessages = await readSegmentMessages(fixture, thirdIndex);
-      expect(messageLabels(thirdMessages)).toEqual([
+      expectRequestConversation(thirdHandoff, [
+        'a-source',
+        'echo:a-source',
+        'b-first',
+        bFirstAnswer,
+        'b-follow',
+        'echo:b-follow',
         'a-return',
         'a-return-answer',
         'a-follow',
         'echo:a-follow',
+        'b-return',
       ]);
-      expect(JSON.stringify(thirdMessages)).not.toContain('a-source');
-      expect(JSON.stringify(thirdMessages)).not.toContain('b-first');
-      expect(JSON.stringify(thirdMessages)).not.toContain(CARRIED_CONTEXT_MARKER);
-      expect(await segmentIds(fixture)).toHaveLength(3);
 
       const completeSource = await expectHistory(fixture, sourceChatId, {
         users: ['a-source', 'b-first', 'b-follow', 'a-return', 'a-follow', 'b-return'],
@@ -256,60 +309,19 @@ describe('repeated agent handoff lifecycle', () => {
           'echo:a-follow',
           'b-return-answer',
         ],
-        switches: [
-          [agentA.agentId, agentB.agentId],
-          [agentB.agentId, agentA.agentId],
-          [agentA.agentId, agentB.agentId],
-        ],
       });
 
       const cutoff = completeSource.messages.find(({ message }) => (
         message.type === 'assistant-message' && message.content === 'a-return-answer'
       ));
-      if (!cutoff) throw new Error('Missing archived cutoff message');
+      if (!cutoff) throw new Error('Missing point-fork cutoff');
       const forkChatId = fixture.newChatId();
       await fixture.client.forkChat({
         sourceChatId,
         chatId: forkChatId,
-        upToSeq: cutoff.seq,
+        transcriptViewId: completeSource.transcriptViewId,
+        upToOrdinal: cutoff.ordinal,
       });
-
-      const forkEntry = await readRegistryEntry(fixture, forkChatId);
-      expect(forkEntry).toMatchObject({
-        agentId: agentB.agentId,
-        agentSessionId: null,
-      });
-      const forkRefs = requiredSegments(forkEntry, 3);
-      expect(forkRefs.slice(0, 2)).toEqual([firstRef, secondRef]);
-      expect(forkRefs[2]).toEqual({
-        ...thirdRef,
-        visibleMessageCount: 2,
-        trailingHandoff: null,
-      });
-      expect(await segmentIds(fixture)).toHaveLength(3);
-      await expectHistory(fixture, forkChatId, {
-        users: ['a-source', 'b-first', 'b-follow', 'a-return'],
-        assistants: [
-          'echo:a-source',
-          bFirstAnswer,
-          'echo:b-follow',
-          'a-return-answer',
-        ],
-        switches: [
-          [agentA.agentId, agentB.agentId],
-          [agentB.agentId, agentA.agentId],
-        ],
-      });
-
-      await fixture.restartGarcon();
-      expect(requiredSegments(await readRegistryEntry(fixture, sourceChatId), 3)).toEqual([
-        firstRef,
-        secondRef,
-        thirdRef,
-      ]);
-      expect(requiredSegments(await readRegistryEntry(fixture, forkChatId), 3)).toEqual(
-        forkRefs,
-      );
 
       const forkRequest = await runWithAnswer({
         fixture,
@@ -319,11 +331,17 @@ describe('repeated agent handoff lifecycle', () => {
         prompt: 'fork-continuation',
         answer: 'fork-continuation-answer',
       });
-      expectSeed(forkRequest, {
-        prompt: 'fork-continuation',
-        included: ['a-source', 'b-first', 'b-follow', 'a-return'],
-        excluded: ['a-follow', 'b-return'],
-      });
+      expectRequestConversation(forkRequest, [
+        'a-source',
+        'echo:a-source',
+        'b-first',
+        bFirstAnswer,
+        'b-follow',
+        'echo:b-follow',
+        'a-return',
+        'a-return-answer',
+        'fork-continuation',
+      ]);
 
       const sourceContinuation = await fixture.client.runDirectChat({
         chatId: sourceChatId,
@@ -332,31 +350,6 @@ describe('repeated agent handoff lifecycle', () => {
       });
       await fixture.client.waitForTurnTerminal(sourceChatId, sourceContinuation.turnId);
 
-      await expectHistory(fixture, sourceChatId, {
-        users: [
-          'a-source',
-          'b-first',
-          'b-follow',
-          'a-return',
-          'a-follow',
-          'b-return',
-          'source-continuation',
-        ],
-        assistants: [
-          'echo:a-source',
-          bFirstAnswer,
-          'echo:b-follow',
-          'a-return-answer',
-          'echo:a-follow',
-          'b-return-answer',
-          'echo:source-continuation',
-        ],
-        switches: [
-          [agentA.agentId, agentB.agentId],
-          [agentB.agentId, agentA.agentId],
-          [agentA.agentId, agentB.agentId],
-        ],
-      });
       await expectHistory(fixture, forkChatId, {
         users: ['a-source', 'b-first', 'b-follow', 'a-return', 'fork-continuation'],
         assistants: [
@@ -366,48 +359,15 @@ describe('repeated agent handoff lifecycle', () => {
           'a-return-answer',
           'fork-continuation-answer',
         ],
-        switches: [
-          [agentA.agentId, agentB.agentId],
-          [agentB.agentId, agentA.agentId],
-          [agentA.agentId, agentB.agentId],
-        ],
       });
+      expect(userContents((await fixture.client.getMessages(sourceChatId)).messages)).toContain(
+        'source-continuation',
+      );
+      expect(userContents((await fixture.client.getMessages(forkChatId)).messages)).not.toContain(
+        'source-continuation',
+      );
 
       await fixture.restartGarcon();
-      expect(requiredSegments(await readRegistryEntry(fixture, sourceChatId), 3)).toEqual([
-        firstRef,
-        secondRef,
-        thirdRef,
-      ]);
-      expect(requiredSegments(await readRegistryEntry(fixture, forkChatId), 3)).toEqual([
-        firstRef,
-        secondRef,
-        expect.objectContaining({ id: thirdRef.id, visibleMessageCount: 2 }),
-      ]);
-      expect(await segmentIds(fixture)).toHaveLength(3);
-      await expectHistory(fixture, forkChatId, {
-        users: ['a-source', 'b-first', 'b-follow', 'a-return', 'fork-continuation'],
-        assistants: [
-          'echo:a-source',
-          bFirstAnswer,
-          'echo:b-follow',
-          'a-return-answer',
-          'fork-continuation-answer',
-        ],
-        switches: [
-          [agentA.agentId, agentB.agentId],
-          [agentB.agentId, agentA.agentId],
-          [agentA.agentId, agentB.agentId],
-        ],
-      });
-
-      const sourceNativePath = requiredNativePath(
-        await readRegistryEntry(fixture, sourceChatId),
-      );
-      const forkNativePath = requiredNativePath(await readRegistryEntry(fixture, forkChatId));
-      expect(await fixture.client.deleteChat(sourceChatId)).toEqual({ success: true });
-      await waitForMissingFile(sourceNativePath);
-      await waitForSegmentCount(fixture, 3);
       expect(userContents((await fixture.client.getMessages(forkChatId)).messages)).toEqual([
         'a-source',
         'b-first',
@@ -416,15 +376,75 @@ describe('repeated agent handoff lifecycle', () => {
         'fork-continuation',
       ]);
 
+      expect(await fixture.client.deleteChat(sourceChatId)).toEqual({ success: true });
       expect(await fixture.client.deleteChat(forkChatId)).toEqual({ success: true });
-      await waitForMissingFile(forkNativePath);
-      await waitForSegmentCount(fixture, 0);
       await fixture.restartGarcon();
       expect((await fixture.client.listChats()).sessions).toEqual([]);
-      expect(await segmentIds(fixture)).toEqual([]);
     });
   }, 45_000);
 });
+
+function recoveryIntent(input: {
+  chatId: string;
+  sourceAgentId: string;
+  sourceEpoch: string;
+  targetAgent: ConfiguredDirectTestAgent;
+  targetEpoch: string;
+  watermark: { viewId: string; ordinal: number };
+}) {
+  return {
+    version: 5,
+    operationId: `agent-handoff:${crypto.randomUUID()}`,
+    clientRequestId: crypto.randomUUID(),
+    submittedTargetHash: 'a'.repeat(64),
+    kind: 'handoff',
+    chatId: input.chatId,
+    phase: 'commit-decided',
+    source: {
+      agentId: input.sourceAgentId,
+      agentOwnershipEpoch: input.sourceEpoch,
+    },
+    target: {
+      execution: {
+        agentId: input.targetAgent.agentId,
+        model: input.targetAgent.provider.model,
+        apiProviderId: input.targetAgent.provider.providerId,
+        modelEndpointId: input.targetAgent.provider.endpointId,
+        modelProtocol: input.targetAgent.provider.protocol,
+        permissionMode: 'default',
+        thinkingMode: 'none',
+        agentSettings: input.targetAgent.agentSettings,
+      },
+      agentOwnershipEpoch: input.targetEpoch,
+    },
+    watermark: input.watermark,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+async function waitForChatOwner(
+  fixture: IntegrationFixture,
+  chatId: string,
+  agentId: string,
+  agentOwnershipEpoch: string,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const registry = JSON.parse(
+      await readFile(join(fixture.dirs.workspace, 'chats.json'), 'utf8'),
+    ) as {
+      sessions?: Record<string, { agentId?: unknown; agentOwnershipEpoch?: unknown }>;
+    };
+    const persisted = registry.sessions?.[chatId];
+    if (persisted?.agentId === agentId && persisted.agentOwnershipEpoch === agentOwnershipEpoch) {
+      const served = (await fixture.client.listChats()).sessions.find((chat) => chat.id === chatId);
+      expect(served).toMatchObject({ agentId, agentOwnershipEpoch });
+      return;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(`Chat ${chatId} did not complete its independent handoff recovery.`);
+}
 
 async function handoffWithAnswer(input: {
   fixture: IntegrationFixture;
@@ -442,8 +462,9 @@ async function handoffWithAnswer(input: {
   });
   const request = await held.received;
   expect(held.releaseText(input.answer)).toBe(true);
-  const terminal = await input.fixture.client.waitForTurnTerminal(input.chatId, accepted.turnId);
-  expect(terminal.type).toBe('agent-run-finished');
+  expect((await input.fixture.client.waitForTurnTerminal(input.chatId, accepted.turnId)).type).toBe(
+    'agent-run-finished',
+  );
   return request;
 }
 
@@ -463,27 +484,29 @@ async function runWithAnswer(input: {
   });
   const request = await held.received;
   expect(held.releaseText(input.answer)).toBe(true);
-  const terminal = await input.fixture.client.waitForTurnTerminal(input.chatId, accepted.turnId);
-  expect(terminal.type).toBe('agent-run-finished');
+  expect((await input.fixture.client.waitForTurnTerminal(input.chatId, accepted.turnId)).type).toBe(
+    'agent-run-finished',
+  );
   return request;
 }
 
-function expectSeed(
+function expectRequestConversation(
   request: RecordedProviderRequest,
-  expected: {
-    prompt: string;
-    included: readonly string[];
-    excluded?: readonly string[];
-  },
+  expected: readonly string[],
 ): void {
-  expect(request.lastUserText).toContain(expected.prompt);
-  expect(occurrences(request.lastUserText, CARRIED_CONTEXT_MARKER)).toBe(1);
-  expect(request.lastUserText).toContain('<transcript>');
-  expect(request.lastUserText).toContain('<user>');
-  expect(request.lastUserText).toContain('<assistant>');
-  expect(request.lastUserText).not.toContain('<segment');
-  for (const content of expected.included) expect(request.lastUserText).toContain(content);
-  for (const content of expected.excluded ?? []) expect(request.lastUserText).not.toContain(content);
+  expect(request.body.messages.map((message) => messageText(message.content))).toEqual([...expected]);
+  expect(request.lastUserText).toBe(expected.at(-1) ?? '');
+  expect(JSON.stringify(request.body)).not.toContain('<carried-context');
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.flatMap((part) => (
+    part && typeof part === 'object' && 'text' in part && typeof part.text === 'string'
+      ? [part.text]
+      : []
+  )).join('');
 }
 
 async function expectHistory(
@@ -492,139 +515,10 @@ async function expectHistory(
   expected: {
     users: string[];
     assistants: string[];
-    switches: Array<[string, string]>;
   },
-) {
+): Promise<{ messages: readonly TranscriptMessage[]; transcriptViewId: string }> {
   const history = await fixture.client.getMessages(chatId);
   expect(userContents(history.messages)).toEqual(expected.users);
   expect(assistantContents(history.messages)).toEqual(expected.assistants);
-  expect(messagesOfType(history.messages, 'agent-switch').map((message) => [
-    message.fromAgentId,
-    message.toAgentId,
-  ])).toEqual(expected.switches);
   return history;
-}
-
-async function readRegistryEntry(
-  fixture: IntegrationFixture,
-  chatId: string,
-): Promise<PersistedChatEntry> {
-  const registry = JSON.parse(
-    await readFile(join(fixture.dirs.workspace, 'chats.json'), 'utf8'),
-  ) as { sessions?: Record<string, PersistedChatEntry> };
-  const entry = registry.sessions?.[chatId];
-  if (!entry) throw new Error(`Missing persisted chat ${chatId}`);
-  return entry;
-}
-
-function requiredNativePath(entry: PersistedChatEntry): string {
-  const nativePath = entry.nativeSession?.value?.path;
-  if (!nativePath) throw new Error('Chat has no persisted native path');
-  return nativePath;
-}
-
-function requiredSegments(
-  entry: PersistedChatEntry,
-  expectedCount: number,
-): readonly CarryOverSegmentRef[] {
-  expect(entry.carryOverSegments).toHaveLength(expectedCount);
-  return entry.carryOverSegments;
-}
-
-async function readSegmentIndex(
-  fixture: IntegrationFixture,
-  segmentId: string,
-): Promise<CarryOverSegmentIndex> {
-  return JSON.parse(await readFile(join(
-    fixture.dirs.workspace,
-    'carryover-transcripts',
-    'segments',
-    segmentId,
-    'segment.json',
-  ), 'utf8')) as CarryOverSegmentIndex;
-}
-
-async function readSegmentMessages(
-  fixture: IntegrationFixture,
-  index: CarryOverSegmentIndex,
-): Promise<ChatMessage[]> {
-  const messages: ChatMessage[] = [];
-  for (const page of index.pages) {
-    const compressed = await readFile(join(
-      fixture.dirs.workspace,
-      'carryover-transcripts',
-      'segments',
-      index.id,
-      page.file,
-    ));
-    const decoded = await decompress(compressed);
-    messages.push(...JSON.parse(decoded.toString('utf8')) as ChatMessage[]);
-  }
-  return messages;
-}
-
-function expectArtifactIsProviderNeutral(index: CarryOverSegmentIndex): void {
-  for (const field of [
-    'parentId',
-    'sourceNodeId',
-    'agentId',
-    'model',
-    'sessionId',
-    'nativeSession',
-    'providerReference',
-  ]) {
-    expect(index).not.toHaveProperty(field);
-  }
-}
-
-async function segmentIds(fixture: IntegrationFixture): Promise<string[]> {
-  const entries = await readdir(join(
-    fixture.dirs.workspace,
-    'carryover-transcripts',
-    'segments',
-  ), { withFileTypes: true });
-  return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
-}
-
-async function waitForMissingFile(filePath: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    try {
-      await access(filePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-      throw error;
-    }
-    await Bun.sleep(20);
-  }
-  throw new Error(`Timed out waiting for released transcript ${filePath}`);
-}
-
-async function waitForSegmentCount(
-  fixture: IntegrationFixture,
-  expectedCount: number,
-): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  let observed: string[] = [];
-  while (Date.now() < deadline) {
-    observed = await segmentIds(fixture);
-    if (observed.length === expectedCount) return;
-    await Bun.sleep(20);
-  }
-  throw new Error(
-    `Timed out waiting for ${expectedCount} carryover segments; observed ${observed.join(', ')}`,
-  );
-}
-
-function messageLabels(messages: readonly ChatMessage[]): string[] {
-  return messages.map((message) => {
-    if (message.type === 'user-message' || message.type === 'assistant-message') {
-      return message.content;
-    }
-    return message.type;
-  });
-}
-
-function occurrences(value: string, needle: string): number {
-  return value.split(needle).length - 1;
 }

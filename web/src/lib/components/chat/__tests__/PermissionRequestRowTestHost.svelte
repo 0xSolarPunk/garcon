@@ -10,7 +10,7 @@
 		request: PermissionRequestMessage;
 		terminal?: PermissionTerminalState;
 		onDecision: (
-			permissionRequestId: string,
+			permissionOccurrenceId: string,
 			decision: PermissionDecisionPayload & { message?: string },
 		) => void;
 		draft?: PermissionQuestionDraft;

@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test';
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
+import { AssistantMessage, UserMessage } from '@garcon/common/chat-types';
 import {
   OpenAiCompatibleResponsesRuntime,
   buildOpenAiResponsesUserContent,
@@ -11,7 +9,6 @@ import {
   runOpenAiResponsesSingleQuery,
 } from '../openai-compatible-responses-runtime.ts';
 
-const createdDirs = [];
 const originalFetch = globalThis.fetch;
 
 function streamResponse(chunks, options = {}) {
@@ -32,38 +29,42 @@ function streamResponse(chunks, options = {}) {
   });
 }
 
-async function tempDir() {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-openai-responses-runtime-'));
-  createdDirs.push(dir);
-  return dir;
-}
-
-function runtimeConfig(dir, overrides = {}) {
+function runtimeConfig(overrides = {}) {
   return {
-    runtimeId: 'direct-openai-responses-compatible',
     runtimeLabel: 'Direct (Responses)',
     defaultModel: 'fallback-model',
-    fallbackModels: [{ value: 'fallback-model', label: 'Fallback' }],
     getApiKey: () => 'sk-test',
     getBaseUrl: () => 'https://api.example.test/v1',
-    getSessionDir: () => dir,
-    getSessionFilePath: (id) => path.join(dir, `${id}.jsonl`),
     ...overrides,
   };
 }
 
-function waitForMessages(runtime) {
-  return new Promise((resolve) => {
-    runtime.onMessages((_chatId, messages) => resolve(messages));
-  });
+function captureOperation(runId) {
+  const events = [];
+  let resolveTerminal;
+  const terminal = new Promise((resolve) => { resolveTerminal = resolve; });
+  return {
+    events,
+    terminal,
+    operation: {
+      runId,
+      publish(event) {
+        events.push(event);
+        if (event.type === 'run-ended') resolveTerminal(event);
+      },
+    },
+  };
+}
+
+function capturedMessages(capture) {
+  return capture.events
+    .filter((event) => event.type === 'rows')
+    .flatMap((event) => event.rows.map((row) => row.message));
 }
 
 describe('OpenAiCompatibleResponsesRuntime', () => {
   afterEach(async () => {
     globalThis.fetch = originalFetch;
-    for (const dir of createdDirs.splice(0)) {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
   });
 
   it('builds text and image input content for the Responses API', () => {
@@ -127,8 +128,7 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       ]);
     });
 
-    const dir = await tempDir();
-    const result = await runOpenAiResponsesSingleQuery(runtimeConfig(dir), 'hi', {
+    const result = await runOpenAiResponsesSingleQuery(runtimeConfig(), 'hi', {
       model: 'selected-model',
       thinkingMode: 'ultra',
       timeoutMs: 110_000,
@@ -335,8 +335,7 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
     await expect(result).rejects.toThrow('Stopped');
   });
 
-  it('streams Direct Responses turns and persists assistant text', async () => {
-    const dir = await tempDir();
+  it('streams Direct Responses turns and emits assistant text', async () => {
     let requestBody;
     globalThis.fetch = mock(async (_url, init) => {
       requestBody = JSON.parse(init.body);
@@ -347,12 +346,10 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       ]);
     });
 
-    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig(dir));
-    const messagesPromise = new Promise((resolve) => {
-      runtime.onMessages((chatId, messages) => resolve({ chatId, messages }));
-    });
+    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig());
+    const capture = captureOperation('run-stream');
 
-    const started = await runtime.startSession({
+    await runtime.startSession({
       chatId: 'chat-1',
       command: 'hi',
       projectPath: '/tmp/project',
@@ -360,31 +357,24 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: capture.operation,
     });
-    const emitted = await messagesPromise;
+    await capture.terminal;
+    const emitted = capturedMessages(capture);
 
-    expect(started.nativePath).toBe(path.join(dir, `${started.agentSessionId}.jsonl`));
-    await fs.access(started.nativePath);
     expect(requestBody).toEqual({
       model: 'selected-model',
       input: [{ role: 'user', content: 'hi' }],
       stream: true,
       store: false,
     });
-    expect(emitted.chatId).toBe('chat-1');
-    expect(emitted.messages[0].content).toBe('hello world');
-
-    const persisted = await fs.readFile(path.join(dir, `${started.agentSessionId}.jsonl`), 'utf8');
-    expect(persisted).toContain('"content":"hi"');
-    expect(persisted).toContain('"content":"hello world"');
-    expect(persisted).not.toContain('private');
+    expect(emitted[0].content).toBe('hello world');
   });
 
   it('accepts a buffered JSON response for an interactive Responses session', async () => {
-    const dir = await tempDir();
     globalThis.fetch = mock(async () => Response.json({ output_text: 'session response' }));
-    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig(dir));
-    const messages = waitForMessages(runtime);
+    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig());
+    const capture = captureOperation('run-json');
 
     await runtime.startSession({
       chatId: 'chat-json',
@@ -394,23 +384,22 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: capture.operation,
     });
 
-    await expect(messages).resolves.toMatchObject([{ content: 'session response' }]);
+    await capture.terminal;
+    expect(capturedMessages(capture)).toMatchObject([{ content: 'session response' }]);
   });
 
-  it('does not emit or persist partial session output after a stream failure', async () => {
-    const dir = await tempDir();
+  it('does not emit partial session output after a stream failure', async () => {
     globalThis.fetch = mock(async () => streamResponse([
       { type: 'response.output_text.delta', delta: 'partial' },
       { type: 'response.failed', response: { error: { message: 'failed' } } },
     ], { complete: false }));
-    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig(dir));
-    const emitted = mock(() => {});
-    runtime.onMessages(emitted);
-    const failure = new Promise((resolve) => runtime.onFailed((_chatId, message) => resolve(message)));
+    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig());
+    const capture = captureOperation('run-failed');
 
-    const started = await runtime.startSession({
+    await runtime.startSession({
       chatId: 'chat-failed',
       command: 'hi',
       projectPath: '/tmp/project',
@@ -418,17 +407,16 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: capture.operation,
     });
 
-    await expect(failure).resolves.toBe('Direct (Responses) stream error: failed');
-    expect(emitted).not.toHaveBeenCalled();
-    const persisted = await fs.readFile(started.nativePath, 'utf8');
-    expect(persisted).toContain('"content":"hi"');
-    expect(persisted).not.toContain('partial');
+    await expect(capture.terminal.then((event) => event.error?.message)).resolves.toBe(
+      'Direct (Responses) stream error: failed',
+    );
+    expect(capturedMessages(capture)).toEqual([]);
   });
 
   it('forwards the current interactive effort and removes it for Default', async () => {
-    const dir = await tempDir();
     const requestBodies = [];
     globalThis.fetch = mock(async (_url, init) => {
       requestBodies.push(JSON.parse(init.body));
@@ -436,8 +424,8 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
         { type: 'response.output_text.delta', delta: 'done' },
       ]);
     });
-    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig(dir));
-    const firstMessages = waitForMessages(runtime);
+    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig());
+    const first = captureOperation('run-first');
 
     const started = await runtime.startSession({
       chatId: 'chat-1',
@@ -447,8 +435,9 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'high',
       claudeThinkingMode: 'auto',
+      operation: first.operation,
     });
-    await firstMessages;
+    await first.terminal;
 
     await runtime.runTurn({
       chatId: 'chat-1',
@@ -459,6 +448,7 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'low',
       claudeThinkingMode: 'auto',
+      operation: captureOperation('run-second').operation,
     });
     await runtime.runTurn({
       chatId: 'chat-1',
@@ -469,6 +459,7 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'none',
       claudeThinkingMode: 'auto',
+      operation: captureOperation('run-third').operation,
     });
 
     expect(requestBodies[0].reasoning).toEqual({ effort: 'high' });
@@ -477,88 +468,8 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
     expect(requestBodies.every((body) => body.stream === true && body.store === false)).toBe(true);
   });
 
-  it('does not start provider work when the initial transcript cannot be persisted', async () => {
-    const root = await tempDir();
-    const blockedParent = path.join(root, 'blocked');
-    const sessionDir = path.join(blockedParent, 'sessions');
-    await fs.writeFile(blockedParent, 'not a directory');
-    const fetchMock = mock(async () => streamResponse([]));
-    globalThis.fetch = fetchMock;
-
-    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig(sessionDir));
-    const sessionCreated = mock(() => {});
-    runtime.onSessionCreated(sessionCreated);
-
-    await expect(runtime.startSession({
-      chatId: 'chat-1',
-      command: 'hi',
-      projectPath: '/tmp/project',
-      model: 'selected-model',
-      permissionMode: 'default',
-      thinkingMode: 'none',
-      claudeThinkingMode: 'auto',
-    })).rejects.toThrow();
-
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(sessionCreated).not.toHaveBeenCalled();
-    expect(runtime.getRunningSessions()).toEqual([]);
-  });
-
-  it('marks resumed turns running before persistence and clears the state on failure', async () => {
-    const root = await tempDir();
-    let activeDir = root;
-    const fetchMock = mock(async () => streamResponse([
-      { type: 'response.output_text.delta', delta: 'first response' },
-    ]));
-    globalThis.fetch = fetchMock;
-    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig(root, {
-      getSessionDir: () => activeDir,
-      getSessionFilePath: (id) => path.join(activeDir, `${id}.jsonl`),
-    }));
-    const firstResponse = new Promise((resolve) => runtime.onMessages(resolve));
-    const processing = mock(() => {});
-    runtime.onProcessing(processing);
-
-    const started = await runtime.startSession({
-      chatId: 'chat-1',
-      command: 'first',
-      projectPath: '/tmp/project',
-      model: 'selected-model',
-      permissionMode: 'default',
-      thinkingMode: 'none',
-      claudeThinkingMode: 'auto',
-    });
-    await firstResponse;
-    processing.mockClear();
-
-    const blockedParent = path.join(root, 'blocked');
-    await fs.writeFile(blockedParent, 'not a directory');
-    activeDir = path.join(blockedParent, 'sessions');
-
-    await expect(runtime.runTurn({
-      chatId: 'chat-1',
-      agentSessionId: started.agentSessionId,
-      command: 'second',
-      projectPath: '/tmp/project',
-      model: 'selected-model',
-      permissionMode: 'default',
-      thinkingMode: 'none',
-      claudeThinkingMode: 'auto',
-    })).rejects.toThrow();
-
-    expect(processing.mock.calls.map((call) => call[1])).toEqual([true, false]);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(runtime.isRunning(started.agentSessionId)).toBe(false);
-  });
-
-  it('hydrates an unknown session from persisted JSONL before resuming', async () => {
-    const dir = await tempDir();
+  it('hydrates an unknown session from the supplied ledger context', async () => {
     const sessionId = 'persisted-session';
-    await fs.writeFile(path.join(dir, `${sessionId}.jsonl`), [
-      JSON.stringify({ role: 'user', content: 'first message' }),
-      JSON.stringify({ role: 'assistant', content: 'first response' }),
-      '',
-    ].join('\n'));
 
     let requestBody;
     globalThis.fetch = mock(async (_url, init) => {
@@ -568,7 +479,7 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       ]);
     });
 
-    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig(dir));
+    const runtime = new OpenAiCompatibleResponsesRuntime(runtimeConfig());
     await runtime.runTurn({
       chatId: 'chat-1',
       agentSessionId: sessionId,
@@ -578,6 +489,11 @@ describe('OpenAiCompatibleResponsesRuntime', () => {
       permissionMode: 'default',
       thinkingMode: 'max',
       claudeThinkingMode: 'auto',
+      priorContext: [
+        new UserMessage('2026-01-01T00:00:00.000Z', 'first message'),
+        new AssistantMessage('2026-01-01T00:00:01.000Z', 'first response'),
+      ],
+      operation: captureOperation('run-hydrated').operation,
     });
 
     expect(requestBody.reasoning).toEqual({ effort: 'max' });

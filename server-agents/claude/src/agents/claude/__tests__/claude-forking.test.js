@@ -3,9 +3,8 @@ import { access, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs
 import os from 'node:os';
 import path from 'node:path';
 import { UserMessage } from '@garcon/common/chat-types';
-import { createJsonlForking } from '@garcon/server-agent-common/forking/jsonl-forking';
+import { createJsonlNativeForking } from '@garcon/server-agent-common/forking/jsonl-forking';
 import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
-import { computeAgentTranscriptRevision } from '@garcon/server-agent-interface';
 import {
   claudeForkSemanticDigest,
   projectClaudeForkEntry,
@@ -101,14 +100,14 @@ describe('Claude JSONL forking', () => {
     await writeFile(sourcePath, sourceContent);
 
     const nativeSessions = createPathNativeSessionCodec('claude');
-    const transcript = {
+    const nativeEvidence = {
       async resolveNativeSession({ chat }) {
         return chat.nativeSession;
       },
       async load({ chat }) {
         const nativePath = nativeSessions.decode(chat.nativeSession).path;
         const messages = await loadClaudeChatMessages(nativePath, undefined, { throwOnError: true });
-        return { messages, revision: computeAgentTranscriptRevision(messages) };
+        return { messages };
       },
     };
     const sourceNativeSession = nativeSessions.encode({
@@ -125,16 +124,9 @@ describe('Claude JSONL forking', () => {
       thinkingMode: 'none',
       settings,
       endpoint: null,
-      operation: {
-        commandType: 'fork-run',
-        clientRequestId: null,
-        clientMessageId: null,
-        turnId: 'turn-1',
-      },
       admission: {
         signal: new AbortController().signal,
         markStarted() {},
-        markAbortable() {},
       },
       source: {
         chatId: 'source-chat',
@@ -146,11 +138,10 @@ describe('Claude JSONL forking', () => {
         carryOverRevision: '',
         settings,
       },
-      point: null,
+      providerMeta: null,
     };
-    const forking = createJsonlForking({
-      supportsWhileRunning: true,
-      transcript,
+    const forking = createJsonlNativeForking({
+      nativeEvidence,
       nativeSessions,
       rewriteEntry: projectClaudeForkEntry,
       transformEntries: transformClaudeForkTranscript,
@@ -214,9 +205,8 @@ describe('Claude JSONL forking', () => {
       modelEndpointId: null,
     });
     const settings = { ownerId: 'claude', schemaVersion: 1, values: {} };
-    const forking = createJsonlForking({
-      supportsWhileRunning: true,
-      transcript: {
+    const forking = createJsonlNativeForking({
+      nativeEvidence: {
         async resolveNativeSession({ chat }) {
           return chat.nativeSession;
         },
@@ -239,16 +229,9 @@ describe('Claude JSONL forking', () => {
       thinkingMode: 'none',
       settings,
       endpoint: null,
-      operation: {
-        commandType: 'fork-run',
-        clientRequestId: null,
-        clientMessageId: null,
-        turnId: 'turn-1',
-      },
       admission: {
         signal: new AbortController().signal,
         markStarted() {},
-        markAbortable() {},
       },
       source: {
         chatId: 'source-chat',
@@ -260,7 +243,7 @@ describe('Claude JSONL forking', () => {
         carryOverRevision: '',
         settings,
       },
-      point: null,
+      providerMeta: null,
     });
 
     expect(outcome).toEqual({ kind: 'unmaterialized' });

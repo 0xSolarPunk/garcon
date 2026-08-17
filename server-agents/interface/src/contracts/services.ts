@@ -16,13 +16,11 @@ import type { ThinkingMode } from '@garcon/common/chat-modes';
 import type { JsonObject } from '@garcon/common/json';
 import type { SlashCommand } from '@garcon/common/slash-commands';
 import type {
-  AgentCompactRequest,
-  AgentExecutionContext,
-  AgentResumeRequest,
-  AgentStartedSession,
-} from './execution.js';
+  AgentExecutionHandle,
+  AgentResumeRequestV5,
+} from './execution-v5.js';
 import type { AgentMigrationStore } from './host.js';
-import type { AgentChatReference, AgentNativeSessionRef } from './transcript.js';
+import type { AgentNativeSessionRef } from './transcript.js';
 
 export interface AgentCatalog {
   snapshot(request: { readonly strict: boolean; readonly signal: AbortSignal }): Promise<{
@@ -42,6 +40,7 @@ export interface AgentSettings {
   defaults(): AgentSettingsEnvelope;
   parse(input: AgentSettingsEnvelope): AgentSettingsEnvelope;
   migrate(input: AgentSettingsEnvelope): Promise<AgentSettingsEnvelope>;
+  // Preserves the semantic envelope without mutating current when patch is empty.
   applyPatch(current: AgentSettingsEnvelope, patch: JsonObject): AgentSettingsEnvelope;
 }
 
@@ -108,7 +107,7 @@ export interface AgentGoals {
   submitControl(request: AgentGoalControlRequest): Promise<boolean>;
 }
 
-export interface AgentGoalControlRequest extends AgentResumeRequest {
+export interface AgentGoalControlRequest extends AgentResumeRequestV5 {
   readonly beforeDelivery: (handoff: AgentGoalControlHandoff) => Promise<void>;
 }
 
@@ -123,30 +122,7 @@ export interface AgentGoalControlHandoff {
 // this facet the chat can still shed context through `/handoff`, which starts a
 // fresh session from a projected transcript instead.
 export interface AgentCompaction {
-  compact(request: AgentCompactRequest): Promise<void>;
-}
-
-export interface AgentForking {
-  readonly supportsAtMessage: boolean;
-  // Gates both whole-session and at-message forks: a running provider session must tolerate
-  // having its transcript read and copied while it is still appending to it.
-  readonly supportsWhileRunning: boolean;
-  fork(request: AgentForkRequest): Promise<AgentForkOutcome>;
-  discard(session: AgentStartedSession, signal: AbortSignal): Promise<void>;
-}
-
-// Distinguishes a copied provider session from a successful fork with no resumable provider state.
-export type AgentForkOutcome =
-  | { readonly kind: 'materialized'; readonly session: AgentStartedSession }
-  | { readonly kind: 'unmaterialized' };
-
-export interface AgentForkRequest extends AgentExecutionContext {
-  readonly source: AgentChatReference;
-  readonly point: {
-    readonly messageSequence: number;
-    readonly archivedMessageCount: number;
-    readonly sourceRevision: { readonly nativePrefix: string; readonly carryOver: string };
-  } | null;
+  compact(request: AgentResumeRequestV5): Promise<AgentExecutionHandle>;
 }
 
 export interface AgentLifecycle {

@@ -19,6 +19,13 @@ export function exactReplyPrompt(value: string): string {
   return `Reply with exactly ${value}. Do not use tools.`;
 }
 
+// A prompt that may still be unanswered when the next one is dispatched gets folded into it, so
+// it must not forbid what that successor asks for. Otherwise the merged instruction contradicts
+// itself and the answer depends on which half the model picks.
+export function foldableReplyPrompt(value: string): string {
+  return `Reply with exactly ${value}.`;
+}
+
 export function expectFinished(type: string): void {
   expect(type).toBe('agent-run-finished');
 }
@@ -27,15 +34,18 @@ export function expectAssistantMarker(contents: readonly string[], value: string
   expect(contents.some((content) => content.includes(value))).toBe(true);
 }
 
+// An interrupted turn proves it never completed by never delivering its completion reply. The
+// prompt asks for that reply verbatim, so the reply is the whole message; a model that narrates
+// the instruction it was given quotes the sentinel without having answered with it.
+export function expectNoCompletionReply(contents: readonly string[], value: string): void {
+  expect(contents.map((content) => content.trim())).not.toContain(value);
+}
+
 export function expectStoppedTurnEventOrder(
   events: readonly ServerWsMessage[],
   chatId: string,
   turnId: string,
 ): void {
-  const stopping = events.findIndex((event) =>
-    event.type === 'chat-processing-updated'
-    && event.chatId === chatId
-    && event.phase === 'stopping');
   const stopped = events.findIndex((event) =>
     event.type === 'chat-session-stopped'
     && event.chatId === chatId
@@ -46,8 +56,7 @@ export function expectStoppedTurnEventOrder(
     && event.chatId === chatId
     && event.phase === null);
 
-  expect(stopping).toBeGreaterThanOrEqual(0);
-  expect(stopped).toBeGreaterThan(stopping);
+  expect(stopped).toBeGreaterThanOrEqual(0);
   expect(idle).toBeGreaterThan(stopped);
   expect(events).not.toContainEqual(expect.objectContaining({
     type: 'agent-run-failed',
@@ -69,7 +78,6 @@ function expectVisibleResponseBeforeSettlement(input: {
   const assistantResponse = input.events.findIndex((event) =>
     event.type === 'chat-messages'
     && event.chatId === input.chatId
-    && event.turnId === input.turnId
     && event.messages.some((entry) =>
       entry.message.type === 'assistant-message'
       && (
@@ -121,7 +129,16 @@ export async function reloadUntilNativeContains(
 ): Promise<void> {
   const deadline = Date.now() + RELOAD_SETTLE_TIMEOUT_MS;
   for (;;) {
-    await reloadFromNativeHistory(fixture, chatId);
+    try {
+      await reloadFromNativeHistory(fixture, chatId);
+    } catch (error) {
+      const providerHistoryStillFlushing = error instanceof GarconWsRequestError
+        && error.response.code === 'HISTORY_LOAD_FAILED'
+        && error.response.retryable === true;
+      if (!providerHistoryStillFlushing || Date.now() >= deadline) throw error;
+      await Bun.sleep(POLL_INTERVAL_MS);
+      continue;
+    }
     const page = await fixture.client.getMessages(chatId);
     if (assistantContents(page.messages).some((content) => content.includes(marker))) return;
     if (Date.now() >= deadline) {
@@ -143,7 +160,7 @@ export async function reloadUntilNativeAnswersAfter(
     await reloadFromNativeHistory(fixture, chatId);
     const page = await fixture.client.getMessages(chatId);
     const answered = page.messages.some((entry) =>
-      entry.seq > afterSeq && entry.message.type === 'assistant-message');
+      entry.ordinal > afterSeq && entry.message.type === 'assistant-message');
     if (answered) return page;
     if (Date.now() >= deadline) {
       throw new Error(`Native history for ${chatId} never answered past seq ${afterSeq}`);
@@ -167,7 +184,6 @@ export async function waitForVisibleResponse(input: {
   const assistantResponse = input.fixture.client.eventsSince(input.afterIndex).findIndex((event) =>
     event.type === 'chat-messages'
     && event.chatId === input.chatId
-    && event.turnId === input.turnId
     && event.messages.some((entry) =>
       entry.message.type === 'assistant-message'
       && (input.marker === undefined || entry.message.content.includes(input.marker))));

@@ -11,11 +11,16 @@ import {
   type ThinkingMode,
 } from './chat-modes.js';
 import type { ChatProcessingPhase } from './chat-types.js';
-import { parseChatViewMessages, type ChatViewMessage } from './chat-view.js';
 import {
-  normalizePendingUserInput,
-  type PendingUserInput,
-} from './pending-user-input.js';
+  isRelationallyValidBoundedTranscriptPage,
+  isRelationallyValidNewestTranscriptPage,
+  parseTranscriptMessages,
+  type TranscriptMessage,
+} from './chat-view.js';
+import {
+  parseChatTransientFeedSnapshot,
+  type ChatTransientFeedSnapshot,
+} from './chat-transient-feed.js';
 import { normalizeTags } from './tags.js';
 
 export const CHAT_SNAPSHOT_DEFAULT_MESSAGE_LIMIT = 10;
@@ -35,6 +40,7 @@ export interface ChatSnapshotChat {
   thinkingMode: ThinkingMode;
   projectPath: string;
   tags: string[];
+  canReloadFromNativeHistory: boolean;
   activity: {
     createdAt: string | null;
     lastActivityAt: string | null;
@@ -43,19 +49,24 @@ export interface ChatSnapshotChat {
 
 export interface AvailableChatSnapshotTranscript {
   availability: 'available';
-  generationId: string;
-  messages: ChatViewMessage[];
-  lastSeq: number;
-  pageOldestSeq: number;
+  transcriptViewId: string;
+  messages: TranscriptMessage[];
+  lastOrdinal: number;
+  pageOldestOrdinal: number;
+  pageNewestOrdinal: number;
+  nextBeforeOrdinal: number | null;
   hasMore: boolean;
 }
 
+// Carries a typed ledger read failure without making the rest of the snapshot unusable.
 export interface UnavailableChatSnapshotTranscript {
   availability: 'unavailable';
-  errorCode: 'TRANSCRIPT_UNAVAILABLE';
+  errorCode: string;
   retryable: boolean;
   message: string;
 }
+
+const SNAPSHOT_TRANSCRIPT_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 export interface NotRequestedChatSnapshotTranscript {
   availability: 'not-requested';
@@ -72,7 +83,7 @@ export interface ChatSnapshotResponse {
   chat: ChatSnapshotChat;
   processingPhase: ChatProcessingPhase | null;
   control: ChatExecutionControlState;
-  pendingUserInputs: PendingUserInput[];
+  transientFeed: ChatTransientFeedSnapshot;
   transcript: ChatSnapshotTranscript;
 }
 
@@ -95,15 +106,13 @@ export function parseChatSnapshotResponse(value: unknown): ChatSnapshotResponse 
       : fail('processingPhase is invalid');
   const control = parseChatExecutionControlState(raw.control);
   if (!control) fail('control is invalid');
-  if (!Array.isArray(raw.pendingUserInputs)) {
-    fail('pendingUserInputs must be an array');
-  }
-  const pendingUserInputs = raw.pendingUserInputs.map(normalizePendingUserInput);
-  if (pendingUserInputs.some((input) => input === null)) {
-    fail('pendingUserInputs contains an invalid entry');
-  }
-  if (pendingUserInputs.some((input) => input?.chatId !== chat.id)) {
-    fail('pendingUserInputs contains another chat');
+  const transientFeed = parseChatTransientFeedSnapshot(raw.transientFeed);
+  if (!transientFeed) fail('transientFeed is invalid');
+  if (transientFeed.chatId !== chat.id) fail('transientFeed belongs to another chat');
+  const transcript = parseTranscript(raw.transcript, messageLimit);
+  if (transcript.availability === 'available'
+      && transcript.transcriptViewId !== transientFeed.transcriptViewId) {
+    fail('transientFeed and transcript views differ');
   }
 
   return {
@@ -112,8 +121,8 @@ export function parseChatSnapshotResponse(value: unknown): ChatSnapshotResponse 
     chat,
     processingPhase,
     control,
-    pendingUserInputs: pendingUserInputs as PendingUserInput[],
-    transcript: parseTranscript(raw.transcript, messageLimit),
+    transientFeed,
+    transcript,
   };
 }
 
@@ -157,6 +166,10 @@ function parseChat(value: unknown): ChatSnapshotChat {
     thinkingMode: raw.thinkingMode,
     projectPath: requiredString(raw.projectPath, 'chat.projectPath'),
     tags: [...tags],
+    canReloadFromNativeHistory: requiredBoolean(
+      raw.canReloadFromNativeHistory,
+      'chat.canReloadFromNativeHistory',
+    ),
     activity: {
       createdAt: nullableTimestamp(activity.createdAt, 'chat.activity.createdAt'),
       lastActivityAt: nullableTimestamp(
@@ -179,7 +192,8 @@ function parseTranscript(value: unknown, messageLimit: number): ChatSnapshotTran
     fail('transcript cannot be not-requested when messages were requested');
   }
   if (raw.availability === 'unavailable') {
-    if (raw.errorCode !== 'TRANSCRIPT_UNAVAILABLE') {
+    if (typeof raw.errorCode !== 'string'
+        || !SNAPSHOT_TRANSCRIPT_ERROR_CODE_PATTERN.test(raw.errorCode)) {
       fail('transcript.errorCode is invalid');
     }
     if (typeof raw.retryable !== 'boolean') fail('transcript.retryable is invalid');
@@ -191,20 +205,47 @@ function parseTranscript(value: unknown, messageLimit: number): ChatSnapshotTran
     };
   }
   if (raw.availability !== 'available') fail('transcript.availability is invalid');
-  const messages = parseChatViewMessages(raw.messages);
+  const messages = parseTranscriptMessages(raw.messages);
   if (!messages || messages.length > messageLimit) fail('transcript.messages is invalid');
-  const lastSeq = nonNegativeInteger(raw.lastSeq, 'transcript.lastSeq');
-  const pageOldestSeq = nonNegativeInteger(raw.pageOldestSeq, 'transcript.pageOldestSeq');
+  const lastOrdinal = nonNegativeInteger(raw.lastOrdinal, 'transcript.lastOrdinal');
+  const pageOldestOrdinal = nonNegativeInteger(
+    raw.pageOldestOrdinal,
+    'transcript.pageOldestOrdinal',
+  );
+  const pageNewestOrdinal = nonNegativeInteger(
+    raw.pageNewestOrdinal,
+    'transcript.pageNewestOrdinal',
+  );
+  const nextBeforeOrdinal = nullableEarlierPageCursor(
+    raw.nextBeforeOrdinal,
+    'transcript.nextBeforeOrdinal',
+  );
   if (typeof raw.hasMore !== 'boolean') fail('transcript.hasMore is invalid');
-  if (messages.length > 0 && messages[messages.length - 1]!.seq > lastSeq) {
-    fail('transcript sequence metadata is inconsistent');
+  const page = {
+    messages,
+    lastOrdinal,
+    pageOldestOrdinal,
+    pageNewestOrdinal,
+    nextBeforeOrdinal,
+    hasMore: raw.hasMore,
+  };
+  if (
+    !isRelationallyValidNewestTranscriptPage(page)
+    || !isRelationallyValidBoundedTranscriptPage(page, messageLimit)
+  ) {
+    fail('transcript ordinal metadata is inconsistent');
   }
   return {
     availability: 'available',
-    generationId: requiredString(raw.generationId, 'transcript.generationId'),
+    transcriptViewId: requiredString(
+      raw.transcriptViewId,
+      'transcript.transcriptViewId',
+    ),
     messages,
-    lastSeq,
-    pageOldestSeq,
+    lastOrdinal,
+    pageOldestOrdinal,
+    pageNewestOrdinal,
+    nextBeforeOrdinal,
     hasMore: raw.hasMore,
   };
 }
@@ -222,6 +263,13 @@ function nonNegativeInteger(value: unknown, field: string): number {
   return value;
 }
 
+function nullableEarlierPageCursor(value: unknown, field: string): number | null {
+  if (value === null) return null;
+  const parsed = nonNegativeInteger(value, field);
+  if (parsed <= 1) fail(`${field} must be greater than one`);
+  return parsed;
+}
+
 function nullableString(value: unknown, field: string): string | null {
   return value === null ? null : requiredString(value, field);
 }
@@ -234,6 +282,11 @@ function nullableApiProtocol(value: unknown, field: string): ApiProtocol | null 
 
 function requiredString(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.length === 0) fail(`${field} is invalid`);
+  return value;
+}
+
+function requiredBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') fail(`${field} is invalid`);
   return value;
 }
 

@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import type { PendingUserInputUpdatedMessage } from '../../../common/ws-events.js';
 import { assistantContents } from '../../support/chat-assertions.js';
 import {
   codexAssistantMessage,
@@ -57,22 +56,19 @@ describe('scripted Codex queue lifecycle', () => {
       const queueCursor = fixture.client.markEvents();
       const queued = await fixture.client.enqueueNew(chatId, secondPrompt);
       expect(queued.control.queue.entries.map((entry) => entry.content)).toEqual([secondPrompt]);
-      expectFinished((await fixture.client.waitForTurnTerminal(chatId, first.turnId, {
+      const firstTerminal = await fixture.client.waitForTurnTerminal(chatId, first.turnId, {
         afterIndex: firstCursor,
         timeoutMs: LIVE_TURN_TIMEOUT_MS,
-      })).type);
+      });
+      expectFinished(firstTerminal.type);
 
-      const secondInput = await fixture.client.waitForEvent(
-        (event): event is PendingUserInputUpdatedMessage =>
-          event.type === 'pending-user-input-updated'
-          && event.input.chatId === chatId
-          && event.input.content === secondPrompt
-          && typeof event.input.turnId === 'string',
-        'scripted Codex queued turn identity',
+      const secondInput = await fixture.client.waitForCommittedUserInput(
+        chatId,
+        secondPrompt,
         { afterIndex: queueCursor, timeoutMs: LIVE_TURN_TIMEOUT_MS },
       );
-      expectFinished((await fixture.client.waitForTurnTerminal(chatId, secondInput.input.turnId, {
-        afterIndex: queueCursor,
+      expectFinished((await fixture.client.waitForTurnTerminal(chatId, undefined, {
+        afterIndex: fixture.client.events().lastIndexOf(secondInput) + 1,
         timeoutMs: LIVE_TURN_TIMEOUT_MS,
       })).type);
       await fixture.client.waitForProcessing(chatId, false, {
@@ -80,7 +76,30 @@ describe('scripted Codex queue lifecycle', () => {
         timeoutMs: LIVE_TURN_TIMEOUT_MS,
       });
 
-      const assistants = assistantContents((await fixture.client.getMessages(chatId)).messages);
+      const queueEvents = fixture.client.eventsSince(queueCursor);
+      const firstReplyEventIndex = queueEvents.findIndex((event) =>
+        event.type === 'chat-messages'
+        && event.chatId === chatId
+        && event.messages.some((entry) =>
+          entry.message.type === 'assistant-message'
+          && entry.message.content === firstReply));
+      const firstTerminalIndex = queueEvents.findIndex((event) => event === firstTerminal);
+      const secondInputIndex = queueEvents.findIndex((event) => event === secondInput);
+      expect(firstReplyEventIndex).toBeGreaterThanOrEqual(0);
+      expect(firstTerminalIndex).toBeGreaterThan(firstReplyEventIndex);
+      expect(secondInputIndex).toBeGreaterThan(firstTerminalIndex);
+
+      const page = await fixture.client.getMessages(chatId);
+      const firstReplyEntry = page.messages.find((entry) =>
+        entry.message.type === 'assistant-message' && entry.message.content === firstReply);
+      const secondInputEntry = page.messages.find((entry) =>
+        entry.message.type === 'user-message' && entry.message.content === secondPrompt);
+      if (!firstReplyEntry || !secondInputEntry) {
+        throw new Error('Queued transcript omitted an expected exact marker');
+      }
+      expect(secondInputEntry.ordinal).toBeGreaterThan(firstReplyEntry.ordinal + 1);
+
+      const assistants = assistantContents(page.messages);
       expect(assistants.findIndex((content) => content.includes(firstReply))).toBeGreaterThanOrEqual(0);
       expect(assistants.findIndex((content) => content.includes(secondReply)))
         .toBeGreaterThan(assistants.findIndex((content) => content.includes(firstReply)));

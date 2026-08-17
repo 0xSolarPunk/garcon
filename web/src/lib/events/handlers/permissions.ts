@@ -1,11 +1,12 @@
 // Handles permission lifecycle from chat event message batches.
 // Inspects ChatMessage entries for permission-request, permission-resolved,
-// and permission-cancelled types.
+// permission-cancelled, and permission-expired types.
 
 import {
 	PermissionRequestMessage,
 	PermissionResolvedMessage,
 	PermissionCancelledMessage,
+	PermissionExpiredMessage,
 	type ChatMessage,
 } from '$shared/chat-types';
 import type { LoadingStatusEntry } from '$lib/chat/conversation/conversation-lifecycle-state.svelte.js';
@@ -34,13 +35,15 @@ export function handlePermissionLifecycleFromBatch(
 		if (entry instanceof PermissionRequestMessage) {
 			let requestAdded = false;
 			ctx.conversationUi.setPendingPermissionRequests((previous) => {
-				if (previous.some((r) => r.permissionRequestId === entry.permissionRequestId))
+				if (previous.some((request) => (
+					request.permissionOccurrenceId === entry.permissionOccurrenceId
+				)))
 					return previous;
 				requestAdded = true;
 				return [
 					...previous,
 					{
-						permissionRequestId: entry.permissionRequestId,
+						permissionOccurrenceId: entry.permissionOccurrenceId,
 						requestedTool: entry.requestedTool,
 						chatId: msg.chatId || null,
 						receivedAt: new Date(),
@@ -59,18 +62,20 @@ export function handlePermissionLifecycleFromBatch(
 			}
 		}
 
-		if (entry instanceof PermissionResolvedMessage) {
-			ctx.popLoadingStatus(WAITING_FOR_PERMISSION_ID);
-			ctx.conversationUi.setPendingPermissionRequests((previous) =>
-				previous.filter((r) => r.permissionRequestId !== entry.permissionRequestId),
-			);
-		}
-
-		if (entry instanceof PermissionCancelledMessage) {
-			ctx.popLoadingStatus(WAITING_FOR_PERMISSION_ID);
-			ctx.conversationUi.setPendingPermissionRequests((previous) =>
-				previous.filter((r) => r.permissionRequestId !== entry.permissionRequestId),
-			);
+		if (
+			entry instanceof PermissionResolvedMessage
+			|| entry instanceof PermissionCancelledMessage
+			|| entry instanceof PermissionExpiredMessage
+		) {
+			let occurrenceRemoved = false;
+			ctx.conversationUi.setPendingPermissionRequests((previous) => {
+				const remaining = previous.filter((request) => (
+					request.permissionOccurrenceId !== entry.permissionOccurrenceId
+				));
+				occurrenceRemoved = remaining.length !== previous.length;
+				return occurrenceRemoved ? remaining : previous;
+			});
+			if (occurrenceRemoved) ctx.popLoadingStatus(WAITING_FOR_PERMISSION_ID);
 		}
 	}
 }

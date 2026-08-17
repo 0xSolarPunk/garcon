@@ -6,7 +6,6 @@ import {
   countUserContent,
   messagesOfType,
 } from '../../support/chat-assertions.js';
-import type { ChatGenerationResetMessage } from '../../../common/ws-events.js';
 import {
   codexAssistantMessage,
   codexExecCommandCall,
@@ -94,7 +93,7 @@ describe('scripted Codex escalation', () => {
     }
   });
 
-  test('persists the sandboxed failure and escalated retry as separate executions', async () => {
+  test('persists the streamed escalated retry without reconciling native-only output', async () => {
     if (!environment) throw new Error('Scripted Codex environment was not initialized.');
     const testEnvironment = environment;
     const serverEnvironment = { ...testEnvironment.serverEnvironment };
@@ -146,32 +145,17 @@ describe('scripted Codex escalation', () => {
           'item/commandExecution/requestApproval',
         ]);
 
-        const liveExecutions = expectExecutions(
-          await fixture.client.getMessages(chatId),
-          command,
-          marker,
-          1,
-        );
-        const reconciled = await fixture.client.waitForEvent(
-          (event): event is ChatGenerationResetMessage =>
-            event.type === 'chat-generation-reset'
-            && event.chatId === chatId
-            && event.reason === 'idle-reconcile',
-          'scripted Codex idle native reconcile',
-          { afterIndex: cursor, timeoutMs: 15_000 },
-        );
-        expect(reconciled.lastSeq).toBeGreaterThan(0);
-        const native = await fixture.client.getMessages(chatId);
-        const nativeExecutions = expectExecutions(native, command, marker, 2);
-        expect(nativeExecutions.filter((execution) => !execution.isError))
-          .toEqual(liveExecutions);
-        expect(nativeExecutions.filter((execution) => execution.isError)).toHaveLength(1);
-        expect(assistantContents(native.messages).some((content) => content.includes(reply)))
+        // The sandbox failure exists only in Codex's rollout. The ledger stores
+        // the successful retry that Codex emitted live and never reconciles the
+        // native-only attempt into ordinary history.
+        const streamed = await fixture.client.getMessages(chatId);
+        const streamedExecutions = expectExecutions(streamed, command, marker, 1);
+        expect(assistantContents(streamed.messages).some((content) => content.includes(reply)))
           .toBe(true);
 
         await fixture.restartGarcon();
         const restored = await fixture.client.getMessages(chatId);
-        expect(expectExecutions(restored, command, marker, 2)).toEqual(nativeExecutions);
+        expect(expectExecutions(restored, command, marker, 1)).toEqual(streamedExecutions);
         expect(countUserContent(restored.messages, prompt)).toBe(1);
         testEnvironment.model.assertSettled();
       }, {
