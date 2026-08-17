@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, untrack } from 'svelte';
+	import { untrack } from 'svelte';
 	import ComposerEditorDialog from './ComposerEditorDialog.svelte';
 	import { getChatSessions, getComposerState, getLocalSettings } from '$lib/context';
 	import { PromptComposerEditorController } from './prompt-composer-editor-controller.js';
@@ -12,10 +12,7 @@
 		isPresented: boolean;
 		isDisabled: boolean;
 		promptTransformPending: boolean;
-		isPromptRefinementPending: boolean;
-		canRefinePrompt: boolean;
 		openRequestId: number;
-		onRefinePrompt: () => void;
 		resizeTextarea: () => void;
 	}
 
@@ -26,10 +23,7 @@
 		isPresented,
 		isDisabled,
 		promptTransformPending,
-		isPromptRefinementPending,
-		canRefinePrompt,
 		openRequestId,
-		onRefinePrompt,
 		resizeTextarea,
 	}: Props = $props();
 	const composer = getComposerState();
@@ -63,8 +57,6 @@
 		},
 	});
 
-	onDestroy(() => controller.destroy());
-
 	export function open(): boolean {
 		return controller.open();
 	}
@@ -95,12 +87,8 @@
 		selection={ui.composerEditorSelection}
 		attachmentCount={composer.images.length}
 		focusRequestId={ui.composerEditorFocusRequestId}
-		readOnly={promptTransformPending}
-		{canRefinePrompt}
-		{isPromptRefinementPending}
 		onTextChange={(text) => controller.updateText(editorChatId, text)}
 		onSelectionChange={(selection) => controller.updateSelection(editorChatId, selection)}
-		{onRefinePrompt}
 		onClose={() => controller.close()}
 	/>
 {/if}

@@ -1,12 +1,5 @@
 import { history, historyKeymap } from '@codemirror/commands';
-import {
-	Annotation,
-	Compartment,
-	EditorSelection,
-	EditorState,
-	Prec,
-	Transaction,
-} from '@codemirror/state';
+import { Annotation, EditorSelection, EditorState, Prec, Transaction } from '@codemirror/state';
 import {
 	drawSelection,
 	dropCursor,
@@ -36,7 +29,6 @@ export interface ComposerEditorControllerOptions {
 	initialText: string;
 	initialSelection: ComposerEditorSelection;
 	ariaLabel: string;
-	readOnly?: boolean;
 	workspaceShortcuts: Pick<WorkspaceShortcutDispatcher, 'registerLocalShortcutOwner'>;
 	onTextChange: (text: string) => void;
 	onSelectionChange: (selection: ComposerEditorSelection) => void;
@@ -46,16 +38,13 @@ export class ComposerEditorController {
 	readonly #view: EditorView;
 	readonly #unregisterLocalOwner: () => void;
 	readonly #unregisterScrollRegion: () => void;
-	readonly #readOnlyCompartment = new Compartment();
 	#selectionNotificationQueued = false;
 	#destroyed = false;
-	#readOnly: boolean;
 
 	constructor(
 		parent: HTMLElement,
 		private readonly options: ComposerEditorControllerOptions,
 	) {
-		this.#readOnly = options.readOnly ?? false;
 		const initialSelection = clampComposerEditorSelection(
 			options.initialSelection,
 			options.initialText.length,
@@ -64,10 +53,6 @@ export class ComposerEditorController {
 			doc: options.initialText,
 			selection: EditorSelection.single(initialSelection.anchor, initialSelection.head),
 			extensions: [
-				this.#readOnlyCompartment.of([
-					EditorState.readOnly.of(this.#readOnly),
-					EditorView.editable.of(!this.#readOnly),
-				]),
 				highlightSpecialChars(),
 				history(),
 				drawSelection(),
@@ -78,7 +63,6 @@ export class ComposerEditorController {
 				EditorView.contentAttributes.of({
 					'aria-label': options.ariaLabel,
 					'aria-multiline': 'true',
-					'aria-readonly': String(this.#readOnly),
 				}),
 				EditorView.updateListener.of((update) => this.#handleUpdate(update)),
 				EditorView.theme({
@@ -130,26 +114,14 @@ export class ComposerEditorController {
 		this.#view.focus();
 	}
 
-	syncText(text: string, requestedSelection: ComposerEditorSelection = this.selection): void {
+	syncText(text: string): void {
 		if (text === this.#view.state.doc.toString()) return;
-		const selection = clampComposerEditorSelection(requestedSelection, text.length);
+		const selection = clampComposerEditorSelection(this.selection, text.length);
 		this.#view.dispatch({
 			changes: { from: 0, to: this.#view.state.doc.length, insert: text },
 			selection: EditorSelection.single(selection.anchor, selection.head),
 			annotations: [externalDocumentSync.of(true), Transaction.addToHistory.of(false)],
 		});
-	}
-
-	setReadOnly(readOnly: boolean): void {
-		if (readOnly === this.#readOnly) return;
-		this.#readOnly = readOnly;
-		this.#view.dispatch({
-			effects: this.#readOnlyCompartment.reconfigure([
-				EditorState.readOnly.of(readOnly),
-				EditorView.editable.of(!readOnly),
-			]),
-		});
-		this.#view.contentDOM.setAttribute('aria-readonly', String(readOnly));
 	}
 
 	get selection(): ComposerEditorSelection {

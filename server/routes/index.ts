@@ -13,7 +13,6 @@ import createShareRoutes from './shares.js';
 import createWorkspaceRoutes from './workspace.js';
 import createScheduledPromptRoutes from './scheduled-prompts.js';
 import createTerminalRoutes from './terminals.js';
-import createPromptRefinementRoutes from './prompt-refinement.js';
 import { createRuntimeRoutes } from './runtime.js';
 import { createAgentTurnReceiptRoutes } from './agent-turn-receipt.js';
 import { createChatSnapshotRoutes } from './chat-snapshot.js';
@@ -144,7 +143,6 @@ export default function createAllRoutes({
     ...createGhRoutes(),
     ...createScheduledPromptRoutes(scheduledPrompts),
     ...createSnippetRoutes(snippets),
-    ...createPromptRefinementRoutes({ settings, agents }),
     ...createTerminalRoutes(terminals),
   };
 }

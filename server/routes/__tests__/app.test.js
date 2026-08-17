@@ -75,7 +75,6 @@ function createMockCtx() {
       getAgentCatalogEntries: mock(() => Promise.resolve([])),
       getModels: mock(() => Promise.resolve([])),
       runSingleQuery: mock(() => Promise.resolve('OK')),
-      singleQueryRunsToolsWithoutPermission: mock(() => false),
     },
   };
 }
@@ -290,10 +289,6 @@ describe('GET /api/app/settings', () => {
     expect(body.uiEffective.commitMessage.model).toBe('haiku');
     expect(body.uiEffective.commitMessage.thinkingMode).toBe('none');
     expect(body.uiEffective.commitMessage).not.toHaveProperty('enabled');
-    expect(body.uiEffective.promptRefinement.agentId).toBe('claude');
-    expect(body.uiEffective.promptRefinement.model).toBe('haiku');
-    expect(body.uiEffective.promptRefinement.thinkingMode).toBe('none');
-    expect(body.uiEffective.promptRefinement).not.toHaveProperty('enabled');
     expect(body.chatSortOrder).toBeUndefined();
   });
 
@@ -319,9 +314,6 @@ describe('GET /api/app/settings', () => {
     expect(body.uiEffective.commitMessage.agentId).toBe('codex');
     expect(body.uiEffective.commitMessage.model).toBe('gpt-5.5');
     expect(body.uiEffective.commitMessage).not.toHaveProperty('enabled');
-    expect(body.uiEffective.promptRefinement.agentId).toBe('codex');
-    expect(body.uiEffective.promptRefinement.model).toBe('gpt-5.5');
-    expect(body.uiEffective.promptRefinement).not.toHaveProperty('enabled');
   });
 
   it('preserves persisted commitMessage extra fields in uiEffective', async () => {
@@ -348,35 +340,6 @@ describe('GET /api/app/settings', () => {
     expect(body.uiEffective.commitMessage.customPrompt).toBe('Write a short message');
     expect(body.uiEffective.commitMessage.useCommonDirPrefix).toBe(true);
     expect(body.uiEffective.commitMessage).not.toHaveProperty('enabled');
-  });
-
-  it('preserves persisted promptRefinement prompt fields in uiEffective', async () => {
-    ctx.settings.getRemoteSettingsSnapshotSource.mockImplementation(() => remoteSettingsSource({
-      version: 4,
-      ui: {
-        promptRefinement: {
-          agentId: 'codex',
-          model: 'gpt-5.5',
-          thinkingMode: 'high',
-          customPrompt: 'Refine {{USER_PROMPT}}',
-        },
-      },
-    }));
-
-    const response = await handler();
-    const body = await response.json();
-
-    expect(body.uiEffective.promptRefinement).toEqual({
-      agentId: 'codex',
-      model: 'gpt-5.5',
-      thinkingMode: 'high',
-      customPrompt: 'Refine {{USER_PROMPT}}',
-      apiProviderId: null,
-      modelEndpointId: null,
-      modelProtocol: null,
-      source: 'manual',
-    });
-    expect(body.uiEffective.promptRefinement).not.toHaveProperty('enabled');
   });
 
   it('removes commit-only fields from persisted and effective title settings', async () => {
@@ -430,16 +393,8 @@ describe('GET /api/app/settings', () => {
       modelProtocol: 'openai-compatible',
       thinkingMode: 'low',
     };
-    const promptRefinement = {
-      agentId: 'direct-openai-compatible',
-      model: 'refinement-model',
-      apiProviderId: 'custom-provider',
-      modelEndpointId: 'custom-endpoint',
-      modelProtocol: 'openai-compatible',
-      thinkingMode: 'medium',
-    };
     ctx.settings.getRemoteSettingsSnapshotSource.mockImplementation(() => remoteSettingsSource({
-      ui: { chatTitle, agentSwitchCompaction, commitMessage, promptRefinement },
+      ui: { chatTitle, agentSwitchCompaction, commitMessage },
     }));
 
     const response = await handler();
@@ -448,7 +403,6 @@ describe('GET /api/app/settings', () => {
     expect(body.uiEffective.chatTitle).toMatchObject(chatTitle);
     expect(body.uiEffective.agentSwitchCompaction).toMatchObject(agentSwitchCompaction);
     expect(body.uiEffective.commitMessage).toMatchObject(commitMessage);
-    expect(body.uiEffective.promptRefinement).toMatchObject(promptRefinement);
     expect(ctx.agents.getAgentAuthStatusMap).not.toHaveBeenCalled();
     expect(ctx.agents.getAgentReadinessMap).not.toHaveBeenCalled();
     expect(ctx.agents.getAgentCatalogEntries).not.toHaveBeenCalled();
@@ -486,8 +440,6 @@ describe('POST /api/app/generation/test', () => {
     }));
     ctx.agents.runSingleQuery.mockClear();
     ctx.agents.runSingleQuery.mockImplementation(() => Promise.resolve('OK'));
-    ctx.agents.singleQueryRunsToolsWithoutPermission.mockClear();
-    ctx.agents.singleQueryRunsToolsWithoutPermission.mockImplementation(() => false);
     ctx.agents.getAgentAuthStatusMap.mockImplementation(() => Promise.resolve({}));
     ctx.agents.getAgentReadinessMap.mockImplementation(() => Promise.resolve({}));
     ctx.agents.getAgentCatalogEntries.mockImplementation(() => Promise.resolve([]));
@@ -562,31 +514,6 @@ describe('POST /api/app/generation/test', () => {
       expect.objectContaining({ model: 'haiku', thinkingMode: 'high' }),
     );
     expect(ctx.agents.runSingleQuery.mock.calls[0][1]).not.toHaveProperty('prompt');
-  });
-
-  it('rejects an unsafe saved prompt refinement target before invoking it', async () => {
-    const promptRefinement = {
-      agentId: 'amp',
-      model: 'smart',
-      thinkingMode: 'none',
-    };
-    ctx.settings.getUiSettings.mockImplementation(() => ({ promptRefinement }));
-    ctx.agents.singleQueryRunsToolsWithoutPermission.mockImplementation(() => true);
-    parseJsonBody.mockImplementation(() => Promise.resolve({
-      target: 'promptRefinement',
-      configurationKey: generationModelTestConfigurationKey(promptRefinement),
-    }));
-
-    const response = await handler(makeRequest(
-      'http://localhost/api/v1/app/generation/test',
-      'POST',
-      { target: 'promptRefinement' },
-    ));
-    const body = await response.json();
-
-    expect(response.status).toBe(422);
-    expect(body.errorCode).toBe('GENERATION_TEST_UNSAFE_AGENT');
-    expect(ctx.agents.runSingleQuery).not.toHaveBeenCalled();
   });
 
   it('rejects invalid targets with a typed contract error', async () => {
@@ -753,49 +680,6 @@ describe('PUT /api/app/settings', () => {
         useCommonDirPrefix: true,
       },
     });
-  });
-
-  it('preserves prompt refinement settings while stripping unrelated fields', async () => {
-    const promptRefinementInput = {
-      enabled: false,
-      agentId: 'codex',
-      model: 'gpt-5.5',
-      customPrompt: 'Refine {{USER_PROMPT}}',
-      useCommonDirPrefix: true,
-    };
-    parseJsonBody.mockImplementation(() => Promise.resolve({
-      ui: { promptRefinement: promptRefinementInput },
-    }));
-
-    const response = await handler(makeRequest('http://localhost/api/app/settings', 'PUT', {}));
-
-    expect(response.status).toBe(200);
-    expect(ctx.settings.setUiSettings).toHaveBeenCalledWith({
-      promptRefinement: {
-        agentId: 'codex',
-        model: 'gpt-5.5',
-        customPrompt: 'Refine {{USER_PROMPT}}',
-      },
-    });
-  });
-
-  it('rejects invalid generation prompt patches before persistence', async () => {
-    const cases = [
-      { commitMessage: { customPrompt: 42 } },
-      { commitMessage: { customPrompt: 'x'.repeat(32_001) } },
-      { promptRefinement: { customPrompt: 'Missing the required token' } },
-      { promptRefinement: { customPrompt: 'x'.repeat(32_001) } },
-    ];
-
-    for (const ui of cases) {
-      ctx.settings.setUiSettings.mockClear();
-      parseJsonBody.mockImplementationOnce(() => Promise.resolve({ ui }));
-      const response = await handler(makeRequest('http://localhost/api/app/settings', 'PUT', {}));
-      const body = await response.json();
-      expect(response.status).toBe(400);
-      expect(body.errorCode).toBe('INVALID_REMOTE_SETTINGS');
-      expect(ctx.settings.setUiSettings).not.toHaveBeenCalled();
-    }
   });
 
   it('patches and trims ui.appIdentity title settings', async () => {

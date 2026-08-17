@@ -85,14 +85,7 @@
 			settingsKey="commitMessage"
 			modelLabel={m.settings_commit_message_model()}
 			showDirectoryPrefix
-			promptKind="commit-message"
-		/>
-
-		<RemoteGenerationSettingsCard
-			settingsKey="promptRefinement"
-			modelLabel={m.settings_prompt_refinement_model()}
-			blurb={m.settings_prompt_refinement_hint()}
-			promptKind="prompt-refinement"
+			showPrompt
 		/>
 
 		<TelegramSettingsPanel />

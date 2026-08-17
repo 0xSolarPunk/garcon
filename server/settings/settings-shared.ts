@@ -4,7 +4,6 @@ import {
   normalizeAgentSwitchCompactionUiSettings,
   normalizeChatTitleUiSettings,
   normalizeCommitMessageUiSettings,
-  normalizePromptRefinementUiSettings,
 } from '../../common/settings.js';
 
 function normalizeAppIdentitySettings(value: unknown): { title: string } | undefined {
@@ -42,11 +41,6 @@ export function normalizeUiSettings(ui: unknown): UiSettings {
     const commitMessage = normalizeCommitMessageUiSettings(normalized.commitMessage);
     if (commitMessage) normalized.commitMessage = commitMessage;
     else delete normalized.commitMessage;
-  }
-  if ('promptRefinement' in normalized) {
-    const promptRefinement = normalizePromptRefinementUiSettings(normalized.promptRefinement);
-    if (promptRefinement) normalized.promptRefinement = promptRefinement;
-    else delete normalized.promptRefinement;
   }
   return normalized;
 }

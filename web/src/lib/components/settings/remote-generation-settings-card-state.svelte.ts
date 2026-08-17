@@ -4,6 +4,7 @@ import type {
 	ModelSelectorChange,
 	ModelSelectorValue,
 } from '$lib/components/model-selector/model-selector-types';
+import { DEFAULT_COMMIT_MESSAGE_PROMPT } from '$lib/git/commit/commit-message-default-prompt.js';
 import * as m from '$lib/paraglide/messages.js';
 import type { ModelCatalogStore } from '$lib/agents/model-catalog-store.svelte';
 import type { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte';
@@ -16,15 +17,10 @@ import type {
 	ChatTitleUiSettings,
 	CommitMessageUiSettings,
 	GenerationSelectionUiSettings,
-	PromptRefinementUiSettings,
 	RemoteUiSettings,
 } from '$shared/settings';
 
-export type GenerationSettingsKey =
-	| 'chatTitle'
-	| 'agentSwitchCompaction'
-	| 'commitMessage'
-	| 'promptRefinement';
+export type GenerationSettingsKey = 'chatTitle' | 'agentSwitchCompaction' | 'commitMessage';
 
 // Keys whose card owns an on/off switch above the model selector.
 const TOGGLEABLE_KEYS = new Set<GenerationSettingsKey>(['chatTitle', 'agentSwitchCompaction']);
@@ -34,11 +30,8 @@ interface RemoteGenerationSettingsCardOptions {
 	modelCatalog: ModelCatalogStore;
 	get settingsKey(): GenerationSettingsKey;
 	get enabledLabel(): string | undefined;
+	get showPrompt(): boolean;
 }
-
-export type GenerationPromptSaveResult =
-	| { ok: true }
-	| { ok: false; message: string };
 
 interface ConfigurationTestResult {
 	configurationKey: string;
@@ -57,8 +50,10 @@ export class RemoteGenerationSettingsCardState {
 	testing = $state(false);
 	testError = $state<ConfigurationTestError | null>(null);
 	testResult = $state<ConfigurationTestResult | null>(null);
+	promptDraft = $state(DEFAULT_COMMIT_MESSAGE_PROMPT);
 	#selectionSaveToken = 0;
 	#testRequestToken = 0;
+	#promptHydrationKey = '';
 
 	constructor(private readonly options: RemoteGenerationSettingsCardOptions) {}
 
@@ -78,18 +73,13 @@ export class RemoteGenerationSettingsCardState {
 		return this.options.remoteSettings.snapshot?.ui?.agentSwitchCompaction ?? {};
 	}
 
-	get persistedPromptRefinementSettings(): PromptRefinementUiSettings {
-		return this.options.remoteSettings.snapshot?.ui?.promptRefinement ?? {};
-	}
-
 	get effectiveSelection(): GenerationSelectionUiSettings {
 		const effective = this.options.remoteSettings.snapshot?.uiEffective;
 		if (this.options.settingsKey === 'chatTitle') return effective?.chatTitle ?? {};
 		if (this.options.settingsKey === 'agentSwitchCompaction') {
 			return effective?.agentSwitchCompaction ?? {};
 		}
-		if (this.options.settingsKey === 'commitMessage') return effective?.commitMessage ?? {};
-		return effective?.promptRefinement ?? {};
+		return effective?.commitMessage ?? {};
 	}
 
 	get enabled(): boolean {
@@ -192,14 +182,26 @@ export class RemoteGenerationSettingsCardState {
 			&& this.options.remoteSettings.snapshot?.uiEffective?.commitMessage?.useCommonDirPrefix === true;
 	}
 
-	get customPrompt(): string {
-		if (this.options.settingsKey === 'commitMessage') {
-			return this.persistedCommitMessageSettings.customPrompt ?? '';
-		}
-		if (this.options.settingsKey === 'promptRefinement') {
-			return this.persistedPromptRefinementSettings.customPrompt ?? '';
-		}
-		return '';
+	get isDefaultPrompt(): boolean {
+		return (
+			this.promptDraft.trim().length === 0 ||
+			this.promptDraft === DEFAULT_COMMIT_MESSAGE_PROMPT
+		);
+	}
+
+	syncPromptDraft(): void {
+		if (this.options.settingsKey !== 'commitMessage' || !this.options.showPrompt) return;
+		const snapshotVersion = this.options.remoteSettings.snapshot?.version ?? 0;
+		const persistedPrompt =
+			typeof this.persistedCommitMessageSettings.customPrompt === 'string'
+				? this.persistedCommitMessageSettings.customPrompt
+				: '';
+		const nextHydrationKey = `${this.options.settingsKey}:${snapshotVersion}:${persistedPrompt}`;
+		if (this.#promptHydrationKey === nextHydrationKey) return;
+		this.promptDraft = persistedPrompt.trim()
+			? persistedPrompt
+			: DEFAULT_COMMIT_MESSAGE_PROMPT;
+		this.#promptHydrationKey = nextHydrationKey;
 	}
 
 	#selectionSettings(
@@ -303,50 +305,32 @@ export class RemoteGenerationSettingsCardState {
 				},
 			});
 		}
-		if (this.options.settingsKey === 'commitMessage') {
-			return this.#saveUiSettings({
-				commitMessage: { ...this.persistedCommitMessageSettings, ...selection },
-			});
-		}
 		return this.#saveUiSettings({
-			promptRefinement: { ...this.persistedPromptRefinementSettings, ...selection },
+			commitMessage: { ...this.persistedCommitMessageSettings, ...selection },
 		});
 	}
 
-	async persistPrompt(customPrompt: string): Promise<GenerationPromptSaveResult> {
-		let ui: Partial<RemoteUiSettings>;
-		if (this.options.settingsKey === 'commitMessage') {
-			ui = {
-				commitMessage: {
-					...this.persistedCommitMessageSettings,
-					...this.#selectionSettings(),
-					customPrompt,
-				},
-			};
-		} else if (this.options.settingsKey === 'promptRefinement') {
-			ui = {
-				promptRefinement: {
-					...this.persistedPromptRefinementSettings,
-					...this.#selectionSettings(),
-					customPrompt,
-				},
-			};
-		} else {
-			return { ok: false, message: m.settings_save_failed() };
-		}
+	async persistPromptDraft(): Promise<void> {
+		if (this.options.settingsKey !== 'commitMessage') return;
+		await this.#saveUiSettings({
+			commitMessage: {
+				...this.persistedCommitMessageSettings,
+				...this.#selectionSettings(),
+				customPrompt: this.isDefaultPrompt ? '' : this.promptDraft,
+			},
+		});
+	}
 
-		this.pendingSaveCount += 1;
-		try {
-			await this.options.remoteSettings.update({ ui });
-			return { ok: true };
-		} catch (error) {
-			return {
-				ok: false,
-				message: error instanceof Error ? error.message : m.settings_save_failed(),
-			};
-		} finally {
-			this.pendingSaveCount -= 1;
-		}
+	async restoreDefaultPrompt(): Promise<void> {
+		if (this.options.settingsKey !== 'commitMessage') return;
+		this.promptDraft = DEFAULT_COMMIT_MESSAGE_PROMPT;
+		await this.#saveUiSettings({
+			commitMessage: {
+				...this.persistedCommitMessageSettings,
+				...this.#selectionSettings(),
+				customPrompt: '',
+			},
+		});
 	}
 
 	formatDuration(durationMs: number): string {
@@ -405,8 +389,6 @@ export class RemoteGenerationSettingsCardState {
 					return m.settings_generation_model_test_configuration_changed();
 				case 'GENERATION_TEST_UNSUPPORTED_EFFORT':
 					return m.settings_generation_model_test_unsupported_effort();
-				case 'GENERATION_TEST_UNSAFE_AGENT':
-					return m.settings_generation_model_test_unsafe_agent();
 				case 'GENERATION_TEST_EMPTY_RESPONSE':
 					return m.settings_generation_model_test_empty();
 				case 'GENERATION_TEST_TIMEOUT':

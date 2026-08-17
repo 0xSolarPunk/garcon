@@ -21,7 +21,6 @@ interface PromptComposerEditorControllerOptions {
 
 export class PromptComposerEditorController {
 	#handledOpenRequestId = 0;
-	#destroyed = false;
 
 	constructor(private readonly options: PromptComposerEditorControllerOptions) {}
 
@@ -56,14 +55,8 @@ export class PromptComposerEditorController {
 		if (this.open()) this.#handledOpenRequestId = requestId;
 	}
 
-	destroy(): void {
-		this.#destroyed = true;
-	}
-
 	updateText(chatId: string, text: string): void {
 		if (
-			this.options.promptTransformPending ||
-			this.options.isDisabled ||
 			this.options.selectedChatId !== chatId ||
 			this.options.ui.composerEditorChatId !== chatId ||
 			this.options.composer.inputText === text
@@ -87,19 +80,16 @@ export class PromptComposerEditorController {
 
 	async #restoreComposer(chatId: string, selection: ComposerEditorSelection): Promise<void> {
 		await tick();
-		if (this.#destroyed) return;
 		const textarea = this.options.textarea;
 		if (this.options.selectedChatId !== chatId || !textarea || !this.options.isVisible) return;
 		textarea.focus({ preventScroll: true });
 		restoreComposerEditorSelection(textarea, selection);
 		const restoredSelection = composerEditorSelectionFromTextarea(textarea);
-		if (!this.options.promptTransformPending) {
-			this.options.ui.updateTriggers(
-				this.options.composer.inputText,
-				restoredSelection.head,
-				this.options.snippetTrigger,
-			);
-		}
+		this.options.ui.updateTriggers(
+			this.options.composer.inputText,
+			restoredSelection.head,
+			this.options.snippetTrigger,
+		);
 		this.options.resizeTextarea();
 	}
 }
