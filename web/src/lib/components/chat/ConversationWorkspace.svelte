@@ -384,7 +384,7 @@
 		sessions,
 	});
 	function scrollToBottomAndFill(): void {
-		void scroll.scrollToLatest().then(() => scroll.fillUnderfilledViewport());
+		void scroll.scrollToLatestAndFill();
 	}
 
 	// Session controller.
@@ -518,10 +518,18 @@
 	// Marks real scroll gestures on the actual viewport element without wrapper event forwarding.
 	$effect(() => {
 		const node = scrollContainer;
+		// The synchronous port read binds this effect to port changes, so teardown releases
+		// native-touch ownership on the captured old port before rebinding.
+		const viewport = conversationViewport;
 		if (!node) return;
-		return observeConversationViewportScrollGestures(node, (direction) =>
-			scroll.noteUserScrollIntent(direction),
-		);
+		const stop = observeConversationViewportScrollGestures(node, (intent) => {
+			if (intent.touch !== null) viewport?.noteNativeTouchLifecycle(intent.touch);
+			if (intent.touch !== 'end') scroll.noteUserScrollIntent(intent.direction);
+		});
+		return () => {
+			stop();
+			viewport?.noteNativeTouchLifecycle('end');
+		};
 	});
 
 	// Scrolls to bottom when the scroll container becomes available.
@@ -764,29 +772,36 @@
 			{/snippet}
 		</svelte:boundary>
 
-		{#if chatState.isUserScrolledUp && chatState.displayMessageCount > 0}
-			<Button
-				variant="outline"
-				size="icon"
-				class={scrollToTopButtonClass}
-				onclick={() => scroll.scrollToTop()}
-				disabled={scroll.isScrollingToTop}
-				title={m.workspace_scroll_to_initial_prompt()}
-			>
-				{#if scroll.isScrollingToTop}
-					<Loader2 class="w-5 h-5 animate-spin" />
-				{:else}
-					<ArrowUp class="w-5 h-5" />
-				{/if}
-			</Button>
+		{#if (chatState.isUserScrolledUp || scroll.isScrollingToBottom) && chatState.displayMessageCount > 0}
+			{#if scroll.canScrollToTop && !scroll.isScrollingToBottom}
+				<Button
+					variant="outline"
+					size="icon"
+					class={scrollToTopButtonClass}
+					onclick={() => scroll.scrollToTop()}
+					disabled={scroll.isScrollingToTop}
+					title={m.workspace_scroll_to_initial_prompt()}
+				>
+					{#if scroll.isScrollingToTop}
+						<Loader2 class="w-5 h-5 animate-spin" />
+					{:else}
+						<ArrowUp class="w-5 h-5" />
+					{/if}
+				</Button>
+			{/if}
 			<Button
 				variant="outline"
 				size="icon"
 				class="absolute bottom-14 right-5 sm:right-6 z-20 w-11 h-11 rounded-full shadow-md hover:shadow-lg"
 				onclick={scrollToBottomAndFill}
+				disabled={scroll.isScrollingToBottom}
 				title={m.workspace_scroll_to_bottom()}
 			>
-				<ArrowDown class="w-5 h-5" />
+				{#if scroll.isScrollingToBottom}
+					<Loader2 class="w-5 h-5 animate-spin" />
+				{:else}
+					<ArrowDown class="w-5 h-5" />
+				{/if}
 			</Button>
 		{/if}
 	</div>
