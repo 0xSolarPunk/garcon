@@ -11,35 +11,19 @@ const executableDir = path.resolve(repoRoot, 'dist');
 const executableTargets = {
   'linux-x64': {
     bunTarget: 'bun-linux-x64-baseline',
-    executablePathEnvironment: 'GARCON_BUN_COMPILE_LINUX_X64_EXECUTABLE',
     outputName: 'garcon-linux-x64',
     cliOutputName: 'garcon-cli-linux-x64',
   },
   'darwin-arm64': {
     bunTarget: 'bun-darwin-arm64',
-    executablePathEnvironment: 'GARCON_BUN_COMPILE_DARWIN_ARM64_EXECUTABLE',
     outputName: 'garcon-darwin-arm64',
     cliOutputName: 'garcon-cli-darwin-arm64',
   },
   'windows-x64': {
     bunTarget: 'bun-windows-x64-baseline',
-    executablePathEnvironment: 'GARCON_BUN_COMPILE_WINDOWS_X64_EXECUTABLE',
     outputName: 'garcon-windows-x64.exe',
   },
 };
-
-export function compileOptionsForTarget(targetId, outfile, environment = process.env) {
-  const target = executableTargets[targetId];
-  if (!target) throw new Error(`Unsupported executable target "${targetId}".`);
-  const configuredExecutablePath = environment[target.executablePathEnvironment]?.trim();
-  return {
-    target: target.bunTarget,
-    outfile,
-    ...(configuredExecutablePath
-      ? { executablePath: path.resolve(configuredExecutablePath) }
-      : {}),
-  };
-}
 
 async function listFilesRecursive(directory) {
   const files = [];
@@ -164,7 +148,7 @@ async function buildExecutable(targetId, embeddedFiles, contributions, transcrip
       mainEntrypoint,
       ...transcriptSearchWorkers.entries.map((entry) => entry.filePath),
     ],
-    compile: compileOptionsForTarget(targetId, outFile),
+    compile: { target: target.bunTarget, outfile: outFile },
     naming: { asset: '[dir]/[name].[ext]' },
     files: {
       [assetsEntrypoint]: assetImports.join('\n'),
@@ -189,7 +173,7 @@ async function buildCliExecutable(targetId) {
   const outFile = path.resolve(executableDir, target.cliOutputName);
   const result = await Bun.build({
     entrypoints: [path.join(repoRoot, 'cli', 'main.ts')],
-    compile: compileOptionsForTarget(targetId, outFile),
+    compile: { target: target.bunTarget, outfile: outFile },
   });
   if (!result.success) {
     for (const log of result.logs) console.error(log);
@@ -213,9 +197,7 @@ async function run() {
   }
 }
 
-if (import.meta.main) {
-  run().catch((error) => {
-    console.error(error.message ?? error);
-    process.exit(1);
-  });
-}
+run().catch((error) => {
+  console.error(error.message ?? error);
+  process.exit(1);
+});
