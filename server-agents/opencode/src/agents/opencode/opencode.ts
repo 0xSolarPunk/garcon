@@ -9,6 +9,8 @@ import {
   extractSessionId,
   extractTextParts,
   isOpenCodeCompactionAssistant,
+  isOpenCodeCompactionContinuationPart,
+  isOpenCodeCompactionControlPart,
   openCodeAssistantTerminal,
   type OpenCodeAssistantTerminal,
   type SSEEvent,
@@ -79,6 +81,7 @@ import {
   modelsFromProviders,
   type OpenCodeModelOption,
 } from './model-catalog.js';
+import { adoptOpenCodeCompactionPartRoute } from './compaction-routing.js';
 
 const SILENT_LOGGER: AgentLogger = Object.freeze({
   debug() {},
@@ -751,8 +754,21 @@ export class OpenCodeRuntime {
       return;
     }
 
-    const route = this.#operationRoutes.resolve(sessionId, event);
+    // Marked parts always pass through current-turn adoption so a foreign named ID cannot
+    // bypass collision refusal through ordinary named resolution.
+    const isCompactionPart = isOpenCodeCompactionControlPart(event)
+      || isOpenCodeCompactionContinuationPart(event);
+    const route = isCompactionPart
+      ? adoptOpenCodeCompactionPartRoute({
+          event,
+          logger: this.#logger,
+          operationRoutes: this.#operationRoutes,
+          session: this.#sessions.get(sessionId),
+          sessionId,
+        })
+      : this.#operationRoutes.resolve(sessionId, event);
     if (!route) {
+      if (isCompactionPart) return;
       const part = event.properties?.part;
       const info = event.properties?.info;
       const tool = event.properties?.tool;
