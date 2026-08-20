@@ -58,6 +58,50 @@ describe('TranscriptLedgerService', () => {
     });
   });
 
+  it('notifies once for a fresh chat row and not for its exact retry', async () => {
+    await withService(async ({ ledger }) => {
+      const view = ledger.initializeChat('chat-1');
+      const notifications = [];
+      ledger.subscribe((event) => notifications.push(event));
+
+      const first = ledger.appendChatRow({
+        chatId: 'chat-1',
+        viewId: view.viewId,
+        clientMessageId: 'chat-row-1',
+        type: 'error',
+        title: 'Release validation',
+        content: 'durable error',
+      });
+      const retry = ledger.appendChatRow({
+        chatId: 'chat-1',
+        viewId: view.viewId,
+        clientMessageId: 'chat-row-1',
+        type: 'error',
+        title: 'Release validation',
+        content: 'durable error',
+      });
+
+      expect(first.inserted).toBe(true);
+      expect(retry.inserted).toBe(false);
+      expect(notifications).toEqual([]);
+      await tick();
+      expect(notifications).toHaveLength(1);
+      expect(notifications[0]).toMatchObject({
+        type: 'rows',
+        rows: [{
+          kind: 'notice',
+          message: 'durable error',
+          detail: {
+            type: 'cli-row',
+            presentation: 'error',
+            title: 'Release validation',
+          },
+        }],
+      });
+      expect(ledger.conversationMessages('chat-1')).toEqual([]);
+    });
+  });
+
   it('fences an ambiguous commit without broadcasting it', async () => {
     await withService(async ({ ledger }) => {
       ledger.initializeChat('failed-chat');

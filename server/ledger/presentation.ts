@@ -1,5 +1,6 @@
 import {
   AgentSwitchMessage,
+  ErrorMessage,
   PermissionCancelledMessage,
   PermissionExpiredMessage,
   PermissionRequestMessage,
@@ -8,9 +9,23 @@ import {
   UserMessage,
   isCarryoverMigrationQuarantineNoticeDetail,
   type ChatMessage,
+  type CliRowPresentationDetail,
 } from '../../common/chat-types.js';
 import type { TranscriptMessage } from '../../common/chat-view.js';
-import type { LedgerRow } from './contracts.js';
+import {
+  isLedgerCliRowNoticeDetail,
+  type LedgerCliRowNoticeDetail,
+  type LedgerRow,
+} from './contracts.js';
+
+function cliRowPresentationDetail(
+  detail: LedgerCliRowNoticeDetail,
+): CliRowPresentationDetail {
+  return {
+    type: 'cli-row',
+    ...(detail.title === null ? {} : { title: detail.title }),
+  };
+}
 
 export function ledgerRowsToMessages(rows: readonly LedgerRow[]): ChatMessage[] {
   return rows.flatMap((row) => {
@@ -42,12 +57,19 @@ export function ledgerRowToMessage(row: LedgerRow): ChatMessage | null {
         : row.detail.message;
     case 'provider-row':
       return row.message;
-    case 'notice':
+    case 'notice': {
+      if (isLedgerCliRowNoticeDetail(row.detail)) {
+        const detail = cliRowPresentationDetail(row.detail);
+        return row.detail.presentation === 'error'
+          ? new ErrorMessage(row.at, row.message, detail)
+          : new TranscriptNoticeMessage(row.at, row.message, detail);
+      }
       return new TranscriptNoticeMessage(
         row.at,
         row.message,
         isCarryoverMigrationQuarantineNoticeDetail(row.detail) ? row.detail : undefined,
       );
+    }
     case 'agent-switch':
       return new AgentSwitchMessage(
         row.at,

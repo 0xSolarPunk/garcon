@@ -10,13 +10,22 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import {
+  parseChatRowContent,
+  parseChatRowTitle,
+} from '../../common/chat-row-contracts.js';
+import {
   decodeLedgerRow,
+  cliRowFingerprint,
   encodeLedgerDraft,
+  parseLedgerCliRowNoticeDetail,
   submissionFingerprint,
   type StoredLedgerRow,
 } from './codec.js';
 import type {
+  AppendChatRowRequest,
+  AppendChatRowResult,
   InputComposition,
+  LedgerCliRowNoticeRow,
   LedgerCheckpoint,
   LedgerRow,
   LedgerRowDraft,
@@ -29,7 +38,11 @@ import type {
   TranscriptViewId,
   TranscriptWatermark,
 } from './contracts.js';
-import { transcriptViewId } from './contracts.js';
+import {
+  isLedgerCliRowNoticeRow,
+  isPresentationOnlyProviderRow,
+  transcriptViewId,
+} from './contracts.js';
 import {
   IncompleteLedgerCheckpointError,
   LedgerError,
@@ -194,6 +207,48 @@ export class TranscriptLedgerStore {
       });
       entry.nextOrdinal += 1;
       return { input, prompt, inserted: true };
+    });
+  }
+
+  appendChatRow(chatId: string, request: AppendChatRowRequest): AppendChatRowResult {
+    const parsedDetail = parseLedgerCliRowNoticeDetail(request.detail);
+    if (!parsedDetail) throw new TypeError('CLI row notice detail is required');
+    const detail = {
+      ...parsedDetail,
+      title: parseChatRowTitle(parsedDetail.title) ?? null,
+    };
+    const message = parseChatRowContent(request.message);
+    const draft: LedgerRowDraft = {
+      kind: 'notice',
+      at: request.at,
+      message,
+      detail,
+      providerMeta: null,
+    };
+    const encoded = { draft, ...encodeLedgerDraft(draft) };
+    return this.#write(chatId, (entry) => {
+      this.#assertCurrent(entry, request.viewId);
+      const existing = this.#submission(
+        entry,
+        request.viewId,
+        detail.clientMessageId,
+      );
+      if (existing) {
+        if (
+          !isLedgerCliRowNoticeRow(existing)
+          || cliRowFingerprint(existing.message, existing.detail)
+            !== cliRowFingerprint(message, detail)
+        ) {
+          throw new SubmissionConflictError(detail.clientMessageId);
+        }
+        return { row: existing, inserted: false };
+      }
+
+      const ordinal = entry.nextOrdinal;
+      const [row] = materializeRows(request.viewId, [encoded], ordinal);
+      runTransaction(entry.db, () => insertEncodedRows(entry.db, request.viewId, [encoded], ordinal));
+      entry.nextOrdinal += 1;
+      return { row: row as LedgerCliRowNoticeRow, inserted: true };
     });
   }
 
@@ -715,6 +770,7 @@ function collectResendCandidates(
       continue;
     }
     if (row.kind === 'run-ended' && row.outcome === 'interrupted') continue;
+    if (isPresentationOnlyProviderRow(row)) continue;
     if (row.kind === 'provider-row'
         || row.kind === 'permission-requested'
         || row.kind === 'run-ended') break;
