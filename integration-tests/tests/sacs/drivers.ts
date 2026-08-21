@@ -35,6 +35,7 @@ import type {
   SacsHeldTurn,
   SacsLegacyHistoryImportFacet,
   SacsLegacyTranscriptRow,
+  SacsNativeForkingFacet,
   SacsNativeHistoryImportFacet,
   SacsPreparedHistorySource,
   SacsReleasedJsonlFacet,
@@ -96,37 +97,100 @@ type SacsHistorySourcePreparer = (
   chatId: string,
 ) => Promise<SacsPreparedHistorySource>;
 
+async function resolvePersistedNativePath(
+  fixture: IntegrationFixture,
+  chatId: string,
+  agentId: string,
+): Promise<string> {
+  const binding = await waitForPersistedNativeSession({
+    directories: fixture.dirs,
+    chatId,
+    agentId,
+  });
+  const nativeSession = binding.nativeSession && typeof binding.nativeSession === 'object'
+    ? binding.nativeSession as Record<string, unknown>
+    : null;
+  const value = nativeSession?.value && typeof nativeSession.value === 'object'
+    ? nativeSession.value as Record<string, unknown>
+    : null;
+  const path = typeof value?.path === 'string' ? value.path : '';
+  if (!path) {
+    throw new Error(`SACS chat ${chatId} has no readable path-backed history source.`);
+  }
+  const deadline = Date.now() + 5_000;
+  while (!await fileExists(path)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`SACS chat ${chatId} did not materialize its path-backed history source.`);
+    }
+    await Bun.sleep(20);
+  }
+  return path;
+}
+
 function filesystemHistorySource(
   agentId: string,
   emptyContents: (original: Uint8Array) => string = () => '',
   corruptContents?: (original: Uint8Array) => string,
 ): SacsHistorySourcePreparer {
   return async (fixture, chatId) => {
-    const binding = await waitForPersistedNativeSession({
-      directories: fixture.dirs,
-      chatId,
-      agentId,
-    });
-    const nativeSession = binding.nativeSession && typeof binding.nativeSession === 'object'
-      ? binding.nativeSession as Record<string, unknown>
-      : null;
-    const value = nativeSession?.value && typeof nativeSession.value === 'object'
-      ? nativeSession.value as Record<string, unknown>
-      : null;
-    const path = typeof value?.path === 'string' ? value.path : '';
-    if (!path) {
-      throw new Error(`SACS chat ${chatId} has no readable path-backed history source.`);
-    }
-    const deadline = Date.now() + 5_000;
-    while (!await fileExists(path)) {
-      if (Date.now() >= deadline) {
-        throw new Error(`SACS chat ${chatId} did not materialize its path-backed history source.`);
-      }
-      await Bun.sleep(20);
-    }
+    const path = await resolvePersistedNativePath(fixture, chatId, agentId);
     return replaceableFile(path, emptyContents, corruptContents);
   };
 }
+
+// Dropping every native line containing the marker removes the identities the
+// integration would resolve a fork boundary from, without disturbing the rest
+// of the session record.
+function pathBackedForkingFacet(agentId: string): SacsNativeForkingFacet {
+  return {
+    kind: 'native-forking',
+    async unsettle(fixture, chatId, marker) {
+      const path = await resolvePersistedNativePath(fixture, chatId, agentId);
+      const original = await readFile(path, 'utf8');
+      const retained = original
+        .split('\n')
+        .filter((line) => !line.includes(marker));
+      await writeFile(path, retained.join('\n'));
+    },
+  };
+}
+
+const openCodeForkingFacet: SacsNativeForkingFacet = {
+  kind: 'native-forking',
+  async unsettle(fixture, chatId, marker) {
+    const binding = await waitForPersistedChat({
+      directories: fixture.dirs,
+      chatId,
+      select: (candidate) => (candidate.agentSessionId ? candidate : null),
+      timeoutMessage: `SACS chat ${chatId} did not persist the required binding.`,
+    });
+    const sessionId = binding.agentSessionId;
+    if (!sessionId) throw new Error(`SACS OpenCode chat ${chatId} has no persisted session.`);
+    const database = new Database(openCodePaths(fixture.dirs).database, { strict: true });
+    try {
+      const markerPattern = `%${marker}%`;
+      const messageIds = new Set<string>([
+        ...(database.query(
+          'SELECT DISTINCT message_id AS id FROM part WHERE session_id = ? AND data LIKE ?',
+        ).all(sessionId, markerPattern) as Array<{ id: string }>).map((row) => row.id),
+        ...(database.query(
+          'SELECT id FROM message WHERE session_id = ? AND data LIKE ?',
+        ).all(sessionId, markerPattern) as Array<{ id: string }>).map((row) => row.id),
+      ]);
+      if (messageIds.size === 0) {
+        throw new Error(`SACS OpenCode session ${sessionId} has no messages containing the marker.`);
+      }
+      database.transaction(() => {
+        for (const messageId of messageIds) {
+          database.query('DELETE FROM part WHERE message_id = ?').run(messageId);
+          database.query('DELETE FROM message WHERE id = ?').run(messageId);
+        }
+      })();
+    } finally {
+      database.close();
+    }
+  },
+};
 
 function legacyHistoryImport(
   prepare: SacsHistorySourcePreparer,
@@ -172,6 +236,9 @@ async function prepareOpenCodeHistorySource(
   const sessionId = binding.agentSessionId;
   if (!sessionId) throw new Error(`SACS OpenCode chat ${chatId} has no persisted session.`);
   let originalMessage: { readonly id: string; readonly data: string } | null = null;
+  let removedTables:
+    | readonly { readonly table: string; readonly rows: readonly OpenCodeStoredRow[] }[]
+    | null = null;
   return {
     async corrupt() {
       const database = new Database(path, { strict: true });
@@ -200,6 +267,26 @@ async function prepareOpenCodeHistorySource(
       }
     },
     async restore() {
+      if (removedTables) {
+        const restoredTables = removedTables;
+        const database = new Database(path, { strict: true });
+        try {
+          database.transaction(() => {
+            for (const { table, rows } of restoredTables) {
+              for (const row of rows) {
+                const columns = Object.keys(row);
+                database.query(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${
+                  columns.map(() => '?').join(', ')
+                })`).run(...Object.values(row));
+              }
+            }
+          })();
+        } finally {
+          database.close();
+        }
+        removedTables = null;
+        return;
+      }
       if (!originalMessage) {
         throw new Error(`SACS OpenCode session ${sessionId} was not captured before restore.`);
       }
@@ -214,6 +301,15 @@ async function prepareOpenCodeHistorySource(
     async remove() {
       const database = new Database(path, { strict: true });
       try {
+        removedTables = [
+          { table: 'session', column: 'id' },
+          { table: 'message', column: 'session_id' },
+          { table: 'part', column: 'session_id' },
+        ].map(({ table, column }) => ({
+          table,
+          rows: database.query(`SELECT * FROM ${table} WHERE ${column} = ?`)
+            .all(sessionId) as OpenCodeStoredRow[],
+        }));
         database.transaction(() => {
           database.query('DELETE FROM part WHERE session_id = ?').run(sessionId);
           database.query('DELETE FROM message WHERE session_id = ?').run(sessionId);
@@ -226,21 +322,40 @@ async function prepareOpenCodeHistorySource(
   };
 }
 
+type OpenCodeStoredRow = Record<string, string | number | bigint | null | Uint8Array>;
+
 const openCodeLegacyHistoryImport: SacsLegacyHistoryImportFacet = {
   kind: 'legacy-history-import',
   releasedJsonl: null,
   directoryScoped: {
     async moveBindingToDifferentDirectory(fixture, chatId) {
       const registryPath = join(fixture.dirs.workspace, 'chats.json');
-      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
-        sessions?: Record<string, Record<string, unknown>>;
+      const rebindProjectPath = async (
+        update: (chat: Record<string, unknown>) => void,
+      ) => {
+        const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+          sessions?: Record<string, Record<string, unknown>>;
+        };
+        const chat = registry.sessions?.[chatId];
+        if (!chat) throw new Error(`SACS chat ${chatId} is missing from the registry.`);
+        update(chat);
+        await writeFile(registryPath, JSON.stringify(registry));
+        return chat;
       };
-      const chat = registry.sessions?.[chatId];
-      if (!chat) throw new Error(`SACS chat ${chatId} is missing from the registry.`);
       const projectPath = join(fixture.dirs.root, 'opencode-other-project');
       await mkdir(projectPath, { recursive: true });
-      chat.projectPath = projectPath;
-      await writeFile(registryPath, JSON.stringify(registry));
+      let originalProjectPath: unknown;
+      await rebindProjectPath((chat) => {
+        originalProjectPath = chat.projectPath;
+        chat.projectPath = projectPath;
+      });
+      return {
+        async restore() {
+          await rebindProjectPath((chat) => {
+            chat.projectPath = originalProjectPath;
+          });
+        },
+      };
     },
   },
   prepare: prepareOpenCodeHistorySource,
@@ -390,6 +505,7 @@ const claudeDriver: SacsDriverFactory = {
   nativeSessions: NATIVE_SESSIONS,
   nativeHistoryImport: nativeHistoryImport(claudeHistorySource),
   legacyHistoryImport: legacyHistoryImport(claudeHistorySource),
+  forking: pathBackedForkingFacet('claude'),
   async start() {
     const environment = await startScriptedClaudeTestEnvironment();
     return {
@@ -423,6 +539,7 @@ const codexDriver: SacsDriverFactory = {
   nativeSessions: NATIVE_SESSIONS,
   nativeHistoryImport: nativeHistoryImport(codexHistorySource),
   legacyHistoryImport: legacyHistoryImport(codexHistorySource),
+  forking: pathBackedForkingFacet('codex'),
   async start() {
     const environment = await startScriptedCodexTestEnvironment();
     return {
@@ -460,6 +577,7 @@ const piDriver: SacsDriverFactory = {
   steering: STEERING,
   nativeSessions: NATIVE_SESSIONS,
   nativeHistoryImport: nativeHistoryImport(piHistorySource),
+  forking: null,
   legacyHistoryImport: legacyHistoryImport(piHistorySource),
   async start() {
     const environment = startScriptedPiTestEnvironment();
@@ -504,6 +622,7 @@ const openCodeDriver: SacsDriverFactory = {
   nativeSessions: NATIVE_SESSIONS,
   nativeHistoryImport: openCodeNativeHistoryImport,
   legacyHistoryImport: openCodeLegacyHistoryImport,
+  forking: openCodeForkingFacet,
   async start() {
     const environment = startScriptedOpenCodeTestEnvironment();
     return {
@@ -567,6 +686,7 @@ function directDriver(
     steering: null,
     nativeSessions: null,
     nativeHistoryImport: null,
+    forking: null,
     legacyHistoryImport,
     async start() {
       const holdAssistant = (fixture: IntegrationFixture, content: string): SacsHeldTurn => {

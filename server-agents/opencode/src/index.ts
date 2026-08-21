@@ -25,9 +25,11 @@ import {
 import { createOpenCodeConfig } from './config.js';
 import { OpenCodeExecution } from './agents/opencode/execution.js';
 import {
+  OpenCodeTranscriptNotFoundError,
   loadLegacyOpenCodeChatMessages,
   loadRequiredOpenCodeChatMessages,
 } from './agents/opencode/history-loader.js';
+import { createOpenCodeNativeForking } from './agents/opencode/forking.js';
 import { getOpenCodeAuthStatus } from './agents/opencode/opencode-auth.js';
 import { OpenCodeRuntime } from './agents/opencode/opencode.js';
 import { createOpenCodeNativeActivityProbe } from './agents/opencode/native-activity.js';
@@ -38,7 +40,7 @@ const OPENCODE_DESCRIPTOR = {
   icon: null,
   supportedPermissionModes: PERMISSION_MODE_VALUES.filter((mode) => mode !== 'plan'),
   supportedThinkingModes: THINKING_MODE_VALUES,
-  supportsImages: false,
+  supportsImages: true,
   supportsProjectPathUpdate: false,
   requiresNativePathForProjectPathUpdate: false,
   supportedEndpointProtocols: [],
@@ -68,7 +70,7 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
   readonly auth: NonNullable<AgentIntegration['auth']>;
   readonly commands = null;
   readonly compaction = null;
-  readonly forking = null;
+  readonly forking;
   readonly steering: NonNullable<AgentIntegration['steering']>;
   readonly goals = null;
   readonly endpoints = null;
@@ -103,6 +105,7 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
       logger,
       withClient: (operation) => runtime.withClientLease((client) => operation(async () => client)),
     });
+    this.forking = createOpenCodeNativeForking({ runtime, nativeSessions, sessionId });
     this.steering = {
       captureTarget: (request) => runtime.steering.captureTarget(request.agentSessionId),
       steer: (request) => runtime.steering.steer(request),
@@ -195,7 +198,20 @@ function createOpenCodeNativeEvidence(
     },
     async load({ chat, signal }) {
       signal.throwIfAborted();
-      return { messages: await load(chat, signal, loadRequiredOpenCodeChatMessages) };
+      try {
+        return { messages: await load(chat, signal, loadRequiredOpenCodeChatMessages) };
+      } catch (error) {
+        // Missing or out-of-scope native evidence surfaces as the typed
+        // failure so Reload and fork seeding report it instead of a raw error.
+        if (error instanceof OpenCodeTranscriptNotFoundError) {
+          throw new AgentIntegrationError(
+            'TRANSCRIPT_UNAVAILABLE',
+            'The OpenCode native session is missing or outside the recorded project directory',
+            false,
+          );
+        }
+        throw error;
+      }
     },
     async loadLegacy({ chat, signal }) {
       signal.throwIfAborted();

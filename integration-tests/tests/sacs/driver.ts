@@ -55,7 +55,7 @@ export interface SacsDirectoryScopedHistoryFacet {
   moveBindingToDifferentDirectory(
     fixture: IntegrationFixture,
     chatId: string,
-  ): Promise<void>;
+  ): Promise<{ restore(): Promise<void> }>;
 }
 
 export interface SacsLegacyHistoryImportFacet {
@@ -67,6 +67,17 @@ export interface SacsLegacyHistoryImportFacet {
     chatId: string,
     rows: readonly SacsLegacyTranscriptRow[],
   ): Promise<SacsPreparedHistorySource>;
+}
+
+export interface SacsNativeForkingFacet {
+  readonly kind: 'native-forking';
+  // Removes every native history entry containing the marker, so a ledger row
+  // rendered from one of them no longer has a provider-native fork position.
+  unsettle(
+    fixture: IntegrationFixture,
+    chatId: string,
+    marker: string,
+  ): Promise<void>;
 }
 
 export interface SacsHeldTurn {
@@ -106,5 +117,6 @@ export interface SacsDriverFactory {
   readonly nativeSessions: SacsNativeSessionsFacet | null;
   readonly nativeHistoryImport: SacsNativeHistoryImportFacet | null;
   readonly legacyHistoryImport: SacsLegacyHistoryImportFacet | null;
+  readonly forking: SacsNativeForkingFacet | null;
   start(): Promise<SacsDriverEnvironment>;
 }

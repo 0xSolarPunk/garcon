@@ -128,7 +128,6 @@ interface OpenCodeRuntimeOptions {
   shutdownStartupGraceMs?: number;
   now?: () => number;
   createInstance?: (input: {
-    port: number;
     signal: AbortSignal;
   }) => Promise<OpenCodeInstance>;
 }
@@ -145,7 +144,6 @@ interface NormalizedOpenCodeRuntimeOptions {
   now: () => number;
   requiresExecutable: boolean;
   createInstance: (input: {
-    port: number;
     signal: AbortSignal;
   }) => Promise<OpenCodeInstance>;
 }
@@ -572,10 +570,9 @@ export class OpenCodeRuntime {
           throw new Error('opencode executable not found in $PATH');
         }
 
-        const port = 10000 + Math.floor(Math.random() * 50000);
         const result: OpenCodeInstance = await withAbortableTimeout(
           (signal) => this.#instanceCreations.track(
-            () => this.#options.createInstance({ port, signal }),
+            () => this.#options.createInstance({ signal }),
             signal,
           ),
           this.#options.startupTimeoutMs,
@@ -819,7 +816,16 @@ export class OpenCodeRuntime {
     if (
       typeof toolMessageId === 'string'
       && !route.turn.assistantMessageIds.has(toolMessageId)
-    ) return;
+    ) {
+      // The provider stays blocked on the unanswered request; the warning is
+      // the diagnostic and user interrupt is the remediation.
+      this.#logger.warn('Ignoring an OpenCode permission for a message outside its turn', {
+        agentSessionId: sessionId,
+        eventId: event.id ?? null,
+        toolMessageId,
+      });
+      return;
+    }
     const permission = extractPermissionRequest(event);
     if (!permission) return;
     if (route.permissionMode === 'manualBypass') {
@@ -1089,7 +1095,6 @@ export class OpenCodeRuntime {
       thinkingMode,
       operation,
     } = request;
-    void images;
     void thinkingMode;
     const scope = createOpenCodeRequestScope(projectPath);
 
@@ -1136,7 +1141,6 @@ export class OpenCodeRuntime {
       permissionMode,
       scope.directory,
     );
-    request.onSessionActivated?.(agentSessionId);
     this.#logger.info('OpenCode session created and registered', { agentSessionId });
 
     try {
@@ -1146,6 +1150,10 @@ export class OpenCodeRuntime {
         throw new Error('OpenCode event stream ended before prompt delivery');
       }
       if (request.executionAdmission) await markOpenCodeExecutionStarted(request);
+      // Activation publishes the durable session fact, so it must follow every
+      // failure whose cleanup deletes the just-created native session; a chat
+      // must never stay durably bound to a session this path removed.
+      request.onSessionActivated?.(agentSessionId);
     } catch (error) {
       this.#operationRoutes.unregister(route);
       this.#sessions.delete(agentSessionId);
@@ -1160,7 +1168,7 @@ export class OpenCodeRuntime {
       throw error;
     }
 
-    const promptBody = buildPromptBody(command, model, turn.providerPromptPartId);
+    const promptBody = buildPromptBody(command, model, turn.providerPromptPartId, images ?? []);
 
     const promptRequest = this.#runScopedTurnRequest(
       scope,
@@ -1194,7 +1202,6 @@ export class OpenCodeRuntime {
       thinkingMode,
       operation,
     } = request;
-    void images;
     void thinkingMode;
     const pendingSession = this.#sessions.get(agentSessionId);
     if (pendingSession) await this.#quiesceSessionBeforeTurn(agentSessionId, pendingSession);
@@ -1248,7 +1255,7 @@ export class OpenCodeRuntime {
       permissionMode,
       scope.directory,
     );
-    const promptBody = buildPromptBody(command, model, turn.providerPromptPartId);
+    const promptBody = buildPromptBody(command, model, turn.providerPromptPartId, images ?? []);
 
     try {
       await this.#globalEventListener.start(scope.directory);
@@ -1299,13 +1306,28 @@ export class OpenCodeRuntime {
 
   async forkSession(
     sourceSessionId: string,
-    options: { projectPath?: string | null } = {},
+    options: { projectPath?: string | null; messageId?: string } = {},
   ): Promise<string> {
     return this.#endpointCoordinator.forkSession(
       sourceSessionId,
-      options.projectPath,
+      options,
       (label, scope, operation) => this.#runScopedSessionRequest(label, scope, operation),
     );
+  }
+
+  async deleteSession(agentSessionId: string, signal?: AbortSignal): Promise<void> {
+    await this.withClientLease(async (client) => {
+      const result = await this.#runScopedSessionRequest(
+        'OpenCode forked session delete',
+        {},
+        (requestSignal, requestScope) => client.session.delete(
+          withOpenCodeRequestScope({ sessionID: agentSessionId }, requestScope),
+          { signal: requestSignal },
+        ),
+        { signal },
+      );
+      throwOpenCodeResultError(result, 'OpenCode forked session delete failed');
+    });
   }
 
   abort(agentSessionId: string): Promise<boolean> {

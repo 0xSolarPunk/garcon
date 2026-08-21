@@ -62,6 +62,24 @@ describe('OpenCodeRuntime fork', () => {
     expect(fork.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
   });
 
+  it('passes the exclusive message boundary through to the provider fork', async () => {
+    const fork = mock(() => Promise.resolve({ data: { id: 'forked-session' } }));
+    const { runtime } = createRuntimeWithClient({
+      session: { fork },
+    });
+
+    await expect(runtime.forkSession('source-session', {
+      projectPath: '/repo',
+      messageId: 'msg_boundary',
+    })).resolves.toBe('forked-session');
+
+    expect(fork.mock.calls[0][0]).toEqual({
+      sessionID: 'source-session',
+      messageID: 'msg_boundary',
+      directory: '/repo',
+    });
+  });
+
   it('rejects missing source session ids before starting OpenCode', async () => {
     const fork = mock(() => Promise.resolve({ data: { id: 'forked-session' } }));
     const { createInstance, runtime } = createRuntimeWithClient({
@@ -87,13 +105,28 @@ describe('OpenCodeRuntime fork', () => {
     );
   });
 
-  it('surfaces OpenCode fork error responses', async () => {
-    const fork = mock(() => Promise.resolve({ error: { message: 'session not found' } }));
+  it('surfaces OpenCode fork error responses as typed retryable failures', async () => {
+    const fork = mock(() => Promise.resolve({ error: { message: 'session busy' } }));
     const { runtime } = createRuntimeWithClient({
       session: { fork },
     });
 
-    await expect(runtime.forkSession('missing-session')).rejects.toThrow('session not found');
+    const failure = await runtime.forkSession('busy-session').then(() => null, (error) => error);
+    expect(failure?.message).toBe('session busy');
+    expect(failure?.code).toBe('TRANSCRIPT_UNAVAILABLE');
+    expect(failure?.retryable).toBe(true);
+  });
+
+  it('refuses a fork of a session the provider cannot return as not settled', async () => {
+    const fork = mock(() => Promise.resolve({ error: { name: 'NotFoundError' } }));
+    const { runtime } = createRuntimeWithClient({
+      session: { fork },
+    });
+
+    const failure = await runtime.forkSession('missing-session').then(() => null, (error) => error);
+    expect(failure?.code).toBe('TRANSCRIPT_UNAVAILABLE');
+    expect(failure?.retryable).toBe(true);
+    expect(failure?.details).toEqual({ nativeForkReason: 'not-settled' });
   });
 
   it('creates new sessions and submits the first prompt in the project directory', async () => {

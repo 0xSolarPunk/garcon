@@ -1,7 +1,8 @@
-import type { AgentLogger } from '@garcon/server-agent-interface';
+import { AgentIntegrationError, type AgentLogger } from '@garcon/server-agent-interface';
 import {
   createOpenCodeRequestScope,
-  throwOpenCodeResultError,
+  isOpenCodeNotFoundResult,
+  openCodeResultErrorMessage,
   withOpenCodeRequestScope,
   type OpenCodeRequestScope,
 } from './sdk-result.js';
@@ -80,21 +81,41 @@ export class OpenCodeEndpointCoordinator {
 
   async forkSession(
     sourceSessionId: string,
-    projectPath: string | null | undefined,
+    options: { projectPath?: string | null; messageId?: string },
     runScopedRequest: ScopedSessionRequest,
   ): Promise<string> {
     const sessionID = sourceSessionId.trim();
     if (!sessionID) throw new Error('Cannot fork OpenCode session: missing source session id');
-    const scope = createOpenCodeRequestScope(projectPath);
+    const scope = createOpenCodeRequestScope(options.projectPath);
     const result: any = await this.withClientLease((client) => runScopedRequest(
       'OpenCode session fork',
       scope,
       (signal, requestScope) => client.session.fork(
-        withOpenCodeRequestScope({ sessionID }, requestScope),
+        withOpenCodeRequestScope({
+          sessionID,
+          ...(options.messageId ? { messageID: options.messageId } : {}),
+        }, requestScope),
         { signal },
       ),
     ));
-    throwOpenCodeResultError(result, 'OpenCode session fork failed');
+    // A source session the provider cannot return has no native fork position;
+    // the typed refusal keeps the handoff-fork consent flow reachable instead
+    // of dead-ending the request in an untyped failure.
+    if (isOpenCodeNotFoundResult(result)) {
+      throw new AgentIntegrationError(
+        'TRANSCRIPT_UNAVAILABLE',
+        'The OpenCode source session has no provider-native fork position',
+        true,
+        { nativeForkReason: 'not-settled' },
+      );
+    }
+    if (result?.error) {
+      throw new AgentIntegrationError(
+        'TRANSCRIPT_UNAVAILABLE',
+        openCodeResultErrorMessage(result, 'OpenCode session fork failed'),
+        true,
+      );
+    }
     const forkedSessionId = typeof result?.data?.id === 'string' ? result.data.id.trim() : '';
     if (!forkedSessionId) throw new Error('OpenCode session fork did not return a session id');
     this.#options.logger.info('OpenCode session forked', { sourceSessionId: sessionID, forkedSessionId });
