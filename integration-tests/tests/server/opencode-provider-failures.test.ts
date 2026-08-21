@@ -231,7 +231,7 @@ describeOnLinux('scripted OpenCode provider failures', () => {
     }, withScriptedOpenCode());
   }, 120_000);
 
-  test('retries one HTTP 500 through OpenCode and then succeeds without duplicate user rows', async () => {
+  test('[TLV5-L06.07-OPENCODE-SCRIPTED-01] retries one HTTP 500 with one durable advisory and no duplicate user rows', async () => {
     const testEnvironment = requireEnvironment();
     const prompt = marker('HTTP500_PROMPT');
     const reply = marker('HTTP500_REPLY');
@@ -263,6 +263,13 @@ describeOnLinux('scripted OpenCode provider failures', () => {
 
       const transcript = await fixture.client.getMessages(chatId);
       expect(userContents(transcript.messages)).toEqual([prompt]);
+      // The upstream retry wait surfaced as one durable titled notice instead
+      // of dead air, and the turn still recovered.
+      const retryNotices = messagesOfType(transcript.messages, 'transcript-notice');
+      expect(retryNotices).toHaveLength(1);
+      expect(retryNotices[0]).toMatchObject({ title: 'Provider retry' });
+      expect((retryNotices[0] as { content: string }).content)
+        .toContain('Model provider retrying');
       const native = await openCodeNativeSession(fixture, chatId);
       const rows = readOpenCodeSessionRows(native);
       expect(rows.messages.filter((row) => row.data.role === 'user')).toHaveLength(1);

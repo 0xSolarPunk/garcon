@@ -9,6 +9,7 @@ import {
 import {
   ledgerRowsToMessages,
   ledgerRowsToTranscriptMessages,
+  ledgerRowToMessage,
 } from '../presentation.ts';
 
 const AT = '2026-08-15T00:00:00.000Z';
@@ -181,15 +182,31 @@ describe('transcript ledger presentation', () => {
       type: 'transcript-notice',
       content: 'Ordinary durable notice.',
     });
+    expect(rendered[2].message.title).toBeUndefined();
+    const titled = ledgerRowToMessage({
+      kind: 'notice',
+      ordinal: 13,
+      at: AT,
+      providerMeta: null,
+      message: 'Model provider retrying: quota exhausted.',
+      detail: { title: 'Provider retry' },
+    });
+    expect(titled).toBeInstanceOf(TranscriptNoticeMessage);
+    expect(titled).toMatchObject({
+      content: 'Model provider retrying: quota exhausted.',
+      title: 'Provider retry',
+    });
+    expect(titled.detail).toBeUndefined();
     expect(rendered[4].message).toBeInstanceOf(TranscriptNoticeMessage);
-    expect(rendered[4].message).toMatchObject({ content: '  exact notice\n' });
-    expect(rendered[4].message.detail).toEqual({
-      type: 'cli-row',
+    expect(rendered[4].message).toMatchObject({
+      content: '  exact notice\n',
       title: 'Deployment',
     });
+    expect(rendered[4].message.detail).toEqual({ type: 'cli-row' });
     expect(rendered[5].message).toBeInstanceOf(ErrorMessage);
     expect(rendered[5].message).toMatchObject({ content: 'exact error', timestamp: AT });
     expect(rendered[5].message.detail).toEqual({ type: 'cli-row' });
+    expect(rendered[5].message.title).toBeUndefined();
     expect(JSON.stringify([rendered[4].message, rendered[5].message]))
       .not.toContain('clientMessageId');
     expect(JSON.stringify([rendered[4].message, rendered[5].message]))
