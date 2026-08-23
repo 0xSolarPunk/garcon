@@ -68,6 +68,8 @@
 	import { SnippetExpansionController } from '$lib/snippets/snippet-expansion-controller.svelte.js';
 	import { ApiError } from '$lib/api/client.js';
 	import { snippetTemplateUsesArguments, type Snippet } from '$shared/snippets';
+	import { createClientChatId } from '$shared/client-chat-id';
+	import type { ChatId } from '$shared/chat-id';
 	import { transientLayerAttachment } from '$lib/workspace/transient-layer-action.js';
 	import { allocateTransientLayerId } from '$lib/workspace/transient-layer-id.js';
 	import { nonDirectAgentIds } from '$lib/agents/direct-agents.js';
@@ -76,7 +78,7 @@
 
 	interface Props {
 		prefill?: string;
-		onStartChat: (config: NewChatConfig) => void;
+		onStartChat: (config: NewChatConfig, chatId: ChatId) => void;
 		onCancel?: () => void;
 	}
 
@@ -126,6 +128,7 @@
 
 	let isMobile = $state(false);
 	let pendingTextareaFocus = $state(true);
+	let prospectiveChatId = $state<ChatId | null>(null);
 	const allKnownTags = $derived(
 		Array.from(new Set(sessions.orderedChats.flatMap((c) => c.tags))).sort(),
 	);
@@ -168,6 +171,7 @@
 	function reseed(): void {
 		snippetExpansion.cancel();
 		promptRefinement.abort();
+		prospectiveChatId = null;
 		composerEditor.reset();
 		snippetInteractionGeneration += 1;
 		snippetPalette.reset();
@@ -350,9 +354,16 @@
 		if (snippetExpansion.pending) textareaRef?.focus();
 	}
 
+	function ensureProspectiveChatId(): ChatId {
+		if (!prospectiveChatId) prospectiveChatId = createClientChatId();
+		return prospectiveChatId;
+	}
+
 	function expansionContext() {
 		const projectPath = form.trimmedPath;
-		if (projectPath) return { type: 'project' as const, projectPath };
+		if (projectPath) {
+			return { type: 'new-chat' as const, chatId: ensureProspectiveChatId(), projectPath };
+		}
 		notifications.error(m.chat_new_chat_errors_project_path_required());
 		return null;
 	}
@@ -469,7 +480,7 @@
 			return;
 		}
 		const config = form.buildConfig();
-		if (config) onStartChat(config);
+		if (config) onStartChat(config, ensureProspectiveChatId());
 	}
 
 	function handleKeyDown(e: KeyboardEvent): void {
@@ -497,6 +508,7 @@
 	}
 
 	function cancelForm(): void {
+		snippetExpansion.cancel();
 		promptRefinement.abort();
 		composerEditor.close();
 		onCancel?.();
