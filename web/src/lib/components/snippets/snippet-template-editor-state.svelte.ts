@@ -1,6 +1,6 @@
 import type { PromptEditorSelection } from '$lib/prompt-editor/prompt-editor-selection.js';
 
-export class NewChatComposerEditorState {
+export class SnippetTemplateEditorState {
 	open = $state(false);
 	focusRequestId = $state(0);
 	selection = $state<PromptEditorSelection>({ anchor: 0, head: 0 });
@@ -13,11 +13,6 @@ export class NewChatComposerEditorState {
 
 	close(): void {
 		this.open = false;
-	}
-
-	reset(): void {
-		this.open = false;
-		this.selection = { anchor: 0, head: 0 };
 	}
 
 	updateSelection(selection: PromptEditorSelection): void {

@@ -1,6 +1,5 @@
 import { tick } from 'svelte';
-import { PROMPT_REFINEMENT_DRAFT_MAX_LENGTH } from '$shared/prompt-refinement';
-import type { NewChatFormState } from '$lib/chat/new-chat/new-chat-form-state.svelte.js';
+import { SNIPPET_TEMPLATE_MAX_LENGTH } from '$shared/snippets';
 import { PromptRefinementController } from '$lib/prompt-editor/prompt-refinement-controller.svelte.js';
 import { promptRefinementErrorMessage } from '$lib/prompt-editor/prompt-refinement-error-message.js';
 import type { NotificationsStore } from '$lib/stores/notifications.svelte.js';
@@ -8,28 +7,28 @@ import { transientLayerAttachment } from '$lib/workspace/transient-layer-action.
 import { allocateTransientLayerId } from '$lib/workspace/transient-layer-id.js';
 import type { TransientLayerRegistry } from '$lib/workspace/transient-layers.svelte.js';
 import * as m from '$lib/paraglide/messages.js';
-import type { NewChatComposerEditorState } from './new-chat-composer-editor-state.svelte.js';
+import type { SnippetFormState } from './snippet-form-state.svelte.js';
+import type { SnippetTemplateEditorState } from './snippet-template-editor-state.svelte.js';
 
-interface NewChatPromptRefinementOptions {
-	form: Pick<NewChatFormState, 'firstMessage' | 'contentRevision'>;
+interface SnippetTemplateRefinementOptions {
+	form: SnippetFormState;
+	editor: SnippetTemplateEditorState;
 	notifications: Pick<NotificationsStore, 'info' | 'error'>;
 	transientLayers: TransientLayerRegistry;
-	editor: NewChatComposerEditorState;
-	get textarea(): HTMLTextAreaElement | undefined;
+	get textarea(): HTMLTextAreaElement | null;
 	get startBlocked(): boolean;
-	closePromptSurfaces(): void;
-	resizeTextarea(): void;
+	isCurrentForm(): boolean;
 }
 
-export class NewChatPromptRefinementController {
+export class SnippetTemplateRefinementController {
 	readonly layerAttachment;
 	readonly #request = new PromptRefinementController();
 	#destroyed = false;
 
-	constructor(private readonly options: NewChatPromptRefinementOptions) {
+	constructor(private readonly options: SnippetTemplateRefinementOptions) {
 		this.layerAttachment = transientLayerAttachment({
 			registry: options.transientLayers,
-			id: allocateTransientLayerId('prompt-refinement'),
+			id: allocateTransientLayerId('snippet-template-refinement'),
 			kind: 'prompt-transform',
 			modality: 'nonmodal',
 			onEscape: () => {
@@ -45,12 +44,13 @@ export class NewChatPromptRefinementController {
 	}
 
 	get canStart(): boolean {
-		const text = this.options.form.firstMessage;
+		const text = this.options.form.template;
 		return (
+			this.options.isCurrentForm() &&
 			!this.options.startBlocked &&
 			!this.pending &&
 			text.trim().length > 0 &&
-			text.length <= PROMPT_REFINEMENT_DRAFT_MAX_LENGTH
+			text.length <= SNIPPET_TEMPLATE_MAX_LENGTH
 		);
 	}
 
@@ -78,16 +78,15 @@ export class NewChatPromptRefinementController {
 	}
 
 	async #run(): Promise<void> {
-		const sourceText = this.options.form.firstMessage;
-		const sourceRevision = this.options.form.contentRevision;
-		this.options.closePromptSurfaces();
+		const sourceText = this.options.form.template;
+		const sourceRevision = this.options.form.templateRevision;
 
 		try {
-			const result = await this.#request.run({ draft: sourceText, target: 'prompt' });
-			if (result.kind !== 'refined') return;
+			const result = await this.#request.run({ draft: sourceText, target: 'snippet-template' });
+			if (result.kind !== 'refined' || !this.options.isCurrentForm()) return;
 			if (
-				this.options.form.contentRevision !== sourceRevision ||
-				this.options.form.firstMessage !== sourceText
+				this.options.form.templateRevision !== sourceRevision ||
+				this.options.form.template !== sourceText
 			) {
 				this.options.notifications.info(m.prompt_refinement_draft_changed());
 				await this.#focusEditor();
@@ -101,16 +100,18 @@ export class NewChatPromptRefinementController {
 				return;
 			}
 
-			this.options.form.firstMessage = refinedPrompt;
+			this.options.form.template = refinedPrompt;
 			this.options.notifications.info(m.prompt_refinement_refined());
 			await this.#focusEditor(refinedPrompt.length);
 		} catch (error) {
+			if (!this.options.isCurrentForm()) return;
 			this.options.notifications.error(promptRefinementErrorMessage(error));
 			await this.#focusEditor();
 		}
 	}
 
 	async #focusEditor(caret?: number): Promise<void> {
+		if (this.#destroyed || !this.options.isCurrentForm()) return;
 		if (this.options.editor.open) {
 			if (caret === undefined) this.options.editor.requestFocus();
 			else this.options.editor.moveCaretToEnd(caret);
@@ -120,9 +121,8 @@ export class NewChatPromptRefinementController {
 
 		await tick();
 		const textarea = this.options.textarea;
-		if (this.#destroyed || !textarea) return;
+		if (this.#destroyed || !this.options.isCurrentForm() || !textarea) return;
 		if (caret !== undefined) textarea.setSelectionRange(caret, caret);
-		this.options.resizeTextarea();
 		textarea.focus({ preventScroll: true });
 	}
 }
