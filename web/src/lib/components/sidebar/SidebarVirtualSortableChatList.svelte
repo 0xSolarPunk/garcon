@@ -14,9 +14,14 @@
 	import SidebarVirtualSortableChatRow from './SidebarVirtualSortableChatRow.svelte';
 	import {
 		CHAT_ROW_SEPARATOR_SLOT_HEIGHT,
+		anchoredSidebarRowTop,
+		clamp,
+		computeSidebarSeparatorItems,
 		DEFAULT_CHAT_ROW_OVERSCAN,
 		estimateSidebarVirtualRowSize,
+		findSidebarScrollAnchor,
 		PROJECT_HEADER_ROW_HEIGHT,
+		snapCssPixel,
 		type SidebarVirtualChatRow,
 		type SidebarVirtualRow,
 	} from './sidebar-virtual-chat-list';
@@ -24,6 +29,7 @@
 		DEFAULT_SIDEBAR_DISPLAY_OPTIONS,
 		type SidebarDisplayOptions,
 	} from './sidebar-display-options';
+	import type { SidebarChatItemLayout } from '$lib/stores/local-settings.svelte';
 	import {
 		SidebarChatReorderState,
 		type SidebarChatReorderRequest,
@@ -148,15 +154,6 @@
 		| { kind: 'blocked-row' }
 		| { kind: 'blocked-item' };
 
-	function clamp(value: number, min: number, max: number): number {
-		return Math.min(Math.max(value, min), max);
-	}
-
-	function snapCssPixel(value: number, pixelRatio: number): number {
-		const ratio = Math.max(pixelRatio, 1);
-		return Math.round(value * ratio) / ratio;
-	}
-
 	function syncSeparatorPixelRatio(): void {
 		separatorPixelRatio = window.devicePixelRatio || 1;
 	}
@@ -177,7 +174,7 @@
 	function estimateRowSize(row: SidebarVirtualRow | undefined): number {
 		if (row?.type === 'project-header') return PROJECT_HEADER_ROW_HEIGHT;
 		if (rowHeight !== undefined) return rowHeight;
-		return estimateSidebarVirtualRowSize(row, displayOptions.compactChatItems);
+		return estimateSidebarVirtualRowSize(row, displayOptions.chatItemLayout);
 	}
 
 	const virtualizer = createVirtualizer<HTMLElement, HTMLElement>({
@@ -192,36 +189,23 @@
 	});
 	let virtualItems = $derived($virtualizer.getVirtualItems());
 	let totalHeight = $derived($virtualizer.getTotalSize());
-	let separatorItems = $derived.by(() =>
-		virtualItems
-			.filter((virtualItem) => rows[virtualItem.index]?.type === 'chat')
-			.map((virtualItem) => {
-				const slotStart = virtualItem.start + virtualItem.size - CHAT_ROW_SEPARATOR_SLOT_HEIGHT;
-				const slotEnd = virtualItem.start + virtualItem.size;
-				const preferredTop = slotStart + (CHAT_ROW_SEPARATOR_SLOT_HEIGHT - separatorLineHeight) / 2;
-				const top = clamp(
-					snapCssPixel(preferredTop, separatorPixelRatio),
-					slotStart,
-					slotEnd - separatorLineHeight,
-				);
-				return {
-					key: rows[virtualItem.index]?.key ?? virtualItem.key,
-					top,
-					height: separatorLineHeight,
-				};
-			}),
+	// Single-line rows drop the separator line entirely; no trailing slot is
+	// reserved for it.
+	let separatorItems = $derived(
+		displayOptions.chatItemLayout === 'single-line'
+			? []
+			: computeSidebarSeparatorItems(virtualItems, rows, separatorLineHeight, separatorPixelRatio),
 	);
 	let selectedBackgroundItem = $derived.by(() => {
 		if (isMultiSelectMode || !selectedChatId) return null;
+		const separatorSlot =
+			displayOptions.chatItemLayout === 'single-line' ? 0 : CHAT_ROW_SEPARATOR_SLOT_HEIGHT;
 
 		for (const virtualItem of virtualItems) {
 			const row = rows[virtualItem.index];
 			if (!row || row.type !== 'chat' || row.chat.id !== selectedChatId) continue;
 
-			const top =
-				virtualItem.start > 0
-					? virtualItem.start - CHAT_ROW_SEPARATOR_SLOT_HEIGHT
-					: virtualItem.start;
+			const top = virtualItem.start > 0 ? virtualItem.start - separatorSlot : virtualItem.start;
 			return {
 				key: row.key ?? virtualItem.key,
 				top,
@@ -232,14 +216,25 @@
 		return null;
 	});
 
+	let lastEstimatedLayout: SidebarChatItemLayout | undefined;
 	$effect(() => {
 		const count = rows.length;
 		const scrollElement = viewportRef;
-		const compactChatItems = displayOptions.compactChatItems;
+		const chatItemLayout = displayOptions.chatItemLayout;
+		const layoutChanged =
+			lastEstimatedLayout !== undefined && lastEstimatedLayout !== chatItemLayout;
+		lastEstimatedLayout = chatItemLayout;
 		const explicitRowHeight = rowHeight;
 		const rowOverscan = overscan;
 		const paddingEnd = bottomPadding;
 		untrack(() => {
+			// Captured before the new estimates land so the viewport can be
+			// re-anchored on the same row at its previous intra-row offset when
+			// row heights change mid-list.
+			const anchor =
+				layoutChanged && scrollElement && explicitRowHeight === undefined
+					? findSidebarScrollAnchor($virtualizer.getVirtualItems(), scrollElement.scrollTop)
+					: null;
 			$virtualizer.setOptions({
 				count,
 				getScrollElement: () => scrollElement,
@@ -248,13 +243,17 @@
 					const row = rows[index];
 					if (row?.type === 'project-header') return PROJECT_HEADER_ROW_HEIGHT;
 					if (explicitRowHeight !== undefined) return explicitRowHeight;
-					return estimateSidebarVirtualRowSize(row, compactChatItems);
+					return estimateSidebarVirtualRowSize(row, chatItemLayout);
 				},
 				observeElementRect: observeSidebarElementRect,
 				initialRect: { width: 0, height: fallbackViewportHeight },
 				overscan: rowOverscan,
 				paddingEnd,
 			});
+			if (anchor && scrollElement) {
+				const anchoredTop = anchoredSidebarRowTop(rows, anchor, chatItemLayout);
+				if (anchoredTop !== null) scrollElement.scrollTop = anchoredTop;
+			}
 		});
 	});
 

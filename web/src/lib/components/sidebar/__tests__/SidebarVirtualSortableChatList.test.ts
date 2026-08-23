@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -204,7 +204,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 		});
@@ -230,7 +230,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 			collapsedProjectKeys: new Set([sidebarProjectKey('/tmp/project-a')]),
@@ -257,7 +257,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 		});
@@ -279,7 +279,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: true,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 		});
@@ -303,7 +303,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: true,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 		});
@@ -348,7 +348,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'recent',
 			},
 		});
@@ -376,7 +376,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: false,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'recent',
 			},
 		});
@@ -397,7 +397,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 		});
@@ -423,7 +423,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 		});
@@ -469,7 +469,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: false,
 				groupNestedProjectPaths: false,
-				compactChatItems: true,
+				chatItemLayout: 'compact',
 				sortMode: 'manual',
 			},
 		});
@@ -479,6 +479,267 @@ describe('SidebarVirtualSortableChatList', () => {
 		);
 
 		expect(firstVirtualItem?.style.height).toBe('70px');
+	});
+
+	it('uses single-line chat row estimates in single-line mode', () => {
+		render(SidebarVirtualSortableChatListHost, {
+			rows: makeRows(20),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'single-line',
+				sortMode: 'manual',
+			},
+		});
+
+		const firstVirtualItem = document.querySelector<HTMLElement>(
+			'[data-sidebar-virtual-item="chat"]',
+		);
+
+		expect(firstVirtualItem?.style.height).toBe('40px');
+	});
+
+	it('drops separators and the separator slot in single-line mode', () => {
+		render(SidebarVirtualSortableChatListHost, {
+			rows: makeRows(20),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'single-line',
+				sortMode: 'manual',
+			},
+		});
+
+		expect(document.querySelectorAll('[data-sidebar-virtual-list-separator]')).toHaveLength(0);
+
+		const row = document.querySelector<HTMLElement>('[data-sidebar-virtual-row="chat-1"]');
+		const rowContent = row?.querySelector<HTMLElement>('[data-sidebar-virtual-row-content]');
+		expect(rowContent?.style.height).toBe('100%');
+	});
+
+	it('re-estimates chat row sizes when the layout switches after mount', async () => {
+		const view = render(SidebarVirtualSortableChatListHost, {
+			rows: makeRows(20),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'default',
+				sortMode: 'manual',
+			},
+		});
+
+		const firstVirtualItem = () =>
+			document.querySelector<HTMLElement>('[data-sidebar-virtual-item="chat"]');
+
+		expect(firstVirtualItem()?.style.height).toBe('88px');
+
+		await view.rerender({
+			rows: makeRows(20),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'single-line',
+				sortMode: 'manual',
+			},
+		});
+
+		await tick();
+
+		expect(firstVirtualItem()?.style.height).toBe('40px');
+	});
+
+	it('keeps the anchored chat row visible when the layout switches while scrolled', async () => {
+		const view = render(SidebarVirtualSortableChatListHost, {
+			rows: makeRows(60),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'default',
+				sortMode: 'manual',
+			},
+		});
+
+		const viewport = document.querySelector<HTMLElement>(
+			'[data-testid="virtual-sidebar-viewport"]',
+		);
+		if (!viewport) throw new Error('expected viewport');
+
+		viewport.scrollTop = 2000;
+		viewport.dispatchEvent(new Event('scroll'));
+		await tick();
+
+		await view.rerender({
+			rows: makeRows(60),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'single-line',
+				sortMode: 'manual',
+			},
+		});
+
+		await waitFor(() => {
+			// chat-22 spans [1936, 2024) at 88px; scrollTop 2000 is 64/88 into the
+			// row. At 40px it spans [880, 920) and the normalized offset is
+			// round(64/88 * 40) = 29, so the restore keeps chat-22 itself visible.
+			expect(viewport.scrollTop).toBe(909);
+		});
+
+		// happy-dom does not emit a scroll event for programmatic writes, which
+		// the virtualizer needs to recompute its visible range.
+		viewport.dispatchEvent(new Event('scroll'));
+		await tick();
+
+		const anchoredRow = document.querySelector<HTMLElement>('[data-sidebar-virtual-row="chat-22"]');
+		if (!anchoredRow) throw new Error('expected anchored row to stay mounted');
+		// happy-dom bounding rects ignore transforms, so verify the rendered
+		// position arithmetically: the row spans [880, 920) inside the
+		// viewport window [909, 909 + 640).
+		expect(anchoredRow.parentElement?.style.transform).toContain('translateY(880px)');
+	});
+
+	it('leaves the scroll offset untouched for explicit row heights', async () => {
+		const view = render(SidebarVirtualSortableChatListHost, {
+			rows: makeRows(60),
+			rowHeight: 88,
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'default',
+				sortMode: 'manual',
+			},
+		});
+
+		const viewport = document.querySelector<HTMLElement>(
+			'[data-testid="virtual-sidebar-viewport"]',
+		);
+		if (!viewport) throw new Error('expected viewport');
+
+		viewport.scrollTop = 2000;
+		viewport.dispatchEvent(new Event('scroll'));
+		await tick();
+
+		await view.rerender({
+			rows: makeRows(60),
+			rowHeight: 88,
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'single-line',
+				sortMode: 'manual',
+			},
+		});
+
+		await waitFor(() => {
+			// Uniform row geometry is unaffected by the layout switch.
+			expect(viewport.scrollTop).toBe(2000);
+		});
+	});
+
+	it('anchors through project headers with fractional scroll offsets', async () => {
+		const groupedRows = (): SidebarVirtualRow[] => [
+			makeProjectHeader('/tmp/project-a', 1, ['chat-0']),
+			...makeRows(16).slice(0, 1),
+			makeProjectHeader(
+				'/tmp/project-b',
+				15,
+				makeRows(16)
+					.slice(1)
+					.map((row) => row.chat.id),
+			),
+			...makeRows(16).slice(1),
+		];
+		const view = render(SidebarVirtualSortableChatListHost, {
+			rows: groupedRows(),
+			displayOptions: {
+				groupByProject: true,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'default',
+				sortMode: 'manual',
+			},
+		});
+
+		const viewport = document.querySelector<HTMLElement>(
+			'[data-testid="virtual-sidebar-viewport"]',
+		);
+		if (!viewport) throw new Error('expected viewport');
+
+		// Default geometry: header 32px, chats 88px; chat-1 spans [152, 240)
+		// behind the second header, and scrollTop 160.5 is 8.5px into the row.
+		viewport.scrollTop = 160.5;
+		viewport.dispatchEvent(new Event('scroll'));
+		await tick();
+
+		await view.rerender({
+			rows: groupedRows(),
+			displayOptions: {
+				groupByProject: true,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'single-line',
+				sortMode: 'manual',
+			},
+		});
+
+		await waitFor(() => {
+			// Single-line geometry: two 32px headers, 40px chats; chat-1 spans
+			// [104, 144) and the normalized offset is round(8.5/88 * 40) = 4.
+			expect(viewport.scrollTop).toBe(108);
+		});
+
+		viewport.dispatchEvent(new Event('scroll'));
+		await tick();
+
+		const anchoredRow = document.querySelector<HTMLElement>('[data-sidebar-virtual-row="chat-1"]');
+		if (!anchoredRow) throw new Error('expected anchored row to stay mounted');
+		expect(anchoredRow.parentElement?.style.transform).toContain('translateY(104px)');
+	});
+
+	it('keeps the bottom-most chat row visible when the list shrinks', async () => {
+		const view = render(SidebarVirtualSortableChatListHost, {
+			rows: makeRows(60),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'default',
+				sortMode: 'manual',
+			},
+		});
+
+		const viewport = document.querySelector<HTMLElement>(
+			'[data-testid="virtual-sidebar-viewport"]',
+		);
+		if (!viewport) throw new Error('expected viewport');
+
+		// Bottom of the default list: chat-52 spans [4576, 4664) and the 88px
+		// content tops out at scrollTop 4640, 64px into the row.
+		viewport.scrollTop = 4640;
+		viewport.dispatchEvent(new Event('scroll'));
+		await tick();
+
+		await view.rerender({
+			rows: makeRows(60),
+			displayOptions: {
+				groupByProject: false,
+				groupNestedProjectPaths: false,
+				chatItemLayout: 'single-line',
+				sortMode: 'manual',
+			},
+		});
+
+		// The normalized restore is 52*40 + round(64/88 * 40) = 2109, beyond the
+		// shrunken list's 1760 maximum. Real browsers clamp the write to 1760;
+		// happy-dom preserves it, and under either behavior chat-52 stays
+		// mounted, which is the anchoring contract at the bottom edge.
+		await waitFor(() => {
+			expect(viewport.scrollTop).toBe(2109);
+		});
+
+		viewport.dispatchEvent(new Event('scroll'));
+		await tick();
+
+		const anchoredRow = document.querySelector<HTMLElement>('[data-sidebar-virtual-row="chat-52"]');
+		if (!anchoredRow) throw new Error('expected anchored row to stay mounted');
+		expect(anchoredRow.parentElement?.style.transform).toContain('translateY(2080px)');
 	});
 
 	it('paints chat separators from the virtual list layer', () => {
@@ -977,7 +1238,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 			onPersistReorder: persist,
@@ -1022,7 +1283,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			displayOptions: {
 				groupByProject: true,
 				groupNestedProjectPaths: false,
-				compactChatItems: false,
+				chatItemLayout: 'default',
 				sortMode: 'manual',
 			},
 			onPersistReorder: persist,
