@@ -17,6 +17,13 @@ describe('user message presentation', () => {
       .toEqual({ origin: 'cli', style: 'info' });
     expect(parseUserMessagePresentation({
       origin: 'cli',
+      style: 'notice',
+      disclosure: 'expanded',
+    })).toEqual({ origin: 'cli', style: 'notice' });
+    expect(parseUserMessagePresentation({ origin: 'cli', disclosure: 'collapsed' }))
+      .toEqual({ origin: 'cli', disclosure: 'collapsed' });
+    expect(parseUserMessagePresentation({
+      origin: 'cli',
       style: 'custom',
       customStyle: { lightAccent: '#7c3aed', darkAccent: '#c4b5fd' },
     })).toEqual({
@@ -38,6 +45,18 @@ describe('user message presentation', () => {
     })).toThrow('presentation is invalid');
     expect(() => parseUserMessagePresentation({ origin: 'cli', style: 'notice', extra: true }))
       .toThrow('unsupported field');
+    expect(() => parseUserMessagePresentation({ origin: 'cli' }))
+      .toThrow('styleless user message presentation must be collapsed');
+    expect(() => parseUserMessagePresentation({
+      origin: 'cli',
+      title: 'Heading',
+      disclosure: 'collapsed',
+    })).toThrow('styleless user message presentation cannot carry a title or custom style');
+    expect(() => parseUserMessagePresentation({
+      origin: 'cli',
+      customStyle: { lightAccent: '#7c3aed', darkAccent: '#c4b5fd' },
+      disclosure: 'collapsed',
+    })).toThrow('styleless user message presentation cannot carry a title or custom style');
   });
 
   it('round-trips presentation as a first-class user message field', () => {
@@ -53,6 +72,20 @@ describe('user message presentation', () => {
       undefined,
       undefined,
       { origin: 'cli', style: 'error', title: 'Blocker' },
+    ));
+
+    const styleless = parseChatMessage({
+      type: 'user-message',
+      timestamp: '2026-08-22T00:00:00.000Z',
+      content: 'Collapsed body',
+      presentation: { origin: 'cli', disclosure: 'collapsed' },
+    });
+    expect(styleless).toEqual(new UserMessage(
+      '2026-08-22T00:00:00.000Z',
+      'Collapsed body',
+      undefined,
+      undefined,
+      { origin: 'cli', disclosure: 'collapsed' },
     ));
   });
 
