@@ -12,8 +12,16 @@ import {
 import { parseChatId, type ChatId } from '@garcon/common/chat-id';
 import {
   parseChatRowTitle,
-  type ChatRowType,
 } from '@garcon/common/chat-row-contracts';
+import {
+  CLI_PRESET_PRESENTATION_STYLES,
+  CLI_PRESENTATION_STYLE_LIST,
+  isCliPresentationStyle,
+  normalizeCliHexColor,
+  type CliCustomStyle,
+  type CliPresentation,
+  type CliRowFormat,
+} from '@garcon/common/cli-presentation';
 import { isCommandCorrelationIdWithinLimit } from '@garcon/common/chat-command-contracts';
 import type { UserMessagePresentation } from '@garcon/common/chat-types';
 import {
@@ -32,13 +40,18 @@ import {
 } from '@garcon/common/chat-export-contracts';
 import { argumentError } from './errors.js';
 
+const ADD_ROW_PRESENTATION_REQUIREMENT = [
+  ...CLI_PRESET_PRESENTATION_STYLES.map((style) => `--type ${style}`),
+  '--color',
+].join(' or ');
+
 export const CLI_HELP = `Usage:
-  garcon-cli [options] [--message-title <title>] [--message-style <notice|error>] <prompt>
-  garcon-cli [options] --resume <chat-id> [--message-title <title>] [--message-style <notice|error>] <prompt>
+  garcon-cli [options] [--message-title <title>] [--message-style <info|notice|error|custom>] <prompt>
+  garcon-cli [options] --resume <chat-id> [--message-title <title>] [--message-style <info|notice|error|custom>] <prompt>
   garcon-cli [options] list <resource>
-  garcon-cli [options] send-async <chat-id> [--allow-steer] [--message-title <title>] [--message-style <notice|error>] <message>
+  garcon-cli [options] send-async <chat-id> [--allow-steer] [--message-title <title>] [--message-style <info|notice|error|custom>] <message>
   garcon-cli [options] stop <chat-id>
-  garcon-cli [connection options] add-row <chat-id> --type <notice|error> [--title <title>] <content>
+  garcon-cli [connection options] add-row <chat-id> (--type <info|notice|error> | --color <light[,dark]>) [--title <title>] [--markdown] <content>
   garcon-cli [connection options] status <chat-id> [--messages <count>] [--json]
   garcon-cli [connection options] wait <chat-id> --turn <turn-id> [--json]
   garcon-cli [connection options] export <chat-id> [--format <markdown|xml>] [--exclude <category>]... [--output <path>] [--force]
@@ -50,12 +63,12 @@ saved execution settings, so it may edit files or run tools. Use - as the
 message to read UTF-8 text from stdin. stop uses the same command as the SPA
 Stop button and interrupts the active turn. If queued messages exist, stop
 pauses the queue; resume it in Garcon before sending a new direct turn.
-add-row appends one durable presentation-only notice or error to chat history.
+add-row appends one durable presentation-only CLI row to chat history.
 It never sends, queues, or exposes the row to the agent.
 export writes the complete untruncated transcript as Markdown or XML. Exclusions
 apply to top-level entries; tool calls embedded in permission entries remain.
 Message presentation is not sent as prompt text. A message title without a style
-uses notice; a style without a title displays CLI notice or CLI error.
+uses notice; a style without a title displays its CLI label. --color selects custom styling.
 Ordinary restart, replay, shares, and frozen forks preserve it. Native-history
 Reload and provider-native fork segments may drop Garcon-only presentation.
 
@@ -80,13 +93,15 @@ Options:
   --reasoning-effort <mode>    Reasoning effort: ${THINKING_MODE_VALUES.join(', ')}
   --title <title>              Set a new-chat title or add-row heading
   --message-title <title>      Add a heading to this conversational CLI user message
-  --message-style <style>      Style this CLI user message: notice or error
+  --message-style <style>      Style this CLI user message: info, notice, error, or custom
+  --color <light[,dark]>       Custom six-digit hex accent; one value applies to both themes
   --tag <name>                 Add a tag; repeatable. New chats always receive cli
   --resume <chat-id>           Resume an existing chat
   --allow-steer                With send-async, steer the active turn when busy; never queues
   --messages <count>           Status transcript entries, 0-${CHAT_SNAPSHOT_MAX_MESSAGE_LIMIT} (default: ${CHAT_SNAPSHOT_DEFAULT_MESSAGE_LIMIT})
   --turn <turn-id>             Exact accepted turn to wait for
-  --type <notice|error>        Durable row type for add-row
+  --type <style>               Add-row style: info, notice, error, or custom
+  --markdown                   Render add-row content as Markdown
   --format <markdown|xml>      Transcript export format (default: markdown)
   --exclude <category>         Export exclusion; repeatable or comma-separated:
                                ${TRANSCRIPT_EXPORT_CATEGORIES.join(', ')}; tools excludes calls and results
@@ -181,7 +196,8 @@ export interface StopCliCommand extends CliConnectionOptions {
 export interface AddRowCliCommand extends CliConnectionOptions {
   readonly kind: 'add-row';
   readonly chatId: ChatId;
-  readonly type: ChatRowType;
+  readonly presentation: CliPresentation;
+  readonly format: CliRowFormat;
   readonly title?: string;
   readonly content: string | null;
   readonly readsContentFromStdin: boolean;
@@ -236,6 +252,7 @@ const SINGLE_STRING_OPTIONS = [
   'title',
   'message-title',
   'message-style',
+  'color',
   'resume',
   'turn',
   'messages',
@@ -296,8 +313,12 @@ function parseUserMessagePresentationOptions(
   values: Record<string, ParsedOptionValue>,
 ): UserMessagePresentation | undefined {
   const rawStyle = values['message-style'];
-  if (rawStyle !== undefined && rawStyle !== 'notice' && rawStyle !== 'error') {
-    throw argumentError('--message-style must be notice or error');
+  if (rawStyle !== undefined && !isCliPresentationStyle(rawStyle)) {
+    throw argumentError(`--message-style must be one of: ${CLI_PRESENTATION_STYLE_LIST}`);
+  }
+  const customStyle = parseCliColorOption(values.color);
+  if (customStyle && rawStyle !== undefined && rawStyle !== 'custom') {
+    throw argumentError('--color cannot be combined with a preset --message-style');
   }
   let title: string | undefined;
   try {
@@ -307,12 +328,35 @@ function parseUserMessagePresentationOptions(
       cause: error,
     });
   }
-  if (rawStyle === undefined && title === undefined) return undefined;
+  if (rawStyle === undefined && title === undefined && !customStyle) return undefined;
+  let presentation: CliPresentation;
+  if (customStyle) {
+    presentation = { style: 'custom', customStyle };
+  } else {
+    if (rawStyle === 'custom') {
+      throw argumentError('--message-style custom requires --color');
+    }
+    presentation = { style: rawStyle ?? 'notice' };
+  }
   return {
     origin: 'cli',
-    style: rawStyle === 'error' ? 'error' : 'notice',
+    ...presentation,
     ...(title === undefined ? {} : { title }),
   };
+}
+
+function parseCliColorOption(value: ParsedOptionValue): CliCustomStyle | undefined {
+  if (value === undefined) return undefined;
+  const parts = (value as string).split(',');
+  if (parts.length < 1 || parts.length > 2 || parts.some((part) => part.length === 0)) {
+    throw argumentError('--color must be one or two six-digit hex colors separated by a comma');
+  }
+  const lightAccent = normalizeCliHexColor(parts[0]!);
+  const darkAccent = normalizeCliHexColor(parts[1] ?? parts[0]!);
+  if (!lightAccent || !darkAccent) {
+    throw argumentError('--color must be one or two six-digit hex colors separated by a comma');
+  }
+  return { lightAccent, darkAccent };
 }
 
 function isListResource(value: string): value is ListResource {
@@ -381,6 +425,7 @@ function parseSendAsync(
   rejectControlForbiddenOptions(values, 'send-async');
   if (values.title !== undefined) throw argumentError('--title cannot be used with send-async');
   if (values.type !== undefined) throw argumentError('--type cannot be used with send-async');
+  if (values.markdown !== undefined) throw argumentError('--markdown cannot be used with send-async');
   if (parsed.positionals.length !== 3) {
     throw argumentError('send-async requires a chat ID and one message');
   }
@@ -414,9 +459,14 @@ function parseStop(
     throw argumentError('--allow-steer cannot be used with stop');
   }
   if (values.type !== undefined) throw argumentError('--type cannot be used with stop');
-  if (values['message-title'] !== undefined || values['message-style'] !== undefined) {
+  if (
+    values['message-title'] !== undefined
+    || values['message-style'] !== undefined
+    || values.color !== undefined
+  ) {
     throw argumentError('message presentation cannot be used with stop');
   }
+  if (values.markdown !== undefined) throw argumentError('--markdown cannot be used with stop');
   if (parsed.positionals.length !== 2) {
     throw argumentError('stop requires exactly one chat ID');
   }
@@ -442,8 +492,24 @@ function parseAddRow(
   if (parsed.positionals.length !== 3) {
     throw argumentError('add-row requires a chat ID and one content argument');
   }
-  if (values.type !== 'notice' && values.type !== 'error') {
-    throw argumentError('add-row requires --type notice or --type error');
+  if (values.type !== undefined && !isCliPresentationStyle(values.type)) {
+    throw argumentError(`add-row requires ${ADD_ROW_PRESENTATION_REQUIREMENT}`);
+  }
+  const customStyle = parseCliColorOption(values.color);
+  if (customStyle && values.type !== undefined && values.type !== 'custom') {
+    throw argumentError('--color cannot be combined with a preset --type');
+  }
+  let presentation: CliPresentation;
+  if (customStyle) {
+    presentation = { style: 'custom', customStyle };
+  } else {
+    if (values.type === 'custom') {
+      throw argumentError('--type custom requires --color');
+    }
+    if (values.type === undefined) {
+      throw argumentError(`add-row requires ${ADD_ROW_PRESENTATION_REQUIREMENT}`);
+    }
+    presentation = { style: values.type };
   }
   let title: string | undefined;
   try {
@@ -462,7 +528,8 @@ function parseAddRow(
     kind: 'add-row',
     ...connection,
     chatId: parseControlChatId(parsed.positionals[1]!, 'add-row'),
-    type: values.type,
+    presentation,
+    format: values.markdown === true ? 'markdown' : 'plain',
     ...(title === undefined ? {} : { title }),
     content: readsContentFromStdin ? null : argument,
     readsContentFromStdin,
@@ -486,6 +553,8 @@ const OBSERVATION_FORBIDDEN_OPTIONS: ReadonlyArray<readonly [string, string]> = 
   ['type', '--type'],
   ['message-title', '--message-title'],
   ['message-style', '--message-style'],
+  ['color', '--color'],
+  ['markdown', '--markdown'],
 ] as const;
 
 function rejectObservationMutationOptions(
@@ -678,6 +747,7 @@ export function parseCliArgs(
         title: { type: 'string' },
         'message-title': { type: 'string' },
         'message-style': { type: 'string' },
+        color: { type: 'string' },
         tag: { type: 'string', multiple: true },
         resume: { type: 'string' },
         turn: { type: 'string' },
@@ -688,6 +758,7 @@ export function parseCliArgs(
         output: { type: 'string' },
         force: { type: 'boolean' },
         'allow-steer': { type: 'boolean' },
+        markdown: { type: 'boolean' },
         json: { type: 'boolean' },
         help: { type: 'boolean' },
         version: { type: 'boolean' },
@@ -782,6 +853,8 @@ export function parseCliArgs(
     rejectListOption(values.type, '--type');
     rejectListOption(values['message-title'], '--message-title');
     rejectListOption(values['message-style'], '--message-style');
+    rejectListOption(values.color, '--color');
+    rejectListOption(values.markdown, '--markdown');
     rejectListOption(values.format, '--format');
     rejectListOption(values.exclude, '--exclude');
     rejectListOption(values.output, '--output');
@@ -830,6 +903,7 @@ export function parseCliArgs(
     throw argumentError('--allow-steer can only be used with send-async');
   }
   if (values.type !== undefined) throw argumentError('--type can only be used with add-row');
+  if (values.markdown !== undefined) throw argumentError('--markdown can only be used with add-row');
   if (values.format !== undefined) throw argumentError('--format can only be used with export');
   if (values.exclude !== undefined) throw argumentError('--exclude can only be used with export');
   if (values.output !== undefined) throw argumentError('--output can only be used with export');

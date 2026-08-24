@@ -372,13 +372,13 @@ routine local testing.
 
 | ID                 | Obligation                                                                                                                                 | Required evidence     |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
-| TLV5-CHAT-ROW.01   | The view-qualified notice/error contract preserves exact nonblank content, normalizes an optional bounded title, and validates both response shapes. | Contract              |
+| TLV5-CHAT-ROW.01   | The view-qualified CLI-row contract preserves exact nonblank content, normalizes an optional bounded title, and validates preset/custom presentation plus plain/Markdown format. | Contract              |
 | TLV5-CHAT-ROW.02   | The shared submission index returns one addressed row for an identical retry and rejects changed or cross-kind reuse without fencing.     | Store unit            |
-| TLV5-CHAT-ROW.03   | Chat-row notices, chat-row errors, and provider `ErrorMessage` rows render but never enter search, preview, model context, resend boundaries, carryover, or fork seeds. | Read-fold matrix      |
+| TLV5-CHAT-ROW.03   | CLI rows of every style and provider `ErrorMessage` rows render but never enter search, preview, model context, resend boundaries, carryover, or fork seeds. | Read-fold matrix      |
 | TLV5-CHAT-ROW.04   | Chat-row append shares the per-chat mutation lock and cannot cross Reload, a stale view, or pending ownership.                             | Concurrency unit      |
-| TLV5-CHAT-ROW.05   | The CLI/API path persists, broadcasts, replays, and restarts exact titled rows without creating or changing agent work.                    | Server black-box      |
+| TLV5-CHAT-ROW.05   | The CLI/API path persists, broadcasts, replays, and restarts exact titled, formatted, custom-styled rows without creating or changing agent work. | Server black-box      |
 | TLV5-CHAT-ROW.06   | Active and background clients apply live and reconnect rows exactly once by address without moving composer or preview state.              | Chromium              |
-| TLV5-CHAT-ROW.07   | Share snapshots preserve exact notice/error content, title, and CLI provenance after publication.                                         | Share unit            |
+| TLV5-CHAT-ROW.07   | Share snapshots preserve exact CLI-row content, title, format, presentation, and provenance after publication.                         | Share unit            |
 
 ### Genesis Adoption
 
@@ -646,7 +646,7 @@ row kind must extend its fixture and every exact surface projection.
 user export, including session exclusion, terminal inclusion, category
 classification, durable ordinals, and provider-metadata privacy.
 `TLV5-CHAT-ROW.03-READ-FOLDS-CORE-UNIT-01` is the required subtype companion:
-it proves that CLI notice/error rows and integration-owned `ErrorMessage` rows
+it proves that CLI rows of every style and integration-owned `ErrorMessage` rows
 remain presentation-only even though the latter retains `provider-row` kind.
 
 ## Browser Behavior Matrix
@@ -786,13 +786,13 @@ for each atomic requirement and records any required complementary tier.
 | TLV5-L05.04-CORE-UNIT-01       | `server/ledger/__tests__/service.test.js`: `ignores stale terminals while retaining late content and session facts`                                       | L05.04                      |
 | TLV5-L06.07-CORE-UNIT-01       | `server/ledger/__tests__/service.test.js`: `accepts only active-run nonblank notices as durable display-only rows`                                        | L06.07                      |
 | TLV5-L06.07-OPENCODE-SCRIPTED-01 | `integration-tests/tests/server/opencode-provider-failures.test.ts`: the real pinned OpenCode binary exposes one durable titled retry advisory and recovers without duplicate user or native rows | L06.07 |
-| TLV5-CHAT-ROW.01-CONTRACT-01   | `common/__tests__/chat-row-contracts.test.js`: `parses both chat row types without trimming content`; supporting cases lock title and response validation | CHAT-ROW.01 |
+| TLV5-CHAT-ROW.01-CONTRACT-01   | `common/__tests__/chat-row-contracts.test.js`: `parses every chat row style without trimming content`; supporting cases lock title and response validation | CHAT-ROW.01 |
 | TLV5-CHAT-ROW.02-STORE-UNIT-01 | `server/ledger/__tests__/store.test.js`: `appends and deduplicates chat rows without fencing`                                                            | CHAT-ROW.02 |
-| TLV5-CHAT-ROW.03-READ-FOLDS-CORE-UNIT-01 | `server/ledger/__tests__/read-fold-matrix.test.js`: `keeps notices and every error presentation-only across ledger folds`                    | CHAT-ROW.03, L01.02 |
+| TLV5-CHAT-ROW.03-READ-FOLDS-CORE-UNIT-01 | `server/ledger/__tests__/read-fold-matrix.test.js`: `keeps every CLI row style presentation-only across ledger folds`                        | CHAT-ROW.03, L01.02 |
 | TLV5-CHAT-ROW.04-RELOAD-INTERLEAVING-CORE-UNIT-01 | `server/ledger/__tests__/reload.test.js`: `holds the shared mutation lock through reload cleanup`                                        | CHAT-ROW.04 |
 | TLV5-CHAT-ROW.05-SERVER-01     | `integration-tests/tests/server/garcon-cli-add-row.test.ts`: `persists presentation-only rows without creating agent work`                              | CHAT-ROW.05 |
 | TLV5-CHAT-ROW.06-CHROMIUM-01   | `integration-tests/tests/chromium/chat-row-visibility.test.ts`: `updates active and background clients and replays each row exactly once`               | CHAT-ROW.06 |
-| TLV5-CHAT-ROW.07-SHARE-UNIT-01 | `server/chats/__tests__/share-transcript.test.js`: `formats notice and error rows without losing content`                                               | CHAT-ROW.07, L01.03 |
+| TLV5-CHAT-ROW.07-SHARE-UNIT-01 | `server/chats/__tests__/share-transcript.test.js`: `formats notice and error rows without losing content`; `web/src/lib/components/chat/__tests__/SharedChatPage.test.ts`: `renders CLI provenance while retaining generic notice and error paths` | CHAT-ROW.07, L01.03 |
 | TLV5-L04.04-CORE-UNIT-01       | `server/ledger/__tests__/store.test.js`: `deduplicates a committed submission without redispatching it`                                                   | L04.04                      |
 | TLV5-L02.01-STORE-UNIT-01      | `server/ledger/__tests__/store.test.js`: `commits atomic batches with dense view-local ordinals`                                                          | L02.01                      |
 | TLV5-L08.02-STORE-UNIT-01      | `server/ledger/__tests__/store.test.js`: `atomically deletes the replaced view when promoting staging`                                                    | L08.02                      |
