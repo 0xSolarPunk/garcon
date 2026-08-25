@@ -6,13 +6,24 @@ import {
   type ThinkingMode,
 } from './chat-modes.js';
 import { parseAgentSettingsById, type AgentSettingsEnvelope } from './agent-integration.js';
+import { CHAT_ID_LENGTH } from './chat-id.js';
 import { normalizeTags } from './tags.js';
+import {
+  CHAT_ID_TEMPLATE_TOKEN,
+  CHAT_ID_TEMPLATE_VARIABLE,
+  TemplateExpansionTooLongError,
+  expandTemplate,
+} from './template-tokens.js';
 
 export const SCHEDULED_PROMPT_INTERVAL_DAYS_MIN = 1;
 export const SCHEDULED_PROMPT_INTERVAL_DAYS_MAX = 3650;
 export const SCHEDULED_PROMPT_MAX_LENGTH = 32_000;
 export const SCHEDULED_PROMPT_RUN_LOG_LIMIT = 200;
 export const SCHEDULED_PROMPT_MAX_COUNT = 500;
+export const SCHEDULED_PROMPT_CHAT_ID_TOKEN = CHAT_ID_TEMPLATE_TOKEN;
+
+const SCHEDULED_PROMPT_TEMPLATE_VARIABLES = [CHAT_ID_TEMPLATE_VARIABLE] as const;
+const SCHEDULED_PROMPT_CHAT_ID_LENGTH_SAMPLE = '1'.repeat(CHAT_ID_LENGTH);
 
 export type ScheduledPromptBusyBehavior = 'queue' | 'skip';
 
@@ -139,6 +150,28 @@ const LEADING_SLASH_COMMAND = /^\s*\/[a-zA-Z0-9:_-]+(?:\s|$)/;
 
 export function hasLeadingSlashCommand(value: string): boolean {
   return LEADING_SLASH_COMMAND.test(value);
+}
+
+export function renderScheduledPrompt(prompt: string, chatId: string): string {
+  return expandTemplate(
+    prompt,
+    SCHEDULED_PROMPT_TEMPLATE_VARIABLES,
+    { chat_id: chatId },
+    SCHEDULED_PROMPT_MAX_LENGTH,
+  );
+}
+
+export function scheduledPromptFitsRenderedLimit(
+  prompt: string,
+  chatId = SCHEDULED_PROMPT_CHAT_ID_LENGTH_SAMPLE,
+): boolean {
+  try {
+    renderScheduledPrompt(prompt, chatId);
+    return true;
+  } catch (error) {
+    if (error instanceof TemplateExpansionTooLongError) return false;
+    throw error;
+  }
 }
 
 export function isScheduledPromptsInvalidationReason(value: unknown): value is ScheduledPromptsInvalidationReason {
@@ -293,6 +326,7 @@ export function normalizeScheduledPromptDefinitionInput(value: unknown): Schedul
     !target ||
     !prompt ||
     prompt.length > SCHEDULED_PROMPT_MAX_LENGTH ||
+    !scheduledPromptFitsRenderedLimit(prompt) ||
     hasLeadingSlashCommand(prompt)
   )
     return null;
