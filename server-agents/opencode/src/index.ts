@@ -1,4 +1,5 @@
 import { PERMISSION_MODE_VALUES, THINKING_MODE_VALUES } from '@garcon/common/chat-modes';
+import { CHAT_FILE_ATTACHMENT_MIME_TYPES } from '@garcon/common/attachments';
 import {
   AgentIntegrationError,
   type AgentChatReference,
@@ -39,7 +40,8 @@ const OPENCODE_DESCRIPTOR = {
   label: 'OpenCode',
   icon: null,
   supportedPermissionModes: PERMISSION_MODE_VALUES.filter((mode) => mode !== 'plan'),
-  supportedThinkingModes: THINKING_MODE_VALUES,
+  // OpenCode expresses effort as per-model variant names; no variant maps to ultra.
+  supportedThinkingModes: THINKING_MODE_VALUES.filter((mode) => mode !== 'ultra'),
   supportsImages: true,
   supportsProjectPathUpdate: false,
   requiresNativePathForProjectPathUpdate: false,
@@ -55,7 +57,9 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
   static readonly integrationId = 'opencode';
   static readonly apiVersion = 5 as const;
   readonly descriptor = OPENCODE_DESCRIPTOR;
-  readonly attachments = null;
+  readonly attachments = {
+    fileMimeTypes: CHAT_FILE_ATTACHMENT_MIME_TYPES,
+  } as const;
   readonly execution;
   readonly legacyHistoryImport;
   readonly nativeHistoryImport;
@@ -69,7 +73,7 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
   readonly migration;
   readonly auth: NonNullable<AgentIntegration['auth']>;
   readonly commands = null;
-  readonly compaction = null;
+  readonly compaction: NonNullable<AgentIntegration['compaction']>;
   readonly forking;
   readonly steering: NonNullable<AgentIntegration['steering']>;
   readonly goals = null;
@@ -90,6 +94,15 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
       descriptors: [],
     });
     const providerExecution = new OpenCodeExecution(runtime, nativeSessions);
+    const producer = createAgentProducerAdapter(providerExecution, logger);
+    this.compaction = {
+      compact: async (request) => (
+        await producer.runExisting(
+          request,
+          (runtimeRequest, publish) => providerExecution.compact(runtimeRequest, publish),
+        )
+      ).handle,
+    };
     this.sessionConfiguration = {
       apply: (agentSessionId, configuration) => (
         providerExecution.applySessionConfiguration(agentSessionId, configuration)
@@ -97,7 +110,7 @@ export default class OpenCodeAgentIntegration implements AgentIntegration {
     };
     const nativeEvidence = createOpenCodeNativeEvidence(runtime, nativeSessions, sessionId);
     this.nativeSessions = nativeEvidence;
-    this.execution = createAgentProducerAdapter(providerExecution, logger).execution;
+    this.execution = producer.execution;
     this.legacyHistoryImport = createHistoryImport({ load: nativeEvidence.loadLegacy });
     this.nativeHistoryImport = createNativeHistoryImport(nativeEvidence);
     this.nativeActivity = createOpenCodeNativeActivityProbe({

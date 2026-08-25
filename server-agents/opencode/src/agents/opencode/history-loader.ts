@@ -1,6 +1,7 @@
 import {
   UserMessage,
   AssistantMessage,
+  CompactionMessage,
   ErrorMessage,
   ThinkingMessage,
   ToolResultMessage,
@@ -41,6 +42,7 @@ export interface OpenCodeMessage {
     agent?: string;
     summary?: boolean;
     error?: unknown;
+    finish?: string;
     time?: {
       created?: string | number | Date;
     };
@@ -127,11 +129,14 @@ function isCompactionAssistant(info: NonNullable<OpenCodeMessage['info']>): bool
 
 // OpenCode persists compaction summaries and continuation prompts as ordinary messages.
 // The overflow path also replays the original prompt after its successful summary.
+// A manual compaction boundary survives as a synthetic marker row so Reload and
+// fork seeding reproduce the live transcript's compaction boundary.
 function visibleOpenCodeStoredMessages(rawMessages: readonly OpenCodeMessage[]): OpenCodeMessage[] {
   const visible: OpenCodeMessage[] = [];
   let overflowCompactionPending = false;
   let replayExpectedText: string | null = null;
   let lastVisibleUserText: string | null = null;
+  let manualCompactionBoundary: OpenCodeMessage | null = null;
 
   for (const message of rawMessages) {
     const info = message.info ?? {};
@@ -142,6 +147,7 @@ function visibleOpenCodeStoredMessages(rawMessages: readonly OpenCodeMessage[]):
       if (compaction) {
         overflowCompactionPending = compaction.overflow === true;
         replayExpectedText = null;
+        manualCompactionBoundary = compaction.auto === true ? null : message;
         continue;
       }
 
@@ -167,13 +173,17 @@ function visibleOpenCodeStoredMessages(rawMessages: readonly OpenCodeMessage[]):
     }
 
     if (info.role === 'assistant' && isCompactionAssistant(info)) {
-      const succeeded = info.error == null;
+      const succeeded = info.error == null && info.finish !== 'error';
       replayExpectedText = overflowCompactionPending && succeeded
         ? lastVisibleUserText
         : null;
       overflowCompactionPending = false;
-      // A failed summary remains internal, but its provider failure must survive reload.
+      // A failed summary remains internal, but its provider failure must survive
+      // reload. A successful manual boundary re-appears as the summary assistant
+      // itself, anchored to its id so point forks match the live transcript.
       if (!succeeded) visible.push({ ...message, parts: [] });
+      else if (manualCompactionBoundary) visible.push({ ...message, parts: [] });
+      manualCompactionBoundary = null;
       continue;
     }
 
@@ -307,6 +317,34 @@ export function convertOpenCodeStoredMessages(rawMessages: readonly OpenCodeMess
     }
 
     if (info.role === 'assistant') {
+      if (isCompactionAssistant(info)) {
+        // A visible summary assistant is either a successful manual boundary
+        // anchored to the same id the live turn published or a failed summary
+        // whose stored error survives. Aborted and incomplete summaries
+        // replaced nothing and reload as no boundary at all.
+        if (info.error != null && !isOpenCodeStoredAbort(info.error)) {
+          push(new ErrorMessage(ts, openCodeStoredErrorMessage(info.error) ?? 'OpenCode session failed'), info.id);
+        } else if (info.error != null) {
+          // Aborted summary: nothing to render.
+        } else if (info.finish === 'error') {
+          push(new ErrorMessage(ts, 'OpenCode session failed'), info.id);
+        } else {
+          const time = asRecord(info.time);
+          const completed = time && typeof time.completed === 'number' ? time.completed : undefined;
+          const terminalFinish = typeof info.finish === 'string'
+            && info.finish
+            && info.finish !== 'tool-calls'
+            && info.finish !== 'unknown';
+          if (completed !== undefined && terminalFinish) {
+            push(new CompactionMessage(
+              dateToIso(completed) ?? ts,
+              'manual',
+              '',
+            ), info.id);
+          }
+        }
+        continue;
+      }
       const providerError = openCodeStoredErrorMessage(info.error);
       const parts = Array.isArray(msg.parts) ? msg.parts : [];
       for (const rawPart of parts) {

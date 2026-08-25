@@ -54,6 +54,7 @@ export class OpenCodeSteeringController {
     const session = this.options.getSession(agentSessionId);
     if (
       !session
+      || session.turn.compaction
       || session.status !== 'running'
       || session.aborting
       || !session.turn.providerMessageId
@@ -91,7 +92,7 @@ export class OpenCodeSteeringController {
 
     const turn = captured.turn;
     const partId = createOpenCodePromptPartId();
-    const promptBody = buildPromptBody(request.input, session.model, partId);
+    const promptBody = buildPromptBody(request.input, session.model, partId, [], session.thinkingVariant);
     let acknowledge!: () => void;
     const acknowledgement = new Promise<void>((resolve) => {
       acknowledge = resolve;

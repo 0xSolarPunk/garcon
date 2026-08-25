@@ -10,6 +10,12 @@ import {
 
 export interface OpenCodeTurnContext {
   operation: AgentRuntimeOperation;
+  // A manual compaction turn: the provider's summary assistant settles the turn
+  // and its internals stay out of the transcript.
+  compaction?: boolean;
+  // One boundary row per manual compaction turn; completed timestamps persist
+  // across later message updates.
+  compactionBoundaryPublished?: boolean;
   // OpenCode assigns this ID and Garcon resolves it from the submitted prompt part event.
   providerMessageId: string | null;
   providerPromptPartId: string;
@@ -35,6 +41,8 @@ export interface OpenCodeSession {
   aborting?: boolean;
   chatId: string;
   model?: string;
+  // The variant the current turn submitted, so steering joins the same effort.
+  thinkingVariant?: string;
   permissionMode: PermissionMode;
   directory?: string;
   startedAt: string;
@@ -58,9 +66,11 @@ const RECENT_EVENT_ID_LIMIT = 512;
 
 export function createOpenCodeTurnContext(
   operation: AgentRuntimeOperation,
+  options: { compaction?: boolean } = {},
 ): OpenCodeTurnContext {
   return {
     operation,
+    compaction: options.compaction === true,
     providerMessageId: null,
     providerPromptPartId: createOpenCodePromptPartId(),
     lastRetryNoticeKey: null,
@@ -154,9 +164,19 @@ export function openCodeEventBelongsToTurn(
     ) {
       return false;
     }
-    if (isOpenCodeCompactionAssistant(info)) return false;
+    if (isOpenCodeCompactionAssistant(info)) {
+      // The summary assistant is internal to ordinary turns; a compaction turn
+      // owns it as its terminal message.
+      if (!turn.compaction) return false;
+      turn.assistantMessageIds.add(messageId);
+      return true;
+    }
     turn.assistantMessageIds.add(messageId);
-    turn.pendingSteeringMessageIds.delete(info.parentID);
+    // A batched loop consumes every queued steering message up to its parent;
+    // ids sort lexically, so all pending steers at or below the parent were read.
+    for (const pending of turn.pendingSteeringMessageIds) {
+      if (pending <= info.parentID) turn.pendingSteeringMessageIds.delete(pending);
+    }
     return true;
   }
   if (event.type === 'message.part.updated') {

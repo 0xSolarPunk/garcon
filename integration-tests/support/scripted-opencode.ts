@@ -47,8 +47,12 @@ export const OPENCODE_TEST_PROVIDER = 'garcon-fake';
 export const OPENCODE_TEST_MODEL_ID = 'fake-model';
 export const OPENCODE_TEST_MODEL = `${OPENCODE_TEST_PROVIDER}/${OPENCODE_TEST_MODEL_ID}`;
 export const OPENCODE_TEST_THINKING_MODE = 'none';
+// Declared with reasoning: true so the server derives low/medium/high thinking
+// variants, letting scripted tests pin variant selection end to end.
+export const OPENCODE_TEST_REASONING_MODEL_ID = 'fake-reasoning';
+export const OPENCODE_TEST_REASONING_MODEL = `${OPENCODE_TEST_PROVIDER}/${OPENCODE_TEST_REASONING_MODEL_ID}`;
 
-// OpenCode 1.18.19 makes one initial request plus five retries for retryable failures.
+// OpenCode 1.18.22 makes one initial request plus five retries for retryable failures.
 // https://github.com/anomalyco/opencode/blob/2b72179c663cadcb54f54d9f19221b3fb3d11fb6/packages/opencode/src/session/retry.ts#L31-L31
 export const OPENCODE_RETRY_EXHAUSTION_REQUEST_COUNT = 6;
 
@@ -71,7 +75,7 @@ const OPENCODE_AGENT_SETTINGS: AgentSettingsEnvelope = {
   values: {},
 };
 
-// OpenCode 1.18.19 schedules an @opencode-ai/plugin install for every config directory and
+// OpenCode 1.18.22 schedules an @opencode-ai/plugin install for every config directory and
 // skips reification only when node_modules exists and package.json plus package-lock.json
 // already declare the pinned plugin. Seeding these bytes keeps provider runtime offline; the
 // loopback npm registry trap turns any future attempt into an otherRequests() violation.
@@ -131,7 +135,7 @@ export function openCodePaths(directories: IntegrationDirectories): OpenCodePath
 function openCodeConfig(
   modelBaseUrl: string,
   modelId: string,
-  options: { nestedTaskAgent?: boolean; subagentDepth?: number } = {},
+  options: { nestedTaskAgent?: boolean; reasoningModel?: boolean; subagentDepth?: number } = {},
 ): Record<string, unknown> {
   const agentModel = `${OPENCODE_TEST_PROVIDER}/${modelId}`;
   return {
@@ -177,6 +181,21 @@ function openCodeConfig(
             cost: { input: 0, output: 0 },
             options: {},
           },
+          ...(options.reasoningModel ? {
+            [OPENCODE_TEST_REASONING_MODEL_ID]: {
+              id: OPENCODE_TEST_REASONING_MODEL_ID,
+              name: 'Garcon Fake Reasoning',
+              attachment: false,
+              modalities: { input: ['text'], output: ['text'] },
+              reasoning: true,
+              temperature: false,
+              tool_call: true,
+              release_date: '2025-01-01',
+              limit: { context: 100_000, output: 10_000 },
+              cost: { input: 0, output: 0 },
+              options: {},
+            },
+          } : {}),
         },
         options: {
           apiKey: 'garcon-test-key',
@@ -199,7 +218,7 @@ function assertFixtureOwnedPaths(paths: OpenCodePaths, fixtureRoot: string): voi
   }
 }
 
-// OpenCode 1.18.19 has no hermetic override for macOS managed-preference plist reads, so the
+// OpenCode 1.18.22 has no hermetic override for macOS managed-preference plist reads, so the
 // real-binary tier runs on Linux only; unit coverage remains cross-platform.
 export function assertScriptedOpenCodePlatform(platform: NodeJS.Platform = process.platform): void {
   if (platform !== 'linux') {
@@ -226,6 +245,7 @@ export function startScriptedOpenCodeTestEnvironment(options: {
   nestedTaskAgent?: boolean;
   proxy?: boolean;
   platform?: NodeJS.Platform;
+  reasoningModel?: boolean;
   subagentDepth?: number;
 } = {}): ScriptedOpenCodeTestEnvironment {
   assertScriptedOpenCodePlatform(options.platform);
@@ -307,6 +327,7 @@ export function startScriptedOpenCodeTestEnvironment(options: {
       }
       await writeFile(paths.config, JSON.stringify(openCodeConfig(model.baseUrl, modelId, {
         nestedTaskAgent: options.nestedTaskAgent,
+        reasoningModel: options.reasoningModel,
         subagentDepth: options.subagentDepth,
       }), null, 2), {
         mode: 0o600,
@@ -548,6 +569,33 @@ export async function waitForSupervisorExit(
   );
 }
 
+// Kills the exact recorded provider process after identity verification so a test exercises
+// Garcon's reaction to a genuine post-readiness server death rather than a simulated one.
+// The supervisor observes the provider exit and winds the wrapper down itself.
+export async function killScriptedOpenCodeProvider(
+  state: OpenCodeProcessState,
+  signal: NodeJS.Signals = 'SIGKILL',
+  timeoutMs = 10_000,
+): Promise<void> {
+  if (!state.providerPid || !state.providerStartTimeTicks) {
+    throw new Error('OpenCode supervisor state has no verified provider process identity.');
+  }
+  const identity: OpenCodeProcessIdentity = {
+    pid: state.providerPid,
+    startTimeTicks: state.providerStartTimeTicks,
+  };
+  if (!identityAlive(identity)) {
+    throw new Error('OpenCode provider process exited before the test could kill it.');
+  }
+  process.kill(identity.pid, signal);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!identityAlive(identity)) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`OpenCode provider process ${identity.pid} survived ${signal}.`);
+}
+
 export function scriptedOpenCodeStartRequest(input: {
   chatId: string;
   projectPath: string;
@@ -555,6 +603,7 @@ export function scriptedOpenCodeStartRequest(input: {
   permissionMode?: StartChatCommandRequest['permissionMode'];
   images?: StartChatCommandRequest['images'];
   model?: StartChatCommandRequest['model'];
+  thinkingMode?: StartChatCommandRequest['thinkingMode'];
 }): StartChatCommandRequest {
   return {
     clientRequestId: crypto.randomUUID(),
@@ -564,7 +613,7 @@ export function scriptedOpenCodeStartRequest(input: {
     projectPath: input.projectPath,
     model: input.model ?? OPENCODE_TEST_MODEL,
     permissionMode: input.permissionMode ?? 'bypassPermissions',
-    thinkingMode: OPENCODE_TEST_THINKING_MODE,
+    thinkingMode: input.thinkingMode ?? OPENCODE_TEST_THINKING_MODE,
     agentSettings: OPENCODE_AGENT_SETTINGS,
     command: input.command,
     ...(input.images ? { images: input.images } : {}),
@@ -576,6 +625,7 @@ export function scriptedOpenCodeRunRequest(input: {
   command: string;
   permissionMode?: AgentRunCommandRequest['permissionMode'];
   model?: AgentRunCommandRequest['model'];
+  thinkingMode?: AgentRunCommandRequest['thinkingMode'];
 }): Omit<AgentRunCommandRequest, 'transcriptViewId'> {
   return {
     clientRequestId: crypto.randomUUID(),
@@ -583,7 +633,7 @@ export function scriptedOpenCodeRunRequest(input: {
     chatId: input.chatId,
     command: input.command,
     permissionMode: input.permissionMode ?? 'bypassPermissions',
-    thinkingMode: OPENCODE_TEST_THINKING_MODE,
+    thinkingMode: input.thinkingMode ?? OPENCODE_TEST_THINKING_MODE,
     agentSettings: OPENCODE_AGENT_SETTINGS,
     model: input.model ?? OPENCODE_TEST_MODEL,
   };
