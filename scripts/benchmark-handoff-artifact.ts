@@ -3,13 +3,14 @@ import {
   estimateHandoffTokens,
 } from '../server/chats/handoff-token-budget.js';
 import {
-  handoffArtifactEntries,
+  foldHandoffArtifactEntries,
   renderHandoffArtifactEntry,
 } from '../server/chats/handoff-artifact/projection.js';
 import { renderFittedHandoffArtifact } from '../server/chats/handoff-artifact/xml.js';
 
 const AT = '2026-08-26T00:00:00.000Z';
 const TARGETS = [100_000, 500_000, 1_000_000] as const;
+const MAX_FIT_RENDER_PASSES = 10;
 const BODY = [
   'Synthetic implementation history with generic identifiers.',
   'Files: src/module.ts, tests/module.test.ts.',
@@ -21,7 +22,7 @@ for (const targetTokens of TARGETS) {
   const rssSamples = [process.memoryUsage.rss()];
   const messages = syntheticMessages(targetTokens);
   const projectionStartedAt = performance.now();
-  const source = handoffArtifactEntries(messages.map((message, index) => ({
+  const sourceFold = foldHandoffArtifactEntries(messages.map((message, index) => ({
     kind: 'message',
     ordinal: index + 1,
     category: 'conversation',
@@ -39,25 +40,27 @@ for (const targetTokens of TARGETS) {
       model: 'benchmark-model',
     },
     transcriptViewId: 'benchmark-view',
-    lastOrdinal: source.length,
+    lastOrdinal: sourceFold.eligibleEntryCount,
     contextWindowTokens: targetTokens,
-    entries: source,
+    sourceFold,
   });
   const renderMs = performance.now() - renderStartedAt;
   rssSamples.push(process.memoryUsage.rss());
   if (!rendered) throw new Error(`Artifact did not fit for ${targetTokens} tokens`);
-  if (rendered.fitCorrectionPasses > 8) throw new Error('Correction pass limit exceeded');
+  if (rendered.fitCorrectionPasses > MAX_FIT_RENDER_PASSES) {
+    throw new Error('Correction pass limit exceeded');
+  }
 
-  const sourceEstimatedTokens = source.reduce(
+  const sourceEstimatedTokens = sourceFold.entries.reduce(
     (total, entry) => total + estimateHandoffTokens(renderHandoffArtifactEntry(entry)),
     0,
   );
   console.log(JSON.stringify({
     targetTokens,
     sourceEstimatedTokens,
-    entryVisits: source.length,
+    entryVisits: sourceFold.sourceEntryCount,
     includedEntries: rendered.includedEntryCount,
-    omittedEntries: rendered.omittedEntryCount,
+    budgetOmittedEntries: rendered.budgetOmittedEntryCount,
     estimatedArtifactTokens: rendered.estimatedTokens,
     fitCorrectionPasses: rendered.fitCorrectionPasses,
     metadataPasses: rendered.metadataPasses,

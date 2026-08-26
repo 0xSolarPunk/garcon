@@ -94,4 +94,46 @@ describe('handoff token budget', () => {
     expect(result.entryBudgetTokens).toBe(19);
     expect(result.estimatedTokens).toBeLessThanOrEqual(usableTokens);
   });
+
+  test('tries one damped budget before the minimum entry budget', () => {
+    const oversizedDocument = 'word '.repeat(200);
+    const usableTokens = estimateHandoffTokens(oversizedDocument) - 100;
+    const seen = [];
+    const result = fitEstimatedTokenDocument({
+      usableTokens,
+      fixedFrameTokens: usableTokens - 20,
+      minimumEntryBudgetTokens: 5,
+      render(entryBudgetTokens) {
+        seen.push(entryBudgetTokens);
+        return entryBudgetTokens === 12 ? 'fits' : oversizedDocument;
+      },
+      document: (value) => value,
+    });
+
+    expect(seen).toEqual([20, 12]);
+    expect(result).not.toBeNull();
+    expect(result.entryBudgetTokens).toBe(12);
+    expect(result.estimatedTokens).toBeLessThanOrEqual(usableTokens);
+  });
+
+  test('tries the minimum after a damped budget still overflows', () => {
+    const oversizedDocument = 'word '.repeat(200);
+    const usableTokens = estimateHandoffTokens(oversizedDocument) - 100;
+    const seen = [];
+    const result = fitEstimatedTokenDocument({
+      usableTokens,
+      fixedFrameTokens: usableTokens - 20,
+      minimumEntryBudgetTokens: 5,
+      render(entryBudgetTokens) {
+        seen.push(entryBudgetTokens);
+        return entryBudgetTokens === 5 ? 'fits' : oversizedDocument;
+      },
+      document: (value) => value,
+    });
+
+    expect(seen).toEqual([20, 12, 5]);
+    expect(result).not.toBeNull();
+    expect(result.entryBudgetTokens).toBe(5);
+    expect(result.estimatedTokens).toBeLessThanOrEqual(usableTokens);
+  });
 });
