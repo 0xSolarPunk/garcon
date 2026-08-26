@@ -286,6 +286,7 @@ describe('GET /api/app/settings', () => {
     expect(body.uiEffective.chatTitle.agentId).toBe('claude');
     expect(body.uiEffective.chatTitle.model).toBe('haiku');
     expect(body.uiEffective.chatTitle.thinkingMode).toBe('none');
+    expect(body.uiEffective.agentSwitchCompaction.contextWindowTokens).toBe(500_000);
     expect(body.uiEffective.commitMessage.agentId).toBe('claude');
     expect(body.uiEffective.commitMessage.model).toBe('haiku');
     expect(body.uiEffective.commitMessage.thinkingMode).toBe('none');
@@ -297,7 +298,7 @@ describe('GET /api/app/settings', () => {
     expect(body.chatSortOrder).toBeUndefined();
   });
 
-  it('auto-enables generation defaults from authenticated agent priority', async () => {
+  it('auto-resolves generation defaults without auto-enabling compaction', async () => {
     ctx.settings.getRemoteSettingsSnapshotSource.mockImplementation(() => remoteSettingsSource({ version: 1 }));
     ctx.agents.getAgentAuthStatusMap.mockImplementation(() => Promise.resolve({
       claude: { authenticated: false },
@@ -316,6 +317,9 @@ describe('GET /api/app/settings', () => {
     expect(body.uiEffective.chatTitle.enabled).toBe(true);
     expect(body.uiEffective.chatTitle.agentId).toBe('codex');
     expect(body.uiEffective.chatTitle.model).toBe('gpt-5.5');
+    expect(body.uiEffective.agentSwitchCompaction.enabled).toBe(false);
+    expect(body.uiEffective.agentSwitchCompaction.agentId).toBe('codex');
+    expect(body.uiEffective.agentSwitchCompaction.model).toBe('gpt-5.5');
     expect(body.uiEffective.commitMessage.agentId).toBe('codex');
     expect(body.uiEffective.commitMessage.model).toBe('gpt-5.5');
     expect(body.uiEffective.commitMessage).not.toHaveProperty('enabled');
@@ -429,6 +433,7 @@ describe('GET /api/app/settings', () => {
       modelEndpointId: 'custom-endpoint',
       modelProtocol: 'openai-compatible',
       thinkingMode: 'low',
+      contextWindowTokens: 200_000,
     };
     const promptRefinement = {
       agentId: 'direct-openai-compatible',
@@ -710,6 +715,44 @@ describe('PUT /api/app/settings', () => {
 
     expect(body.success).toBe(true);
     expect(ctx.settings.setUiSettings).toHaveBeenCalledWith({ chatTitle: chatTitleConfig });
+  });
+
+  it('persists supported compaction context windows and drops invalid values', async () => {
+    parseJsonBody.mockImplementationOnce(() => Promise.resolve({
+      ui: {
+        agentSwitchCompaction: {
+          enabled: true,
+          contextWindowTokens: 200_000,
+        },
+      },
+    }));
+
+    const validResponse = await handler(makeRequest('http://localhost/api/app/settings', 'PUT', {}));
+
+    expect(validResponse.status).toBe(200);
+    expect(ctx.settings.setUiSettings).toHaveBeenLastCalledWith({
+      agentSwitchCompaction: {
+        enabled: true,
+        contextWindowTokens: 200_000,
+      },
+    });
+
+    ctx.settings.setUiSettings.mockClear();
+    parseJsonBody.mockImplementationOnce(() => Promise.resolve({
+      ui: {
+        agentSwitchCompaction: {
+          enabled: true,
+          contextWindowTokens: 250_000,
+        },
+      },
+    }));
+
+    const invalidResponse = await handler(makeRequest('http://localhost/api/app/settings', 'PUT', {}));
+
+    expect(invalidResponse.status).toBe(200);
+    expect(ctx.settings.setUiSettings).toHaveBeenCalledWith({
+      agentSwitchCompaction: { enabled: true },
+    });
   });
 
   it('ignores a title settings patch containing only unsupported fields', async () => {

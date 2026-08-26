@@ -91,6 +91,7 @@ export class SessionCommands {
         chatId: input.chatId,
         clientRequestId: input.clientRequestId,
         handoff: input.handoff,
+        command: input.command,
         source: chat,
         permissionFallbackPolicy: input.permissionFallbackPolicy,
         service: this.deps.handoffs,
@@ -253,6 +254,8 @@ export class SessionCommands {
 
   async submitStop(input: StopInput): Promise<AgentStopResponse> {
     this.support.requireChat(input.chatId);
+    this.support.requireClientRequestId(input.clientRequestId);
+    this.deps.handoffs.cancelPreparation(input.chatId);
     return this.support.withChatMutationLock(input.chatId, () => this.submitStopLocked(input));
   }
 

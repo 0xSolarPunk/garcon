@@ -1,14 +1,17 @@
 import crypto from 'node:crypto';
 import type { ChatMessage, TodoItem, ToolUseChatMessage } from './chat-types.js';
 import { AssistantMessage, UserMessage, isToolUseMessage } from './chat-types.js';
+import {
+  projectionPriorityLevel,
+  selectPrioritizedProjection,
+  type PrioritizedProjectionEntry,
+} from './transcript-projection.js';
 
 export const SEED_CONTEXT_OPEN = '<carried-context>';
 export const SEED_CONTEXT_CLOSE = '</carried-context>';
 export const CARRIED_CONTEXT_VERSION = 3 as const;
 
-// Assembled only when a compaction model will reduce it before injection.
-export const CARRYOVER_COMPACTION_INPUT_MAX_CHARS = 500_000;
-// Ceiling on injected text, whether rendered directly or returned by compaction.
+// Ceiling on the accepted compacted summary plus newest-turn spine.
 export const CARRYOVER_INJECTION_MAX_CHARS = 250_000;
 
 const CARRIED_CONTEXT_OPEN_PREFIX = '<carried-context';
@@ -33,17 +36,6 @@ const TRUNCATION_ELEMENT = '    <earlier-turns-truncated/>';
 // leave turns that were excluded from summarization to be laddered away instead.
 export const RECENT_TURNS_VERBATIM = 3;
 
-// Message classes admitted in order while the budget holds. Conversation first
-// because the asks are irreducible, then file activity because it is durable
-// state, then command history, which is the bulk and the least durable signal.
-const LADDER: readonly (readonly string[])[] = [
-  ['user-message'],
-  ['assistant-message'],
-  ['read-tool-use', 'grep-tool-use', 'glob-tool-use', 'list-tool-use'],
-  ['edit-tool-use', 'write-tool-use', 'apply-patch-tool-use'],
-  ['bash-tool-use', 'exec-tool-use'],
-];
-const LONG_TAIL_LEVEL = LADDER.length;
 const READ_LEVEL = 2;
 const EDIT_LEVEL = 3;
 const AGGREGATED_READS = new Set(['read-tool-use']);
@@ -57,12 +49,7 @@ export interface NativeSeedReceipt {
   readonly sha256: string;
 }
 
-interface ProjectedEntry {
-  readonly level: number;
-  readonly turn: number;
-  readonly text: string;
-  refit(maximum: number): string;
-}
+type ProjectedEntry = PrioritizedProjectionEntry;
 
 export interface CarriedContext {
   readonly prefix: string;
@@ -70,6 +57,25 @@ export interface CarriedContext {
   // compaction caller treats it as an overflow and falls back rather than
   // shipping a silently clipped account of the older history.
   readonly summaryTruncated?: boolean;
+}
+
+export interface ProjectionCostBudget {
+  readonly maximumCost: number;
+  cost(text: string): number;
+}
+
+export interface CostedCarriedContext extends CarriedContext {
+  readonly admissionCost: number;
+}
+
+interface PreparedCarryoverProjection {
+  readonly opening: string;
+  readonly closing: string;
+  readonly summaryElement: string;
+  readonly turns: readonly (readonly ChatMessage[])[];
+  readonly entries: readonly ProjectedEntry[];
+  readonly body: string;
+  readonly full: string;
 }
 
 export type SanitizeCarriedContextResult =
@@ -90,36 +96,9 @@ export function createCarryoverTranscript(
   maxChars: number,
   options: { readonly summary?: string } = {},
 ): CarriedContext | null {
-  const projected = messages.filter(isProjectableMessage);
-  // A summary with no surviving transcript is still worth carrying; it is the
-  // compacted history.
-  if (projected.length === 0 && !options.summary) return null;
-
-  const opening = [
-    `<carried-context version="${CARRIED_CONTEXT_VERSION}">`,
-    `  <instructions>${CARRIED_CONTEXT_PREAMBLE}</instructions>`,
-    '  <transcript>',
-  ].join('\n');
-  const closing = '  </transcript>\n</carried-context>\n\n';
-  // Rendered inside the same envelope as the transcript rather than beside it.
-  // A second root would escape `sanitizeRecordedCarriedContext`'s rewritten-
-  // envelope guard, which anchors on the prefix starting with `<carried-context`.
-  // Trimmed but never clipped: the per-message bound exists to stop one chat
-  // message dominating the budget, and the summary *is* the compacted history,
-  // so the budget alone governs it. An oversized one leaves the prefix over the
-  // ceiling, which the compaction caller detects and falls back from.
-  const summaryElement = options.summary
-    ? fitElement('    <summary>', options.summary.trim(), '</summary>', Number.POSITIVE_INFINITY)
-    : '';
-  const lead = summaryElement ? `${summaryElement}\n` : '';
-  const turns = groupIntoTurns(projected);
-  const entries = turns.flatMap((turn, index) => renderTurn(turn, index));
-  if (entries.length === 0 && !summaryElement) return null;
-
-  const body = entries.map((entry) => entry.text).join('\n');
-  const full = entries.length > 0
-    ? `${opening}\n${lead}${body}\n${closing}`
-    : `${opening}\n${summaryElement}\n${closing}`;
+  const prepared = prepareCarryoverProjection(messages, options);
+  if (!prepared) return null;
+  const { opening, closing, summaryElement, turns, entries, body, full } = prepared;
   if (maxChars <= 0 || full.length <= maxChars) return { prefix: full };
 
   const truncatedMinimum = `${opening}\n${TRUNCATION_ELEMENT}\n${closing}`;
@@ -151,34 +130,88 @@ export function createCarryoverTranscript(
     : '';
   const truncatedLead = fittedSummary ? `${fittedSummary}\n` : '';
   const available = Math.max(0, maxChars - opening.length - closing.length - 2 - truncatedLead.length);
-  const pinnedFrom = Math.max(0, turns.length - RECENT_TURNS_VERBATIM);
-  const admitted = new Set<ProjectedEntry>();
-  // The asks come first, ahead of even the pinned turns. They are the irreducible
-  // floor and they are cheap; a single recent turn carrying forty commands would
-  // otherwise consume the whole budget and strand every request that produced it.
-  const asks = admitLevel(
+  const selection = selectPrioritizedProjection({
     entries,
-    0,
-    admitted,
-    TRUNCATION_ELEMENT.length,
-    available,
-    Number.POSITIVE_INFINITY,
-    true,
-  );
-  const pinned = admitPinnedTurns(entries, pinnedFrom, turns.length, admitted, asks.used, available);
-  // The ladder covers every turn the pin did not take, so a chat whose newest
-  // turns are too large to pin still gets the rest of its history laddered.
-  const used = runLadder(entries, pinned.admittedFrom, admitted, pinned.used, available);
-
-  const selected = entries.filter((entry) => admitted.has(entry));
-  if (selected.length === 0) {
-    const fitted = entries.at(-1)!.refit(available - used - 1);
-    if (fitted) selected.push({ ...entries.at(-1)!, text: fitted });
-  }
+    turnCount: turns.length,
+    maximumCost: available,
+    truncationMarkerCost: TRUNCATION_ELEMENT.length,
+    cost: codeUnitEntryCost,
+    recentTurnsVerbatim: RECENT_TURNS_VERBATIM,
+  });
   return {
-    prefix: `${opening}\n${truncatedLead}${[TRUNCATION_ELEMENT, ...selected.map((entry) => entry.text)].join('\n')}\n${closing}`,
+    prefix: `${opening}\n${truncatedLead}${[TRUNCATION_ELEMENT, ...selection.selected.map((entry) => entry.text)].join('\n')}\n${closing}`,
     summaryTruncated: fittedSummary !== summaryElement,
   };
+}
+
+export function createCarryoverTranscriptWithinCost(
+  messages: readonly ChatMessage[],
+  budget: ProjectionCostBudget,
+  options: { readonly summary?: string } = {},
+): CostedCarriedContext | null {
+  if (!Number.isFinite(budget.maximumCost) || budget.maximumCost <= 0) return null;
+  const prepared = prepareCarryoverProjection(messages, options);
+  if (!prepared) return null;
+  const { opening, closing, summaryElement, turns, entries, body, full } = prepared;
+  const fullCost = budget.cost(full);
+  if (fullCost <= budget.maximumCost) return { prefix: full, admissionCost: fullCost };
+
+  const truncatedMinimum = `${opening}\n${TRUNCATION_ELEMENT}\n${closing}`;
+  if (budget.cost(truncatedMinimum) > budget.maximumCost) return null;
+
+  const fittedSummary = options.summary
+    ? fitElementWithinCost(
+      '    <summary>',
+      options.summary.trim(),
+      '</summary>',
+      budget.maximumCost,
+      (element) => budget.cost(
+        `${opening}\n${element}\n${TRUNCATION_ELEMENT}${body ? `\n${body}` : ''}\n${closing}`,
+      ),
+    )
+    : '';
+  const truncatedLead = fittedSummary ? `${fittedSummary}\n` : '';
+  const fixedDocument = `${opening}\n${truncatedLead}${closing}`;
+  const available = Math.max(0, budget.maximumCost - budget.cost(fixedDocument));
+  const selection = selectPrioritizedProjection({
+    entries,
+    turnCount: turns.length,
+    maximumCost: available,
+    truncationMarkerCost: budget.cost(`${TRUNCATION_ELEMENT}\n`),
+    cost: (text) => budget.cost(`${text}\n`),
+    recentTurnsVerbatim: RECENT_TURNS_VERBATIM,
+  });
+  return {
+    prefix: `${opening}\n${truncatedLead}${[TRUNCATION_ELEMENT, ...selection.selected.map((entry) => entry.text)].join('\n')}\n${closing}`,
+    summaryTruncated: fittedSummary !== summaryElement,
+    admissionCost: budget.cost(fixedDocument) + selection.admissionCost,
+  };
+}
+
+function prepareCarryoverProjection(
+  messages: readonly ChatMessage[],
+  options: { readonly summary?: string },
+): PreparedCarryoverProjection | null {
+  const projected = messages.filter(isProjectableMessage);
+  if (projected.length === 0 && !options.summary) return null;
+  const opening = [
+    `<carried-context version="${CARRIED_CONTEXT_VERSION}">`,
+    `  <instructions>${CARRIED_CONTEXT_PREAMBLE}</instructions>`,
+    '  <transcript>',
+  ].join('\n');
+  const closing = '  </transcript>\n</carried-context>\n\n';
+  const summaryElement = options.summary
+    ? fitElement('    <summary>', options.summary.trim(), '</summary>', Number.POSITIVE_INFINITY)
+    : '';
+  const lead = summaryElement ? `${summaryElement}\n` : '';
+  const turns = groupIntoTurns(projected);
+  const entries = turns.flatMap((turn, index) => renderTurn(turn, index));
+  if (entries.length === 0 && !summaryElement) return null;
+  const body = entries.map((entry) => entry.text).join('\n');
+  const full = entries.length > 0
+    ? `${opening}\n${lead}${body}\n${closing}`
+    : `${opening}\n${summaryElement}\n${closing}`;
+  return { opening, closing, summaryElement, turns, entries, body, full };
 }
 
 // Retained for callers that want the injection ceiling without naming it.
@@ -187,88 +220,6 @@ export function renderCarriedContext(
   options: { readonly maxChars?: number } = {},
 ): CarriedContext | null {
   return createCarryoverTranscript(messages, options.maxChars ?? CARRYOVER_INJECTION_MAX_CHARS);
-}
-
-// Admits the newest turns whole. When even those overflow, drops them oldest
-// first so the turn the next agent continues from always survives.
-function admitPinnedTurns(
-  entries: readonly ProjectedEntry[],
-  pinnedFrom: number,
-  turnCount: number,
-  admitted: Set<ProjectedEntry>,
-  used: number,
-  available: number,
-): { readonly used: number; readonly admittedFrom: number } {
-  for (let earliest = pinnedFrom; earliest < turnCount; earliest += 1) {
-    const candidates = entries.filter((entry) => entry.turn >= earliest && !admitted.has(entry));
-    const cost = candidates.reduce((total, entry) => total + 1 + entry.text.length, 0);
-    if (used + cost <= available) {
-      for (const entry of candidates) admitted.add(entry);
-      return { used: used + cost, admittedFrom: earliest };
-    }
-  }
-  return { used, admittedFrom: turnCount };
-}
-
-// Admits one ladder class in full when it fits, otherwise newest-first until the
-// budget is spent. `complete` tells the ladder whether to continue to the next
-// class or stop, so a cheaper later class never displaces a more valuable one.
-function admitLevel(
-  entries: readonly ProjectedEntry[],
-  level: number,
-  admitted: Set<ProjectedEntry>,
-  used: number,
-  available: number,
-  turnLimit = Number.POSITIVE_INFINITY,
-  pinOldest = false,
-): { readonly used: number; readonly complete: boolean } {
-  const candidates = entries.filter((entry) => (
-    entry.turn < turnLimit && entry.level === level && !admitted.has(entry)
-  ));
-  const cost = candidates.reduce((sum, entry) => sum + 1 + entry.text.length, 0);
-  if (used + cost <= available) {
-    for (const entry of candidates) admitted.add(entry);
-    return { used: used + cost, complete: true };
-  }
-  let total = used;
-  // The asks are the one class where the oldest entry is reserved before the
-  // newest-first fill: a chat that outgrows the budget still states the
-  // objective it started from, and the requests lost come from the middle.
-  // The newest ask is reserved ahead of the oldest. Both are protected, but when
-  // only one fits it must be the request the next agent has to act on rather
-  // than the objective it started from.
-  for (const pin of pinOldest ? [candidates.at(-1), candidates[0]] : []) {
-    if (!pin || admitted.has(pin) || total + 1 + pin.text.length > available) continue;
-    admitted.add(pin);
-    total += 1 + pin.text.length;
-  }
-  for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    if (admitted.has(candidates[index])) continue;
-    const entryCost = 1 + candidates[index].text.length;
-    if (total + entryCost > available) break;
-    admitted.add(candidates[index]);
-    total += entryCost;
-  }
-  return { used: total, complete: false };
-}
-
-// Admits older turns one class at a time. A level that fits entirely is taken
-// whole; the first level that does not is filled newest-first and ends the pass,
-// so a cheaper later class never displaces a more valuable earlier one.
-function runLadder(
-  entries: readonly ProjectedEntry[],
-  turnLimit: number,
-  admitted: Set<ProjectedEntry>,
-  used: number,
-  available: number,
-): number {
-  let total = used;
-  for (let level = 0; level <= LONG_TAIL_LEVEL; level += 1) {
-    const outcome = admitLevel(entries, level, admitted, total, available, turnLimit);
-    total = outcome.used;
-    if (!outcome.complete) break;
-  }
-  return total;
 }
 
 // A turn is a user message and the activity that follows it, up to the next user
@@ -311,10 +262,10 @@ function renderTurn(turn: readonly ChatMessage[], turnIndex: number): ProjectedE
     const text = renderMessageElement(message);
     if (text) {
       entries.push({
-        level: levelOf(message.type),
+        level: projectionPriorityLevel(message.type),
         turn: turnIndex,
         text,
-        refit: (maximum) => renderMessageElement(message, maximum),
+        refit: (maximumCost, cost) => refitMessageElement(message, maximumCost, cost),
       });
     }
   }
@@ -333,13 +284,14 @@ function aggregateEntry(name: string, content: string, level: number, turn: numb
     level,
     turn,
     text: fitElement(open, content, close, Number.POSITIVE_INFINITY),
-    refit: (maximum) => fitElement(open, content, close, maximum),
+    refit: (maximumCost, cost) => fitElementWithinCost(
+      open,
+      content,
+      close,
+      maximumCost,
+      cost,
+    ),
   };
-}
-
-function levelOf(type: string): number {
-  const index = LADDER.findIndex((classes) => classes.includes(type));
-  return index === -1 ? LONG_TAIL_LEVEL : index;
 }
 
 function toolFilePath(message: ChatMessage): string {
@@ -571,6 +523,43 @@ function renderMessageElement(message: ChatMessage, maximum = Number.POSITIVE_IN
   }
 }
 
+function refitMessageElement(
+  message: ChatMessage,
+  maximumCost: number,
+  cost: (text: string) => number,
+): string {
+  if (isToolUseMessage(message)) {
+    const detail = toolSummary(message);
+    return fitElementWithinCost(
+      '    <assistant><tool-use>',
+      detail ? `${toolName(message)}: ${detail}` : toolName(message),
+      '</tool-use></assistant>',
+      maximumCost,
+      cost,
+    );
+  }
+  switch (message.type) {
+    case 'user-message':
+      return fitElementWithinCost(
+        '    <user>',
+        boundedCollapse(message.content),
+        '</user>',
+        maximumCost,
+        cost,
+      );
+    case 'assistant-message':
+      return fitElementWithinCost(
+        '    <assistant>',
+        boundedCollapse(message.content),
+        '</assistant>',
+        maximumCost,
+        cost,
+      );
+    default:
+      return '';
+  }
+}
+
 function fitElement(open: string, content: string, close: string, maximum: number): string {
   const overhead = open.length + close.length;
   if (maximum < overhead) return '';
@@ -588,6 +577,34 @@ function fitElement(open: string, content: string, close: string, maximum: numbe
     else high = middle - 1;
   }
   return `${open}${escapeXml(codePoints.slice(0, low).join(''))}${suffix}${close}`;
+}
+
+function fitElementWithinCost(
+  open: string,
+  content: string,
+  close: string,
+  maximumCost: number,
+  cost: (text: string) => number,
+): string {
+  const escaped = escapeXml(content);
+  const full = `${open}${escaped}${close}`;
+  if (cost(full) <= maximumCost) return full;
+  const suffix = '...';
+  if (cost(`${open}${suffix}${close}`) > maximumCost) return '';
+  const codePoints = Array.from(content);
+  let low = 0;
+  let high = codePoints.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const candidate = `${open}${escapeXml(codePoints.slice(0, middle).join(''))}${suffix}${close}`;
+    if (cost(candidate) <= maximumCost) low = middle;
+    else high = middle - 1;
+  }
+  return `${open}${escapeXml(codePoints.slice(0, low).join(''))}${suffix}${close}`;
+}
+
+function codeUnitEntryCost(text: string): number {
+  return text.length + 1;
 }
 
 function escapeXml(value: string): string {
@@ -624,8 +641,23 @@ function toolName(message: ToolUseChatMessage): string {
   return message.type.replace(/-tool-use$/, '');
 }
 
+export interface ProjectedToolUseSummary {
+  readonly text: string;
+  readonly abridged: boolean;
+}
+
+export function projectToolUseSummary(message: ToolUseChatMessage): ProjectedToolUseSummary {
+  const raw = extractToolDetail(message);
+  const collapsed = boundedCollapse(raw);
+  const text = truncate(collapsed, TOOL_SUMMARY_MAX_CHARS);
+  return {
+    text,
+    abridged: raw.length > PROJECTED_BODY_MAX_CHARS || text !== collapsed,
+  };
+}
+
 function toolSummary(message: ToolUseChatMessage): string {
-  return truncate(boundedCollapse(extractToolDetail(message)), TOOL_SUMMARY_MAX_CHARS);
+  return projectToolUseSummary(message).text;
 }
 
 // Frozen alongside `stringifyLegacyToolResult` and for the same reason: the

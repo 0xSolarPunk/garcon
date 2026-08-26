@@ -17,6 +17,11 @@ import type { ResolvedAgentHandoffTarget } from './agent-handoff-types.js';
 import type { TranscriptLedgerService } from '../ledger/service.js';
 import type { LedgerAgentSwitchRow, TranscriptWatermark } from '../ledger/contracts.js';
 import { frozenConversationDrafts } from '../ledger/projection.js';
+import type {
+  CarryOverCompactionInput,
+  CarryOverCompactionResult,
+} from '../chats/carryover-compaction.js';
+import type { PreparedCarryover } from '../chats/prepared-carryover.js';
 
 const logger = createLogger('agents:handoff');
 const MAX_RECOVERY_RETRY_DELAY_MS = 1_000;
@@ -29,6 +34,15 @@ interface PendingHandoffRecovery {
   step: HandoffRecoveryStep;
 }
 
+interface CarryoverPlanningPort {
+  planFor(input: CarryOverCompactionInput): Promise<CarryOverCompactionResult>;
+}
+
+interface PreparedCarryoverPort {
+  deposit(value: PreparedCarryover): void;
+  discard(chatId: string): void;
+}
+
 export interface AgentHandoffPreparation {
   readonly operation: 'agent-handoff';
   prepare(context: DirectInputPreparationContext): Promise<void>;
@@ -39,6 +53,7 @@ export class AgentHandoffService {
   readonly #recoveries = new Map<string, PendingHandoffRecovery>();
   readonly #activeRecoveryAttempts = new Map<string, Promise<void>>();
   readonly #recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #carryoverPreparations = new Map<string, AbortController>();
   readonly #shutdownController = new AbortController();
 
   constructor(private readonly deps: {
@@ -50,15 +65,24 @@ export class AgentHandoffService {
     };
     readonly ownership: AgentOwnershipJournal;
     readonly ledger: TranscriptLedgerService;
+    readonly carryover: CarryoverPlanningPort;
+    readonly preparedCarryover: PreparedCarryoverPort;
     readonly reopenProducer: (chatId: string) => void;
     readonly onCommitted?: (chatId: string) => void | Promise<void>;
   }) {}
 
   shutdown(): void {
     if (this.#shutdownController.signal.aborted) return;
-    this.#shutdownController.abort(new Error('Agent handoff service shut down'));
+    const reason = new Error('Agent handoff service shut down');
+    this.#shutdownController.abort(reason);
+    for (const controller of this.#carryoverPreparations.values()) controller.abort(reason);
+    this.#carryoverPreparations.clear();
     for (const timer of this.#recoveryTimers.values()) clearTimeout(timer);
     this.#recoveryTimers.clear();
+  }
+
+  cancelPreparation(chatId: string): void {
+    this.#carryoverPreparations.get(chatId)?.abort(new Error('Turn interrupted by the user'));
   }
 
   seedContinuationLedger(input: {
@@ -204,6 +228,7 @@ export class AgentHandoffService {
     readonly handoff: AgentHandoffRequest;
     readonly source: ChatRegistryEntry;
     readonly target: ResolvedAgentHandoffTarget;
+    readonly command: string;
   }): AgentHandoffPreparation {
     const operationId = handoffOperationId(input.chatId, input.clientRequestId);
     const submittedTargetHash = handoffTargetHash(input.handoff);
@@ -239,6 +264,27 @@ export class AgentHandoffService {
           if (checkpoint.viewId !== watermark.viewId || checkpoint.ordinal !== watermark.ordinal) {
             throw new Error('Transcript changed while the handoff checkpoint was captured');
           }
+          const planningController = new AbortController();
+          this.#carryoverPreparations.set(input.chatId, planningController);
+          let planned: CarryOverCompactionResult;
+          try {
+            planned = await this.deps.carryover.planFor({
+              operation: 'agent-switch',
+              chatId: input.chatId,
+              projectPath: sourceSnapshot.projectPath,
+              messages: this.deps.ledger.conversationMessages(input.chatId),
+              destination: {
+                agentId: input.target.agentId,
+                model: input.target.model,
+                prompt: input.command,
+              },
+              signal: AbortSignal.any([context.signal, planningController.signal]),
+            });
+          } finally {
+            if (this.#carryoverPreparations.get(input.chatId) === planningController) {
+              this.#carryoverPreparations.delete(input.chatId);
+            }
+          }
           this.#requireUnchangedSource(input.chatId, sourceFence);
           context.assertAdmissionActive();
           decisionAttempted = true;
@@ -253,6 +299,13 @@ export class AgentHandoffService {
             watermark,
           });
           await this.#rollForwardPersistedHandoff(intent);
+          this.deps.preparedCarryover.deposit({
+            chatId: input.chatId,
+            transcriptViewId: checkpoint.viewId,
+            targetAgentId: input.target.agentId,
+            clientRequestId: input.clientRequestId,
+            result: planned,
+          });
           completed = true;
           await this.#notifyCommitted(input.chatId);
         } catch (error) {
@@ -272,6 +325,7 @@ export class AgentHandoffService {
         }
       },
       compensate: async () => {
+        this.deps.preparedCarryover.discard(input.chatId);
         if (completed) return;
       },
     };
