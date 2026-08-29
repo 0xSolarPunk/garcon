@@ -7,16 +7,12 @@ import {
   PermissionResolvedMessage,
   TranscriptNoticeMessage,
   UserMessage,
-  isCarryoverMigrationQuarantineNoticeDetail,
-  isChatIdDisclosureNoticeDetail,
-  isChatIdDiscoveryFailureNoticeDetail,
-  isHandoffSummaryNoticeDetail,
   type ChatMessage,
 } from '../../common/chat-types.js';
+import { parseTranscriptNoticeDetail } from '../../common/transcript-notice-details.js';
 import type { TranscriptMessage } from '../../common/chat-view.js';
 import {
   isLedgerCliRowNoticeDetail,
-  type LedgerNoticeRow,
   type LedgerRow,
 } from './contracts.js';
 
@@ -65,7 +61,7 @@ export function ledgerRowToMessage(row: LedgerRow): ChatMessage | null {
       return new TranscriptNoticeMessage(
         row.at,
         row.message,
-        noticeDetail(row.detail),
+        parseTranscriptNoticeDetail(row.detail) ?? undefined,
         typeof row.detail.title === 'string' && row.detail.title ? row.detail.title : undefined,
       );
     }
@@ -105,20 +101,4 @@ export function ledgerRowToMessage(row: LedgerRow): ChatMessage | null {
     case 'run-ended':
       return null;
   }
-}
-
-function noticeDetail(detail: LedgerNoticeRow['detail']) {
-  if (isCarryoverMigrationQuarantineNoticeDetail(detail)) {
-    return {
-      type: detail.type,
-      artifactId: detail.artifactId,
-      errorCode: detail.errorCode,
-    };
-  }
-  if (isHandoffSummaryNoticeDetail(detail)) return { type: detail.type };
-  if (isChatIdDisclosureNoticeDetail(detail)) return { type: detail.type };
-  if (isChatIdDiscoveryFailureNoticeDetail(detail)) {
-    return { type: detail.type, reason: detail.reason };
-  }
-  return undefined;
 }

@@ -68,3 +68,19 @@ function hasType(value: unknown, type: string): boolean {
     && !Array.isArray(value)
     && (value as Record<string, unknown>).type === type;
 }
+
+export function parseTranscriptNoticeDetail(value: unknown): TranscriptNoticeDetail | null {
+  if (isCarryoverMigrationQuarantineNoticeDetail(value)) {
+    return {
+      type: value.type,
+      artifactId: value.artifactId,
+      errorCode: value.errorCode,
+    };
+  }
+  if (isHandoffSummaryNoticeDetail(value)) return { type: value.type };
+  if (isChatIdDisclosureNoticeDetail(value)) return { type: value.type };
+  if (isChatIdDiscoveryFailureNoticeDetail(value)) {
+    return { type: value.type, reason: value.reason };
+  }
+  return null;
+}
