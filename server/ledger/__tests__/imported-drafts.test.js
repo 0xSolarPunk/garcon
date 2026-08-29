@@ -20,7 +20,7 @@ describe('imported transcript drafts', () => {
       {
         message: new AssistantMessage(
           AT,
-          '<get-garcon-chat-id />\nContinuing the response.',
+          '<garcon-get-chat-id />\nContinuing the response.',
         ),
         providerMeta: { nativeIdentity: { id: 'assistant-1' } },
       },
@@ -41,6 +41,13 @@ describe('imported transcript drafts', () => {
       {
         kind: 'notice',
         at: AT,
+        message: 'Agent requested chat ID',
+        detail: { type: 'chat-id-request' },
+        providerMeta: null,
+      },
+      {
+        kind: 'notice',
+        at: AT,
         message: 'Sent chat ID 1787836573296800 to agent.',
         detail: { type: 'chat-id-disclosure', title: 'Chat ID auto-discovery' },
         providerMeta: null,
@@ -48,10 +55,16 @@ describe('imported transcript drafts', () => {
     ]);
   });
 
-  it('drops a marker-only native request without synthesizing an outcome', () => {
+  it('retains a hidden marker-only request without synthesizing an outcome', () => {
     expect(importedDrafts([
-      { message: new AssistantMessage(AT, '<get-garcon-chat-id />'), providerMeta: null },
-    ], () => AT)).toEqual([]);
+      { message: new AssistantMessage(AT, '<garcon-get-chat-id />'), providerMeta: null },
+    ], () => AT)).toEqual([{
+      kind: 'notice',
+      at: AT,
+      message: 'Agent requested chat ID',
+      detail: { type: 'chat-id-request' },
+      providerMeta: null,
+    }]);
   });
 
   it('preserves non-standalone disclosure content', () => {
