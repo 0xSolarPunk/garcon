@@ -18,6 +18,7 @@ import {
   UiSettingsStore,
 } from './domain-stores.js';
 import {
+  AGENT_COMMAND_SETTING_KEYS,
   DEFAULT_REMOTE_FEATURE_SETTINGS,
   normalizeRemoteFeatureSettings,
 } from '../../common/settings.js';
@@ -168,12 +169,9 @@ function sanitizeProjectSettings(parsed: unknown): SanitizedSettingsResult {
     : null;
   if (
     !rawAgentCommands
-    || typeof rawAgentCommands.enabled !== 'boolean'
-    || typeof rawAgentCommands.chatIdDiscovery !== 'boolean'
-    || typeof rawAgentCommands.sendMessage !== 'boolean'
-    || typeof rawAgentCommands.subAgents !== 'boolean'
-    || typeof rawAgentCommands.allowCustomSubAgentProjectPath !== 'boolean'
-    || typeof rawAgentCommands.allowCustomSubAgentPermissionLevel !== 'boolean'
+    || AGENT_COMMAND_SETTING_KEYS.some((key) => typeof rawAgentCommands[key] !== 'boolean')
+    || Object.keys(rawAgentCommands).some((key) =>
+      !AGENT_COMMAND_SETTING_KEYS.some((settingKey) => settingKey === key))
     || Boolean(rawFeatures && 'chatIdDiscovery' in rawFeatures)
   ) {
     migrated = true;
