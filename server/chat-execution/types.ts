@@ -23,6 +23,7 @@ import type {
 import {
   cloneStoredChatExecutionControl,
   type StoredChatExecutionControlState,
+  type StoredControlInputEntry,
 } from './control-state.ts';
 import { DomainError } from '../lib/domain-error.ts';
 import type { TurnIdentity } from '../lib/turn-identity.ts';
@@ -204,6 +205,10 @@ export interface CapturedSteerTarget {
   readonly identity: Readonly<TurnIdentity> & { readonly turnId: string };
   readonly providerTarget: AgentSteerTarget | null;
 }
+
+export type ServerControlInput = Omit<StoredControlInputEntry, 'id'>;
+
+export type ServerControlDisposition = 'delivered' | 'queued';
 
 export interface AcceptedSteerInput {
   command: AcceptedExecutionCommand;
@@ -472,5 +477,11 @@ export function transitionError(
       );
     case 'QUEUE_PAUSE_CHANGED':
       return new QueuePauseChangedError(control);
+    case 'CONTROL_INPUT_QUEUE_FULL':
+      return new DomainError(
+        'CONTROL_INPUT_QUEUE_FULL',
+        'The inter-agent control input lane is full',
+        409,
+      );
   }
 }

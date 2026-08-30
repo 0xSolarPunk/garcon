@@ -8,7 +8,6 @@ import type {
   AgentRunFailureDetail,
 } from '@garcon/server-agent-interface';
 import type { AgentAttachment } from '../../common/agent-execution.js';
-import { transformChatIdRequest } from '../../common/chat-id-discovery.js';
 import {
   parseChatRowContent,
   parseChatRowTitle,
@@ -37,7 +36,16 @@ import type {
   TranscriptWatermark,
 } from './contracts.js';
 import { isConversationalLedgerRow, transcriptViewId } from './contracts.js';
-import { chatIdRequestNoticeDraft } from './chat-id-request.js';
+import {
+  canonicalizeGarconProducerRows,
+  DISABLED_AGENT_START_SINK,
+  DISABLED_CHAT_ID_REQUEST_SINK,
+  DISABLED_INTER_AGENT_MESSAGE_SINK,
+  dispatchGarconCommands,
+  type AgentStartRequestSink,
+  type ChatIdRequestSink,
+  type InterAgentMessageRequestSink,
+} from './garcon-command-publication.js';
 import { PermissionNotActionableError } from './errors.js';
 import { TranscriptLedgerStore } from './store.js';
 
@@ -96,20 +104,9 @@ export interface TranscriptLedgerServiceOptions {
   readonly serverInstanceId?: string;
   readonly onListenerError?: (error: unknown) => void;
   readonly chatIdRequests?: ChatIdRequestSink;
+  readonly interAgentMessages?: InterAgentMessageRequestSink;
+  readonly agentStarts?: AgentStartRequestSink;
 }
-
-export interface ChatIdRequestSink {
-  request(input: {
-    readonly chatId: string;
-    readonly viewId: TranscriptViewId;
-    readonly runId: string | null;
-    readonly at: string;
-  }): void;
-}
-
-const DISABLED_CHAT_ID_REQUEST_SINK: ChatIdRequestSink = Object.freeze({
-  request: () => undefined,
-});
 
 export interface PermissionResolutionClaim {
   readonly chatId: string;
@@ -147,6 +144,8 @@ export class TranscriptLedgerService {
   readonly #serverInstanceId: string;
   readonly #onListenerError: (error: unknown) => void;
   readonly #chatIdRequests: ChatIdRequestSink;
+  readonly #interAgentMessages: InterAgentMessageRequestSink;
+  readonly #agentStarts: AgentStartRequestSink;
   readonly #listeners = new Set<(event: TranscriptCommitEvent) => void | Promise<void>>();
   readonly #sessionCommitListeners = new Set<(event: TranscriptSessionCommitEvent) => void>();
   readonly #leases = new Map<string, ProducerLease>();
@@ -162,6 +161,8 @@ export class TranscriptLedgerService {
     this.#serverInstanceId = options.serverInstanceId ?? crypto.randomUUID();
     this.#onListenerError = options.onListenerError ?? (() => undefined);
     this.#chatIdRequests = options.chatIdRequests ?? DISABLED_CHAT_ID_REQUEST_SINK;
+    this.#interAgentMessages = options.interAgentMessages ?? DISABLED_INTER_AGENT_MESSAGE_SINK;
+    this.#agentStarts = options.agentStarts ?? DISABLED_AGENT_START_SINK;
   }
 
   subscribe(listener: (event: TranscriptCommitEvent) => void | Promise<void>): () => void {
@@ -670,34 +671,21 @@ export class TranscriptLedgerService {
   ): void {
     switch (event.type) {
       case 'rows': {
-        const drafts: LedgerRowDraft[] = [];
-        let discoveryRequestAt: string | undefined;
-        for (const row of event.rows) {
-          const request = transformChatIdRequest(row.message);
-          const message = request ? request.message : row.message;
-          if (message) {
-            drafts.push({
-              kind: 'provider-row',
-              at: message.timestamp,
-              message,
-              providerMeta: row.providerMeta ?? null,
-            });
-          }
-          if (!request) continue;
-          discoveryRequestAt ??= row.message.timestamp;
-          drafts.push(chatIdRequestNoticeDraft(row.message.timestamp));
+        const publication = canonicalizeGarconProducerRows(event.rows);
+        let committed: readonly LedgerRow[] = [];
+        if (publication.drafts.length > 0) {
+          committed = this.#store.append(chatId, viewId, publication.drafts);
         }
-        if (drafts.length > 0) {
-          const rows = this.#store.append(chatId, viewId, drafts);
-          this.#notify({ type: 'rows', chatId, viewId, rows });
-        }
-        if (discoveryRequestAt !== undefined) {
-          this.#chatIdRequests.request({
-            chatId,
-            viewId,
-            runId: this.#activeRuns.get(chatId) ?? null,
-            at: discoveryRequestAt,
-          });
+        dispatchGarconCommands(publication.commands, {
+          chatId,
+          viewId,
+          runId: this.#activeRuns.get(chatId) ?? null,
+          chatIdRequests: this.#chatIdRequests,
+          interAgentMessages: this.#interAgentMessages,
+          agentStarts: this.#agentStarts,
+        });
+        if (committed.length > 0) {
+          this.#notify({ type: 'rows', chatId, viewId, rows: committed });
         }
         return;
       }

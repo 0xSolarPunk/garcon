@@ -2,15 +2,27 @@ import {
   isToolUseMessage,
   type ChatMessage,
 } from '../../common/chat-types.js';
-import { isCarryoverMigrationQuarantineNoticeDetail } from '../../common/transcript-notice-details.js';
+import {
+  extractGarconCommands,
+  parseGarconCreateChatResults,
+  parseGarconMessage,
+  SUB_AGENT_START_NOTICE_TITLE,
+} from '../../common/garcon-commands.js';
+import {
+  isCarryoverMigrationQuarantineNoticeDetail,
+  renderSubAgentStartOutcome,
+} from '../../common/transcript-notice-details.js';
 import {
   chatIdDisclosureNoticeContent,
   CHAT_ID_DISCOVERY_NOTICE_TITLE,
   parseChatIdDisclosure,
-  transformChatIdRequest,
 } from '../../common/chat-id-discovery.js';
 import type { JsonObject } from '../../common/json.js';
-import { chatIdRequestNoticeDraft } from './chat-id-request.js';
+import {
+  chatIdRequestNoticeDraft,
+  interAgentSendRequestNoticeDraft,
+  subAgentStartRequestNoticeDraft,
+} from './garcon-command-request.js';
 import type { LedgerRowDraft } from './contracts.js';
 
 export interface ImportedRow {
@@ -43,17 +55,64 @@ function importedDraftFor(
   providerMeta: JsonObject | null,
   now: () => string,
 ): LedgerRowDraft[] {
-  const request = transformChatIdRequest(original);
-  if (request) {
+  const commandTransform = extractGarconCommands(original);
+  if (commandTransform) {
     const at = original.timestamp || now();
     return [
-      ...(request.message
-        ? [{ kind: 'provider-row' as const, at, message: request.message, providerMeta }]
+      ...(commandTransform.message
+        ? [{ kind: 'provider-row' as const, at, message: commandTransform.message, providerMeta }]
         : []),
-      chatIdRequestNoticeDraft(at),
+      ...commandTransform.commands.map((command) => {
+        switch (command.type) {
+          case 'get-chat-id':
+            return chatIdRequestNoticeDraft(at);
+          case 'send-message':
+            return interAgentSendRequestNoticeDraft(at, {
+              recipients: command.recipients,
+              hideSender: command.hideSender,
+              body: command.body,
+            });
+          case 'start-agent':
+            return subAgentStartRequestNoticeDraft(at, {
+              prompt: command.prompt,
+              params: command.params,
+            });
+        }
+      }),
     ];
   }
   if (original.type === 'user-message') {
+    const createChatResults = parseGarconCreateChatResults(original.content);
+    if (createChatResults) {
+      return [{
+        kind: 'notice',
+        at: original.timestamp || now(),
+        message: renderSubAgentStartOutcome('delivered', createChatResults),
+        detail: {
+          type: 'sub-agent-start-outcome',
+          deliveryStatus: 'delivered',
+          results: createChatResults.map((result) => ({ ...result })),
+          title: SUB_AGENT_START_NOTICE_TITLE,
+        },
+        providerMeta: null,
+      }];
+    }
+    const received = parseGarconMessage(original.content);
+    if (received) {
+      return [{
+        kind: 'notice',
+        at: original.timestamp || now(),
+        message: received.body,
+        detail: {
+          type: 'inter-agent-message-received',
+          fromChatId: received.fromChatId,
+          title: received.fromChatId === null
+            ? 'Inter-agent message'
+            : `Message from chat ${received.fromChatId}`,
+        },
+        providerMeta: null,
+      }];
+    }
     const disclosedChatId = parseChatIdDisclosure(original.content);
     if (disclosedChatId) {
       return [{

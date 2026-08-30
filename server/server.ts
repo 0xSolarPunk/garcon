@@ -55,7 +55,7 @@ import {
   CarryOverCompactionService,
 } from './chats/carryover-compaction.js';
 import { PreparedCarryoverStore } from './chats/prepared-carryover.js';
-import { ChatIdDiscoveryController } from './chats/chat-id-discovery-controller.js';
+import { AgentCommandComposition } from './chats/agent-command-composition.js';
 import { defaultAgentIntegrations } from './agents/default-agent-integrations.js';
 import { IntegrationHostFactory } from './agents/integration-host.js';
 import { IntegrationRegistry } from './agents/integration-registry.js';
@@ -281,10 +281,7 @@ export async function startServer(): Promise<void> {
     await chatRegistry.init();
     await settings.init();
     let queue: ChatExecutionCoordinator | null = null;
-    const requireExecutionQueue = (): ChatExecutionCoordinator => {
-      if (!queue) throw new Error('Chat execution coordinator is not initialized');
-      return queue;
-    };
+    const agentCommands = new AgentCommandComposition();
     const transcriptStore = new TranscriptLedgerStore(
       path.join(workspaceDir, 'transcript-ledgers'),
     );
@@ -296,41 +293,19 @@ export async function startServer(): Promise<void> {
       onListenerError(error) {
         logger.warn('Transcript commit listener failed:', errorMessage(error));
       },
-      chatIdRequests: {
-        request: (input) => chatIdDiscovery.request(input),
-      },
-    });
-    const chatIdDiscovery = new ChatIdDiscoveryController({
-      execution: {
-        deliverControlInput: (chatId, content, viewId, runId, signal, onControlRun) => (
-          requireExecutionQueue().deliverControlInput(
-            chatId,
-            content,
-            viewId,
-            runId,
-            signal,
-            onControlRun,
-          )
-        ),
-      },
-      notices: transcriptLedger,
-      isEnabled: () => settings.getFeatureSettings().chatIdDiscovery.enabled,
-      onError(error, chatId) {
-        logger.warn('Chat ID auto-discovery delivery failed', {
-          chatId,
-          reason: errorMessage(error),
-        });
-      },
+      chatIdRequests: agentCommands.chatIdRequests,
+      interAgentMessages: agentCommands.interAgentMessages,
+      agentStarts: agentCommands.agentStarts,
     });
     const preparedCarryover = new PreparedCarryoverStore();
     transcriptLedger.subscribe((event) => {
       if (event.type !== 'view-replaced') return;
       preparedCarryover.discard(event.chatId);
-      chatIdDiscovery.discard(event.chatId);
+      agentCommands.discardSource(event.chatId);
     });
     chatRegistry.onChatRemoved((chatId) => {
       preparedCarryover.discard(chatId);
-      chatIdDiscovery.discard(chatId);
+      agentCommands.discardSource(chatId);
     });
     const agentOwnership = new AgentOwnershipJournal({
       workspaceDir,
@@ -536,6 +511,7 @@ export async function startServer(): Promise<void> {
       (chatId) => Boolean(chatRegistry.getChat(chatId)),
       new InMemoryChatExecutionControlRepository(runtimeState.identity.instanceId),
       (chatId) => commandLedger.unsettledQueueReceiptKeys(chatId),
+      agentCommands.appendControlReceipt,
     );
     executionQueries = queue;
     const transcriptReload = new TranscriptReloadService({
@@ -617,6 +593,24 @@ export async function startServer(): Promise<void> {
       handoffs,
       transientFeeds,
       chatMutationLock,
+    });
+    agentCommands.initialize({
+      registry: chatRegistry,
+      adoption: transcriptAdoption,
+      execution: queue,
+      notices: transcriptLedger,
+      chatMutationLock,
+      settings,
+      commands: chatCommands,
+      chatIds,
+      agents: agentRegistry,
+      apiProviders,
+      onChatIdError(error, chatId) {
+        logger.warn('Chat ID auto-discovery delivery failed', {
+          chatId,
+          reason: errorMessage(error),
+        });
+      },
     });
 
     const scheduledPromptStore = new ScheduledPromptStore(workspaceDir);
@@ -896,6 +890,7 @@ export async function startServer(): Promise<void> {
       shuttingDown = true;
       carryOverGarbageCollector.shutdown();
       logger.info('server: shutting down...');
+      agentCommands.beginShutdown();
       const reservedChatIds = queue.beginShutdown();
       handoffs.shutdown();
       let abortTimedOut = false;
@@ -921,6 +916,7 @@ export async function startServer(): Promise<void> {
           );
         }
         const backgroundTasks = await waitForShutdownPhasesWithTimeout([
+          () => agentCommands.waitForIdle(),
           () => chatCommands.waitForBackgroundTasks(),
           () => queue.waitForExecutionOwners(),
           () => eventWiring!.waitForIdle(),

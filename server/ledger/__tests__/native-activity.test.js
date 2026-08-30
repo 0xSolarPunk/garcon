@@ -169,6 +169,102 @@ describe('NativeTranscriptActivityService', () => {
         ordinal: 12,
         at: IMPORTED_AT,
       });
+
+      store.append(CHAT_ID, view.viewId, [{
+        kind: 'notice',
+        at: IMPORTED_AT,
+        message: 'Agent requested inter-agent message delivery',
+        detail: {
+          type: 'inter-agent-send-request',
+          recipients: ['1787974832309199'],
+          hideSender: false,
+          body: 'message',
+        },
+        providerMeta: null,
+      }]);
+      expect(ledger.nativeActivityState(CHAT_ID).providerWatermark).toEqual({
+        ordinal: 13,
+        at: IMPORTED_AT,
+      });
+
+      store.append(CHAT_ID, view.viewId, [{
+        kind: 'notice',
+        at: IMPORTED_AT,
+        message: 'message',
+        detail: {
+          type: 'inter-agent-message-received',
+          fromChatId: '1787974832309199',
+        },
+        providerMeta: null,
+      }]);
+      expect(ledger.nativeActivityState(CHAT_ID).providerWatermark).toEqual({
+        ordinal: 14,
+        at: IMPORTED_AT,
+      });
+
+      store.append(CHAT_ID, view.viewId, [{
+        kind: 'notice',
+        at: IMPORTED_AT,
+        message: 'Queued message',
+        detail: {
+          type: 'inter-agent-message-outcome',
+          results: [{ chatId: '1787974832309199', status: 'queued' }],
+        },
+        providerMeta: null,
+      }]);
+      expect(ledger.nativeActivityState(CHAT_ID).providerWatermark?.ordinal).toBe(14);
+
+      store.append(CHAT_ID, view.viewId, [{
+        kind: 'notice',
+        at: IMPORTED_AT,
+        message: 'Agent requested sub-agent creation',
+        detail: {
+          type: 'sub-agent-start-request',
+          prompt: 'Investigate.',
+          params: [{
+            ref: '69b623a7-757e-49f6-93b8-4b7ea1bc569b',
+            agentId: 'codex',
+            providerId: null,
+            endpointId: null,
+            model: 'gpt-5.4',
+            reasoningEffort: null,
+          }],
+        },
+        providerMeta: null,
+      }]);
+      expect(ledger.nativeActivityState(CHAT_ID).providerWatermark?.ordinal).toBe(16);
+
+      const result = {
+        ref: '69b623a7-757e-49f6-93b8-4b7ea1bc569b',
+        error: false,
+        msg: 'created',
+        chatId: '1787974832309199',
+      };
+      store.append(CHAT_ID, view.viewId, [{
+        kind: 'notice',
+        at: IMPORTED_AT,
+        message: 'Results queued.',
+        detail: {
+          type: 'sub-agent-start-outcome',
+          deliveryStatus: 'queued',
+          results: [result],
+        },
+        providerMeta: null,
+      }]);
+      expect(ledger.nativeActivityState(CHAT_ID).providerWatermark?.ordinal).toBe(16);
+
+      store.append(CHAT_ID, view.viewId, [{
+        kind: 'notice',
+        at: IMPORTED_AT,
+        message: 'Results delivered.',
+        detail: {
+          type: 'sub-agent-start-outcome',
+          deliveryStatus: 'delivered',
+          results: [result],
+        },
+        providerMeta: null,
+      }]);
+      expect(ledger.nativeActivityState(CHAT_ID).providerWatermark?.ordinal).toBe(18);
     });
   });
 

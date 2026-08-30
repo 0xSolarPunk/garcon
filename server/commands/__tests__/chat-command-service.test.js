@@ -37,6 +37,8 @@ let activeServices = [];
 const SOURCE_CHAT_ID = '1783725900000000';
 const TARGET_CHAT_ID = '1783725900000001';
 const SCHEDULED_CHAT_ID = '1783725900000002';
+const AGENT_COMMAND_CHAT_ID = '1783725900000003';
+const CLI_CHAT_ID = '1783725900000004';
 
 const runtimeHandoff = () => ({
   validate: () => undefined,
@@ -90,10 +92,25 @@ function queueEntry(id, content = 'queued', status = 'queued', revision = 1) {
   };
 }
 
+function controlEntry(id, content = 'control') {
+  return {
+    id,
+    content: `<garcon-message>\n${content}\n</garcon-message>`,
+    transcriptViewId: 'view-1',
+    createdAt: '2026-02-27T00:00:00.000Z',
+    receipt: {
+      title: 'Inter-agent message',
+      content,
+      detail: { type: 'inter-agent-message-received', fromChatId: null },
+    },
+  };
+}
+
 function storedQueue(entries = [], overrides = {}) {
   return {
     serverInstanceId: 'server-instance-test',
     entries,
+    controlEntries: [],
     recentlyDispatched: [],
     appliedCommands: [],
     pause: null,
@@ -788,6 +805,7 @@ describe('ChatCommandService', () => {
 
     await expect(
       service.submitStart({
+        origin: 'interactive',
         chatId: TARGET_CHAT_ID,
         agentId: 'claude',
         projectPath: projectBaseDir,
@@ -812,6 +830,7 @@ describe('ChatCommandService', () => {
     });
     await expect(
       unsupported.service.submitStart({
+        origin: 'interactive',
         chatId: TARGET_CHAT_ID,
         agentId: 'claude',
         projectPath: projectBaseDir,
@@ -901,6 +920,7 @@ describe('ChatCommandService', () => {
     const { service, ledger, queue } = makeService();
 
     await expect(service.submitStart({
+      origin: 'interactive',
       chatId: SOURCE_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -926,6 +946,7 @@ describe('ChatCommandService', () => {
     const { service, chats, ledger } = makeService();
 
     const result = await service.submitStart(parseStartChatCommandRequest({
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -961,6 +982,7 @@ describe('ChatCommandService', () => {
     });
 
     await service.submitStart({
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -974,8 +996,8 @@ describe('ChatCommandService', () => {
     expect(events).toEqual(['registry-flushed', 'input-admitted']);
   });
 
-  it('keeps interactive and scheduled new-chat creation behavior conformant', async () => {
-    const { service, chats, agents } = makeService();
+  it('keeps all start origins on one lifecycle without rewriting non-interactive preferences', async () => {
+    const { service, chats, agents, settings } = makeService();
     const shared = {
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -990,10 +1012,20 @@ describe('ChatCommandService', () => {
     };
 
     await service.submitStart({
+      origin: 'interactive',
       ...shared,
       chatId: TARGET_CHAT_ID,
       clientRequestId: 'req-interactive',
       clientMessageId: 'msg-interactive',
+      agentSettings: agentSettings(),
+    });
+    expect(settings.recordChatStartup).toHaveBeenCalledTimes(1);
+    const cli = await service.submitStart({
+      origin: 'cli',
+      ...shared,
+      chatId: CLI_CHAT_ID,
+      clientRequestId: 'req-cli',
+      clientMessageId: 'msg-cli',
       agentSettings: agentSettings(),
     });
     const scheduled = await service.submitScheduledStart({
@@ -1003,13 +1035,32 @@ describe('ChatCommandService', () => {
       clientMessageId: 'msg-scheduled',
       agentSettingsById: { claude: agentSettings() },
     });
+    const agentCommand = await service.submitAgentCommandStart({
+      ...shared,
+      chatId: AGENT_COMMAND_CHAT_ID,
+      clientRequestId: 'req-agent-command',
+      clientMessageId: 'msg-agent-command',
+      agentSettings: agentSettings(),
+    });
 
+    expect(cli.chatId).toBe(CLI_CHAT_ID);
     expect(scheduled.chatId).toBe(SCHEDULED_CHAT_ID);
-    const [{ id: interactiveId, ...interactive }, { id: scheduledId, ...scheduledEntry }] =
+    expect(agentCommand.chatId).toBe(AGENT_COMMAND_CHAT_ID);
+    expect(settings.recordChatStartup).toHaveBeenCalledTimes(1);
+    const [
+      { id: interactiveId, ...interactive },
+      { id: cliId, ...cliEntry },
+      { id: scheduledId, ...scheduledEntry },
+      { id: agentCommandId, ...agentCommandEntry },
+    ] =
       chats.addChat.mock.calls.map(([entry]) => entry);
     expect(interactiveId).toBe(TARGET_CHAT_ID);
+    expect(cliId).toBe(CLI_CHAT_ID);
     expect(scheduledId).toBe(SCHEDULED_CHAT_ID);
+    expect(agentCommandId).toBe(AGENT_COMMAND_CHAT_ID);
+    expect(cliEntry).toEqual(interactive);
     expect(scheduledEntry).toEqual(interactive);
+    expect(agentCommandEntry).toEqual(interactive);
     expect(interactive.thinkingMode).toBe('ultra');
     expect(interactive.tags).toEqual(['qa', 'review-needed']);
     expect(agents.startSession).toHaveBeenNthCalledWith(
@@ -1020,7 +1071,19 @@ describe('ChatCommandService', () => {
     );
     expect(agents.startSession).toHaveBeenNthCalledWith(
       2,
+      CLI_CHAT_ID,
+      shared.command,
+      expect.objectContaining({ projectPath: projectBaseDir }),
+    );
+    expect(agents.startSession).toHaveBeenNthCalledWith(
+      3,
       SCHEDULED_CHAT_ID,
+      shared.command,
+      expect.objectContaining({ projectPath: projectBaseDir }),
+    );
+    expect(agents.startSession).toHaveBeenNthCalledWith(
+      4,
+      AGENT_COMMAND_CHAT_ID,
       shared.command,
       expect.objectContaining({ projectPath: projectBaseDir }),
     );
@@ -1041,6 +1104,7 @@ describe('ChatCommandService', () => {
     });
     const { service, queue } = makeService({ agents: { startSession } });
     const startPromise = service.submitStart({
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1088,6 +1152,7 @@ describe('ChatCommandService', () => {
     });
 
     await expect(service.submitStart({
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1113,6 +1178,7 @@ describe('ChatCommandService', () => {
       if (attempts === 1) throw new Error('startup bookkeeping failed');
     });
     const input = {
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1134,6 +1200,7 @@ describe('ChatCommandService', () => {
   it('replays an accepted start before revalidating a removed project path', async () => {
     const { service, queue } = makeService({ session: null });
     const input = {
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1145,6 +1212,9 @@ describe('ChatCommandService', () => {
     };
 
     const first = await service.submitStart(input);
+    await expect(service.submitStart({ ...input, origin: 'cli' })).rejects.toMatchObject({
+      code: 'IDEMPOTENCY_CONFLICT',
+    });
     await fs.rm(projectBaseDir, { recursive: true, force: true });
     const replay = await service.submitStart(input);
 
@@ -1159,6 +1229,7 @@ describe('ChatCommandService', () => {
   it('replays accepted start identity without retaining a deleted chat projection', async () => {
     const { service, queue, sessions, chatListProjector } = makeService({ session: null });
     const input = {
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1185,6 +1256,7 @@ describe('ChatCommandService', () => {
   it('keeps an unprojectable live start replay retryable', async () => {
     const { service, queue, chatListProjector } = makeService({ session: null });
     const input = {
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1209,6 +1281,7 @@ describe('ChatCommandService', () => {
   it('replays a terminally failed start so callers can read its receipt', async () => {
     const { service, ledger, queue } = makeService({ session: null });
     const input = {
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1239,6 +1312,7 @@ describe('ChatCommandService', () => {
   it('rejects a private terminal start failure instead of returning an unreadable receipt', async () => {
     const { service, ledger, queue } = makeService({ session: null });
     const input = {
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1279,6 +1353,7 @@ describe('ChatCommandService', () => {
       queue: { stopActiveTurn },
     });
     const start = service.submitStart({
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1622,6 +1697,7 @@ describe('ChatCommandService', () => {
   it('requires command identity and rejects invalid IDs at the request boundary', async () => {
     const { chats } = makeService();
     const input = {
+      origin: 'interactive',
       chatId: TARGET_CHAT_ID,
       agentId: 'claude',
       projectPath: projectBaseDir,
@@ -1653,6 +1729,7 @@ describe('ChatCommandService', () => {
     try {
       await expect(
         service.submitStart({
+          origin: 'interactive',
           chatId: TARGET_CHAT_ID,
           agentId: 'claude',
           projectPath: outsidePath,
@@ -5136,6 +5213,24 @@ describe('ChatCommandService', () => {
     queue.readChatExecutionControl.mockResolvedValueOnce(storedQueue([
       queueEntry('steering-1', 'continue', 'steering'),
     ]));
+
+    await expect(
+      service.updateProjectPath({
+        chatId: SOURCE_CHAT_ID,
+        projectPath: nextPath,
+      }),
+    ).rejects.toMatchObject({ code: 'CHAT_NOT_IDLE', status: 409 });
+
+    expect(agents.prepareProjectPathUpdate).not.toHaveBeenCalled();
+  });
+
+  it('rejects project path updates while private control input is waiting', async () => {
+    const { service, queue, agents } = makeService();
+    const nextPath = path.join(projectBaseDir, 'repo-worktree');
+    await fs.mkdir(nextPath, { recursive: true });
+    queue.readChatExecutionControl.mockResolvedValueOnce(storedQueue([], {
+      controlEntries: [controlEntry('control-1')],
+    }));
 
     await expect(
       service.updateProjectPath({

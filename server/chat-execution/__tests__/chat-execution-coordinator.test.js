@@ -28,6 +28,38 @@ function rejectWhenExecutionAdmissionAborts(_chatId, _content, options) {
   });
 }
 
+function interAgentInput(content = 'message') {
+  return {
+    content: `<garcon-message>\n${content}\n</garcon-message>`,
+    transcriptViewId: 'view-1',
+    createdAt: '2026-08-29T00:00:00.000Z',
+    receipt: {
+      title: 'Inter-agent message',
+      content,
+      detail: { type: 'inter-agent-message-received', fromChatId: null },
+    },
+  };
+}
+
+function agentCommandResultInput() {
+  const results = [{
+    ref: '69b623a7-757e-49f6-93b8-4b7ea1bc569b',
+    error: false,
+    msg: 'created',
+    chatId: '1787974832309199',
+  }];
+  return {
+    content: '<garcon-create-chat-result ref="69b623a7-757e-49f6-93b8-4b7ea1bc569b" error="false" msg="created" chat-id="1787974832309199" />',
+    transcriptViewId: 'view-1',
+    createdAt: '2026-08-29T00:00:00.000Z',
+    receipt: {
+      title: 'Sub-agent start',
+      content: 'Results delivered to the requesting agent.\nCreated: 69b623a7-757e-49f6-93b8-4b7ea1bc569b -> chat 1787974832309199',
+      detail: { type: 'sub-agent-start-outcome', deliveryStatus: 'delivered', results },
+    },
+  };
+}
+
 function createFixture(overrides = {}) {
   const events = [];
   const queuedAdmission = overrides.queuedAdmission ?? (() => ({ inserted: true }));
@@ -48,6 +80,7 @@ function createFixture(overrides = {}) {
     isChatRunning: mock(() => false),
     ...overrides.turnRunner,
   };
+  const appendControlReceipt = overrides.appendControlReceipt ?? mock(() => undefined);
   const coordinator = new ChatExecutionCoordinator(
     '/unused',
     turnRunner,
@@ -60,8 +93,10 @@ function createFixture(overrides = {}) {
     overrides.chatExists ?? (() => true),
     overrides.controlRepository
       ?? new InMemoryChatExecutionControlRepository('server-instance-test'),
+    () => new Set(),
+    appendControlReceipt,
   );
-  return { coordinator, events, projection, turnRunner };
+  return { coordinator, events, projection, turnRunner, appendControlReceipt };
 }
 
 describe('ChatExecutionCoordinator', () => {
@@ -271,6 +306,317 @@ describe('ChatExecutionCoordinator', () => {
 
     expect(fixture.turnRunner.runAgentTurn).not.toHaveBeenCalled();
     await coordinator.releaseDirectTurn(reservation);
+  });
+
+  it('steers inter-agent control input to the active target before queue admission', async () => {
+    const providerTarget = { providerTurnId: 'provider-turn-1' };
+    const fixture = createFixture({
+      turnRunner: {
+        captureSteerTarget: mock(() => providerTarget),
+        steerInput: mock(async (_chatId, _content, _options, _target, prepare) => {
+          await prepare();
+          return { kind: 'accepted' };
+        }),
+      },
+    });
+    coordinator = fixture.coordinator;
+    const reservation = coordinator.reserveDirectTurn('chat-1', { turnId: 'turn-1' });
+
+    await expect(coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput(),
+      new AbortController().signal,
+    )).resolves.toBe('delivered');
+
+    expect(fixture.turnRunner.steerInput).toHaveBeenCalledTimes(1);
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries).toEqual([]);
+    expect(fixture.projection.admitInput).not.toHaveBeenCalled();
+    expect(fixture.projection.admitQueuedInput).not.toHaveBeenCalled();
+    await coordinator.releaseDirectTurn(reservation);
+  });
+
+  it('queues inter-agent control input after a definitively rejected attempt settles', async () => {
+    let providerRunning = false;
+    const fixture = createFixture({
+      turnRunner: {
+        captureSteerTarget: mock(() => ({ providerTurnId: 'provider-turn-1' })),
+        steerInput: mock(async () => {
+          throw new DomainError(
+            'STEER_TURN_CHANGED',
+            'The active turn changed before steering could be applied',
+            409,
+          );
+        }),
+        isChatRunning: mock(() => providerRunning),
+      },
+    });
+    coordinator = fixture.coordinator;
+    const reservation = coordinator.reserveDirectTurn('chat-1', { turnId: 'turn-1' });
+    providerRunning = true;
+
+    const delivery = coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput(),
+      new AbortController().signal,
+    );
+    await waitFor(() => fixture.turnRunner.steerInput.mock.calls.length === 1);
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries).toEqual([]);
+
+    await coordinator.releaseDirectTurn(reservation);
+    await expect(delivery).resolves.toBe('queued');
+
+    expect(fixture.turnRunner.steerInput).toHaveBeenCalledTimes(1);
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries)
+      .toHaveLength(1);
+  });
+
+  it('steers agent-command results only to the publication-time source run', async () => {
+    const providerTarget = { providerTurnId: 'provider-turn-1' };
+    const onQueued = mock(() => undefined);
+    const fixture = createFixture({
+      turnRunner: {
+        captureSteerTarget: mock(() => providerTarget),
+        steerInput: mock(async (_chatId, _content, _options, _target, prepare) => {
+          await prepare();
+          return { kind: 'accepted' };
+        }),
+      },
+    });
+    coordinator = fixture.coordinator;
+    const reservation = coordinator.reserveDirectTurn('chat-1', { turnId: 'source-turn' });
+
+    await expect(coordinator.deliverAgentCommandResult(
+      'chat-1',
+      agentCommandResultInput(),
+      'source-turn',
+      new AbortController().signal,
+      onQueued,
+    )).resolves.toBe('delivered');
+
+    expect(onQueued).not.toHaveBeenCalled();
+    expect(fixture.turnRunner.steerInput).toHaveBeenCalledTimes(1);
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries).toEqual([]);
+    await coordinator.releaseDirectTurn(reservation);
+  });
+
+  it('queues agent-command results without steering a successor run', async () => {
+    let providerRunning = false;
+    const onQueued = mock(() => undefined);
+    const fixture = createFixture({
+      turnRunner: {
+        captureSteerTarget: mock(() => ({ providerTurnId: 'provider-turn-2' })),
+        isChatRunning: mock(() => providerRunning),
+      },
+    });
+    coordinator = fixture.coordinator;
+    const reservation = coordinator.reserveDirectTurn('chat-1', { turnId: 'successor-turn' });
+    providerRunning = true;
+
+    await expect(coordinator.deliverAgentCommandResult(
+      'chat-1',
+      agentCommandResultInput(),
+      'source-turn',
+      new AbortController().signal,
+      onQueued,
+    )).resolves.toBe('queued');
+
+    expect(onQueued).toHaveBeenCalledTimes(1);
+    expect(fixture.turnRunner.steerInput).not.toHaveBeenCalled();
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries)
+      .toEqual([expect.objectContaining({ content: agentCommandResultInput().content })]);
+    await coordinator.releaseDirectTurn(reservation);
+  });
+
+  it('records queued agent-command results before an idle source drains them', async () => {
+    const provider = deferred();
+    const events = [];
+    const fixture = createFixture({
+      appendControlReceipt: mock(() => { events.push('receipt'); }),
+      turnRunner: {
+        runAgentTurn: mock(() => {
+          events.push('provider');
+          return provider.promise;
+        }),
+      },
+    });
+    coordinator = fixture.coordinator;
+
+    await expect(coordinator.deliverAgentCommandResult(
+      'chat-1',
+      agentCommandResultInput(),
+      'completed-source-turn',
+      new AbortController().signal,
+      () => { events.push('queued'); },
+    )).resolves.toBe('queued');
+    await waitFor(() => fixture.turnRunner.runAgentTurn.mock.calls.length === 1);
+
+    expect(events).toEqual(['queued', 'receipt', 'provider']);
+    const runOptions = fixture.turnRunner.runAgentTurn.mock.calls[0][2];
+    await coordinator.onAgentTurnTerminal('chat-1', { turnId: runOptions.turnId });
+    provider.resolve();
+    await coordinator.waitForDispatches();
+  });
+
+  it('drains queued inter-agent control input with a receipt and no user admission', async () => {
+    const provider = deferred();
+    const events = [];
+    const fixture = createFixture({
+      appendControlReceipt: mock(() => { events.push('receipt'); }),
+      turnRunner: {
+        runAgentTurn: mock(() => {
+          events.push('provider');
+          return provider.promise;
+        }),
+      },
+    });
+    coordinator = fixture.coordinator;
+
+    await expect(coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput('queued message'),
+      new AbortController().signal,
+    )).resolves.toBe('queued');
+    await waitFor(() => fixture.turnRunner.runAgentTurn.mock.calls.length === 1);
+
+    expect(events).toEqual(['receipt', 'provider']);
+    expect(fixture.appendControlReceipt).toHaveBeenCalledWith(
+      'chat-1',
+      expect.objectContaining({
+        content: '<garcon-message>\nqueued message\n</garcon-message>',
+        receipt: expect.objectContaining({ content: 'queued message' }),
+      }),
+    );
+    expect(fixture.projection.admitInput).not.toHaveBeenCalled();
+    expect(fixture.projection.admitQueuedInput).not.toHaveBeenCalled();
+    const runOptions = fixture.turnRunner.runAgentTurn.mock.calls[0][2];
+    expect(runOptions).toMatchObject({
+      transcriptViewId: 'view-1',
+      commandType: 'agent-run',
+      clientMessageId: expect.any(String),
+      turnId: expect.any(String),
+    });
+    const control = await coordinator.readChatExecutionControl('chat-1');
+    expect(control.controlEntries).toEqual([]);
+    expect(control.entries).toEqual([]);
+    expect(control.recentlyDispatched).toEqual([]);
+    expect(control.version).toBe(0);
+
+    await coordinator.onAgentTurnTerminal('chat-1', { turnId: runOptions.turnId });
+    provider.resolve();
+    await coordinator.waitForDispatches();
+  });
+
+  it('queues inter-agent control input behind a shared pause without steering', async () => {
+    const controlRepository = new InMemoryChatExecutionControlRepository('server-instance-test');
+    const control = controlRepository.load('chat-1');
+    control.pause = {
+      id: 'pause-1',
+      kind: 'manual',
+      pausedAt: '2026-08-29T00:00:00.000Z',
+    };
+    controlRepository.save('chat-1', control);
+    const fixture = createFixture({
+      controlRepository,
+      turnRunner: {
+        captureSteerTarget: mock(() => ({ providerTurnId: 'provider-turn-1' })),
+      },
+    });
+    coordinator = fixture.coordinator;
+
+    await expect(coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput(),
+      new AbortController().signal,
+    )).resolves.toBe('queued');
+
+    expect(fixture.turnRunner.steerInput).not.toHaveBeenCalled();
+    expect(fixture.turnRunner.runAgentTurn).not.toHaveBeenCalled();
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries)
+      .toHaveLength(1);
+  });
+
+  it('drains preserved control input after the public queue is cleared', async () => {
+    const provider = deferred();
+    const fixture = createFixture({
+      turnRunner: { runAgentTurn: mock(() => provider.promise) },
+    });
+    coordinator = fixture.coordinator;
+    const snapshot = coordinator.reserveTranscriptSnapshot('chat-1');
+    await coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput(),
+      new AbortController().signal,
+    );
+
+    await coordinator.clearChatQueue('chat-1');
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries)
+      .toHaveLength(1);
+
+    const release = coordinator.releaseTranscriptSnapshot(snapshot);
+    await waitFor(() => fixture.turnRunner.runAgentTurn.mock.calls.length === 1);
+    const options = fixture.turnRunner.runAgentTurn.mock.calls[0][2];
+    await coordinator.onAgentTurnTerminal('chat-1', { turnId: options.turnId });
+    provider.resolve();
+    await release;
+
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries).toEqual([]);
+  });
+
+  it('retains queued control input when receipt admission fails', async () => {
+    const failure = new Error('receipt append failed');
+    const fixture = createFixture({
+      appendControlReceipt: mock(() => { throw failure; }),
+    });
+    coordinator = fixture.coordinator;
+    const snapshot = coordinator.reserveTranscriptSnapshot('chat-1');
+    await coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput(),
+      new AbortController().signal,
+    );
+
+    await expect(coordinator.releaseTranscriptSnapshot(snapshot)).rejects.toBe(failure);
+    expect((await coordinator.readChatExecutionControl('chat-1')).controlEntries)
+      .toHaveLength(1);
+    expect(fixture.turnRunner.runAgentTurn).not.toHaveBeenCalled();
+  });
+
+  it('continues the control lane after dispatch failure without pausing the user queue', async () => {
+    const second = deferred();
+    let calls = 0;
+    const fixture = createFixture({
+      turnRunner: {
+        runAgentTurn: mock(() => {
+          calls += 1;
+          if (calls === 1) throw new Error('control launch failed');
+          return second.promise;
+        }),
+      },
+    });
+    coordinator = fixture.coordinator;
+    const snapshot = coordinator.reserveTranscriptSnapshot('chat-1');
+    await coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput('first'),
+      new AbortController().signal,
+    );
+    await coordinator.deliverInterAgentControlInput(
+      'chat-1',
+      interAgentInput('second'),
+      new AbortController().signal,
+    );
+
+    const release = coordinator.releaseTranscriptSnapshot(snapshot);
+    await waitFor(() => fixture.turnRunner.runAgentTurn.mock.calls.length === 2);
+    const secondOptions = fixture.turnRunner.runAgentTurn.mock.calls[1][2];
+    await coordinator.onAgentTurnTerminal('chat-1', { turnId: secondOptions.turnId });
+    second.resolve();
+    await release;
+
+    const control = await coordinator.readChatExecutionControl('chat-1');
+    expect(control.controlEntries).toEqual([]);
+    expect(control.pause).toBeNull();
+    expect(fixture.appendControlReceipt).toHaveBeenCalledTimes(2);
   });
 
   it('[TLV5-CHAT-ID-DISCOVERY.04-CORE-HIDDEN-RUN-UNIT-01] schedules a control turn without admitting user input', async () => {

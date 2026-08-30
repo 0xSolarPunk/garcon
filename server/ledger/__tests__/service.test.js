@@ -94,6 +94,205 @@ describe('TranscriptLedgerService', () => {
     });
   });
 
+  describe('Garcon command publication', () => {
+    it('commits cleaned output and private command evidence before ordered dispatch', async () => {
+      const dispatches = [];
+      const chatIdRequests = mock((input) => dispatches.push({ type: 'get-chat-id', input }));
+      const interAgentMessages = mock((input) => {
+        dispatches.push({ type: 'send-message', input });
+      });
+      await withService(async ({ ledger }) => {
+        ledger.initializeChat('chat-1');
+        const lease = ledger.openProducer('chat-1', 'test');
+        ledger.beginRun('chat-1', 'run-1');
+        const notifications = [];
+        ledger.subscribe((event) => notifications.push(event));
+        interAgentMessages.mockImplementation((input) => {
+          expect(ledger.currentRows('chat-1')).toHaveLength(3);
+          expect(notifications).toEqual([]);
+          dispatches.push({ type: 'send-message', input });
+        });
+
+        lease.sink.publish({
+          type: 'rows',
+          rows: [{
+            message: new AssistantMessage(
+              TS,
+              '<garcon-get-chat-id />\n'
+                + '<garcon-send-message to="1787974832309199, 1787973671383699" hide-sender="true">\n'
+                + 'message body\n'
+                + '</garcon-send-message>\n'
+                + 'Continuing the response.',
+            ),
+          }],
+        });
+
+        expect(dispatches).toEqual([
+          {
+            type: 'get-chat-id',
+            input: {
+              chatId: 'chat-1',
+              viewId: expect.any(String),
+              runId: 'run-1',
+              at: TS,
+            },
+          },
+          {
+            type: 'send-message',
+            input: {
+              sourceChatId: 'chat-1',
+              sourceViewId: expect.any(String),
+              requestAt: TS,
+              recipients: ['1787974832309199', '1787973671383699'],
+              hideSender: true,
+              body: 'message body',
+            },
+          },
+        ]);
+        expect(ledger.currentRows('chat-1')).toMatchObject([
+          {
+            ordinal: 1,
+            kind: 'provider-row',
+            message: { type: 'assistant-message', content: 'Continuing the response.' },
+          },
+          { ordinal: 2, kind: 'notice', detail: { type: 'chat-id-request' } },
+          {
+            ordinal: 3,
+            kind: 'notice',
+            detail: {
+              type: 'inter-agent-send-request',
+              recipients: ['1787974832309199', '1787973671383699'],
+              hideSender: true,
+              body: 'message body',
+            },
+          },
+        ]);
+        await tick();
+        expect(notifications).toHaveLength(1);
+      }, {
+        chatIdRequests: { request: chatIdRequests },
+        interAgentMessages: { request: interAgentMessages },
+      });
+    });
+
+    it('commits private start evidence before dispatching a run-bound agent start', async () => {
+      const agentStarts = mock(() => undefined);
+      await withService(async ({ ledger }) => {
+        ledger.initializeChat('chat-1');
+        const lease = ledger.openProducer('chat-1', 'test');
+        ledger.beginRun('chat-1', 'run-1');
+        const notifications = [];
+        ledger.subscribe((event) => notifications.push(event));
+        agentStarts.mockImplementation((input) => {
+          expect(ledger.currentRows('chat-1')).toHaveLength(2);
+          expect(notifications).toEqual([]);
+          expect(input).toEqual({
+            sourceChatId: 'chat-1',
+            sourceViewId: expect.any(String),
+            requestRunId: 'run-1',
+            requestAt: TS,
+            prompt: 'Investigate the failure.',
+            params: [{
+              ref: '69b623a7-757e-49f6-93b8-4b7ea1bc569b',
+              agentId: 'codex',
+              providerId: null,
+              endpointId: null,
+              model: 'gpt-5.4',
+              reasoningEffort: 'high',
+            }],
+          });
+        });
+
+        lease.sink.publish({
+          type: 'rows',
+          rows: [{
+            message: new AssistantMessage(
+              TS,
+              'Continuing the response.\n'
+                + '<garcon-start-agent>\n'
+                + '{"prompt":"Investigate the failure.","params":[{"ref":"69b623a7-757e-49f6-93b8-4b7ea1bc569b","agent":"codex","model":"gpt-5.4","reasoningEffort":"high"}]}\n'
+                + '</garcon-start-agent>',
+            ),
+          }],
+        });
+
+        expect(agentStarts).toHaveBeenCalledTimes(1);
+        expect(ledger.currentRows('chat-1')).toMatchObject([
+          {
+            ordinal: 1,
+            kind: 'provider-row',
+            message: { type: 'assistant-message', content: 'Continuing the response.' },
+          },
+          {
+            ordinal: 2,
+            kind: 'notice',
+            message: 'Agent requested sub-agent creation',
+            detail: {
+              type: 'sub-agent-start-request',
+              prompt: 'Investigate the failure.',
+              params: [{ ref: '69b623a7-757e-49f6-93b8-4b7ea1bc569b' }],
+            },
+          },
+        ]);
+        expect(ledger.conversationMessages('chat-1')).toEqual([
+          new AssistantMessage(TS, 'Continuing the response.'),
+        ]);
+      }, { agentStarts: { request: agentStarts } });
+    });
+
+    it('keeps malformed commands as provider output and appends a visible diagnostic', async () => {
+      const requests = mock(() => undefined);
+      await withService(async ({ ledger }) => {
+        ledger.initializeChat('chat-1');
+        const lease = ledger.openProducer('chat-1', 'test');
+        const content = '<garcon-send-message to="invalid" hide-sender="false">body</garcon-send-message>';
+
+        lease.sink.publish({
+          type: 'rows',
+          rows: [{ message: new AssistantMessage(TS, content) }],
+        });
+
+        expect(requests).not.toHaveBeenCalled();
+        expect(ledger.currentRows('chat-1')).toMatchObject([
+          {
+            kind: 'provider-row',
+            message: { type: 'assistant-message', content },
+          },
+          {
+            kind: 'notice',
+            at: TS,
+            message: 'Garcon could not parse an inter-agent message command.',
+            detail: { title: 'Inter-agent message' },
+          },
+        ]);
+      }, { interAgentMessages: { request: requests } });
+    });
+
+    it('keeps malformed start commands as provider output and labels the diagnostic', async () => {
+      const requests = mock(() => undefined);
+      await withService(async ({ ledger }) => {
+        ledger.initializeChat('chat-1');
+        const lease = ledger.openProducer('chat-1', 'test');
+        const content = '<garcon-start-agent>\n{"prompt":"prompt"}\n</garcon-start-agent>';
+
+        lease.sink.publish({
+          type: 'rows',
+          rows: [{ message: new AssistantMessage(TS, content) }],
+        });
+
+        expect(requests).not.toHaveBeenCalled();
+        expect(ledger.currentRows('chat-1')).toMatchObject([
+          { kind: 'provider-row', message: { content } },
+          {
+            kind: 'notice',
+            message: 'Garcon could not parse a sub-agent start command.',
+            detail: { title: 'Sub-agent start' },
+          },
+        ]);
+      }, { agentStarts: { request: requests } });
+    });
+  });
+
   it('[TLV5-L03.01-CORE-UNIT-01] commits producer events synchronously and notifies after publish returns', async () => {
     await withService(async ({ ledger }) => {
       ledger.initializeChat('chat-1');
