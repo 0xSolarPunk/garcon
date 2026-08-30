@@ -1,23 +1,34 @@
-import type { HostId, PresentationHostId, WorkspaceLayoutSnapshot } from './surface-types.js';
-import { CHAT_SURFACE_ID } from './surface-types.js';
+import type {
+	PresentationHostId,
+	WorkspaceLayoutSnapshot,
+	WorkspaceWindowId,
+} from './surface-types.js';
+import { collectWindowNodes, windowNodeById } from './window-tree.js';
 
 export interface PortablePresentation {
 	surfaceId: string;
-	presentation: HostId | 'mobile';
+	presentation: WorkspaceWindowId | 'mobile';
 }
 
 export interface RenderedPortablePresentation extends PortablePresentation {
 	visible: boolean;
+	windowId: WorkspaceWindowId | null;
 }
 
-export function portablePresentationKey(presentation: HostId, surfaceId: string): string {
+export function portablePresentationKey(
+	presentation: WorkspaceWindowId,
+	surfaceId: string,
+): string {
 	return `${presentation}:${surfaceId}`;
 }
 
-export function isDesktopHostPresented(snapshot: WorkspaceLayoutSnapshot, host: HostId): boolean {
-	if (host === 'main') return snapshot.fullscreenHost !== 'sidebar';
+export function isDesktopWindowPresented(
+	snapshot: WorkspaceLayoutSnapshot,
+	windowId: WorkspaceWindowId,
+): boolean {
 	return (
-		snapshot.sidebarOpen && snapshot.fullscreenHost !== 'main' && Boolean(snapshot.sidebar.activeId)
+		windowNodeById(snapshot.desktopRoot, windowId) !== null &&
+		(!snapshot.fullscreenWindowId || snapshot.fullscreenWindowId === windowId)
 	);
 }
 
@@ -31,11 +42,14 @@ export function visiblePresentationMap(
 		visible.set('mobile', snapshot.mobileActiveSurfaceId);
 		return visible;
 	}
-	if (isDesktopHostPresented(snapshot, 'main')) {
-		visible.set('main', snapshot.main.activeId ?? CHAT_SURFACE_ID);
-	}
-	if (isDesktopHostPresented(snapshot, 'sidebar') && snapshot.sidebar.activeId) {
-		visible.set('sidebar', snapshot.sidebar.activeId);
+	const fullscreenWindow = snapshot.fullscreenWindowId
+		? windowNodeById(snapshot.desktopRoot, snapshot.fullscreenWindowId)
+		: null;
+	const desktopWindows = fullscreenWindow
+		? [fullscreenWindow]
+		: collectWindowNodes(snapshot.desktopRoot);
+	for (const workspaceWindow of desktopWindows) {
+		visible.set(workspaceWindow.id, workspaceWindow.tabs.activeId);
 	}
 	if (includeDialog && snapshot.dialogFileSurfaceId) {
 		visible.set('dialog', snapshot.dialogFileSurfaceId);
@@ -47,12 +61,18 @@ export function visiblePortablePresentations(
 	snapshot: WorkspaceLayoutSnapshot,
 	isMobile: boolean,
 ): PortablePresentation[] {
-	return [...visiblePresentationMap(snapshot, isMobile ? 'mobile' : 'desktop', false)]
-		.filter(([, surfaceId]) => surfaceId !== CHAT_SURFACE_ID)
-		.map(([presentation, surfaceId]) => ({
-			surfaceId,
-			presentation: presentation as HostId | 'mobile',
-		}));
+	return [...visiblePresentationMap(snapshot, isMobile ? 'mobile' : 'desktop', false)].flatMap(
+		([presentation, surfaceId]) => {
+			const surface = snapshot.surfaces[surfaceId];
+			if (!surface || surface.type === 'chat') return [];
+			return [
+				{
+					surfaceId,
+					presentation: presentation as WorkspaceWindowId | 'mobile',
+				},
+			];
+		},
+	);
 }
 
 export function nextRetainedSingletonPresentationKeys(
@@ -62,24 +82,19 @@ export function nextRetainedSingletonPresentationKeys(
 	current: ReadonlySet<string>,
 ): ReadonlySet<string> {
 	if (isMobile) return new Set();
-
 	const next = new Set<string>();
 	const visibleKeys = new Set(
 		visible.flatMap(({ presentation, surfaceId }) =>
 			presentation === 'mobile' ? [] : [portablePresentationKey(presentation, surfaceId)],
 		),
 	);
-	const retainHost = (host: HostId): void => {
-		for (const surfaceId of snapshot[host].order) {
-			const surface = snapshot.surfaces[surfaceId];
-			if (surface?.type !== 'singleton' || surface.kind === 'chat') continue;
-			const key = portablePresentationKey(host, surfaceId);
+	for (const workspaceWindow of collectWindowNodes(snapshot.desktopRoot)) {
+		for (const surfaceId of workspaceWindow.tabs.order) {
+			if (snapshot.surfaces[surfaceId]?.type !== 'singleton') continue;
+			const key = portablePresentationKey(workspaceWindow.id, surfaceId);
 			if (current.has(key) || visibleKeys.has(key)) next.add(key);
 		}
-	};
-
-	if (isDesktopHostPresented(snapshot, 'main')) retainHost('main');
-	if (isDesktopHostPresented(snapshot, 'sidebar')) retainHost('sidebar');
+	}
 	return next;
 }
 
@@ -89,25 +104,34 @@ export function renderedPortablePresentations(
 	visible: readonly PortablePresentation[],
 	retainedSingletonKeys: ReadonlySet<string>,
 ): RenderedPortablePresentation[] {
-	if (isMobile) return visible.map((item) => ({ ...item, visible: true }));
-
+	if (isMobile) {
+		return visible.flatMap((item) =>
+			item.presentation === 'mobile' ? [{ ...item, visible: true, windowId: null }] : [],
+		);
+	}
 	const visibleKeys = new Set(
 		visible.flatMap(({ presentation, surfaceId }) =>
 			presentation === 'mobile' ? [] : [portablePresentationKey(presentation, surfaceId)],
 		),
 	);
 	const rendered: RenderedPortablePresentation[] = [];
-	const appendHost = (host: HostId): void => {
-		for (const surfaceId of snapshot[host].order) {
-			if (surfaceId === CHAT_SURFACE_ID) continue;
-			const key = portablePresentationKey(host, surfaceId);
+	for (const workspaceWindow of collectWindowNodes(snapshot.desktopRoot)) {
+		for (const surfaceId of workspaceWindow.tabs.order) {
+			if (snapshot.surfaces[surfaceId]?.type === 'chat') continue;
+			const key = portablePresentationKey(workspaceWindow.id, surfaceId);
 			const isVisible = visibleKeys.has(key);
-			if (!isVisible && !retainedSingletonKeys.has(key)) continue;
-			rendered.push({ surfaceId, presentation: host, visible: isVisible });
+			const isHiddenFullscreenActive =
+				Boolean(snapshot.fullscreenWindowId) &&
+				workspaceWindow.id !== snapshot.fullscreenWindowId &&
+				workspaceWindow.tabs.activeId === surfaceId;
+			if (!isVisible && !retainedSingletonKeys.has(key) && !isHiddenFullscreenActive) continue;
+			rendered.push({
+				surfaceId,
+				presentation: workspaceWindow.id,
+				windowId: workspaceWindow.id,
+				visible: isVisible,
+			});
 		}
-	};
-
-	if (isDesktopHostPresented(snapshot, 'main')) appendHost('main');
-	if (isDesktopHostPresented(snapshot, 'sidebar')) appendHost('sidebar');
+	}
 	return rendered;
 }

@@ -51,9 +51,7 @@ function input(overrides: Partial<ProjectionInput> = {}): ProjectionInput {
 		mutationClock: clock(1, { replacement: 1 }),
 		hiddenToolTypes: NO_HIDDEN_TOOL_TYPES,
 		showThinking: true,
-		textScale: 1,
 		isLiveWindow: true,
-		showTopToolbarSpacer: false,
 		showRefreshError: false,
 		showEarlierBoundary: false,
 		showLaterBoundary: false,
@@ -112,12 +110,18 @@ describe('ConversationFeedProjectionState', () => {
 		);
 		const oldEndKey = first.model.items.at(-1)?.key;
 
-		transcript.applyMessages('chat-1', 'generation-1', [
-			{
-				ordinal: ACTIVE_TRANSCRIPT_RETENTION_LIMIT,
-				message: new AssistantMessage(TS, 'new response'),
-			},
-		], ACTIVE_TRANSCRIPT_RETENTION_LIMIT, ACTIVE_TRANSCRIPT_RETENTION_LIMIT);
+		transcript.applyMessages(
+			'chat-1',
+			'generation-1',
+			[
+				{
+					ordinal: ACTIVE_TRANSCRIPT_RETENTION_LIMIT,
+					message: new AssistantMessage(TS, 'new response'),
+				},
+			],
+			ACTIVE_TRANSCRIPT_RETENTION_LIMIT,
+			ACTIVE_TRANSCRIPT_RETENTION_LIMIT,
+		);
 		const appendedRows = transcript.visibleRows;
 		const appendedTail = appendedRows.at(-1);
 		if (appendedTail?.kind !== 'message') throw new Error('Expected an appended transcript row');
@@ -146,7 +150,7 @@ describe('ConversationFeedProjectionState', () => {
 		expect(appended.geometry.geometryRevision).toBeGreaterThan(first.geometry.geometryRevision);
 		expect(appended.geometry.keys).toEqual(appended.model.items.map((item) => item.key));
 		expect(appended.geometry.estimates).toEqual(
-			appended.model.items.map((item) => estimateConversationFeedItemSize(item, 1)),
+			appended.model.items.map(estimateConversationFeedItemSize),
 		);
 	});
 
@@ -163,16 +167,6 @@ describe('ConversationFeedProjectionState', () => {
 		expect(shrunk.geometry.keys.length).toBeLessThan(first.geometry.keys.length);
 		expect(shrunk.geometry.geometryRevision).toBeGreaterThan(first.geometry.geometryRevision);
 		expect(shrunk.geometry.measurementReset).toBe('none');
-	});
-
-	it('marks text scale as a full measurement reset while retaining stable keys', () => {
-		const projections = new ConversationFeedProjectionState();
-		const first = projections.reconcile(input());
-		const scaled = projections.reconcile(input({ textScale: 0.85 }));
-
-		expect(scaled.geometry.keys).toEqual(first.geometry.keys);
-		expect(scaled.geometry.geometryRevision).toBeGreaterThan(first.geometry.geometryRevision);
-		expect(scaled.geometry.measurementReset).toBe('all');
 	});
 
 	it('publishes changed end geometry when the composer tray reservation changes', () => {

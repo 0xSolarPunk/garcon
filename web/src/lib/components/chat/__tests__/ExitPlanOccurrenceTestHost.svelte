@@ -2,29 +2,22 @@
 	import { onDestroy } from 'svelte';
 	import ConversationTranscriptItem from '../ConversationTranscriptItem.svelte';
 	import { buildConversationFeedRenderModel } from '$lib/chat/transcript/conversation-feed-items.js';
-	import {
-		setAppShell,
-		setChatSessions,
-		setFileSessions,
-		setLocalSettings,
-	} from '$lib/context';
+	import { setAppShell, setChatSessions, setFileSessions, setLocalSettings } from '$lib/context';
 	import { FileSessionRegistry } from '$lib/files/sessions/file-session-registry.svelte.js';
 	import { createAppShellStore } from '$lib/stores/app-shell.svelte.js';
 	import { createChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.js';
 	import { createLocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
 	import { ExitPlanModeToolUseMessage } from '$shared/chat-types';
 	import type { PendingPermissionRequest } from '$lib/types/chat';
+	import { setCanonicalWorkspaceLayout } from './workspace-layout-test-context.js';
 
 	interface Props {
 		pendingPermissionRequests: PendingPermissionRequest[];
-		onExitPlanMode: (
-			permissionOccurrenceId: string,
-			choice: string,
-			plan: string,
-		) => void;
+		onExitPlanMode: (permissionOccurrenceId: string, choice: string, plan: string) => void;
 	}
 
 	let { pendingPermissionRequests, onExitPlanMode }: Props = $props();
+	setCanonicalWorkspaceLayout();
 
 	const message = new ExitPlanModeToolUseMessage(
 		'2026-08-15T00:00:00.000Z',
@@ -51,17 +44,19 @@
 	});
 	setChatSessions(chatSessions);
 
-	setFileSessions(new FileSessionRegistry({
-		getIsMobile: () => false,
-		getDefaultPlacement: () => 'main',
-		getEditorSettings: () => ({ wordWrap: false, showLineNumbers: true, fontSize: 12 }),
-		getPlacement: () => ({
-			async placeFileSession() {
-				return 'cancelled';
-			},
-			async focusFileSession() {},
+	setFileSessions(
+		new FileSessionRegistry({
+			getIsMobile: () => false,
+			getDefaultPlacement: () => ({ type: 'window', windowId: 'window-main' }),
+			getEditorSettings: () => ({ wordWrap: false, showLineNumbers: true, fontSize: 12 }),
+			getPlacement: () => ({
+				async placeFileSession() {
+					return 'cancelled';
+				},
+				async focusFileSession() {},
+			}),
 		}),
-	}));
+	);
 
 	const appShell = createAppShellStore();
 	appShell.projectBasePath = '/workspace';

@@ -1,25 +1,40 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 import * as m from '$lib/paraglide/messages.js';
+import { createNotificationsStore } from '$lib/stores/notifications.svelte.js';
 import FileDialogHostTestHost from './FileDialogHostTestHost.svelte';
 
 describe('FileDialogHost', () => {
-	it('points host-move icons toward the configured pane positions', async () => {
-		const rendered = render(FileDialogHostTestHost, { request: 'file' });
-		const moveMain = await screen.findByRole('button', { name: m.file_session_move_main() });
-		const moveSidebar = screen.getByRole('button', { name: m.file_session_move_sidebar() });
-		const defaultMainIcon = moveMain.querySelector('.lucide-panel-left');
-		expect(defaultMainIcon).toBeTruthy();
-		expect(defaultMainIcon?.classList).toContain('rtl:-scale-x-100');
-		expect(moveSidebar.querySelector('.lucide-panel-right')).toBeTruthy();
+	it('offers one move-to-window control for the dialog file', async () => {
+		const onMove = vi.fn();
+		render(FileDialogHostTestHost, { request: 'file', onMove });
+		const moveButtons = await screen.findAllByRole('button', {
+			name: m.file_session_move_to_window(),
+		});
+		expect(moveButtons).toHaveLength(1);
+		expect(moveButtons[0].querySelector('.lucide-panel-left')).toBeTruthy();
 
-		await rendered.rerender({
+		await fireEvent.click(moveButtons[0]);
+		expect(onMove).toHaveBeenCalledWith('window-main');
+	});
+
+	it('reports a failed move to the destination window', async () => {
+		const notifications = createNotificationsStore();
+		render(FileDialogHostTestHost, {
 			request: 'file',
-			desktopLayoutOrder: ['workspace-sidebar', 'main', 'chat-list'],
+			moveError: new Error('Destination window is no longer available'),
+			notifications,
 		});
 
-		expect(moveMain.querySelector('.lucide-panel-right')).toBeTruthy();
-		expect(moveSidebar.querySelector('.lucide-panel-left')).toBeTruthy();
+		await fireEvent.click(
+			await screen.findByRole('button', { name: m.file_session_move_to_window() }),
+		);
+
+		await waitFor(() => expect(notifications.items).toHaveLength(1));
+		expect(notifications.items[0]).toMatchObject({
+			tone: 'error',
+			message: 'Destination window is no longer available',
+		});
 	});
 
 	it('overrides the shared responsive width cap in restored and maximized layouts', async () => {

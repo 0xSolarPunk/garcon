@@ -9,6 +9,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import { getFileSessions, getWorkspaceCoordinator } from '$lib/context';
 	import { fileSurfaceId } from '$lib/workspace/surface-types.js';
+	import { windowIdOfSurface } from '$lib/workspace/window-tree.js';
 	import * as m from '$lib/paraglide/messages.js';
 	import CopyFilePathButton from './CopyFilePathButton.svelte';
 
@@ -20,8 +21,8 @@
 		const surfaceId = fileSurfaceId(sessionId);
 		const snapshot = workspace.layout.snapshot;
 		if (snapshot.dialogFileSurfaceId === surfaceId) return m.file_session_placement_dialog();
-		if (snapshot.main.order.includes(surfaceId)) return m.file_session_placement_main();
-		if (snapshot.sidebar.order.includes(surfaceId)) return m.file_session_placement_sidebar();
+		if (windowIdOfSurface(snapshot.desktopRoot, surfaceId))
+			return m.file_session_placement_window();
 		if (snapshot.mobileOnlySurfaceIds.includes(surfaceId)) return m.file_session_placement_mobile();
 		return m.file_session_placement_retained();
 	}

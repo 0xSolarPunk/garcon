@@ -15,13 +15,13 @@
 		type FileOpenPlacementPreference,
 		type ThemeMode,
 	} from '$lib/stores/local-settings.svelte.js';
+	import type { ChatListDock } from '$lib/layout/desktop-layout.js';
 	import {
 		SNIPPET_TRIGGER_MAX_LENGTH,
 		snippetTriggerValidationError,
 	} from '$lib/chat/composer/snippet-trigger.js';
 	import { getLocalSettings } from '$lib/context';
 	import * as m from '$lib/paraglide/messages.js';
-	import DesktopLayoutOrderSetting from './DesktopLayoutOrderSetting.svelte';
 	import CompletionSoundSettings from './CompletionSoundSettings.svelte';
 
 	interface SettingRowOptions {
@@ -48,11 +48,13 @@
 	type FilePlacementSettingKey =
 		'textEditorOpenPlacement' | 'imageViewerOpenPlacement' | 'markdownViewerOpenPlacement';
 	const fileOpenPlacementLabels: Record<FileOpenPlacementPreference, () => string> = {
-		source: m.settings_file_open_placement_source,
-		other: m.settings_file_open_placement_other,
+		'same-window': m.settings_file_open_placement_source,
+		'new-window': m.settings_file_open_placement_new_window,
 		dialog: m.settings_file_open_placement_dialog,
-		main: m.settings_file_open_placement_main,
-		sidebar: m.settings_file_open_placement_sidebar,
+	};
+	const chatListDockLabels: Record<ChatListDock, () => string> = {
+		left: m.settings_chat_list_dock_left,
+		right: m.settings_chat_list_dock_right,
 	};
 
 	function setTheme(mode: ThemeMode) {
@@ -67,6 +69,10 @@
 
 	function setFileOpenPlacement(key: FilePlacementSettingKey, value: string): void {
 		if (isFileOpenPlacement(value)) ls.set(key, value);
+	}
+
+	function setChatListDock(value: string): void {
+		if (value === 'left' || value === 'right') ls.set('chatListDock', value);
 	}
 
 	let snippetTriggerDraft = $state(ls.snippetTrigger);
@@ -132,7 +138,7 @@
 		</label>
 		<select
 			id={`local-${key}`}
-			class="w-36 max-w-[50%] shrink-0 rounded-md border border-border bg-muted px-2 py-1 text-sm text-foreground"
+			class="w-36 max-w-[50%] shrink-0 rounded-md border border-border bg-muted px-2 py-1 text-base text-foreground sm:pointer-fine:text-sm"
 			{value}
 			onchange={(event) =>
 				setFileOpenPlacement(key, (event.currentTarget as HTMLSelectElement).value)}
@@ -180,11 +186,25 @@
 		</div>
 
 		<div class="px-4">
-			<DesktopLayoutOrderSetting />
+			<div class="flex items-center justify-between gap-4 border-t border-border py-2">
+				<label class="min-w-0 text-sm font-medium text-foreground" for="local-chat-list-dock">
+					{m.settings_chat_list_dock()}
+				</label>
+				<select
+					id="local-chat-list-dock"
+					class="w-36 max-w-[50%] shrink-0 rounded-md border border-border bg-muted px-2 py-1 text-base text-foreground sm:pointer-fine:text-sm"
+					value={ls.chatListDock}
+					onchange={(event) => setChatListDock((event.currentTarget as HTMLSelectElement).value)}
+				>
+					{#each ['left', 'right'] as const as dock (dock)}
+						<option value={dock}>{chatListDockLabels[dock]()}</option>
+					{/each}
+				</select>
+			</div>
 			<div class="flex items-center justify-between gap-4 py-2">
 				<div class="text-sm font-medium text-foreground">{m.settings_chat_max_width()}</div>
 				<select
-					class="text-sm bg-muted border border-border rounded-md px-2 py-1 text-foreground"
+					class="rounded-md border border-border bg-muted px-2 py-1 text-base text-foreground sm:pointer-fine:text-sm"
 					aria-label={m.settings_chat_max_width()}
 					value={ls.chatMaxWidth}
 					onchange={(event) => setChatMaxWidth((event.currentTarget as HTMLSelectElement).value)}
@@ -205,8 +225,8 @@
 			)}
 			{@render settingRow(
 				m.settings_workspace_hide_chat_list_for_git(),
-				ls.hideChatListWhenGitInMain,
-				() => ls.toggle('hideChatListWhenGitInMain'),
+				ls.hideChatListWhenGitFocused,
+				() => ls.toggle('hideChatListWhenGitFocused'),
 			)}
 			{@render settingRow(m.settings_chat_auto_expand_tools(), ls.autoExpandTools, () =>
 				ls.toggle('autoExpandTools'),
@@ -226,10 +246,8 @@
 				() => ls.toggle('allowDirectChats'),
 				{ description: m.settings_chat_allow_direct_chats_description() },
 			)}
-			{@render settingRow(
-				m.settings_chat_reduce_motion(),
-				ls.reduceMotion,
-				() => ls.toggle('reduceMotion'),
+			{@render settingRow(m.settings_chat_reduce_motion(), ls.reduceMotion, () =>
+				ls.toggle('reduceMotion'),
 			)}
 			<div class="py-2">
 				<div class="text-sm font-medium text-foreground">{m.settings_chat_hidden_tools()}</div>

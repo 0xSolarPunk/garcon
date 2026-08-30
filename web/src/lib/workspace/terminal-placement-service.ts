@@ -3,13 +3,16 @@ import type { TerminalRegistry } from '$lib/terminal/sessions/terminal-registry.
 import { createRandomId } from '$lib/utils/random-id.js';
 import { TERMINAL_SESSION_LIMIT } from '$shared/terminal';
 import {
+	MAX_WORKSPACE_WINDOWS,
 	TERMINAL_LAUNCHER_ID,
 	terminalSurfaceId,
-	type HostId,
+	type WorkspaceWindowId,
+	type WorkspacePartitionId,
 	type WorkspaceLayoutMutation,
 	type WorkspaceLayoutReader,
 	type WorkspaceLayoutSnapshot,
 } from './surface-types.js';
+import { collectWindowNodes, windowNodeById } from './window-tree.js';
 import type { WorkspaceCommit } from './workspace-commit.js';
 import type { WorkspaceMutationPlan } from './workspace-transition-arbiter.js';
 import { isCanonicalFirstRunLayout } from './canonical-layout.js';
@@ -36,15 +39,15 @@ interface TerminalPlacementServiceDeps {
 	layout: WorkspaceLayoutReader;
 	terminals: TerminalRegistry;
 	reservations: SurfaceReservations;
+	isWindowReserved(windowId: WorkspaceWindowId): boolean;
 	commit: WorkspaceCommit;
 	commitDestroyedRemoval(surfaceId: string, mutations: WorkspaceMutationPlan): Promise<boolean>;
 	currentProjectPath(): string | null;
 	isMobile(): boolean;
-	isChatPresented(): boolean;
-	cancelChatTransition(): void;
-	hostOf(surfaceId: string): HostId | null;
-	activeMainId(): string;
-	activeSidebarId(): string | null;
+	cancelWorkspaceDrag(): void;
+	windowOf(surfaceId: string): WorkspaceWindowId | null;
+	defaultWindowId(): WorkspaceWindowId;
+	defaultActiveId(): string;
 	lastFocusedSurfaceId(): string;
 	focusSurface(surfaceId: string): Promise<void>;
 	present(surfaceId: string): void;
@@ -63,10 +66,8 @@ export class TerminalPlacementService {
 
 	constructor(private readonly deps: TerminalPlacementServiceDeps) {}
 
-	async create(host: HostId = 'main', requestKey?: string): Promise<string> {
-		if (host === 'main' && this.deps.isChatPresented()) {
-			this.deps.cancelChatTransition();
-		}
+	async create(windowId: WorkspaceWindowId, requestKey?: string): Promise<string> {
+		this.deps.cancelWorkspaceDrag();
 		const terminalId = requestKey
 			? await this.#retryCreate(requestKey)
 			: await this.#createWithRequestId(createRandomId());
@@ -75,16 +76,13 @@ export class TerminalPlacementService {
 		try {
 			current = await this.deps.commit(
 				(latest) => {
+					const destinationWindowId = this.#resolveWindowId(latest, windowId);
 					if (latest.surfaces[surfaceId]) {
-						const existingHost = latest.main.order.includes(surfaceId)
-							? 'main'
-							: latest.sidebar.order.includes(surfaceId)
-								? 'sidebar'
-								: null;
+						const existingWindowId = this.#windowOf(latest, surfaceId);
 						const mutations: WorkspaceLayoutMutation[] = [
-							existingHost === host
-								? { type: 'focus-host', host, surfaceId }
-								: { type: 'move-to-host', surfaceId, destination: host },
+							existingWindowId === destinationWindowId
+								? { type: 'activate-window-tab', windowId: destinationWindowId, surfaceId }
+								: { type: 'move-tab', surfaceId, destinationWindowId },
 						];
 						if (this.deps.isMobile()) {
 							mutations.push({
@@ -106,9 +104,9 @@ export class TerminalPlacementService {
 						{
 							type: 'register-surface',
 							surface: { id: surfaceId, type: 'terminal', terminalId },
-							host,
+							windowId: destinationWindowId,
 						},
-						{ type: 'focus-host', host, surfaceId },
+						{ type: 'activate-window-tab', windowId: destinationWindowId, surfaceId },
 					);
 					if (this.deps.isMobile()) {
 						mutations.push({
@@ -121,6 +119,89 @@ export class TerminalPlacementService {
 				},
 				{ requiredPublication: true },
 			);
+			if (!this.deps.layout.surface(surfaceId)) {
+				throw new Error(`Terminal surface was not placed: ${surfaceId}`);
+			}
+		} catch (error) {
+			await this.#rollbackUnplaced(terminalId, error);
+		}
+		if (!current) return terminalId;
+		this.deps.present(surfaceId);
+		return terminalId;
+	}
+
+	// Creates a terminal in a new window adjacent to the anchor window.
+	async createInNewWindow(anchorWindowId: WorkspaceWindowId, requestKey?: string): Promise<string> {
+		if (this.deps.isMobile()) return this.create(this.deps.defaultWindowId(), requestKey);
+		this.deps.cancelWorkspaceDrag();
+		const terminalId = requestKey
+			? await this.#retryCreate(requestKey)
+			: await this.#createWithRequestId(createRandomId());
+		const surfaceId = terminalSurfaceId(terminalId);
+		const newWindowId = `window-${createRandomId()}` as WorkspaceWindowId;
+		const partitionId = `partition-${createRandomId()}` as WorkspacePartitionId;
+		let current = false;
+		try {
+			current = await this.deps.commit(
+				(latest) => {
+					const currentAnchorWindowId = this.#resolveWindowId(latest, anchorWindowId);
+					const mutations: WorkspaceLayoutMutation[] = [];
+					if (
+						latest.surfaces[TERMINAL_LAUNCHER_ID]?.type === 'terminal-launcher' &&
+						!this.deps.reservations.has(TERMINAL_LAUNCHER_ID)
+					) {
+						mutations.push({ type: 'remove-surface', surfaceId: TERMINAL_LAUNCHER_ID });
+					}
+					if (latest.surfaces[surfaceId]) {
+						const existingWindowId = this.#windowOf(latest, surfaceId);
+						mutations.push(
+							existingWindowId === currentAnchorWindowId
+								? { type: 'activate-window-tab', windowId: currentAnchorWindowId, surfaceId }
+								: { type: 'move-tab', surfaceId, destinationWindowId: currentAnchorWindowId },
+						);
+						if (this.deps.isMobile()) {
+							mutations.push({
+								type: 'set-mobile-presentation',
+								activeId: surfaceId,
+								returnStack: latest.mobileReturnStack,
+							});
+						}
+						return mutations;
+					}
+					if (this.deps.isMobile()) {
+						mutations.push(
+							{
+								type: 'register-surface',
+								surface: { id: surfaceId, type: 'terminal', terminalId },
+								windowId: currentAnchorWindowId,
+							},
+							{ type: 'activate-window-tab', windowId: currentAnchorWindowId, surfaceId },
+							{
+								type: 'set-mobile-presentation',
+								activeId: surfaceId,
+								returnStack: latest.mobileReturnStack,
+							},
+						);
+						return mutations;
+					}
+					if (collectWindowNodes(latest.desktopRoot).length >= MAX_WORKSPACE_WINDOWS) {
+						throw new Error(m.workspace_window_limit_reached({ count: MAX_WORKSPACE_WINDOWS }));
+					}
+					mutations.push({
+						type: 'register-surface-in-new-window',
+						surface: { id: surfaceId, type: 'terminal', terminalId },
+						targetWindowId: currentAnchorWindowId,
+						edge: 'right',
+						newWindowId,
+						partitionId,
+					});
+					return mutations;
+				},
+				{ requiredPublication: true },
+			);
+			if (!this.deps.layout.surface(surfaceId)) {
+				throw new Error(`Terminal surface was not placed: ${surfaceId}`);
+			}
 		} catch (error) {
 			await this.#rollbackUnplaced(terminalId, error);
 		}
@@ -170,29 +251,32 @@ export class TerminalPlacementService {
 		}
 	}
 
-	async open(terminalId: string, preferredHost: HostId = 'main'): Promise<void> {
+	async open(terminalId: string, preferredWindowId: WorkspaceWindowId): Promise<void> {
 		if (!this.deps.terminals.sessions[terminalId]) return;
 		const surfaceId = terminalSurfaceId(terminalId);
 		if (this.deps.layout.surface(surfaceId)) {
 			await this.deps.focusSurface(surfaceId);
 			return;
 		}
-		const mutations: WorkspaceLayoutMutation[] = [
-			{
-				type: 'register-surface',
-				surface: { id: surfaceId, type: 'terminal', terminalId },
-				host: preferredHost,
-			},
-			{ type: 'focus-host', host: preferredHost, surfaceId },
-		];
-		if (this.deps.isMobile()) {
-			mutations.push({
-				type: 'set-mobile-presentation',
-				activeId: surfaceId,
-				returnStack: this.deps.layout.snapshot.mobileReturnStack,
-			});
-		}
-		const current = await this.deps.commit(mutations);
+		const current = await this.deps.commit((latest) => {
+			const destinationWindowId = this.#resolveWindowId(latest, preferredWindowId);
+			const mutations: WorkspaceLayoutMutation[] = [
+				{
+					type: 'register-surface',
+					surface: { id: surfaceId, type: 'terminal', terminalId },
+					windowId: destinationWindowId,
+				},
+				{ type: 'activate-window-tab', windowId: destinationWindowId, surfaceId },
+			];
+			if (this.deps.isMobile()) {
+				mutations.push({
+					type: 'set-mobile-presentation',
+					activeId: surfaceId,
+					returnStack: latest.mobileReturnStack,
+				});
+			}
+			return mutations;
+		});
 		if (current) this.deps.present(surfaceId);
 	}
 
@@ -286,7 +370,7 @@ export class TerminalPlacementService {
 		}
 		this.deps.reservations.add(surfaceId);
 		try {
-			const sourceHost = this.deps.hostOf(surfaceId);
+			const sourceWindowId = this.deps.windowOf(surfaceId);
 			let mobileFallbackId: string | null = null;
 			const current = await this.deps.commitDestroyedRemoval(surfaceId, (latest) => {
 				if (!latest.surfaces[surfaceId]) return [];
@@ -304,12 +388,11 @@ export class TerminalPlacementService {
 			});
 			this.deps.clearAttachmentError(surfaceId);
 			if (!current) return;
+			const sourceWindowActive = sourceWindowId
+				? windowNodeById(this.deps.layout.snapshot.desktopRoot, sourceWindowId)?.tabs.activeId
+				: null;
 			const fallbackSurfaceId =
-				mobileFallbackId ??
-				(sourceHost === 'sidebar' && this.deps.layout.snapshot.sidebarOpen
-					? this.deps.activeSidebarId()
-					: this.deps.activeMainId()) ??
-				this.deps.activeMainId();
+				mobileFallbackId ?? sourceWindowActive ?? this.deps.defaultActiveId();
 			this.deps.present(fallbackSurfaceId);
 		} finally {
 			this.deps.reservations.delete(surfaceId);
@@ -322,10 +405,10 @@ export class TerminalPlacementService {
 		}
 	}
 
-	async focusMostRecentOrCreate(preferredHost: HostId = 'main'): Promise<void> {
+	async focusMostRecentOrCreate(preferredWindowId: WorkspaceWindowId): Promise<void> {
 		const focused = this.deps.layout.surface(this.deps.lastFocusedSurfaceId());
 		if (focused?.type === 'terminal' && this.deps.terminals.sessions[focused.terminalId]) {
-			await this.open(focused.terminalId, preferredHost);
+			await this.open(focused.terminalId, preferredWindowId);
 			return;
 		}
 		let terminal = this.deps.terminals.orderedSessions.at(-1);
@@ -334,14 +417,14 @@ export class TerminalPlacementService {
 			terminal = this.deps.terminals.orderedSessions.at(-1);
 		}
 		if (terminal) {
-			await this.open(terminal.metadata.terminalId, preferredHost);
+			await this.open(terminal.metadata.terminalId, preferredWindowId);
 			return;
 		}
 		if (
 			this.deps.terminals.listStatus === 'ready' &&
 			this.deps.terminals.orderedSessions.length < TERMINAL_SESSION_LIMIT
 		) {
-			await this.create(preferredHost, `terminal-empty-state:${preferredHost}`);
+			await this.create(preferredWindowId, `terminal-empty-state:${preferredWindowId}`);
 		}
 	}
 
@@ -387,7 +470,7 @@ export class TerminalPlacementService {
 				mutations.push({
 					type: 'register-surface',
 					surface: { id: TERMINAL_LAUNCHER_ID, type: 'terminal-launcher' },
-					host: 'main',
+					windowId: this.deps.defaultWindowId(),
 				});
 			}
 			const unrepresentedTerminalIds = [...live].filter(
@@ -403,7 +486,7 @@ export class TerminalPlacementService {
 							type: 'terminal',
 							terminalId,
 						},
-						host: 'main',
+						windowId: this.deps.defaultWindowId(),
 					});
 				}
 			} else {
@@ -425,14 +508,14 @@ export class TerminalPlacementService {
 		if (current && mobileFallbackId) this.deps.present(mobileFallbackId);
 	}
 
-	async activateLauncher(host: HostId): Promise<void> {
+	async activateLauncher(windowId: WorkspaceWindowId): Promise<void> {
 		const launcherId = TERMINAL_LAUNCHER_ID;
 		if (!this.deps.layout.surface(launcherId) || this.deps.reservations.has(launcherId)) {
 			return;
 		}
 		this.deps.reservations.add(launcherId);
 		try {
-			const terminalId = await this.#retryCreate(`launcher:${host}`);
+			const terminalId = await this.#retryCreate(`launcher:${windowId}`);
 			const surfaceId = terminalSurfaceId(terminalId);
 			let current = false;
 			try {
@@ -443,7 +526,7 @@ export class TerminalPlacementService {
 							previousId: launcherId,
 							surface: { id: surfaceId, type: 'terminal', terminalId },
 						},
-						{ type: 'focus-host', host, surfaceId },
+						{ type: 'activate-window-tab', windowId, surfaceId },
 					],
 					{ requiredPublication: true },
 				);
@@ -454,6 +537,37 @@ export class TerminalPlacementService {
 		} finally {
 			this.deps.reservations.delete(launcherId);
 		}
+	}
+
+	#windowOf(snapshot: WorkspaceLayoutSnapshot, surfaceId: string): WorkspaceWindowId | null {
+		for (const workspaceWindow of collectWindowNodes(snapshot.desktopRoot)) {
+			if (workspaceWindow.tabs.order.includes(surfaceId)) return workspaceWindow.id;
+		}
+		return null;
+	}
+
+	#resolveWindowId(
+		snapshot: WorkspaceLayoutSnapshot,
+		preferredWindowId: WorkspaceWindowId,
+	): WorkspaceWindowId {
+		if (
+			windowNodeById(snapshot.desktopRoot, preferredWindowId) &&
+			!this.deps.isWindowReserved(preferredWindowId)
+		) {
+			return preferredWindowId;
+		}
+		const defaultWindowId = this.deps.defaultWindowId();
+		if (
+			windowNodeById(snapshot.desktopRoot, defaultWindowId) &&
+			!this.deps.isWindowReserved(defaultWindowId)
+		) {
+			return defaultWindowId;
+		}
+		const firstWindow = collectWindowNodes(snapshot.desktopRoot).find(
+			(workspaceWindow) => !this.deps.isWindowReserved(workspaceWindow.id),
+		);
+		if (!firstWindow) throw new Error('Workspace has no destination window');
+		return firstWindow.id;
 	}
 
 	async #retryCreate(requestKey: string): Promise<string> {

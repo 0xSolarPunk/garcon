@@ -1,7 +1,4 @@
-import {
-	isToolUseMessage,
-	ToolResultMessage,
-} from '$shared/chat-types';
+import { isToolUseMessage, ToolResultMessage } from '$shared/chat-types';
 import { isHandoffSummaryNoticeDetail } from '$shared/transcript-notice-details';
 import type { PendingPermissionRequest } from '$lib/types/chat';
 import {
@@ -9,11 +6,10 @@ import {
 	type ConversationFeedRenderItem,
 } from '$lib/chat/transcript/conversation-feed-items.js';
 
-export type ConversationFeedSpacing = 'responsive-feed' | 'scaled-transcript' | 'none';
+export type ConversationFeedSpacing = 'responsive-feed' | 'transcript' | 'none';
 
 export type ConversationVirtualFeedItem =
 	| { kind: 'viewport-start-spacer'; key: string; spacingAfter: 'none' }
-	| { kind: 'top-toolbar-spacer'; key: string; spacingAfter: 'none' }
 	| { kind: 'refresh-error'; key: string; spacingAfter: 'none' }
 	| { kind: 'earlier-boundary'; key: string; spacingAfter: 'none' }
 	| {
@@ -52,7 +48,6 @@ export interface ConversationVirtualFeedModel {
 }
 
 export interface ConversationVirtualFeedInput {
-	showTopToolbarSpacer: boolean;
 	showRefreshError: boolean;
 	showEarlierBoundary: boolean;
 	showLaterBoundary: boolean;
@@ -79,7 +74,7 @@ function toolAnchorIds(item: ConversationFeedRenderItem): string[] {
 }
 
 function transcriptSpacing(item: ConversationFeedRenderItem): ConversationFeedSpacing {
-	return conversationFeedItemLayout(item) === 'hidden' ? 'none' : 'scaled-transcript';
+	return conversationFeedItemLayout(item) === 'hidden' ? 'none' : 'transcript';
 }
 
 // Consumes the requests anchored to this row so a later row cannot claim them again.
@@ -104,13 +99,6 @@ export function buildConversationVirtualFeedModel(
 		spacingAfter: 'none',
 	});
 
-	if (input.showTopToolbarSpacer) {
-		items.push({
-			kind: 'top-toolbar-spacer',
-			key: key('prefix:top-toolbar-spacer'),
-			spacingAfter: 'none',
-		});
-	}
 	if (input.showRefreshError) {
 		items.push({
 			kind: 'refresh-error',
@@ -154,12 +142,9 @@ export function buildConversationVirtualFeedModel(
 		});
 		for (const [permissionIndex, request] of anchored.entries()) {
 			const isLastAnchored = permissionIndex === anchored.length - 1;
-			items.push(permissionItem(
-				key,
-				request,
-				permissionIndex === 0,
-				!(isLastAnchored && isLastItem),
-			));
+			items.push(
+				permissionItem(key, request, permissionIndex === 0, !(isLastAnchored && isLastItem)),
+			);
 		}
 	}
 	for (const permissions of permissionsByAnchor.values()) detachedPermissions.push(...permissions);
@@ -173,12 +158,14 @@ export function buildConversationVirtualFeedModel(
 		});
 	}
 	for (const [permissionIndex, request] of detachedPermissions.entries()) {
-		items.push(permissionItem(
-			key,
-			request,
-			permissionIndex === 0,
-			permissionIndex < detachedPermissions.length - 1,
-		));
+		items.push(
+			permissionItem(
+				key,
+				request,
+				permissionIndex === 0,
+				permissionIndex < detachedPermissions.length - 1,
+			),
+		);
 	}
 	items.push({
 		kind: 'viewport-end-spacer',
@@ -266,12 +253,10 @@ export function appendConversationVirtualTranscriptTail(
 
 export function estimateConversationFeedItemSize(
 	item: ConversationVirtualFeedItem | undefined,
-	textScale: number,
 ): number {
 	if (!item) return 120;
 	if (item.kind === 'viewport-start-spacer') return 16;
 	if (item.kind === 'viewport-end-spacer') return item.reserveComposerTraySpace ? 56 : 16;
-	if (item.kind === 'top-toolbar-spacer') return 48;
 	if (
 		item.kind === 'refresh-error' ||
 		item.kind === 'earlier-boundary' ||
@@ -286,24 +271,23 @@ export function estimateConversationFeedItemSize(
 	}
 
 	const renderItem = item.item;
-	const scale = Math.max(0.5, Math.min(textScale, 2));
-	const spacing = item.spacingAfter === 'scaled-transcript' ? 12 * scale : 0;
+	const spacing = item.spacingAfter === 'transcript' ? 12 : 0;
 	const layout = conversationFeedItemLayout(renderItem);
 	if (layout === 'hidden') return 0;
-	if (layout === 'permission') return 240 * scale + spacing;
-	if (renderItem.kind === 'local-notice') return 52 * scale + spacing;
+	if (layout === 'permission') return 240 + spacing;
+	if (renderItem.kind === 'local-notice') return 52 + spacing;
 	if (renderItem.message.type === 'transcript-notice') {
 		// The collapsed handoff body is clamp-bounded, so its default height is stable
 		// enough to estimate even though expansion is measured after render.
-		return (isHandoffSummaryNoticeDetail(renderItem.message.detail) ? 230 : 52) * scale + spacing;
+		return (isHandoffSummaryNoticeDetail(renderItem.message.detail) ? 230 : 52) + spacing;
 	}
 	if (renderItem.message.type === 'user-message') {
-		return (renderItem.message.presentation?.style ? 144 : 112) * scale + spacing;
+		return (renderItem.message.presentation?.style ? 144 : 112) + spacing;
 	}
-	if (renderItem.message.type === 'assistant-message') return 180 * scale + spacing;
-	if (renderItem.message.type === 'thinking') return 160 * scale + spacing;
-	if (renderItem.message.type === 'cli-row') return 112 * scale + spacing;
-	return 96 * scale + spacing;
+	if (renderItem.message.type === 'assistant-message') return 180 + spacing;
+	if (renderItem.message.type === 'thinking') return 160 + spacing;
+	if (renderItem.message.type === 'cli-row') return 112 + spacing;
+	return 96 + spacing;
 }
 
 function permissionItem(

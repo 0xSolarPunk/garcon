@@ -61,6 +61,18 @@ describe('sidebar search interactions', () => {
 		cleanup();
 	});
 
+	it('omits the separate New Window control from the sidebar toolbar', () => {
+		const { container } = render(SidebarControlsRow, {
+			isLoading: false,
+			onOpenSearchDialog: vi.fn(),
+			onCreateChat: vi.fn(),
+			onShowScheduledPrompts: vi.fn(),
+			onShowSettings: vi.fn(),
+		});
+
+		expect(container.querySelector('[data-workspace-new-window-menu]')).toBeNull();
+	});
+
 	it('opens the highlighted chat from the query input and respects Ctrl-J selection', async () => {
 		const onSelectChat = vi.fn();
 

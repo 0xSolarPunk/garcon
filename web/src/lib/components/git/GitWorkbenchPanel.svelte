@@ -6,7 +6,12 @@
 	import type { ChatDraftAppend } from '$lib/chat/composer/chat-draft-append.js';
 	import { gitProjectInvalidations } from '$lib/git/surface/git-project-invalidation.svelte.js';
 	import { resolveGitEditorRoot } from '$lib/git/surface/git-editor-root.js';
-	import { getFileSessions, getLocalSettings, getWorkspaceCoordinator } from '$lib/context';
+	import {
+		getFileSessions,
+		getLocalSettings,
+		getNotifications,
+		getWorkspaceCoordinator,
+	} from '$lib/context';
 	import { startGitFreshnessPolling } from './git-freshness-polling';
 	import GitConfirmModal from './GitConfirmModal.svelte';
 	import GitFreshnessBanner from './GitFreshnessBanner.svelte';
@@ -14,6 +19,8 @@
 	import GitWorkbench from './GitWorkbench.svelte';
 	import GitWorkbenchToolbar from './GitWorkbenchToolbar.svelte';
 	import * as m from '$lib/paraglide/messages.js';
+	import type { WorkspaceWindowId } from '$lib/workspace/surface-types.js';
+	import { openCommitFromGitWorkbench } from '$lib/git/workbench/git-workbench-navigation.js';
 
 	let {
 		controller,
@@ -22,12 +29,13 @@
 		onAppendToChatDraft,
 	}: {
 		controller: GitWorkbenchSurfaceController;
-		presentation: 'main' | 'sidebar' | 'mobile';
+		presentation: WorkspaceWindowId | 'mobile';
 		visible?: boolean;
 		onAppendToChatDraft?: ChatDraftAppend;
 	} = $props();
 
 	const workspace = getWorkspaceCoordinator();
+	const notifications = getNotifications();
 	const fileSessions = getFileSessions();
 	const localSettings = getLocalSettings();
 	const wb = $derived(controller.workbench);
@@ -78,9 +86,10 @@
 	}
 
 	function openCommit(): void {
-		void (presentation === 'mobile'
-			? workspace.focusMobileSingleton('commit')
-			: workspace.openSingleton('commit', 'sidebar'));
+		const opening = openCommitFromGitWorkbench(workspace, presentation);
+		void opening.catch((error) => {
+			notifications.error(error instanceof Error ? error.message : m.workspace_open_failed());
+		});
 	}
 
 	async function openPush(): Promise<void> {

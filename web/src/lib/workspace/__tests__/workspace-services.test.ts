@@ -11,7 +11,8 @@ import { createModelCatalogStore } from '$lib/agents/model-catalog-store.svelte.
 import { createNavigationStore } from '$lib/stores/navigation.svelte.js';
 import { createNotificationsStore } from '$lib/stores/notifications.svelte.js';
 import type { PrimaryWsConnectionPort } from '$lib/ws/connection.svelte.js';
-import { fileSurfaceId } from '$lib/workspace/surface-types.js';
+import type { WorkspaceWindowId } from '$lib/workspace/surface-types.js';
+import { windowIdOfSurface, windowNodeById } from '../window-tree.js';
 import {
 	createWorkspaceServices,
 	resolveConfiguredFilePlacement,
@@ -44,6 +45,9 @@ vi.mock('$lib/api/files.js', async (importOriginal) => {
 		})),
 	};
 });
+
+const DEFAULT_WINDOW: WorkspaceWindowId = 'window-main';
+const OTHER_WINDOW: WorkspaceWindowId = 'window-2';
 
 function assembleWorkspaceServices(localSettings: LocalSettingsStore): {
 	services: WorkspaceServices;
@@ -90,111 +94,96 @@ describe('createWorkspaceServices', () => {
 	});
 
 	it.each([
-		['code', 'main', 'main'],
-		['code', 'sidebar', 'sidebar'],
-		['code', 'dialog', 'dialog'],
-		['image', 'main', 'main'],
-		['image', 'sidebar', 'sidebar'],
-		['image', 'dialog', 'dialog'],
-		['markdown', 'main', 'main'],
-		['markdown', 'sidebar', 'sidebar'],
-		['markdown', 'dialog', 'dialog'],
-	] as const)('resolves source %s from %s to %s', (mode, origin, expected) => {
+		['code', 'window-main'],
+		['image', 'window-main'],
+		['markdown', 'window-2'],
+	] as const)('resolves source placement for %s from origin %s', (mode, origin) => {
 		localStorage.clear();
 		const localSettings = createLocalSettingsStore();
 
-		expect(resolveConfiguredFilePlacement(localSettings, mode, origin)).toBe(expected);
+		expect(
+			resolveConfiguredFilePlacement(
+				localSettings,
+				mode,
+				origin as WorkspaceWindowId,
+				DEFAULT_WINDOW,
+			),
+		).toEqual({ type: 'window', windowId: origin });
+
 		localSettings.destroy();
 	});
 
-	it('keeps fixed placements independent of origin and observes setting changes', () => {
+	it('resolves fixed placements independent of origin and observes setting changes', () => {
 		localStorage.clear();
 		const localSettings = createLocalSettingsStore();
 
-		localSettings.set('textEditorOpenPlacement', 'main');
-		localSettings.set('imageViewerOpenPlacement', 'sidebar');
+		localSettings.set('textEditorOpenPlacement', 'new-window');
+		localSettings.set('imageViewerOpenPlacement', 'same-window');
 		localSettings.set('markdownViewerOpenPlacement', 'dialog');
 
-		expect(resolveConfiguredFilePlacement(localSettings, 'code', 'dialog')).toBe('main');
-		expect(resolveConfiguredFilePlacement(localSettings, 'image', 'main')).toBe('sidebar');
-		expect(resolveConfiguredFilePlacement(localSettings, 'markdown', 'sidebar')).toBe('dialog');
+		expect(resolveConfiguredFilePlacement(localSettings, 'code', 'dialog', DEFAULT_WINDOW)).toEqual(
+			{ type: 'new-window', anchorWindowId: DEFAULT_WINDOW },
+		);
+		expect(
+			resolveConfiguredFilePlacement(localSettings, 'image', OTHER_WINDOW, DEFAULT_WINDOW),
+		).toEqual({ type: 'window', windowId: OTHER_WINDOW });
+		expect(
+			resolveConfiguredFilePlacement(localSettings, 'markdown', OTHER_WINDOW, DEFAULT_WINDOW),
+		).toEqual({ type: 'dialog' });
 
-		localSettings.set('textEditorOpenPlacement', 'source');
-		expect(resolveConfiguredFilePlacement(localSettings, 'code', 'sidebar')).toBe('sidebar');
 		localSettings.destroy();
 	});
 
-	it('opens each renderer in the other desktop view and falls back to main without one', () => {
+	it('falls back to the default window when the origin is not a window', () => {
 		localStorage.clear();
 		const localSettings = createLocalSettingsStore();
 
-		localSettings.set('textEditorOpenPlacement', 'other');
-		localSettings.set('imageViewerOpenPlacement', 'other');
-		localSettings.set('markdownViewerOpenPlacement', 'other');
+		expect(
+			resolveConfiguredFilePlacement(localSettings, 'markdown', 'mobile', DEFAULT_WINDOW),
+		).toEqual({ type: 'window', windowId: DEFAULT_WINDOW });
+		expect(
+			resolveConfiguredFilePlacement(localSettings, 'markdown', 'dialog', DEFAULT_WINDOW),
+		).toEqual({ type: 'window', windowId: DEFAULT_WINDOW });
 
-		expect(resolveConfiguredFilePlacement(localSettings, 'code', 'main')).toBe('sidebar');
-		expect(resolveConfiguredFilePlacement(localSettings, 'code', 'sidebar')).toBe('main');
-		expect(resolveConfiguredFilePlacement(localSettings, 'image', 'main')).toBe('sidebar');
-		expect(resolveConfiguredFilePlacement(localSettings, 'image', 'sidebar')).toBe('main');
-		expect(resolveConfiguredFilePlacement(localSettings, 'markdown', 'main')).toBe('sidebar');
-		expect(resolveConfiguredFilePlacement(localSettings, 'markdown', 'sidebar')).toBe('main');
-		expect(resolveConfiguredFilePlacement(localSettings, 'markdown', 'dialog')).toBe('main');
-		expect(resolveConfiguredFilePlacement(localSettings, 'markdown', 'mobile')).toBe('main');
 		localSettings.destroy();
 	});
 
-	it('uses main as the desktop fallback for a mobile source origin', () => {
-		localStorage.clear();
-		const localSettings = createLocalSettingsStore();
-
-		expect(resolveConfiguredFilePlacement(localSettings, 'markdown', 'mobile')).toBe('main');
-		localSettings.destroy();
-	});
-
-	it('routes other-view file opens through the assembled registry and coordinator', async () => {
+	it('routes new-window file opens through the assembled registry and coordinator', async () => {
 		localStorage.clear();
 		rootLocalSettings = createLocalSettingsStore();
-		rootLocalSettings.set('textEditorOpenPlacement', 'other');
+		rootLocalSettings.set('textEditorOpenPlacement', 'new-window');
 		({ services } = assembleWorkspaceServices(rootLocalSettings));
 
-		const openingFromMain = services.files.open({
+		const opening = services.files.open({
 			fileRootPath: '/workspace',
 			relativePath: 'from-main.ts',
 			mode: 'code',
-			origin: 'main',
+			origin: 'window-main',
 			reason: 'user-open',
 		});
-		await vi.waitFor(() => expect(services?.layout.snapshot.sidebar.activeId).toMatch(/^file:/));
-		const sidebarSurfaceId = services.layout.snapshot.sidebar.activeId;
-		if (!sidebarSurfaceId) throw new Error('Expected a sidebar file surface');
-		services.surfaceFrames.register(sidebarSurfaceId, 'sidebar', {
+		await vi.waitFor(() => {
+			const snapshot = services!.layout.snapshot;
+			const fileSurface = Object.keys(snapshot.surfaces).find((id) => id.startsWith('file:'));
+			expect(fileSurface).toBeDefined();
+			const windowId = windowIdOfSurface(snapshot.desktopRoot, fileSurface!);
+			expect(windowId).not.toBeNull();
+			expect(windowId).not.toBe('window-main');
+		});
+		const snapshot = services.layout.snapshot;
+		const placedSurfaceId = Object.keys(snapshot.surfaces).find((id) => id.startsWith('file:'))!;
+		const windowId = windowIdOfSurface(snapshot.desktopRoot, placedSurfaceId)!;
+		services.surfaceFrames.register(placedSurfaceId, windowId, {
 			element: document.createElement('div'),
 			attachRetainedRenderer: () => {},
 			focusPrimary: () => {},
 		});
-		const fromMain = await openingFromMain;
-		if (!fromMain) throw new Error('Expected main-origin file to open');
-		expect(services.layout.snapshot.sidebar.order).toContain(fileSurfaceId(fromMain.id));
-		expect(services.layout.snapshot.sidebarOpen).toBe(true);
-
-		const openingFromSidebar = services.files.open({
-			fileRootPath: '/workspace',
-			relativePath: 'from-sidebar.ts',
-			mode: 'code',
-			origin: 'sidebar',
-			reason: 'user-open',
+		const opened = await opening;
+		if (!opened) throw new Error('Expected file to open');
+		await vi.waitFor(() => {
+			expect(windowNodeById(services!.layout.snapshot.desktopRoot, windowId)?.tabs.activeId).toBe(
+				placedSurfaceId,
+			);
 		});
-		await vi.waitFor(() => expect(services?.layout.snapshot.main.activeId).toMatch(/^file:/));
-		const mainSurfaceId = services.layout.snapshot.main.activeId;
-		if (!mainSurfaceId) throw new Error('Expected a main file surface');
-		services.surfaceFrames.register(mainSurfaceId, 'main', {
-			element: document.createElement('div'),
-			attachRetainedRenderer: () => {},
-			focusPrimary: () => {},
-		});
-		const fromSidebar = await openingFromSidebar;
-		if (!fromSidebar) throw new Error('Expected sidebar-origin file to open');
-		expect(services.layout.snapshot.main.order).toContain(fileSurfaceId(fromSidebar.id));
 	});
 
 	it('assembles the coordinator and keeps root-owned domain bindings reactive', async () => {
@@ -207,8 +196,10 @@ describe('createWorkspaceServices', () => {
 
 		expect(services.restore.source).toBe('absent');
 		expect(services.coordinator.layout).toBe(services.layout);
-		expect(services.layout.snapshot.main.order[0]).toBe('singleton:chat');
-		expect(services.chatInteractionGate).toBeDefined();
+		expect(
+			windowNodeById(services.layout.snapshot.desktopRoot, DEFAULT_WINDOW)?.tabs.order[0],
+		).toBe('chat-view:window-main');
+		expect(services.workspaceInteractionGate).toBeDefined();
 		expect(services.surfaceFrames).toBeDefined();
 		expect(services.shortcuts).toBeDefined();
 		expect(services.gitQuickSummary.isEnabled).toBe(false);
@@ -220,5 +211,30 @@ describe('createWorkspaceServices', () => {
 
 		expect(services.gitQuickSummary.isEnabled).toBe(true);
 		expect(services.singletonSurfaces.pullRequests().capabilityState).toBe('unavailable');
+	});
+
+	it('cancels root-owned window drag before a main-inert transition', () => {
+		rootLocalSettings = createLocalSettingsStore();
+		({ services } = assembleWorkspaceServices(rootLocalSettings));
+		services.windowDnd.beginChatDrag('chat-dragged');
+		expect(services.windowDnd.isDragging).toBe(true);
+
+		const element = document.createElement('div');
+		document.body.append(element);
+		let unregister: () => void = () => undefined;
+		services.transientLayers.open('main-inert', () => {
+			unregister = services!.transientLayers.register({
+				id: 'test-dialog',
+				kind: 'application-dialog',
+				modality: 'main-inert',
+				element: () => element,
+				onEscape: () => true,
+				restoreFocus: () => undefined,
+			});
+		});
+
+		expect(services.windowDnd.isDragging).toBe(false);
+		unregister();
+		element.remove();
 	});
 });

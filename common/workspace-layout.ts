@@ -1,20 +1,35 @@
-export interface PersistedWorkspaceLayoutV1 {
-  version: 1;
-  desiredSidebarWidth: number;
-  sidebarOpen: boolean;
-  main: PersistedWorkspaceHost;
-  sidebar: PersistedWorkspaceHost;
+export interface PersistedWorkspaceLayoutV2 {
+  version: 2;
+  root: PersistedWorkspaceLayoutNode;
   unplacedTerminalIds: string[];
 }
 
-export interface PersistedWorkspaceHost {
-  order: PersistedWorkspaceSurfaceRef[];
-  active: PersistedWorkspaceSurfaceRef | null;
-}
-
 export type PersistedWorkspaceSurfaceRef =
+  | { type: "chat"; chatId: string | null }
   | {
-      type: 'singleton';
-      kind: 'git' | 'git-history' | 'git-compare' | 'pull-requests' | 'files' | 'commit';
+      type: "singleton";
+      kind:
+        | "git"
+        | "git-history"
+        | "git-compare"
+        | "pull-requests"
+        | "files"
+        | "commit";
     }
-  | { type: 'terminal'; terminalId: string };
+  | { type: "terminal"; terminalId: string };
+
+export type PersistedWorkspaceLayoutNode =
+  | {
+      type: "window";
+      id: string;
+      order: PersistedWorkspaceSurfaceRef[];
+      active: PersistedWorkspaceSurfaceRef | null;
+      mru: PersistedWorkspaceSurfaceRef[];
+    }
+  | {
+      type: "partition";
+      id: string;
+      direction: "horizontal" | "vertical";
+      ratio: number;
+      children: [PersistedWorkspaceLayoutNode, PersistedWorkspaceLayoutNode];
+    };

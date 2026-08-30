@@ -10,7 +10,6 @@
 		setSidebarProjectCollapse,
 		setChatSessions,
 		setSidebarSearch,
-		setSplitLayout,
 	} from '$lib/context';
 	import {
 		createSidebarSearchStore,
@@ -18,6 +17,7 @@
 	} from '$lib/sidebar/search/sidebar-search-store.svelte.js';
 	import type { ChatSessionRecord } from '$lib/types/chat-session';
 	import type { SidebarChatItemLayout } from '$lib/stores/local-settings.svelte';
+	import { setWorkspaceWindowDndTestContext } from './workspace-window-dnd-test-context.js';
 
 	interface SidebarHostProps {
 		chats?: ChatSessionRecord[];
@@ -164,11 +164,7 @@
 		},
 	} as never);
 
-	setSplitLayout({
-		isEnabled: false,
-		startDrag() {},
-		endDrag() {},
-	} as never);
+	setWorkspaceWindowDndTestContext();
 
 	setChatSessions({
 		get selectedChat() {
@@ -200,4 +196,5 @@
 	onManageTags={() => {}}
 	onShowScheduledPrompts={() => {}}
 	onShowSettings={() => {}}
+	newWindowBlocked={false}
 />

@@ -4,11 +4,9 @@
 	import { ConversationFeedItemState } from '../ConversationFeedItemState.svelte.js';
 	import { buildConversationVirtualFeedModel } from '../conversation-feed-virtual-items.js';
 	import type { PermissionDecisionPayload } from '$shared/chat-command-contracts';
-	import {
-		AskUserQuestionToolUseMessage,
-		PermissionRequestMessage,
-	} from '$shared/chat-types';
+	import { AskUserQuestionToolUseMessage, PermissionRequestMessage } from '$shared/chat-types';
 	import type { PendingPermissionRequest } from '$lib/types/chat';
+	import { setCanonicalWorkspaceLayout } from './workspace-layout-test-context.js';
 
 	interface Props {
 		onDecision: (
@@ -18,6 +16,7 @@
 	}
 
 	let { onDecision }: Props = $props();
+	setCanonicalWorkspaceLayout();
 
 	const timestamp = '2026-08-15T00:00:00.000Z';
 	const itemState = new ConversationFeedItemState();
@@ -26,7 +25,6 @@
 		permissionRequest('occurrence-two', 'Second'),
 	];
 	const model = buildConversationVirtualFeedModel({
-		showTopToolbarSpacer: false,
 		showRefreshError: false,
 		showEarlierBoundary: false,
 		showLaterBoundary: false,
@@ -52,7 +50,10 @@
 		},
 	} as never);
 
-	function permissionRequest(permissionOccurrenceId: string, label: string): PendingPermissionRequest {
+	function permissionRequest(
+		permissionOccurrenceId: string,
+		label: string,
+	): PendingPermissionRequest {
 		return {
 			chatId: 'chat-1',
 			permissionOccurrenceId,
@@ -100,10 +101,7 @@
 			{onDecision}
 			draft={itemState.permissionDraft(item.request.permissionOccurrenceId)}
 			onDraftChange={(draft) =>
-				itemState.setPermissionDraft(
-					item.request.permissionOccurrenceId,
-					draft,
-				)}
+				itemState.setPermissionDraft(item.request.permissionOccurrenceId, draft)}
 		/>
 	</section>
 {/each}

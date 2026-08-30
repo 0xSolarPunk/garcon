@@ -1,21 +1,30 @@
 import type {
-	PersistedWorkspaceHost,
-	PersistedWorkspaceLayoutV1,
+	PersistedWorkspaceLayoutNode,
+	PersistedWorkspaceLayoutV2,
 	PersistedWorkspaceSurfaceRef,
 } from '$shared/workspace-layout';
+import { isRecord } from '$shared/json';
 import {
-	CHAT_SURFACE_ID,
-	type HostId,
+	MAX_WORKSPACE_WINDOWS,
+	chatViewSurfaceId,
+	portableSingletonDescriptor,
+	terminalSurfaceId,
+	type DesktopWorkspaceNode,
+	type PortableSingletonKind,
 	type SurfaceDescriptor,
 	type WorkspaceLayoutSnapshot,
-	portableSingletonDescriptor,
-	singletonSurfaceId,
-	terminalSurfaceId,
-} from './surface-types';
+	type WorkspacePartitionId,
+	type WorkspaceWindowId,
+	type WorkspaceWindowNode,
+} from './surface-types.js';
 import { assertWorkspaceLayoutInvariants } from './workspace-layout.svelte.js';
 import { canonicalWorkspaceSnapshot } from './canonical-layout.js';
-import { clampDesiredSidebarWidth } from './sidebar-sizing';
-import { isRecord } from '$shared/json';
+import {
+	clampPartitionRatio,
+	collectWindowNodes,
+	mapWindows,
+	removeWindowAndCollapse,
+} from './window-tree.js';
 
 export type WorkspaceLayoutRestoreSource = 'absent' | 'valid' | 'fallback';
 
@@ -24,18 +33,26 @@ export interface WorkspaceLayoutParseResult {
 	snapshot: WorkspaceLayoutSnapshot;
 }
 
-function parseRef(value: unknown): PersistedWorkspaceSurfaceRef | null {
+const PORTABLE_SINGLETON_REF_KINDS = new Set<PortableSingletonKind>([
+	'git',
+	'git-history',
+	'git-compare',
+	'pull-requests',
+	'files',
+	'commit',
+]);
+
+function parseV2Ref(value: unknown): PersistedWorkspaceSurfaceRef | null {
 	if (!isRecord(value)) return null;
+	if (value.type === 'chat' && (value.chatId === null || typeof value.chatId === 'string')) {
+		return { type: 'chat', chatId: value.chatId };
+	}
 	if (
 		value.type === 'singleton' &&
-		(value.kind === 'git' ||
-			value.kind === 'git-history' ||
-			value.kind === 'git-compare' ||
-			value.kind === 'pull-requests' ||
-			value.kind === 'files' ||
-			value.kind === 'commit')
+		typeof value.kind === 'string' &&
+		PORTABLE_SINGLETON_REF_KINDS.has(value.kind as PortableSingletonKind)
 	) {
-		return { type: 'singleton', kind: value.kind };
+		return { type: 'singleton', kind: value.kind as PortableSingletonKind };
 	}
 	if (value.type === 'terminal' && typeof value.terminalId === 'string' && value.terminalId) {
 		return { type: 'terminal', terminalId: value.terminalId };
@@ -43,132 +60,249 @@ function parseRef(value: unknown): PersistedWorkspaceSurfaceRef | null {
 	return null;
 }
 
-function parseHost(value: unknown): PersistedWorkspaceHost | null {
-	if (!isRecord(value) || !Array.isArray(value.order)) return null;
-	const order = value.order
-		.map(parseRef)
-		.filter((ref): ref is PersistedWorkspaceSurfaceRef => Boolean(ref));
-	const active = value.active === null ? null : parseRef(value.active);
-	return { order, active };
+function globalRefKey(ref: Exclude<PersistedWorkspaceSurfaceRef, { type: 'chat' }>): string {
+	return ref.type === 'singleton' ? `singleton:${ref.kind}` : terminalSurfaceId(ref.terminalId);
 }
 
-function refKey(ref: PersistedWorkspaceSurfaceRef): string {
-	return ref.type === 'singleton'
-		? singletonSurfaceId(ref.kind)
-		: terminalSurfaceId(ref.terminalId);
-}
-
-function descriptorFor(ref: PersistedWorkspaceSurfaceRef): SurfaceDescriptor {
+function descriptorForGlobalRef(
+	ref: Exclude<PersistedWorkspaceSurfaceRef, { type: 'chat' }>,
+): SurfaceDescriptor {
 	if (ref.type === 'terminal') {
 		return { id: terminalSurfaceId(ref.terminalId), type: 'terminal', terminalId: ref.terminalId };
 	}
 	return portableSingletonDescriptor(ref.kind);
 }
 
-function restoreHost(
-	host: PersistedWorkspaceHost,
-	hostId: HostId,
-	seen: Set<string>,
-	surfaces: Record<string, SurfaceDescriptor>,
-): { order: string[]; activeId: string | null; mru: string[] } {
-	const order: string[] = [];
-	for (const ref of host.order) {
-		const id = refKey(ref);
-		if (id === CHAT_SURFACE_ID || seen.has(id)) continue;
-		seen.add(id);
-		order.push(id);
-		surfaces[id] = descriptorFor(ref);
-	}
-	if (hostId === 'main') order.unshift(CHAT_SURFACE_ID);
-	const activeKey = host.active ? refKey(host.active) : null;
-	const activeId =
-		activeKey && order.includes(activeKey)
-			? activeKey
-			: hostId === 'main'
-				? CHAT_SURFACE_ID
-				: (order[0] ?? null);
-	const mru = activeId ? [activeId, ...order.filter((id) => id !== activeId)] : [];
-	return { order, activeId, mru };
+function asWindowId(id: unknown): WorkspaceWindowId | null {
+	return typeof id === 'string' && id.startsWith('window-') ? (id as WorkspaceWindowId) : null;
 }
 
-export function parsePersistedWorkspaceLayout(raw: string | null): WorkspaceLayoutParseResult {
-	if (raw === null) return { source: 'absent', snapshot: canonicalWorkspaceSnapshot() };
-	try {
-		const value: unknown = JSON.parse(raw);
-		if (!isRecord(value) || value.version !== 1) throw new Error('Unsupported layout version');
-		const mainRecord = parseHost(value.main);
-		const sidebarRecord = parseHost(value.sidebar);
-		if (!mainRecord || !sidebarRecord) throw new Error('Invalid persisted hosts');
-		const mainBase = canonicalWorkspaceSnapshot();
-		const surfaces: Record<string, SurfaceDescriptor> = {
-			[CHAT_SURFACE_ID]: mainBase.surfaces[CHAT_SURFACE_ID],
-		};
-		const seen = new Set<string>();
-		const main = restoreHost(mainRecord, 'main', seen, surfaces);
-		const sidebar = restoreHost(sidebarRecord, 'sidebar', seen, surfaces);
-		const unplacedTerminalIds = Array.isArray(value.unplacedTerminalIds)
-			? [
-					...new Set(
-						value.unplacedTerminalIds.filter(
-							(terminalId): terminalId is string =>
-								typeof terminalId === 'string' &&
-								Boolean(terminalId) &&
-								!seen.has(terminalSurfaceId(terminalId)),
-						),
-					),
-				]
-			: [];
-		const snapshot: WorkspaceLayoutSnapshot = {
-			main,
-			sidebar,
-			surfaces,
-			sidebarOpen: Boolean(value.sidebarOpen) && sidebar.order.length > 0,
-			desiredSidebarWidth: clampDesiredSidebarWidth(
-				typeof value.desiredSidebarWidth === 'number'
-					? value.desiredSidebarWidth
-					: mainBase.desiredSidebarWidth,
-			),
-			dialogFileSurfaceId: null,
-			fullscreenHost: null,
-			mobileActiveSurfaceId: CHAT_SURFACE_ID,
-			mobileOnlySurfaceIds: [],
-			mobileReturnStack: [],
-			unplacedTerminalIds,
-		};
-		assertWorkspaceLayoutInvariants(snapshot);
-		return { source: 'valid', snapshot };
-	} catch {
-		return { source: 'fallback', snapshot: canonicalWorkspaceSnapshot() };
+function asPartitionId(id: unknown): WorkspacePartitionId | null {
+	return typeof id === 'string' && id.startsWith('partition-')
+		? (id as WorkspacePartitionId)
+		: null;
+}
+
+interface TreeBuildState {
+	surfaces: Record<string, SurfaceDescriptor>;
+	seenGlobalSurfaceIds: Set<string>;
+}
+
+function restoredRefSurfaceId(
+	ref: PersistedWorkspaceSurfaceRef,
+	windowId: WorkspaceWindowId,
+): string {
+	return ref.type === 'chat' ? chatViewSurfaceId(windowId) : globalRefKey(ref);
+}
+
+function restoreWindow(
+	node: Record<string, unknown>,
+	state: TreeBuildState,
+): WorkspaceWindowNode | null {
+	const id = asWindowId(node.id);
+	if (!id || !Array.isArray(node.order)) return null;
+	const order: string[] = [];
+	let chatPlaced = false;
+	for (const rawRef of node.order) {
+		const ref = parseV2Ref(rawRef);
+		if (!ref) continue;
+		if (ref.type === 'chat') {
+			if (chatPlaced) continue;
+			chatPlaced = true;
+			const surfaceId = chatViewSurfaceId(id);
+			state.surfaces[surfaceId] = { id: surfaceId, type: 'chat', chatId: ref.chatId };
+			order.push(surfaceId);
+			continue;
+		}
+		const surfaceId = globalRefKey(ref);
+		if (state.seenGlobalSurfaceIds.has(surfaceId)) continue;
+		state.seenGlobalSurfaceIds.add(surfaceId);
+		state.surfaces[surfaceId] = descriptorForGlobalRef(ref);
+		order.push(surfaceId);
 	}
+	if (order.length === 0) return null;
+	const activeRef = parseV2Ref(node.active);
+	const activeKey = activeRef ? restoredRefSurfaceId(activeRef, id) : null;
+	const activeId = activeKey && order.includes(activeKey) ? activeKey : order[0];
+	const persistedMru: string[] = [];
+	if (Array.isArray(node.mru)) {
+		for (const rawRef of node.mru) {
+			const ref = parseV2Ref(rawRef);
+			if (!ref) continue;
+			const surfaceId = restoredRefSurfaceId(ref, id);
+			if (!order.includes(surfaceId) || persistedMru.includes(surfaceId)) continue;
+			persistedMru.push(surfaceId);
+		}
+	}
+	const mru = [
+		activeId,
+		...persistedMru.filter((surfaceId) => surfaceId !== activeId),
+		...order.filter((surfaceId) => surfaceId !== activeId && !persistedMru.includes(surfaceId)),
+	];
+	return { type: 'window', id, tabs: { order, activeId, mru } };
+}
+
+function restoreNode(node: unknown, state: TreeBuildState): DesktopWorkspaceNode | null {
+	if (!isRecord(node)) return null;
+	if (node.type === 'window') return restoreWindow(node, state);
+	if (node.type !== 'partition') return null;
+	const id = asPartitionId(node.id);
+	if (!id || !Array.isArray(node.children) || node.children.length !== 2) return null;
+	const first = restoreNode(node.children[0], state);
+	const second = restoreNode(node.children[1], state);
+	if (!first) return second;
+	if (!second) return first;
+	if (node.direction !== 'horizontal' && node.direction !== 'vertical') return null;
+	return {
+		type: 'partition',
+		id,
+		direction: node.direction,
+		ratio: clampPartitionRatio(typeof node.ratio === 'number' ? node.ratio : 0.5),
+		children: [first, second],
+	};
+}
+
+function appendTabsToWindow(
+	root: DesktopWorkspaceNode,
+	windowId: WorkspaceWindowId,
+	tabIds: readonly string[],
+): DesktopWorkspaceNode {
+	return mapWindows(root, (workspaceWindow) => {
+		if (workspaceWindow.id !== windowId || tabIds.length === 0) return workspaceWindow;
+		const order = [...workspaceWindow.tabs.order, ...tabIds];
+		return {
+			...workspaceWindow,
+			tabs: {
+				order,
+				activeId: workspaceWindow.tabs.activeId,
+				mru: [...workspaceWindow.tabs.mru, ...tabIds],
+			},
+		};
+	});
+}
+
+function enforceWindowCap(root: DesktopWorkspaceNode): DesktopWorkspaceNode {
+	let next = root;
+	while (collectWindowNodes(next).length > MAX_WORKSPACE_WINDOWS) {
+		const windows = collectWindowNodes(next);
+		const overflow = windows[windows.length - 1];
+		const collapsed = removeWindowAndCollapse(next, overflow.id);
+		if (!collapsed) break;
+		const first = collectWindowNodes(collapsed)[0];
+		const movable = overflow.tabs.order.filter((surfaceId) => !surfaceId.startsWith('chat-view:'));
+		next = appendTabsToWindow(collapsed, first.id, movable);
+	}
+	return next;
+}
+
+function pruneUnplacedDescriptors(root: DesktopWorkspaceNode, state: TreeBuildState): void {
+	const placed = new Set(
+		collectWindowNodes(root).flatMap((workspaceWindow) => workspaceWindow.tabs.order),
+	);
+	for (const surfaceId of Object.keys(state.surfaces)) {
+		if (!placed.has(surfaceId)) delete state.surfaces[surfaceId];
+	}
+}
+
+function parseUnplacedTerminalIds(
+	value: unknown,
+	surfaces: Readonly<Record<string, SurfaceDescriptor>>,
+): string[] {
+	if (!Array.isArray(value)) return [];
+	return [
+		...new Set(
+			value.filter(
+				(terminalId): terminalId is string =>
+					typeof terminalId === 'string' &&
+					Boolean(terminalId) &&
+					!surfaces[terminalSurfaceId(terminalId)],
+			),
+		),
+	];
+}
+
+function parseV2(value: Record<string, unknown>): WorkspaceLayoutParseResult {
+	const state: TreeBuildState = { surfaces: {}, seenGlobalSurfaceIds: new Set() };
+	const restored = restoreNode(value.root, state);
+	if (!restored) return { source: 'fallback', snapshot: canonicalWorkspaceSnapshot() };
+	const root = enforceWindowCap(restored);
+	pruneUnplacedDescriptors(root, state);
+	const firstWindow = collectWindowNodes(root)[0];
+	if (!firstWindow) return { source: 'fallback', snapshot: canonicalWorkspaceSnapshot() };
+	const snapshot: WorkspaceLayoutSnapshot = {
+		desktopRoot: root,
+		surfaces: state.surfaces,
+		fullscreenWindowId: null,
+		dialogFileSurfaceId: null,
+		mobileActiveSurfaceId: firstWindow.tabs.activeId,
+		mobileOnlySurfaceIds: [],
+		mobileReturnStack: [],
+		unplacedTerminalIds: parseUnplacedTerminalIds(value.unplacedTerminalIds, state.surfaces),
+	};
+	assertWorkspaceLayoutInvariants(snapshot);
+	return { source: 'valid', snapshot };
+}
+
+export function parsePersistedWorkspaceLayout(rawV2: string | null): WorkspaceLayoutParseResult {
+	if (rawV2 !== null) {
+		try {
+			const value: unknown = JSON.parse(rawV2);
+			if (!isRecord(value) || value.version !== 2) throw new Error('Unsupported layout version');
+			return parseV2(value);
+		} catch {
+			return { source: 'fallback', snapshot: canonicalWorkspaceSnapshot() };
+		}
+	}
+	return { source: 'absent', snapshot: canonicalWorkspaceSnapshot() };
 }
 
 function persistedRef(surface: SurfaceDescriptor): PersistedWorkspaceSurfaceRef | null {
+	if (surface.type === 'chat') return { type: 'chat', chatId: surface.chatId };
 	if (surface.type === 'terminal') return { type: 'terminal', terminalId: surface.terminalId };
-	if (surface.type !== 'singleton' || surface.kind === 'chat') return null;
-	return { type: 'singleton', kind: surface.kind };
+	if (surface.type === 'singleton') return { type: 'singleton', kind: surface.kind };
+	return null;
 }
 
-function serializeHost(
-	host: WorkspaceLayoutSnapshot['main'],
-	surfaces: WorkspaceLayoutSnapshot['surfaces'],
-): PersistedWorkspaceHost {
-	const order = host.order.flatMap((id) => {
-		const ref = surfaces[id] ? persistedRef(surfaces[id]) : null;
-		return ref ? [ref] : [];
-	});
-	const activeSurface = host.activeId ? surfaces[host.activeId] : null;
-	return { order, active: activeSurface ? persistedRef(activeSurface) : null };
+function serializeNode(
+	node: DesktopWorkspaceNode,
+	surfaces: Readonly<Record<string, SurfaceDescriptor>>,
+): PersistedWorkspaceLayoutNode {
+	if (node.type === 'window') {
+		const order = node.tabs.order.flatMap((surfaceId) => {
+			const ref = surfaces[surfaceId] ? persistedRef(surfaces[surfaceId]) : null;
+			return ref ? [ref] : [];
+		});
+		const activeSurface = surfaces[node.tabs.activeId];
+		const mru = node.tabs.mru.flatMap((surfaceId) => {
+			const ref = surfaces[surfaceId] ? persistedRef(surfaces[surfaceId]) : null;
+			return ref ? [ref] : [];
+		});
+		return {
+			type: 'window',
+			id: node.id,
+			order,
+			active: activeSurface ? persistedRef(activeSurface) : null,
+			mru,
+		};
+	}
+	return {
+		type: 'partition',
+		id: node.id,
+		direction: node.direction,
+		ratio: node.ratio,
+		children: [
+			serializeNode(node.children[0], surfaces),
+			serializeNode(node.children[1], surfaces),
+		],
+	};
 }
 
 export function serializeWorkspaceLayout(
 	snapshot: WorkspaceLayoutSnapshot,
-): PersistedWorkspaceLayoutV1 {
+): PersistedWorkspaceLayoutV2 {
 	return {
-		version: 1,
-		desiredSidebarWidth: clampDesiredSidebarWidth(snapshot.desiredSidebarWidth),
-		sidebarOpen: snapshot.sidebarOpen,
-		main: serializeHost(snapshot.main, snapshot.surfaces),
-		sidebar: serializeHost(snapshot.sidebar, snapshot.surfaces),
+		version: 2,
+		root: serializeNode(snapshot.desktopRoot, snapshot.surfaces),
 		unplacedTerminalIds: [...snapshot.unplacedTerminalIds],
 	};
 }

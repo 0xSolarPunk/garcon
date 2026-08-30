@@ -6,14 +6,12 @@
 	import type { ChatDraftAppend } from '$lib/chat/composer/chat-draft-append.js';
 
 	let {
-		reserveTopFloatingToolbar,
 		subagentToolbar,
 		isVisible,
 		isInteractive,
 		onRegisterUserMessageNavigator,
 		onRegisterAppendToDraft,
 	}: {
-		reserveTopFloatingToolbar: boolean;
 		subagentToolbar: SubagentToolbarState;
 		isVisible: boolean;
 		isInteractive: boolean;
@@ -73,7 +71,6 @@
 
 <div
 	data-testid="chat-surface-stub"
-	data-reserve-top-floating-toolbar={reserveTopFloatingToolbar}
 	data-navigator-open-count={navigatorOpenCount}
 	data-visible={isVisible}
 	data-interactive={isInteractive}

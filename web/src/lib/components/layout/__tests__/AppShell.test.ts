@@ -1,12 +1,18 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AppShellBreakpointWorkspace } from './AppShellBreakpointWorkspace.svelte.js';
+import {
+	AppShellBreakpointWorkspace,
+	AppShellLocalSettingsState,
+} from './AppShellBreakpointWorkspace.svelte.js';
 import { reduceWorkspaceLayout } from '$lib/workspace/workspace-layout.svelte.js';
 import { portableSingletonDescriptor } from '$lib/workspace/surface-types.js';
 
 const testContext = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
 const chatNavigation = vi.hoisted(() => ({
 	gotoChat: vi.fn<(_chatId: string) => Promise<void>>(() => Promise.resolve()),
+}));
+const chatDraftContext = vi.hoisted(() => ({
+	set: vi.fn<(_drafts: unknown) => void>(),
 }));
 
 vi.mock('$lib/chat/actions/chat-navigation.js', () => ({
@@ -22,8 +28,10 @@ vi.mock('$lib/context', () => ({
 	getNotifications: () => testContext.current?.notifications,
 	getSidebarProjectCollapse: () => testContext.current?.projectCollapse,
 	getSidebarSearch: () => testContext.current?.sidebarSearch,
+	getTerminalRegistry: () => testContext.current?.terminals,
 	getWorkspaceCoordinator: () => testContext.current?.workspace,
 	getWs: () => testContext.current?.ws,
+	setChatDrafts: chatDraftContext.set,
 }));
 
 vi.mock('$lib/components/workspace/WorkspaceRoot.svelte', async () => ({
@@ -117,31 +125,37 @@ class TestMediaQueryList {
 function installContext(): AppShellBreakpointWorkspace {
 	const workspace = new AppShellBreakpointWorkspace();
 	const noOpSubscription = () => () => undefined;
+	let selectedChatId: string | null = null;
+	const sessions = {
+		orderedChats: [],
+		get selectedChatId() {
+			return selectedChatId;
+		},
+		selectedChat: null,
+		lastSelectedChatId: null,
+		isLoadingChats: false,
+		order: [],
+		byId: {},
+		setSelectedChatId: vi.fn((chatId: string | null) => {
+			selectedChatId = chatId;
+		}),
+		rememberSelectedChat: vi.fn(),
+		refreshChats: vi.fn(async () => undefined),
+		quietRefreshChats: vi.fn(async () => undefined),
+		upsertServerChat: vi.fn(),
+		hasChat: vi.fn((chatId: string) => chatId === 'chat-test'),
+		removeChat: vi.fn(),
+		deleteRemoteChat: vi.fn(async () => undefined),
+		renameChat: vi.fn(async () => undefined),
+		patchChat: vi.fn(),
+	};
 	testContext.current = {
 		workspace,
 		navigation: {
 			onNavigateChatAboveRequested: noOpSubscription,
 			onNavigateChatBelowRequested: noOpSubscription,
 		},
-		sessions: {
-			orderedChats: [],
-			selectedChatId: null,
-			selectedChat: null,
-			lastSelectedChatId: null,
-			isLoadingChats: false,
-			order: [],
-			byId: {},
-			setSelectedChatId: vi.fn(),
-			rememberSelectedChat: vi.fn(),
-			refreshChats: vi.fn(async () => undefined),
-			quietRefreshChats: vi.fn(async () => undefined),
-			upsertServerChat: vi.fn(),
-			hasChat: vi.fn(() => false),
-			removeChat: vi.fn(),
-			deleteRemoteChat: vi.fn(async () => undefined),
-			renameChat: vi.fn(async () => undefined),
-			patchChat: vi.fn(),
-		},
+		sessions,
 		appShell: {
 			sidebarOpen: false,
 			keyboardHeight: 0,
@@ -168,14 +182,8 @@ function installContext(): AppShellBreakpointWorkspace {
 				lastConnectedAt: null,
 			},
 		},
-		localSettings: {
-			hideChatListWhenGitInMain: false,
-			desktopLayoutOrder: ['chat-list', 'main', 'workspace-sidebar'],
-			sidebarWidth: 320,
-			sidebarGroupByProject: false,
-			sidebarGroupNestedProjectPaths: false,
-			set: vi.fn(),
-		},
+		localSettings: new AppShellLocalSettingsState(),
+		terminals: { orderedSessions: [] },
 		notifications: {
 			error: vi.fn(),
 			info: vi.fn(),
@@ -207,6 +215,19 @@ describe('AppShell responsive workspace binding', () => {
 		vi.restoreAllMocks();
 		chatNavigation.gotoChat.mockReset();
 		chatNavigation.gotoChat.mockResolvedValue(undefined);
+		chatDraftContext.set.mockReset();
+	});
+
+	it('provides one shared draft store for the shell lifetime', () => {
+		installContext();
+		const view = render(AppShell);
+
+		expect(chatDraftContext.set).toHaveBeenCalledOnce();
+		const drafts = chatDraftContext.set.mock.calls[0]?.[0] as { destroy(): void };
+		const destroy = vi.spyOn(drafts, 'destroy');
+
+		view.unmount();
+		expect(destroy).toHaveBeenCalledOnce();
 	});
 
 	it('hands desktop and mobile breakpoint changes to the workspace coordinator', async () => {
@@ -223,6 +244,20 @@ describe('AppShell responsive workspace binding', () => {
 		mediaQuery.setMatches(false);
 		await waitFor(() => expect(workspace.exitCalls).toBe(2));
 		expect(screen.getByTestId('workspace-root-stub').getAttribute('data-mobile')).toBe('false');
+	});
+
+	it('reconciles breakpoint changes from resize when the media query omits change events', async () => {
+		const workspace = installContext();
+		render(AppShell);
+
+		await waitFor(() => expect(workspace.exitCalls).toBe(1));
+		mediaQuery.matches = true;
+		window.dispatchEvent(new Event('resize'));
+		await waitFor(() => expect(workspace.enterCalls).toBe(1));
+
+		mediaQuery.matches = false;
+		window.dispatchEvent(new Event('resize'));
+		await waitFor(() => expect(workspace.exitCalls).toBe(2));
 	});
 
 	it('loads the initial chat list independently of WebSocket connection state', async () => {
@@ -278,8 +313,9 @@ describe('AppShell responsive workspace binding', () => {
 
 		expect(sessions.setSelectedChatId).toHaveBeenCalledWith('chat-test');
 		expect(chatNavigation.gotoChat).toHaveBeenCalledWith('chat-test');
-		expect(workspace.focusChatCalls).toBe(1);
+		expect(workspace.showChatCalls).toBe(1);
 		await waitFor(() => expect(appShell.requestComposerFocus).toHaveBeenCalledOnce());
+		expect(chatNavigation.gotoChat).toHaveBeenCalledOnce();
 	});
 
 	it.each(['git', 'git-history', 'git-compare'] as const)(
@@ -287,21 +323,21 @@ describe('AppShell responsive workspace binding', () => {
 		async (kind) => {
 			const workspace = installContext();
 			(
-				testContext.current?.localSettings as { hideChatListWhenGitInMain: boolean }
-			).hideChatListWhenGitInMain = true;
+				testContext.current?.localSettings as { hideChatListWhenGitFocused: boolean }
+			).hideChatListWhenGitFocused = true;
 			const surfaceId = `singleton:${kind}`;
 			if (!workspace.layout.surface(surfaceId)) {
 				const registered = reduceWorkspaceLayout(workspace.layout.snapshot, [
 					{
 						type: 'register-surface',
 						surface: portableSingletonDescriptor(kind),
-						host: 'main',
+						windowId: 'window-main',
 					},
 				]);
 				workspace.layout.publish(workspace.layout.revision, registered);
 			}
 			const focused = reduceWorkspaceLayout(workspace.layout.snapshot, [
-				{ type: 'focus-host', host: 'main', surfaceId },
+				{ type: 'activate-window-tab', windowId: 'window-main', surfaceId },
 			]);
 			workspace.layout.publish(workspace.layout.revision, focused);
 
@@ -314,50 +350,60 @@ describe('AppShell responsive workspace binding', () => {
 		},
 	);
 
-	it.each(['main', 'sidebar'] as const)(
-		'hides and restores the desktop chat list for %s fullscreen',
-		async (host) => {
-			const workspace = installContext();
-			if (host === 'sidebar') {
-				const open = reduceWorkspaceLayout(workspace.layout.snapshot, [
-					{ type: 'set-sidebar-open', open: true },
-				]);
-				workspace.layout.publish(workspace.layout.revision, open);
-			}
-			await workspace.toggleFullscreen(host);
-			render(AppShell);
+	it('reorders one mounted desktop chat list when its dock side changes', async () => {
+		installContext();
+		render(AppShell);
+		const localSettings = testContext.current?.localSettings as AppShellLocalSettingsState;
+		const chatList = document.querySelector<HTMLElement>('[data-workspace-chat-list]');
+		const sidebarButton = screen.getByRole('button', { name: 'Select test chat' });
+		expect(chatList?.classList.contains('order-first')).toBe(true);
 
-			await waitFor(() =>
-				expect(
-					screen.getByTestId('workspace-root-stub').getAttribute('data-desktop-chat-list-hidden'),
-				).toBe('true'),
-			);
+		localSettings.chatListDock = 'right';
+
+		await waitFor(() => expect(chatList?.classList.contains('order-last')).toBe(true));
+		expect(document.querySelector('[data-workspace-chat-list]')).toBe(chatList);
+		expect(screen.getByRole('button', { name: 'Select test chat' })).toBe(sidebarButton);
+	});
+
+	it('hides and restores the desktop chat list for window fullscreen', async () => {
+		const workspace = installContext();
+		await workspace.enterWindowFullscreen('window-main');
+		render(AppShell);
+
+		await waitFor(() =>
 			expect(
 				document.querySelector('[data-workspace-chat-list]')?.getAttribute('aria-hidden'),
-			).toBe('true');
+			).toBe('true'),
+		);
 
-			await workspace.toggleFullscreen(host);
-			await waitFor(() =>
-				expect(
-					screen.getByTestId('workspace-root-stub').getAttribute('data-desktop-chat-list-hidden'),
-				).toBe('false'),
-			);
+		await workspace.exitWindowFullscreen('window-main');
+		await waitFor(() =>
 			expect(
 				document.querySelector('[data-workspace-chat-list]')?.getAttribute('aria-hidden'),
-			).toBe('false');
-		},
-	);
+			).toBe('false'),
+		);
+	});
 
 	it.each(['commit', 'files', 'pull-requests'] as const)(
 		'keeps the desktop chat list visible when %s is active',
 		async (kind) => {
 			const workspace = installContext();
 			(
-				testContext.current?.localSettings as { hideChatListWhenGitInMain: boolean }
-			).hideChatListWhenGitInMain = true;
+				testContext.current?.localSettings as { hideChatListWhenGitFocused: boolean }
+			).hideChatListWhenGitFocused = true;
 			const surfaceId = `singleton:${kind}`;
+			if (!workspace.layout.surface(surfaceId)) {
+				const registered = reduceWorkspaceLayout(workspace.layout.snapshot, [
+					{
+						type: 'register-surface',
+						surface: portableSingletonDescriptor(kind),
+						windowId: 'window-main',
+					},
+				]);
+				workspace.layout.publish(workspace.layout.revision, registered);
+			}
 			const focused = reduceWorkspaceLayout(workspace.layout.snapshot, [
-				{ type: 'focus-host', host: kind === 'pull-requests' ? 'main' : 'sidebar', surfaceId },
+				{ type: 'activate-window-tab', windowId: 'window-main', surfaceId },
 			]);
 			workspace.layout.publish(workspace.layout.revision, focused);
 

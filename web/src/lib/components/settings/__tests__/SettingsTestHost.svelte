@@ -9,12 +9,11 @@
 	} from '$lib/context';
 	import type { AppShellStore } from '$lib/stores/app-shell.svelte';
 	import type { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte';
-	import type { UpdateRemoteSettingsInput } from '$shared/settings';
 	import {
-		normalizeDesktopLayoutOrder,
-		type DesktopLayoutOrder,
-	} from '$lib/layout/desktop-layout.js';
-	import type { GlobalShortcutOverrides } from '$lib/workspace/global-shortcuts.js';
+		LocalSettingsStore,
+		type LocalSettingsSnapshot,
+	} from '$lib/stores/local-settings.svelte.js';
+	import { onDestroy, untrack } from 'svelte';
 
 	interface SettingsTestHostProps {
 		appShell: AppShellStore;
@@ -29,12 +28,40 @@
 		onLocalSet = () => undefined,
 		onLocalToggle = () => undefined,
 	}: SettingsTestHostProps = $props();
-	let desktopLayoutOrder = $state<DesktopLayoutOrder>(['chat-list', 'main', 'workspace-sidebar']);
-	let globalShortcuts = $state<GlobalShortcutOverrides>({});
-	let completionSoundMode = $state<'off' | 'default' | 'custom'>('off');
-	let completionSoundVolume = $state(0.7);
-	let completionSoundVisibility = $state<'always' | 'unfocused'>('unfocused');
-	let customCompletionSoundName = $state<string | null>(null);
+	class SettingsLocalStore extends LocalSettingsStore {
+		#notifySet: (key: string, value: unknown) => void;
+		#notifyToggle: (key: string) => void;
+
+		constructor(
+			notifySet: (key: string, value: unknown) => void,
+			notifyToggle: (key: string) => void,
+		) {
+			super();
+			this.#notifySet = notifySet;
+			this.#notifyToggle = notifyToggle;
+		}
+
+		override set<K extends keyof LocalSettingsSnapshot>(
+			key: K,
+			value: LocalSettingsSnapshot[K],
+		): void {
+			super.set(key, value);
+			this.#notifySet(key, value);
+		}
+
+		override toggle(key: Parameters<LocalSettingsStore['toggle']>[0]): void {
+			this.#notifyToggle(key);
+			super.toggle(key);
+		}
+	}
+
+	const localSettings = new SettingsLocalStore(
+		(key, value) => onLocalSet(key, value),
+		(key) => onLocalToggle(key),
+	);
+	localSettings.chatListDock = 'left';
+	localSettings.chatMaxWidth = 'none';
+	localSettings.hiddenToolTypes = [];
 	const agentIds = ['claude', 'codex', 'amp', 'cursor', 'factory', 'opencode', 'pi'];
 	const agentLabels: Record<string, string> = {
 		claude: 'Claude',
@@ -157,83 +184,9 @@
 		refresh: async () => {},
 	});
 
-	setAppShell({
-		get showSettings() {
-			return appShell.showSettings;
-		},
-		get settingsTab() {
-			return appShell.settingsTab;
-		},
-		setSettingsTab(tab: string) {
-			appShell.setSettingsTab(tab);
-		},
-		closeSettings() {
-			appShell.closeSettings();
-		},
-	} as never);
-	setRemoteSettings({
-		get hasSnapshot() {
-			return remoteSettings.hasSnapshot;
-		},
-		get snapshot() {
-			return remoteSettings.snapshot;
-		},
-		get error() {
-			return remoteSettings.error;
-		},
-		refreshInBackground() {
-			return remoteSettings.refreshInBackground();
-		},
-		update(patch: UpdateRemoteSettingsInput) {
-			return remoteSettings.update(patch);
-		},
-	} as never);
-	setLocalSettings({
-		theme: 'system',
-		colorblindMode: false,
-		overlayBackdropEffects: true,
-		hideChatListWhenGitInMain: false,
-		get desktopLayoutOrder() {
-			return desktopLayoutOrder;
-		},
-		autoExpandTools: false,
-		alwaysExpandCliMessages: false,
-		showThinking: true,
-		allowDirectChats: false,
-		reduceMotion: false,
-		hiddenToolTypes: [],
-		showQuickCommitTray: true,
-		autoScrollToBottom: true,
-		sendByShiftEnter: false,
-		steerWithCtrlEnter: true,
-		get globalShortcuts() {
-			return globalShortcuts;
-		},
-		chatMaxWidth: 'none',
-		textEditorOpenPlacement: 'source',
-		imageViewerOpenPlacement: 'source',
-		markdownViewerOpenPlacement: 'source',
-		get completionSoundMode() { return completionSoundMode; },
-		get completionSoundVolume() { return completionSoundVolume; },
-		get completionSoundVisibility() { return completionSoundVisibility; },
-		get customCompletionSoundName() { return customCompletionSoundName; },
-		set(key: string, value: unknown) {
-			if (key === 'desktopLayoutOrder') desktopLayoutOrder = normalizeDesktopLayoutOrder(value);
-			if (key === 'globalShortcuts') globalShortcuts = value as GlobalShortcutOverrides;
-			if (key === 'completionSoundMode') completionSoundMode = value as typeof completionSoundMode;
-			if (key === 'completionSoundVolume') completionSoundVolume = value as number;
-			if (key === 'completionSoundVisibility') completionSoundVisibility = value as typeof completionSoundVisibility;
-			if (key === 'customCompletionSoundName') customCompletionSoundName = value as string | null;
-			onLocalSet(key, value);
-		},
-		toggle(key: string) {
-			onLocalToggle(key);
-		},
-		areToolTypesHidden() {
-			return false;
-		},
-		setToolTypesHidden() {},
-	} as never);
+	setAppShell(untrack(() => appShell));
+	setRemoteSettings(untrack(() => remoteSettings));
+	setLocalSettings(localSettings);
 	setModelCatalog({
 		version: 0,
 		apiProviderCatalog: [],
@@ -284,6 +237,8 @@
 			return null;
 		},
 	} as never);
+
+	onDestroy(() => localSettings.destroy());
 </script>
 
 <Settings />

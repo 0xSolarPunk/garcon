@@ -6,12 +6,11 @@ import {
 	LOCAL_STORAGE_KEYS,
 	setLocalStorageItem,
 } from '$lib/utils/local-persistence';
-import type { DesktopPlacement } from '$lib/workspace/surface-types.js';
 import { parseFontSizeOption, type FontSizeOption } from '$lib/utils/font-size.js';
 import {
-	DEFAULT_DESKTOP_LAYOUT_ORDER,
-	normalizeDesktopLayoutOrder,
-	type DesktopLayoutOrder,
+	DEFAULT_CHAT_LIST_DOCK,
+	normalizeChatListDock,
+	type ChatListDock,
 } from '$lib/layout/desktop-layout.js';
 import {
 	sanitizeGlobalShortcutOverrides,
@@ -34,13 +33,11 @@ export type SidebarSortMode = (typeof SIDEBAR_SORT_MODE_VALUES)[number];
 
 export const SIDEBAR_CHAT_ITEM_LAYOUT_VALUES = ['default', 'compact', 'single-line'] as const;
 export type SidebarChatItemLayout = (typeof SIDEBAR_CHAT_ITEM_LAYOUT_VALUES)[number];
-export type FileOpenPlacementPreference = DesktopPlacement | 'source' | 'other';
+export type FileOpenPlacementPreference = 'same-window' | 'new-window' | 'dialog';
 export const FILE_OPEN_PLACEMENT_VALUES = [
-	'source',
-	'other',
+	'same-window',
+	'new-window',
 	'dialog',
-	'main',
-	'sidebar',
 ] as const satisfies readonly FileOpenPlacementPreference[];
 export const HIDEABLE_TOOL_GROUPS = [
 	{
@@ -113,8 +110,8 @@ export interface LocalSettingsSnapshot {
 	steerWithCtrlEnter: boolean;
 	snippetTrigger: string;
 	chatMaxWidth: ChatMaxWidth;
-	hideChatListWhenGitInMain: boolean;
-	desktopLayoutOrder: DesktopLayoutOrder;
+	hideChatListWhenGitFocused: boolean;
+	chatListDock: ChatListDock;
 	sidebarVisible: boolean;
 	sidebarWidth: number;
 	sidebarGroupByProject: boolean;
@@ -151,7 +148,7 @@ type BooleanLocalSettingKey =
 	| 'autoScrollToBottom'
 	| 'sendByShiftEnter'
 	| 'steerWithCtrlEnter'
-	| 'hideChatListWhenGitInMain'
+	| 'hideChatListWhenGitFocused'
 	| 'sidebarVisible'
 	| 'sidebarGroupByProject'
 	| 'sidebarGroupNestedProjectPaths'
@@ -173,8 +170,8 @@ const DEFAULTS: LocalSettingsSnapshot = {
 	steerWithCtrlEnter: true,
 	snippetTrigger: DEFAULT_SNIPPET_TRIGGER,
 	chatMaxWidth: 'none',
-	hideChatListWhenGitInMain: false,
-	desktopLayoutOrder: [...DEFAULT_DESKTOP_LAYOUT_ORDER],
+	hideChatListWhenGitFocused: false,
+	chatListDock: DEFAULT_CHAT_LIST_DOCK,
 	sidebarVisible: true,
 	sidebarWidth: 320,
 	sidebarGroupByProject: true,
@@ -187,9 +184,9 @@ const DEFAULTS: LocalSettingsSnapshot = {
 	gitDiffFontSize: '12',
 	markdownViewerFontSize: '12',
 	terminalFontSize: '13',
-	textEditorOpenPlacement: 'source',
-	imageViewerOpenPlacement: 'source',
-	markdownViewerOpenPlacement: 'source',
+	textEditorOpenPlacement: 'same-window',
+	imageViewerOpenPlacement: 'same-window',
+	markdownViewerOpenPlacement: 'same-window',
 	language: 'en',
 	hiddenToolTypes: [],
 	globalShortcuts: {},
@@ -271,7 +268,8 @@ function parseFileOpenPlacement(
 	value: unknown,
 	fallback: FileOpenPlacementPreference,
 ): FileOpenPlacementPreference {
-	return isFileOpenPlacement(value) ? value : fallback;
+	if (isFileOpenPlacement(value)) return value;
+	return fallback;
 }
 
 function normalizeHiddenToolTypes(value: unknown): HideableToolType[] {
@@ -304,11 +302,11 @@ function parseFromRaw(parsed: Record<string, unknown>): LocalSettingsSnapshot {
 		steerWithCtrlEnter: parseBoolean(parsed.steerWithCtrlEnter, DEFAULTS.steerWithCtrlEnter),
 		snippetTrigger: normalizeSnippetTrigger(parsed.snippetTrigger),
 		chatMaxWidth: parseChatMaxWidth(parsed.chatMaxWidth),
-		hideChatListWhenGitInMain: parseBoolean(
-			parsed.hideChatListWhenGitInMain,
-			DEFAULTS.hideChatListWhenGitInMain,
+		hideChatListWhenGitFocused: parseBoolean(
+			parsed.hideChatListWhenGitFocused,
+			DEFAULTS.hideChatListWhenGitFocused,
 		),
-		desktopLayoutOrder: normalizeDesktopLayoutOrder(parsed.desktopLayoutOrder),
+		chatListDock: normalizeChatListDock(parsed.chatListDock),
 		sidebarVisible: parseBoolean(parsed.sidebarVisible, DEFAULTS.sidebarVisible),
 		sidebarWidth: parseSidebarWidth(parsed.sidebarWidth),
 		sidebarGroupByProject: parseBoolean(
@@ -393,8 +391,8 @@ export class LocalSettingsStore {
 	steerWithCtrlEnter = $state(DEFAULTS.steerWithCtrlEnter);
 	snippetTrigger = $state(DEFAULTS.snippetTrigger);
 	chatMaxWidth = $state<ChatMaxWidth>(DEFAULTS.chatMaxWidth);
-	hideChatListWhenGitInMain = $state(DEFAULTS.hideChatListWhenGitInMain);
-	desktopLayoutOrder = $state<DesktopLayoutOrder>([...DEFAULT_DESKTOP_LAYOUT_ORDER]);
+	hideChatListWhenGitFocused = $state(DEFAULTS.hideChatListWhenGitFocused);
+	chatListDock = $state<ChatListDock>(DEFAULTS.chatListDock);
 	sidebarVisible = $state(DEFAULTS.sidebarVisible);
 	sidebarWidth = $state(DEFAULTS.sidebarWidth);
 	sidebarGroupByProject = $state(DEFAULTS.sidebarGroupByProject);
@@ -445,8 +443,8 @@ export class LocalSettingsStore {
 		const next = { ...this.snapshot(), [key]: value };
 		if (key === 'snippetTrigger') next.snippetTrigger = normalizeSnippetTrigger(value);
 		if (key === 'hiddenToolTypes') next.hiddenToolTypes = normalizeHiddenToolTypes(value);
-		if (key === 'desktopLayoutOrder') {
-			next.desktopLayoutOrder = normalizeDesktopLayoutOrder(value);
+		if (key === 'chatListDock') {
+			next.chatListDock = normalizeChatListDock(value);
 		}
 		if (key === 'globalShortcuts') {
 			next.globalShortcuts = sanitizeGlobalShortcutOverrides(value);
@@ -490,8 +488,8 @@ export class LocalSettingsStore {
 			steerWithCtrlEnter: this.steerWithCtrlEnter,
 			snippetTrigger: this.snippetTrigger,
 			chatMaxWidth: this.chatMaxWidth,
-			hideChatListWhenGitInMain: this.hideChatListWhenGitInMain,
-			desktopLayoutOrder: [...this.desktopLayoutOrder],
+			hideChatListWhenGitFocused: this.hideChatListWhenGitFocused,
+			chatListDock: this.chatListDock,
 			sidebarVisible: this.sidebarVisible,
 			sidebarWidth: this.sidebarWidth,
 			sidebarGroupByProject: this.sidebarGroupByProject,
@@ -532,8 +530,8 @@ export class LocalSettingsStore {
 		this.steerWithCtrlEnter = snap.steerWithCtrlEnter;
 		this.snippetTrigger = snap.snippetTrigger;
 		this.chatMaxWidth = snap.chatMaxWidth;
-		this.hideChatListWhenGitInMain = snap.hideChatListWhenGitInMain;
-		this.desktopLayoutOrder = [...snap.desktopLayoutOrder];
+		this.hideChatListWhenGitFocused = snap.hideChatListWhenGitFocused;
+		this.chatListDock = snap.chatListDock;
 		this.sidebarVisible = snap.sidebarVisible;
 		this.sidebarWidth = snap.sidebarWidth;
 		this.sidebarGroupByProject = snap.sidebarGroupByProject;

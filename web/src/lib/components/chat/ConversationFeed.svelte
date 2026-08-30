@@ -60,9 +60,7 @@
 		onLoadEarlier?: () => void;
 		onLoadLater?: () => void;
 		reserveComposerTraySpace?: boolean;
-		reserveTopFloatingToolbar?: boolean;
 		isPreparingInitialScroll?: boolean;
-		textScale?: number;
 		isProcessing?: boolean;
 		onForkChat?: (upToSeq?: number) => void;
 		onGenerateTitleFromMessage?: (message: string, messageSeq?: number) => void | Promise<void>;
@@ -85,9 +83,7 @@
 		onLoadEarlier = () => {},
 		onLoadLater = () => {},
 		reserveComposerTraySpace = false,
-		reserveTopFloatingToolbar = false,
 		isPreparingInitialScroll = false,
-		textScale = 1,
 		isProcessing = false,
 		onForkChat,
 		onGenerateTitleFromMessage,
@@ -119,7 +115,7 @@
 		}),
 	);
 
-	function handleMessagePaneFocusIntent() {
+	function handleMessageFeedFocusIntent() {
 		appShell.requestSidebarRecenterToSelected();
 	}
 
@@ -204,9 +200,7 @@
 		mutationClock: chatState.feedMutationClock,
 		hiddenToolTypes: localSettings.hiddenToolTypes,
 		showThinking: localSettings.showThinking,
-		textScale,
 		isLiveWindow: !chatState.hasLaterMessages,
-		showTopToolbarSpacer: reserveTopFloatingToolbar,
 		showRefreshError: chatState.loadStatus === 'error' && chatState.displayMessageCount > 0,
 		showEarlierBoundary:
 			chatState.pageStates.earlier.status === 'error' ||
@@ -338,9 +332,6 @@
 </script>
 
 {#snippet feedContent()}
-	{#if reserveTopFloatingToolbar && chatState.displayMessageCount === 0}
-		<div class="h-12" aria-hidden="true" data-chat-top-toolbar-spacer></div>
-	{/if}
 	{#if chatState.isLoadingMessages && chatState.displayMessageCount === 0}
 		<div class="text-center text-muted-foreground mt-8">
 			<div class="flex items-center justify-center space-x-2">
@@ -380,7 +371,6 @@
 			data-chat-virtual-model-count={projection.model.items.length}
 			data-chat-virtual-data-revision={projection.projectedDataRevision}
 			data-chat-transcript-entry-count={chatState.entries.length}
-			data-chat-transcript-scale={String(textScale)}
 			{@attach virtualController.sizer}
 		>
 			{#each virtualItems as virtualItem (virtualItem.key)}
@@ -396,7 +386,6 @@
 						renderModel={projection.renderModel}
 						agentId={agentState.agentId}
 						showThinking={localSettings.showThinking}
-						{textScale}
 						{pendingPermissionRequests}
 						earlierPageState={chatState.pageStates.earlier}
 						laterPageState={chatState.pageStates.later}
@@ -429,12 +418,7 @@
 	{:else if showEarlierLoadingStatus}
 		<!-- Keeps automatic loading outside virtual geometry so prepends cannot move the reading anchor. -->
 		<div
-			class={cn(
-				'pointer-events-none absolute left-1/2 z-10 flex size-8 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-none',
-				reserveTopFloatingToolbar
-					? 'top-[calc(var(--workspace-floating-taskbar-inset)+0.5rem)]'
-					: 'top-2',
-			)}
+			class="pointer-events-none absolute left-1/2 top-2 z-10 flex size-8 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-none"
 			role="status"
 			aria-live="polite"
 			data-chat-earlier-loading-indicator
@@ -447,7 +431,7 @@
 	<ScrollAreaPrimitive.Viewport
 		bind:ref={scrollContainer}
 		{onscroll}
-		onfocusin={handleMessagePaneFocusIntent}
+		onfocusin={handleMessageFeedFocusIntent}
 		tabindex={-1}
 		role="region"
 		aria-busy={chatState.isLoadingMessages ||

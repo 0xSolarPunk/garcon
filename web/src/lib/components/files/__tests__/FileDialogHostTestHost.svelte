@@ -4,29 +4,34 @@
 		setAppShell,
 		setFileSessions,
 		setLocalSettings,
+		setNotifications,
 		setSurfaceFrames,
 		setWorkspaceCoordinator,
 	} from '$lib/context';
 	import { SurfaceFrameRegistry } from '$lib/workspace/surface-frame-registry.svelte';
-	import { fileSurfaceId } from '$lib/workspace/surface-types';
+	import { fileSurfaceId, type WorkspaceWindowId } from '$lib/workspace/surface-types';
 	import { FileSession } from '$lib/files/sessions/file-session.svelte.js';
 	import { createLocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
-	import FileDialogHost from '../FileDialogHost.svelte';
 	import {
-		DEFAULT_DESKTOP_LAYOUT_ORDER,
-		type DesktopLayoutOrder,
-	} from '$lib/layout/desktop-layout.js';
+		createNotificationsStore,
+		type NotificationsStore,
+	} from '$lib/stores/notifications.svelte.js';
+	import FileDialogHost from '../FileDialogHost.svelte';
 
 	let {
 		request,
 		onResolve = () => undefined,
 		isMobile = false,
-		desktopLayoutOrder = DEFAULT_DESKTOP_LAYOUT_ORDER,
+		moveError,
+		onMove = () => undefined,
+		notifications = createNotificationsStore(),
 	}: {
 		request: 'guard' | 'refresh' | 'overwrite' | 'threshold' | 'file' | 'open-files';
 		onResolve?: (choice: string) => void;
 		isMobile?: boolean;
-		desktopLayoutOrder?: DesktopLayoutOrder;
+		moveError?: Error;
+		onMove?: (windowId: WorkspaceWindowId) => void;
+		notifications?: NotificationsStore;
 	} = $props();
 
 	const initialRequest = untrack(() => request);
@@ -67,16 +72,13 @@
 	let openFilesVisible = $state(initialRequest === 'open-files');
 	const localSettings = createLocalSettingsStore();
 
-	$effect(() => {
-		localSettings.desktopLayoutOrder = [...desktopLayoutOrder];
-	});
-
 	setAppShell({
 		get isMobile() {
 			return isMobile;
 		},
 	} as never);
 	setLocalSettings(localSettings);
+	setNotifications(untrack(() => notifications));
 	setSurfaceFrames(new SurfaceFrameRegistry());
 	setWorkspaceCoordinator({
 		layout: {
@@ -88,7 +90,11 @@
 		},
 		attachmentErrors: {},
 		closeSurface: async () => true,
-		moveDialogFileToHost: async () => undefined,
+		moveDialogFileToWindow: async (windowId: WorkspaceWindowId) => {
+			onMove(windowId);
+			if (moveError) throw moveError;
+		},
+		lastFocusedWindowId: 'window-main',
 		isSurfaceCloseBlocked: () => false,
 		frameVersion: () => 0,
 		retryPresentation: async () => undefined,

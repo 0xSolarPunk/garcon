@@ -10,7 +10,7 @@ describe('LocalSettingsStore', () => {
 	it('defaults max chat width and file opening preferences', () => {
 		const store = createLocalSettingsStore();
 
-		expect(store.desktopLayoutOrder).toEqual(['chat-list', 'main', 'workspace-sidebar']);
+		expect(store.chatListDock).toBe('left');
 		expect(store.chatMaxWidth).toBe('none');
 		expect(store.overlayBackdropEffects).toBe(true);
 		expect(store.alwaysExpandCliMessages).toBe(false);
@@ -21,9 +21,9 @@ describe('LocalSettingsStore', () => {
 		expect(store.sidebarSortMode).toBe('manual');
 		expect(store.reduceMotion).toBe(false);
 		expect(store.showQuickCommitTray).toBe(true);
-		expect(store.textEditorOpenPlacement).toBe('source');
-		expect(store.imageViewerOpenPlacement).toBe('source');
-		expect(store.markdownViewerOpenPlacement).toBe('source');
+		expect(store.textEditorOpenPlacement).toBe('same-window');
+		expect(store.imageViewerOpenPlacement).toBe('same-window');
+		expect(store.markdownViewerOpenPlacement).toBe('same-window');
 		expect(store.terminalFontSize).toBe('13');
 		expect(store.hiddenToolTypes).toEqual([]);
 		expect(store.steerWithCtrlEnter).toBe(true);
@@ -88,18 +88,18 @@ describe('LocalSettingsStore', () => {
 		malformed.destroy();
 	});
 
-	it('persists and restores the desktop layout order', () => {
+	it('persists and restores the chat list dock', () => {
 		const store = createLocalSettingsStore();
-		store.set('desktopLayoutOrder', ['workspace-sidebar', 'chat-list', 'main']);
+		store.set('chatListDock', 'right');
 
 		expect(
 			JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEYS.localSettings) ?? '{}'),
 		).toMatchObject({
-			desktopLayoutOrder: ['workspace-sidebar', 'chat-list', 'main'],
+			chatListDock: 'right',
 		});
 
 		const restored = createLocalSettingsStore();
-		expect(restored.desktopLayoutOrder).toEqual(['workspace-sidebar', 'chat-list', 'main']);
+		expect(restored.chatListDock).toBe('right');
 
 		store.destroy();
 		restored.destroy();
@@ -138,37 +138,22 @@ describe('LocalSettingsStore', () => {
 		store.destroy();
 	});
 
-	it.each([
-		['chat-list', 'main'],
-		['chat-list', 'main', 'main'],
-		['chat-list', 'main', 'unknown'],
-		'chat-list,main,workspace-sidebar',
-	])('falls back atomically for malformed desktop layout order %j', (desktopLayoutOrder) => {
-		localStorage.setItem(LOCAL_STORAGE_KEYS.localSettings, JSON.stringify({ desktopLayoutOrder }));
-
-		const store = createLocalSettingsStore();
-
-		expect(store.desktopLayoutOrder).toEqual(['chat-list', 'main', 'workspace-sidebar']);
-		store.destroy();
-	});
-
-	it('copies desktop layout arrays between stores and snapshots', () => {
+	it('copies chat-list dock values between stores and snapshots', () => {
 		const first = createLocalSettingsStore();
 		const second = createLocalSettingsStore();
 
-		expect(first.desktopLayoutOrder).not.toBe(second.desktopLayoutOrder);
-		expect(first.snapshot().desktopLayoutOrder).not.toBe(first.desktopLayoutOrder);
+		expect(first.chatListDock).toBe(second.chatListDock);
 
 		first.destroy();
 		second.destroy();
 	});
 
-	it('normalizes malformed desktop layout orders passed to set', () => {
+	it('normalizes malformed chat-list dock values passed to set', () => {
 		const store = createLocalSettingsStore();
 
-		store.set('desktopLayoutOrder', ['main', 'main', 'chat-list']);
+		store.set('chatListDock', 'middle' as never);
 
-		expect(store.desktopLayoutOrder).toEqual(['chat-list', 'main', 'workspace-sidebar']);
+		expect(store.chatListDock).toBe('left');
 		store.destroy();
 	});
 
@@ -250,56 +235,35 @@ describe('LocalSettingsStore', () => {
 
 	it('persists and restores independent file opening preferences', () => {
 		const store = createLocalSettingsStore();
-		store.set('textEditorOpenPlacement', 'other');
-		store.set('imageViewerOpenPlacement', 'sidebar');
-		store.set('markdownViewerOpenPlacement', 'dialog');
+		store.set('textEditorOpenPlacement', 'new-window');
+		store.set('imageViewerOpenPlacement', 'dialog');
+		store.set('markdownViewerOpenPlacement', 'same-window');
 
 		expect(
 			JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEYS.localSettings) ?? '{}'),
 		).toMatchObject({
-			textEditorOpenPlacement: 'other',
-			imageViewerOpenPlacement: 'sidebar',
-			markdownViewerOpenPlacement: 'dialog',
+			textEditorOpenPlacement: 'new-window',
+			imageViewerOpenPlacement: 'dialog',
+			markdownViewerOpenPlacement: 'same-window',
 		});
 
 		const restored = createLocalSettingsStore();
-		expect(restored.textEditorOpenPlacement).toBe('other');
-		expect(restored.imageViewerOpenPlacement).toBe('sidebar');
-		expect(restored.markdownViewerOpenPlacement).toBe('dialog');
+		expect(restored.textEditorOpenPlacement).toBe('new-window');
+		expect(restored.imageViewerOpenPlacement).toBe('dialog');
+		expect(restored.markdownViewerOpenPlacement).toBe('same-window');
 
 		store.destroy();
 		restored.destroy();
 	});
 
-	it('preserves valid legacy fixed placement values', () => {
-		localStorage.setItem(
-			LOCAL_STORAGE_KEYS.localSettings,
-			JSON.stringify({
-				textEditorOpenPlacement: 'main',
-				imageViewerOpenPlacement: 'sidebar',
-				markdownViewerOpenPlacement: 'dialog',
-			}),
-		);
+	it('defaults missing file opening preferences to the same window', () => {
+		localStorage.setItem(LOCAL_STORAGE_KEYS.localSettings, JSON.stringify({}));
 
 		const store = createLocalSettingsStore();
 
-		expect(store.textEditorOpenPlacement).toBe('main');
-		expect(store.imageViewerOpenPlacement).toBe('sidebar');
-		expect(store.markdownViewerOpenPlacement).toBe('dialog');
-		store.destroy();
-	});
-
-	it('defaults missing file opening preferences to source', () => {
-		localStorage.setItem(
-			LOCAL_STORAGE_KEYS.localSettings,
-			JSON.stringify({ imageViewerOpenPlacement: 'main' }),
-		);
-
-		const store = createLocalSettingsStore();
-
-		expect(store.textEditorOpenPlacement).toBe('source');
-		expect(store.imageViewerOpenPlacement).toBe('main');
-		expect(store.markdownViewerOpenPlacement).toBe('source');
+		expect(store.textEditorOpenPlacement).toBe('same-window');
+		expect(store.imageViewerOpenPlacement).toBe('same-window');
+		expect(store.markdownViewerOpenPlacement).toBe('same-window');
 		store.destroy();
 	});
 
@@ -308,16 +272,16 @@ describe('LocalSettingsStore', () => {
 			LOCAL_STORAGE_KEYS.localSettings,
 			JSON.stringify({
 				textEditorOpenPlacement: 'floating',
-				imageViewerOpenPlacement: 'sidebar',
+				imageViewerOpenPlacement: 'retired-value',
 				markdownViewerOpenPlacement: 42,
 			}),
 		);
 
 		const store = createLocalSettingsStore();
 
-		expect(store.textEditorOpenPlacement).toBe('source');
-		expect(store.imageViewerOpenPlacement).toBe('sidebar');
-		expect(store.markdownViewerOpenPlacement).toBe('source');
+		expect(store.textEditorOpenPlacement).toBe('same-window');
+		expect(store.imageViewerOpenPlacement).toBe('same-window');
+		expect(store.markdownViewerOpenPlacement).toBe('same-window');
 		store.destroy();
 	});
 
@@ -496,10 +460,10 @@ describe('LocalSettingsStore', () => {
 				showQuickCommitTray: false,
 				allowDirectChats: true,
 				steerWithCtrlEnter: false,
-				desktopLayoutOrder: ['main', 'workspace-sidebar', 'chat-list'],
-				textEditorOpenPlacement: 'source',
-				imageViewerOpenPlacement: 'sidebar',
-				markdownViewerOpenPlacement: 'main',
+				chatListDock: 'right',
+				textEditorOpenPlacement: 'same-window',
+				imageViewerOpenPlacement: 'new-window',
+				markdownViewerOpenPlacement: 'same-window',
 			}),
 		);
 		window.dispatchEvent(
@@ -517,10 +481,10 @@ describe('LocalSettingsStore', () => {
 		expect(secondStore.showQuickCommitTray).toBe(false);
 		expect(secondStore.allowDirectChats).toBe(true);
 		expect(secondStore.steerWithCtrlEnter).toBe(false);
-		expect(secondStore.desktopLayoutOrder).toEqual(['main', 'workspace-sidebar', 'chat-list']);
-		expect(secondStore.textEditorOpenPlacement).toBe('source');
-		expect(secondStore.imageViewerOpenPlacement).toBe('sidebar');
-		expect(secondStore.markdownViewerOpenPlacement).toBe('main');
+		expect(secondStore.chatListDock).toBe('right');
+		expect(secondStore.textEditorOpenPlacement).toBe('same-window');
+		expect(secondStore.imageViewerOpenPlacement).toBe('new-window');
+		expect(secondStore.markdownViewerOpenPlacement).toBe('same-window');
 
 		firstStore.destroy();
 		secondStore.destroy();

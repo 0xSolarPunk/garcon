@@ -1,24 +1,28 @@
 import {
-	CHAT_SURFACE_ID,
 	isTransientMobileSingletonKind,
-	type HostId,
 	type WorkspaceLayoutMutation,
 	type WorkspaceLayoutSnapshot,
 } from './surface-types.js';
+import { collectWindowNodes, windowIdOfSurface, windowNodeById } from './window-tree.js';
 
 export function selectMobileEntrySurface(
 	layout: WorkspaceLayoutSnapshot,
 	lastFocusedSurfaceId: string,
 ): string {
 	if (layout.dialogFileSurfaceId) return layout.dialogFileSurfaceId;
-	const activeMainId = layout.main.activeId ?? CHAT_SURFACE_ID;
-	const activeSidebarId = layout.sidebarOpen ? layout.sidebar.activeId : null;
-	if (layout.fullscreenHost === 'main') return activeMainId;
-	if (layout.fullscreenHost === 'sidebar') return activeSidebarId ?? activeMainId;
-	if (lastFocusedSurfaceId === activeMainId || lastFocusedSurfaceId === activeSidebarId) {
-		return lastFocusedSurfaceId;
+	if (layout.fullscreenWindowId) {
+		const workspaceWindow = windowNodeById(layout.desktopRoot, layout.fullscreenWindowId);
+		if (workspaceWindow) return workspaceWindow.tabs.activeId;
 	}
-	return activeMainId;
+	const focusedWindowId = windowIdOfSurface(layout.desktopRoot, lastFocusedSurfaceId);
+	if (focusedWindowId) {
+		const workspaceWindow = windowNodeById(layout.desktopRoot, focusedWindowId);
+		if (workspaceWindow?.tabs.activeId === lastFocusedSurfaceId) return lastFocusedSurfaceId;
+		if (workspaceWindow) return workspaceWindow.tabs.activeId;
+	}
+	const first = collectWindowNodes(layout.desktopRoot)[0];
+	if (!first) throw new Error('Workspace has no windows');
+	return first.tabs.activeId;
 }
 
 export function planDesktopReturnMutations(
@@ -27,6 +31,10 @@ export function planDesktopReturnMutations(
 ): WorkspaceLayoutMutation[] {
 	const mobileOnly = new Set(layout.mobileOnlySurfaceIds);
 	if (mobileOnly.size === 0) return [];
+	const destinationWindowId =
+		windowIdOfSurface(layout.desktopRoot, layout.mobileActiveSurfaceId) ??
+		collectWindowNodes(layout.desktopRoot)[0]?.id;
+	if (!destinationWindowId) return [];
 	const ordered = mobileMruSurfaceIds.filter((surfaceId) => mobileOnly.has(surfaceId));
 	for (const surfaceId of layout.mobileOnlySurfaceIds) {
 		if (!ordered.includes(surfaceId)) ordered.push(surfaceId);
@@ -44,19 +52,16 @@ export function planDesktopReturnMutations(
 				mutations.push({ type: 'place-in-dialog', surfaceId });
 				dialogAvailable = false;
 			} else {
-				mutations.push({ type: 'assign-to-host', surfaceId, destination: 'main' });
+				mutations.push({ type: 'assign-to-window', surfaceId, destinationWindowId });
 			}
 			continue;
 		}
-		if (surface.type === 'singleton' && surface.kind !== 'chat') {
-			if (isTransientMobileSingletonKind(surface.kind)) {
-				mutations.push({ type: 'remove-surface', surfaceId });
-				continue;
-			}
-			const destination: HostId =
-				surface.kind === 'files' || surface.kind === 'commit' ? 'sidebar' : 'main';
-			mutations.push({ type: 'assign-to-host', surfaceId, destination });
+		if (surface.type !== 'singleton') continue;
+		if (isTransientMobileSingletonKind(surface.kind)) {
+			mutations.push({ type: 'remove-surface', surfaceId });
+			continue;
 		}
+		mutations.push({ type: 'assign-to-window', surfaceId, destinationWindowId });
 	}
 	return mutations;
 }

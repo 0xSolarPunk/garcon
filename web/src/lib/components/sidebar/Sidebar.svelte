@@ -34,6 +34,7 @@
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Button } from '$lib/components/ui/button';
 	import * as m from '$lib/paraglide/messages.js';
+	import type { WorkspaceWindowEdge } from '$lib/workspace/surface-types.js';
 
 	interface QuickMoveWrite {
 		list: PersistedChatOrderGroup;
@@ -63,8 +64,10 @@
 		onForkChat: (sourceChatId: string) => Promise<void> | void;
 		onShareChat: (chat: ChatSessionRecord) => void;
 		onManageTags: (chat: ChatSessionRecord) => void;
+		onOpenChatInNewWindow?: (chatId: string, edge?: WorkspaceWindowEdge) => void;
 		onShowScheduledPrompts: () => void;
 		onShowSettings: () => void;
+		newWindowBlocked: boolean;
 	}
 
 	let {
@@ -84,8 +87,10 @@
 		onForkChat,
 		onShareChat,
 		onManageTags,
+		onOpenChatInNewWindow,
 		onShowScheduledPrompts,
 		onShowSettings,
+		newWindowBlocked,
 	}: SidebarProps = $props();
 	const appShell = getAppShell();
 	const notifications = getNotifications();
@@ -495,6 +500,8 @@
 			{onShareChat}
 			onTagClick={handleTagClick}
 			{onManageTags}
+			onOpenInNewWindow={onOpenChatInNewWindow}
+			{newWindowBlocked}
 			onQuickMove={handleQuickMove}
 		/>
 	</div>

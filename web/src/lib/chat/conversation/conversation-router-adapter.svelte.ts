@@ -19,6 +19,7 @@ import type {
 	ChatTranscriptCache,
 } from '$lib/chat/transcript/chat-transcript-cache.svelte.js';
 import type { BackgroundTranscriptLoader } from '$lib/chat/transcript/background-transcript-loader.js';
+import type { ChatDraftStore } from '$lib/chat/composer/chat-draft-store.svelte.js';
 
 export interface ConversationRouterStoreDeps {
 	sessions: Pick<
@@ -46,6 +47,8 @@ export interface ConversationRouterStoreDeps {
 	notifyCompletion: () => void;
 	transcriptCache?: ChatTranscriptCache;
 	backgroundTranscriptLoader?: Pick<BackgroundTranscriptLoader, 'queueLoad'>;
+	chatDrafts?: Pick<ChatDraftStore, 'discardChat'>;
+	clearDeletedChat: (chatId: string) => void;
 	visiblePreviews?: {
 		isVisible: (chatId: string) => boolean;
 		applyMessages: (
@@ -125,13 +128,15 @@ export function buildRouterStores(deps: ConversationRouterStoreDeps): EventRoute
 				resendCandidates: ResendCandidate[],
 			) => {
 				if (deps.sessions.selectedChatId !== chatId) {
-					return routerApplyStatus(applyBackgroundTranscript(
-						chatId,
-						transcriptViewId,
-						messages,
-						firstOrdinal,
-						lastOrdinal,
-					));
+					return routerApplyStatus(
+						applyBackgroundTranscript(
+							chatId,
+							transcriptViewId,
+							messages,
+							firstOrdinal,
+							lastOrdinal,
+						),
+					);
 				}
 				return deps.chatState.applyMessages(
 					chatId,
@@ -148,33 +153,18 @@ export function buildRouterStores(deps: ConversationRouterStoreDeps): EventRoute
 					// Leaves current visible state until a later retry succeeds.
 				});
 			},
-			warmBackgroundTranscript: (
-				chatId,
-				transcriptViewId,
-				messages,
-				firstOrdinal,
-				lastOrdinal,
-			) => applyBackgroundTranscript(
-				chatId,
-				transcriptViewId,
-				messages,
-				firstOrdinal,
-				lastOrdinal,
-			).status === 'applied',
+			warmBackgroundTranscript: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) =>
+				applyBackgroundTranscript(chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal)
+					.status === 'applied',
 			isVisiblePreviewChat: (chatId) => deps.visiblePreviews?.isVisible(chatId) ?? false,
-			warmVisibleChatPreview: (
-				chatId,
-				transcriptViewId,
-				messages,
-				firstOrdinal,
-				lastOrdinal,
-			) => deps.visiblePreviews?.applyMessages(
-				chatId,
-				transcriptViewId,
-				messages,
-				firstOrdinal,
-				lastOrdinal,
-			) ?? undefined,
+			warmVisibleChatPreview: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) =>
+				deps.visiblePreviews?.applyMessages(
+					chatId,
+					transcriptViewId,
+					messages,
+					firstOrdinal,
+					lastOrdinal,
+				) ?? undefined,
 			loadVisibleChatPreview: (chatId) => deps.visiblePreviews?.loadSnapshot(chatId),
 			markVisibleChatPreviewStale: (chatId) => {
 				deps.visiblePreviews?.markStale(chatId);
@@ -187,6 +177,7 @@ export function buildRouterStores(deps: ConversationRouterStoreDeps): EventRoute
 			removeChatTranscript: (chatId) => {
 				transcriptCache.remove(chatId);
 				deps.chatState.discardServerNotices(chatId);
+				deps.chatDrafts?.discardChat(chatId);
 			},
 			markChatTranscriptStale: (chatId) => transcriptCache.markStale(chatId),
 			markChatTranscriptValidated: (chatId) => transcriptCache.markValidated(chatId),
@@ -233,6 +224,9 @@ export function buildRouterStores(deps: ConversationRouterStoreDeps): EventRoute
 				deps.readReceiptOutbox.enqueue(chatId, readAt);
 				deps.sessions.patchLastReadAt(chatId, readAt);
 			},
+		},
+		chatPresentations: {
+			clearDeletedChat: deps.clearDeletedChat,
 		},
 		notifyCompletion: deps.notifyCompletion,
 	};

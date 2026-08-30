@@ -1,209 +1,295 @@
 import { describe, expect, it } from 'vitest';
+import {
+	CANONICAL_CHAT_SURFACE_ID,
+	CANONICAL_WINDOW_ID,
+	canonicalWorkspaceSnapshot,
+} from '../canonical-layout';
 import { parsePersistedWorkspaceLayout, serializeWorkspaceLayout } from '../layout-schema';
-import { canonicalWorkspaceSnapshot } from '../canonical-layout';
+import { portableSingletonDescriptor } from '../surface-types';
 import { reduceWorkspaceLayout } from '../workspace-layout.svelte';
+import { collectWindowNodes, windowNodeById } from '../window-tree';
+import type { PersistedWorkspaceLayoutNode } from '$shared/workspace-layout';
 
-describe('workspace layout persistence', () => {
-	it('distinguishes absent data from corrupt fallback', () => {
-		expect(parsePersistedWorkspaceLayout(null).source).toBe('absent');
-		expect(parsePersistedWorkspaceLayout('{').source).toBe('fallback');
-		expect(parsePersistedWorkspaceLayout('{"version":2}').source).toBe('fallback');
+describe('workspace layout V2 schema', () => {
+	it('round-trips mixed window topology, local tab MRU, ratios, terminals, and Chat IDs', () => {
+		const snapshot = reduceWorkspaceLayout(canonicalWorkspaceSnapshot(), [
+			{ type: 'set-window-chat', windowId: CANONICAL_WINDOW_ID, chatId: 'chat-a' },
+			{
+				type: 'register-surface',
+				surface: portableSingletonDescriptor('git'),
+				windowId: CANONICAL_WINDOW_ID,
+			},
+			{
+				type: 'open-chat-in-new-window',
+				chatId: 'chat-a',
+				targetWindowId: CANONICAL_WINDOW_ID,
+				edge: 'right',
+				newWindowId: 'window-two',
+				partitionId: 'partition-root',
+			},
+			{
+				type: 'register-surface-in-new-window',
+				surface: { id: 'terminal:t1', type: 'terminal', terminalId: 't1' },
+				targetWindowId: 'window-two',
+				edge: 'bottom',
+				newWindowId: 'window-three',
+				partitionId: 'partition-nested',
+			},
+			{ type: 'set-partition-ratio', partitionId: 'partition-root', ratio: 0.62 },
+		]);
+		const persisted = serializeWorkspaceLayout({
+			...snapshot,
+			fullscreenWindowId: 'window-two',
+			unplacedTerminalIds: ['spare'],
+		});
+		const result = parsePersistedWorkspaceLayout(JSON.stringify(persisted));
+
+		expect(result.source).toBe('valid');
+		expect(serializeWorkspaceLayout(result.snapshot)).toEqual(persisted);
+		expect(result.snapshot.surfaces[CANONICAL_CHAT_SURFACE_ID]).toMatchObject({ chatId: 'chat-a' });
+		expect(result.snapshot.surfaces['chat-view:window-two']).toMatchObject({ chatId: 'chat-a' });
+		expect(result.snapshot.unplacedTerminalIds).toEqual(['spare']);
+		expect(result.snapshot.fullscreenWindowId).toBeNull();
 	});
 
-	it('injects Chat and restores valid singleton and unresolved terminal references', () => {
+	it('restores a null Chat ID and keeps only the first Chat ref in a window', () => {
 		const result = parsePersistedWorkspaceLayout(
 			JSON.stringify({
-				version: 1,
-				desiredSidebarWidth: 520,
-				sidebarOpen: true,
-				main: {
+				version: 2,
+				root: {
+					type: 'window',
+					id: 'window-main',
 					order: [
-						{ type: 'terminal', terminalId: 'server-terminal' },
+						{ type: 'chat', chatId: null },
+						{ type: 'chat', chatId: 'ignored' },
 						{ type: 'singleton', kind: 'git' },
 					],
-					active: { type: 'terminal', terminalId: 'server-terminal' },
+					active: { type: 'chat', chatId: 'ignored-active-value' },
+					mru: [
+						{ type: 'singleton', kind: 'git' },
+						{ type: 'chat', chatId: 'ignored-mru-value' },
+					],
 				},
-				sidebar: {
-					order: [{ type: 'singleton', kind: 'files' }],
-					active: { type: 'singleton', kind: 'files' },
-				},
+				unplacedTerminalIds: [],
 			}),
 		);
 
 		expect(result.source).toBe('valid');
-		expect(result.snapshot.main.order).toEqual([
-			'singleton:chat',
-			'terminal:server-terminal',
+		expect(result.snapshot.surfaces[CANONICAL_CHAT_SURFACE_ID]).toEqual({
+			id: CANONICAL_CHAT_SURFACE_ID,
+			type: 'chat',
+			chatId: null,
+		});
+		expect(windowNodeById(result.snapshot.desktopRoot, CANONICAL_WINDOW_ID)?.tabs).toEqual({
+			order: [CANONICAL_CHAT_SURFACE_ID, 'singleton:git'],
+			activeId: CANONICAL_CHAT_SURFACE_ID,
+			mru: [CANONICAL_CHAT_SURFACE_ID, 'singleton:git'],
+		});
+	});
+
+	it('deduplicates portable singletons and terminals globally while allowing duplicate chat records', () => {
+		const result = parsePersistedWorkspaceLayout(
+			JSON.stringify({
+				version: 2,
+				root: {
+					type: 'partition',
+					id: 'partition-root',
+					direction: 'horizontal',
+					ratio: 0.5,
+					children: [
+						{
+							type: 'window',
+							id: 'window-a',
+							order: [
+								{ type: 'chat', chatId: 'same' },
+								{ type: 'singleton', kind: 'git' },
+								{ type: 'terminal', terminalId: 't1' },
+							],
+							active: { type: 'chat', chatId: 'same' },
+							mru: [],
+						},
+						{
+							type: 'window',
+							id: 'window-b',
+							order: [
+								{ type: 'chat', chatId: 'same' },
+								{ type: 'singleton', kind: 'git' },
+								{ type: 'terminal', terminalId: 't1' },
+								{ type: 'singleton', kind: 'files' },
+							],
+							active: { type: 'singleton', kind: 'files' },
+							mru: [],
+						},
+					],
+				},
+				unplacedTerminalIds: ['t1', 't2', 't2'],
+			}),
+		);
+
+		expect(result.source).toBe('valid');
+		expect(windowNodeById(result.snapshot.desktopRoot, 'window-a')?.tabs.order).toEqual([
+			'chat-view:window-a',
 			'singleton:git',
+			'terminal:t1',
 		]);
-		expect(result.snapshot.main.activeId).toBe('terminal:server-terminal');
-		expect(result.snapshot.sidebar.activeId).toBe('singleton:files');
-		expect(result.snapshot.sidebarOpen).toBe(true);
+		expect(windowNodeById(result.snapshot.desktopRoot, 'window-b')?.tabs.order).toEqual([
+			'chat-view:window-b',
+			'singleton:files',
+		]);
+		expect(result.snapshot.unplacedTerminalIds).toEqual(['t2']);
 	});
 
-	it('repairs duplicates, unknown refs, invalid active values, and widths', () => {
+	it('repairs invalid active and MRU refs, clamps ratios, and collapses empty branches', () => {
 		const result = parsePersistedWorkspaceLayout(
 			JSON.stringify({
-				version: 1,
-				desiredSidebarWidth: -100,
-				sidebarOpen: true,
-				main: {
-					order: [
-						{ type: 'singleton', kind: 'git' },
-						{ type: 'singleton', kind: 'git' },
-						{ type: 'singleton', kind: 'unknown' },
+				version: 2,
+				root: {
+					type: 'partition',
+					id: 'partition-root',
+					direction: 'horizontal',
+					ratio: 9,
+					children: [
+						{
+							type: 'window',
+							id: 'window-main',
+							order: [
+								{ type: 'chat', chatId: 'a' },
+								{ type: 'singleton', kind: 'git' },
+							],
+							active: { type: 'terminal', terminalId: 'missing' },
+							mru: [
+								{ type: 'singleton', kind: 'git' },
+								{ type: 'singleton', kind: 'git' },
+								{ type: 'terminal', terminalId: 'missing' },
+							],
+						},
+						{
+							type: 'window',
+							id: 'window-empty',
+							order: [{ type: 'unknown' }],
+							active: null,
+							mru: [],
+						},
 					],
-					active: { type: 'singleton', kind: 'files' },
 				},
-				sidebar: {
-					order: [
-						{ type: 'singleton', kind: 'git' },
-						{ type: 'singleton', kind: 'files' },
-					],
-					active: { type: 'singleton', kind: 'git' },
-				},
+				unplacedTerminalIds: [],
 			}),
 		);
 
 		expect(result.source).toBe('valid');
-		expect(result.snapshot.main.order).toEqual(['singleton:chat', 'singleton:git']);
-		expect(result.snapshot.main.activeId).toBe('singleton:chat');
-		expect(result.snapshot.sidebar.order).toEqual(['singleton:files']);
-		expect(result.snapshot.sidebar.activeId).toBe('singleton:files');
-		expect(result.snapshot.desiredSidebarWidth).toBe(360);
+		expect(result.snapshot.desktopRoot.type).toBe('window');
+		const root = result.snapshot.desktopRoot;
+		if (root.type !== 'window') throw new Error('Expected collapsed window');
+		expect(root.tabs.activeId).toBe('chat-view:window-main');
+		expect(root.tabs.mru).toEqual(['chat-view:window-main', 'singleton:git']);
 	});
 
-	it('repairs an empty sidebar host that was persisted open', () => {
-		const result = parsePersistedWorkspaceLayout(
-			JSON.stringify({
-				version: 1,
-				desiredSidebarWidth: 480,
-				sidebarOpen: true,
-				main: { order: [], active: null },
-				sidebar: { order: [], active: null },
+	it('caps malformed oversized topology without moving window-owned Chat views', () => {
+		const windows: PersistedWorkspaceLayoutNode[] = [
+			{
+				type: 'window',
+				id: 'window-1',
+				order: [{ type: 'singleton', kind: 'git' }],
+				active: { type: 'singleton', kind: 'git' },
+				mru: [],
+			},
+			...Array.from({ length: 3 }, (_, index) => ({
+				type: 'window' as const,
+				id: `window-${index + 2}`,
+				order: [{ type: 'chat' as const, chatId: `chat-${index + 2}` }],
+				active: { type: 'chat' as const, chatId: `chat-${index + 2}` },
+				mru: [],
+			})),
+			{
+				type: 'window',
+				id: 'window-5',
+				order: [
+					{ type: 'chat', chatId: 'chat-5' },
+					{ type: 'terminal', terminalId: 'terminal-5' },
+				],
+				active: { type: 'chat', chatId: 'chat-5' },
+				mru: [{ type: 'terminal', terminalId: 'terminal-5' }],
+			},
+		];
+		const root = windows.slice(1).reduce<PersistedWorkspaceLayoutNode>(
+			(first, second, index) => ({
+				type: 'partition',
+				id: `partition-${index + 1}`,
+				direction: 'horizontal',
+				ratio: 0.5,
+				children: [first, second],
 			}),
+			windows[0]!,
 		);
-
+		const result = parsePersistedWorkspaceLayout(
+			JSON.stringify({ version: 2, root, unplacedTerminalIds: [] }),
+		);
 		expect(result.source).toBe('valid');
-		expect(result.snapshot.sidebar.order).toEqual([]);
-		expect(result.snapshot.sidebarOpen).toBe(false);
-	});
-
-	it('serializes only singleton and terminal placement data', () => {
-		const file = { id: 'file:a', type: 'file' as const, fileSessionId: 'a' };
-		const terminal = { id: 'terminal:a', type: 'terminal' as const, terminalId: 'a' };
-		const snapshot = reduceWorkspaceLayout(canonicalWorkspaceSnapshot(), [
-			{ type: 'register-surface', surface: file, host: 'main' },
-			{ type: 'place-in-dialog', surfaceId: file.id },
-			{ type: 'register-surface', surface: terminal, host: 'main' },
-			{ type: 'focus-host', host: 'main', surfaceId: terminal.id },
-			{ type: 'set-fullscreen-host', host: 'main' },
+		expect(collectWindowNodes(result.snapshot.desktopRoot)).toHaveLength(4);
+		expect(windowNodeById(result.snapshot.desktopRoot, 'window-1')?.tabs.order).toEqual([
+			'singleton:git',
+			'terminal:terminal-5',
 		]);
-		const serialized = serializeWorkspaceLayout(snapshot);
-
-		expect(serialized.main.order).toEqual([
-			{ type: 'singleton', kind: 'git' },
-			{ type: 'singleton', kind: 'pull-requests' },
-			{ type: 'terminal', terminalId: 'a' },
-		]);
-		expect(serialized.main.active).toEqual({ type: 'terminal', terminalId: 'a' });
-		expect(JSON.stringify(serialized)).not.toContain('file:a');
-		expect(JSON.stringify(serialized)).not.toContain('fullscreenHost');
 		expect(
-			parsePersistedWorkspaceLayout(JSON.stringify(serialized)).snapshot.fullscreenHost,
-		).toBeNull();
+			Object.values(result.snapshot.surfaces).filter((surface) => surface.type === 'chat'),
+		).toHaveLength(3);
+		expect(result.snapshot.surfaces['chat-view:window-5']).toBeUndefined();
 	});
 
-	it('preserves sidebar placement but not sidebar fullscreen', () => {
-		const snapshot = reduceWorkspaceLayout(canonicalWorkspaceSnapshot(), [
-			{ type: 'set-sidebar-open', open: true },
-			{ type: 'set-fullscreen-host', host: 'sidebar' },
-		]);
-		const serialized = serializeWorkspaceLayout(snapshot);
-		const restored = parsePersistedWorkspaceLayout(JSON.stringify(serialized)).snapshot;
-
-		expect(serialized.sidebarOpen).toBe(true);
-		expect(restored.sidebarOpen).toBe(true);
-		expect(restored.sidebar.order).toEqual(snapshot.sidebar.order);
-		expect(restored.sidebar.activeId).toBe(snapshot.sidebar.activeId);
-		expect(restored.fullscreenHost).toBeNull();
+	it('falls back for malformed current roots and unsupported versions', () => {
+		for (const raw of [
+			{ version: 2, root: null, unplacedTerminalIds: [] },
+			{ version: 3, root: null },
+		]) {
+			const result = parsePersistedWorkspaceLayout(JSON.stringify(raw));
+			expect(result.source).toBe('fallback');
+			expect(result.snapshot).toEqual(canonicalWorkspaceSnapshot());
+		}
 	});
 
-	it('round-trips intentionally unplaced terminal sessions', () => {
-		const terminal = { id: 'terminal:a', type: 'terminal' as const, terminalId: 'a' };
-		const snapshot = reduceWorkspaceLayout(canonicalWorkspaceSnapshot(), [
-			{ type: 'register-surface', surface: terminal, host: 'main' },
-			{ type: 'unplace-terminal', terminalId: terminal.terminalId },
-		]);
-
-		const serialized = serializeWorkspaceLayout(snapshot);
-		const restored = parsePersistedWorkspaceLayout(JSON.stringify(serialized));
-
-		expect(serialized.unplacedTerminalIds).toEqual(['a']);
-		expect(restored.source).toBe('valid');
-		expect(restored.snapshot.unplacedTerminalIds).toEqual(['a']);
-		expect(restored.snapshot.surfaces[terminal.id]).toBeUndefined();
-	});
-
-	it('round-trips standalone History and Compare desktop placements', () => {
-		const snapshot = reduceWorkspaceLayout(canonicalWorkspaceSnapshot(), [
-			{
-				type: 'register-surface',
-				surface: {
-					id: 'singleton:git-history',
-					type: 'singleton',
-					kind: 'git-history',
+	it('falls back when restored topology has no Chat view', () => {
+		const result = parsePersistedWorkspaceLayout(
+			JSON.stringify({
+				version: 2,
+				root: {
+					type: 'window',
+					id: 'window-main',
+					order: [{ type: 'singleton', kind: 'git' }],
+					active: { type: 'singleton', kind: 'git' },
+					mru: [],
 				},
-				host: 'main',
-			},
-			{
-				type: 'register-surface',
-				surface: {
-					id: 'singleton:git-compare',
-					type: 'singleton',
-					kind: 'git-compare',
-				},
-				host: 'sidebar',
-			},
-		]);
-
-		const serialized = serializeWorkspaceLayout(snapshot);
-		const restored = parsePersistedWorkspaceLayout(JSON.stringify(serialized));
-
-		expect(serialized.main.order).toContainEqual({
-			type: 'singleton',
-			kind: 'git-history',
-		});
-		expect(serialized.sidebar.order).toContainEqual({
-			type: 'singleton',
-			kind: 'git-compare',
-		});
-		expect(restored.snapshot.main.order).toContain('singleton:git-history');
-		expect(restored.snapshot.sidebar.order).toContain('singleton:git-compare');
-	});
-
-	it('does not serialize mobile-only History or Compare', () => {
-		const snapshot = reduceWorkspaceLayout(canonicalWorkspaceSnapshot(), [
-			{
-				type: 'register-surface',
-				surface: {
-					id: 'singleton:git-history',
-					type: 'singleton',
-					kind: 'git-history',
-				},
-			},
-			{
-				type: 'register-surface',
-				surface: {
-					id: 'singleton:git-compare',
-					type: 'singleton',
-					kind: 'git-compare',
-				},
-			},
-		]);
-
-		expect(JSON.stringify(serializeWorkspaceLayout(snapshot))).not.toMatch(
-			/git-history|git-compare/,
+				unplacedTerminalIds: [],
+			}),
 		);
+
+		expect(result.source).toBe('fallback');
+		expect(result.snapshot).toEqual(canonicalWorkspaceSnapshot());
+	});
+
+	it('omits fullscreen, files, dialog, mobile, and focus projections from serialization', () => {
+		const fileSnapshot = reduceWorkspaceLayout(canonicalWorkspaceSnapshot(), [
+			{
+				type: 'register-surface',
+				surface: { id: 'file:f1', type: 'file', fileSessionId: 'f1' },
+				windowId: CANONICAL_WINDOW_ID,
+			},
+		]);
+		const value = serializeWorkspaceLayout({
+			...fileSnapshot,
+			fullscreenWindowId: CANONICAL_WINDOW_ID,
+			dialogFileSurfaceId: 'file:f1',
+			mobileActiveSurfaceId: 'file:f1',
+			mobileOnlySurfaceIds: ['file:f1'],
+		});
+		const serialized = JSON.stringify(value);
+		expect(serialized).not.toContain('fullscreen');
+		expect(serialized).not.toContain('dialog');
+		expect(serialized).not.toContain('mobile');
+		expect(serialized).not.toContain('file:f1');
+	});
+
+	it('uses the one-Chat-window canonical layout when storage is absent', () => {
+		const result = parsePersistedWorkspaceLayout(null);
+		expect(result).toEqual({ source: 'absent', snapshot: canonicalWorkspaceSnapshot() });
 	});
 });

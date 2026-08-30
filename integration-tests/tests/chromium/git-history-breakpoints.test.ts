@@ -21,7 +21,7 @@ const SEGMENTED_SELECTOR = `${DETAILS_SELECTOR} [data-git-history-segmented-navi
 const FILES_PANE_SELECTOR = `${DETAILS_SELECTOR} [data-git-history-files-pane]`;
 const DIFF_PANE_SELECTOR = `${DETAILS_SELECTOR} [data-git-history-diff-pane]`;
 
-// Desktop viewport whose workspace main pane lands inside the 560-839px band the
+// Desktop viewport whose workspace window lands inside the 560-839px band the
 // removed compact tier once covered: viewport minus chat list and divider.
 const BAND_VIEWPORT = { width: 1_000, height: 900 };
 const WIDE_VIEWPORT = { width: 1_440, height: 900 };
@@ -273,18 +273,15 @@ async function openChatWorkspace(
     { waitUntil: 'domcontentloaded' },
   );
   if (!response?.ok()) throw new Error(`SPA navigation failed with ${response?.status()}.`);
-  await fixture.page.locator('[data-floating-workspace-toolbar]').waitFor({
+  await fixture.page.locator('[data-workspace-window-titlebar]').waitFor({
     state: 'visible',
     timeout: 20_000,
   });
 }
 
-async function openWorkspaceSurface(page: Page, label: string): Promise<void> {
+async function openWorkspaceAddMenuItem(page: Page, label: string): Promise<void> {
   await page
-    .locator(
-      '[data-floating-workspace-toolbar] [data-workspace-taskbar-end]' +
-        ' [data-slot="dropdown-menu-trigger"]',
-    )
+    .locator('[data-workspace-window-current="true"] [data-workspace-window-add-trigger]')
     .click();
   await page.getByRole('menuitem', { name: label }).click();
 }
@@ -294,7 +291,7 @@ async function verifyHistoryBreakpoints(
   markPhase: MarkPhase,
 ): Promise<void> {
   markPhase('opening Git History');
-  await openWorkspaceSurface(fixture.page, 'Open Git History');
+  await openWorkspaceAddMenuItem(fixture.page, 'Open Git History');
   await fixture.page.locator(PANEL_SELECTOR).waitFor({ state: 'visible' });
   await fixture.page.waitForFunction(
     (selector) =>
@@ -370,7 +367,7 @@ async function verifyCompareResponsiveActions(
   markPhase: MarkPhase,
 ): Promise<void> {
   markPhase('opening Git Compare');
-  await openWorkspaceSurface(fixture.page, 'Open Git Compare');
+  await openWorkspaceAddMenuItem(fixture.page, 'Open Git Compare');
   await fixture.page.locator(COMPARE_PANEL_SELECTOR).waitFor({ state: 'visible' });
   await fixture.page.locator(`${COMPARE_PANEL_SELECTOR} [data-git-diff-document]`).waitFor({
     state: 'visible',

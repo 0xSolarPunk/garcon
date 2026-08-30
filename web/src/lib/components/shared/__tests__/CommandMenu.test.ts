@@ -1,16 +1,27 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as m from '$lib/paraglide/messages.js';
+import type { WorkspaceCoordinator } from '$lib/workspace/workspace-coordinator.svelte.js';
+
+type CommandMenuWorkspacePort = Pick<
+	WorkspaceCoordinator,
+	| 'isMobile'
+	| 'focusChat'
+	| 'focusMobileSingleton'
+	| 'openSingletonInNewWindow'
+	| 'focusMostRecentTerminalOrCreate'
+	| 'createTerminalInNewWindow'
+>;
 
 const mocks = vi.hoisted(() => ({
 	workspace: {
-		isMobile: false,
+		isMobile: false as boolean,
 		focusChat: vi.fn(),
 		focusMobileSingleton: vi.fn(),
-		openSingleton: vi.fn(),
+		openSingletonInNewWindow: vi.fn(async () => undefined),
 		focusMostRecentTerminalOrCreate: vi.fn(async () => undefined),
-		createTerminal: vi.fn(async () => undefined),
-	},
+		createTerminalInNewWindow: vi.fn(async () => 'terminal-new'),
+	} satisfies CommandMenuWorkspacePort,
 	terminals: {
 		listStatus: 'ready',
 		orderedSessions: [],
@@ -79,12 +90,12 @@ describe('CommandMenu', () => {
 	it.each([
 		['History', 'git-history'],
 		['Compare', 'git-compare'],
-	] as const)('opens standalone %s in desktop main', async (label, kind) => {
+	] as const)('opens standalone %s in a new desktop window', async (label, kind) => {
 		const { component } = render(CommandMenu);
 		component.toggle();
 
 		await fireEvent.click(await screen.findByText(label));
-		expect(mocks.workspace.openSingleton).toHaveBeenCalledWith(kind, 'main');
+		expect(mocks.workspace.openSingletonInNewWindow).toHaveBeenCalledWith(kind);
 	});
 
 	it.each([
@@ -97,5 +108,24 @@ describe('CommandMenu', () => {
 
 		await fireEvent.click(await screen.findByText(label));
 		expect(mocks.workspace.focusMobileSingleton).toHaveBeenCalledWith(kind);
+	});
+
+	it('creates a new terminal in a new window', async () => {
+		const { component } = render(CommandMenu);
+		component.toggle();
+
+		await fireEvent.click(await screen.findByText(m.workspace_new_terminal()));
+		expect(mocks.workspace.createTerminalInNewWindow).toHaveBeenCalledWith(
+			undefined,
+			'command-menu:new-terminal',
+		);
+	});
+
+	it('focuses the most recent terminal without a legacy host argument', async () => {
+		const { component } = render(CommandMenu);
+		component.toggle();
+
+		await fireEvent.click(await screen.findByText(m.command_switch_to_terminal()));
+		expect(mocks.workspace.focusMostRecentTerminalOrCreate).toHaveBeenCalledWith();
 	});
 });

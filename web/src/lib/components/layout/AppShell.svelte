@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, untrack } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { gotoChat } from '$lib/chat/actions/chat-navigation.js';
@@ -10,7 +10,7 @@
 	import NotificationHost from '$lib/components/shared/NotificationHost.svelte';
 	import type { MobileWorkspaceTabId } from '$lib/components/workspace/mobile-workspace-tabs';
 	import type { ChatSessionRecord } from '$lib/types/chat-session';
-	import type { DesktopLayoutEdge } from '$lib/layout/desktop-layout.js';
+	import { chatListDividerEdge, type ChatListDock } from '$lib/layout/desktop-layout.js';
 
 	const lazySettings = () => import('../settings/Settings.svelte');
 	const lazyScheduledPrompts = () => import('../settings/ScheduledPromptsDialog.svelte');
@@ -26,11 +26,12 @@
 		getSidebarProjectCollapse,
 		getGhCapability,
 		getWorkspaceCoordinator,
+		setChatDrafts,
 	} from '$lib/context';
 	import * as m from '$lib/paraglide/messages.js';
 	import { WsConnectionNotificationPresenter } from '$lib/ws/connection-notifications';
 	import { restoreChatIdForBareRoute, selectedChatIdFromRoute } from './app-shell-route';
-	import { resolveAdjacentChatId } from './app-shell-chat-navigation';
+	import { resolveAdjacentChatId, shouldSynchronizeFocusedChat } from './app-shell-chat-navigation';
 	import NewChatDialog from '../chat/NewChatDialog.svelte';
 	import FileDialogHost from '../files/FileDialogHost.svelte';
 	import FileDirtyUnloadGuard from '../files/FileDirtyUnloadGuard.svelte';
@@ -43,6 +44,10 @@
 	import ShareChatDialog from '$lib/components/chat/ShareChatDialog.svelte';
 	import SidebarTagDialog from '$lib/components/sidebar/SidebarTagDialog.svelte';
 	import { buildSidebarDisplayChatIds } from '$lib/components/sidebar/sidebar-row-model';
+	import type { WorkspaceWindowEdge } from '$lib/workspace/surface-types.js';
+	import { windowNodeById } from '$lib/workspace/window-tree.js';
+	import { ChatDraftStore } from '$lib/chat/composer/chat-draft-store.svelte.js';
+	import { AppShellChatNavigationController } from './app-shell-chat-navigation-controller.svelte.js';
 
 	const navigation = getNavigation();
 	const sessions = getChatSessions();
@@ -54,6 +59,8 @@
 	const projectCollapse = getSidebarProjectCollapse();
 	const ghCapability = getGhCapability();
 	const workspace = getWorkspaceCoordinator();
+	const chatDrafts = new ChatDraftStore();
+	setChatDrafts(chatDrafts);
 	const wsConnectionNotifications = new WsConnectionNotificationPresenter({
 		notifications,
 	});
@@ -85,20 +92,20 @@
 	});
 
 	let isMobile = $derived(workspace.isMobile);
-	let workspaceOverlayOpen = $state(false);
 	let mobileAppHeight = $state<number | null>(null);
 	let mobileViewportBaselineHeight = $state<number | null>(null);
 	let mobileKeyboardVisible = $state(false);
 	let reloadSelectedChatFn = $state<((chatId: string) => Promise<void>) | null>(null);
 	const workspaceFullscreen = $derived(
-		!isMobile && workspace.layout.snapshot.fullscreenHost !== null,
+		!isMobile && workspace.layout.snapshot.fullscreenWindowId !== null,
 	);
+	const focusedWindowKind = $derived(workspace.focusedWindowActiveKind);
 	const hideLeftForGit = $derived(
 		!isMobile &&
-			localSettings.hideChatListWhenGitInMain &&
-			(workspace.layout.activeMainKind === 'git' ||
-				workspace.layout.activeMainKind === 'git-history' ||
-				workspace.layout.activeMainKind === 'git-compare'),
+			localSettings.hideChatListWhenGitFocused &&
+			(focusedWindowKind === 'git' ||
+				focusedWindowKind === 'git-history' ||
+				focusedWindowKind === 'git-compare'),
 	);
 	const hideLeftSidebar = $derived(workspaceFullscreen || hideLeftForGit);
 	const mobileActiveDescriptor = $derived(
@@ -107,9 +114,10 @@
 	const mobileActiveTab = $derived.by<MobileWorkspaceTabId>(() => {
 		const surface = mobileActiveDescriptor;
 		if (surface?.type === 'terminal' || surface?.type === 'terminal-launcher') return 'terminal';
+		if (surface?.type === 'chat') return 'chat';
 		if (surface?.type === 'singleton') {
 			if (surface.kind === 'pull-requests') return 'pull-requests';
-			if (surface.kind === 'git' || surface.kind === 'files' || surface.kind === 'chat') {
+			if (surface.kind === 'git' || surface.kind === 'files') {
 				return surface.kind;
 			}
 		}
@@ -122,7 +130,11 @@
 					mobileActiveDescriptor.kind === 'git-history' ||
 					mobileActiveDescriptor.kind === 'git-compare')),
 	);
-	let notificationDesktopInlineStartPx = $state(16);
+	let notificationDesktopInlineStartPx = $derived(
+		!isMobile && !hideLeftSidebar && localSettings.chatListDock === 'left'
+			? localSettings.sidebarWidth + 16
+			: 16,
+	);
 	const sidebarMounted = $derived(!isMobile || appShell.sidebarOpen);
 	const displayedSidebarChatIds = $derived.by(() =>
 		buildSidebarDisplayChatIds({
@@ -132,31 +144,78 @@
 			collapsedProjectKeys: projectCollapse.collapsedProjectKeys,
 		}),
 	);
+	const chatNavigation = new AppShellChatNavigationController({
+		get routeChatId() {
+			return page.params.id as string | undefined;
+		},
+		get selectedChatId() {
+			return sessions.selectedChatId;
+		},
+		get isLoadingChats() {
+			return sessions.isLoadingChats;
+		},
+		get currentWindowId() {
+			return workspace.currentWindowId;
+		},
+		hasChat: (chatId) => sessions.hasChat(chatId),
+		showChatInCurrentWindow: (chatId) => workspace.showChatInCurrentWindow(chatId),
+		setSelectedChatId: (chatId) => sessions.setSelectedChatId(chatId),
+		navigateToChat: gotoChat,
+		navigateToBareRoute: () => goto('/'),
+		requestComposerFocus: () => appShell.requestComposerFocus(),
+		reportOpenError: (error) => {
+			notifications.error(error instanceof Error ? error.message : m.workspace_open_failed());
+		},
+		reportDeleteError: (error) => {
+			notifications.error(
+				error instanceof Error ? error.message : m.notifications_delete_chat_failed(),
+			);
+		},
+	});
 
-	// Syncs URL params to selected chat ID. The session store is the
-	// single source of truth; this effect keeps it in sync with the URL.
 	$effect(() => {
 		const chatId = page.params.id as string | undefined;
 		const selectedChatId = selectedChatIdFromRoute(page.url.pathname, chatId);
 		if (selectedChatId === undefined) return;
-		const changed = untrack(() => selectedChatId !== sessions.selectedChatId);
-		sessions.setSelectedChatId(selectedChatId);
-		if (changed && selectedChatId) appShell.requestComposerFocus();
+		untrack(() => chatNavigation.handleRouteChat(selectedChatId));
 	});
 
 	$effect(() => {
+		const lastSelectedChatId = sessions.lastSelectedChatId;
 		const target = restoreChatIdForBareRoute({
 			pathname: page.url.pathname,
 			routeChatId: page.params.id as string | undefined,
 			isLoadingChats: sessions.isLoadingChats,
-			lastSelectedChatId: sessions.lastSelectedChatId,
+			lastSelectedChatId,
+			lastSelectedChatExists: lastSelectedChatId ? sessions.hasChat(lastSelectedChatId) : false,
 			selectedChatId: sessions.selectedChatId,
 		});
 		if (!target) return;
-		untrack(() => {
-			sessions.setSelectedChatId(target);
-			void gotoChat(target);
-		});
+		untrack(() => void chatNavigation.showChatInCurrentWindow(target, { navigate: true }));
+	});
+
+	$effect(() => {
+		const currentWindowId = workspace.currentWindowId;
+		const currentSnapshot = workspace.layout.snapshot;
+		const resolvedActiveId = isMobile
+			? currentSnapshot.mobileActiveSurfaceId
+			: windowNodeById(currentSnapshot.desktopRoot, currentWindowId)?.tabs.activeId;
+		const surface = resolvedActiveId ? currentSnapshot.surfaces[resolvedActiveId] : null;
+		const chatId = surface?.type === 'chat' ? surface.chatId : null;
+		if (
+			!chatId ||
+			!shouldSynchronizeFocusedChat({
+				focusedWindowId: currentWindowId,
+				focusedChatId: chatId,
+				focusedChatExists: sessions.hasChat(chatId),
+				selectedChatId: sessions.selectedChatId,
+				pendingChatTarget: chatNavigation.pendingChatTarget,
+				pendingWindowId: chatNavigation.pendingWindowId,
+			})
+		) {
+			return;
+		}
+		untrack(() => void chatNavigation.synchronizeFocusedChat(chatId));
 	});
 
 	$effect(() => {
@@ -169,17 +228,31 @@
 	$effect(() => {
 		if (typeof window === 'undefined') return;
 		const mql = window.matchMedia('(max-width: 768px)');
-		if (mql.matches) void workspace.enterMobilePresentation();
-		else void workspace.exitMobilePresentation();
+
+		function applyBreakpoint(matches: boolean): void {
+			if (matches) void workspace.enterMobilePresentation();
+			else {
+				void workspace.exitMobilePresentation();
+				appShell.setSidebarOpen(false);
+			}
+		}
+
+		applyBreakpoint(mql.matches);
 
 		function onChange(e: MediaQueryListEvent) {
-			if (e.matches) void workspace.enterMobilePresentation();
-			else void workspace.exitMobilePresentation();
-			if (!e.matches) appShell.setSidebarOpen(false);
+			applyBreakpoint(e.matches);
+		}
+
+		function onResize(): void {
+			applyBreakpoint(mql.matches);
 		}
 
 		mql.addEventListener('change', onChange);
-		return () => mql.removeEventListener('change', onChange);
+		window.addEventListener('resize', onResize);
+		return () => {
+			mql.removeEventListener('change', onChange);
+			window.removeEventListener('resize', onResize);
+		};
 	});
 
 	// Tracks virtual keyboard height via visualViewport for mobile layout.
@@ -244,18 +317,14 @@
 		void sessions.refreshChats();
 	});
 
-	function requestComposerFocusAfterNavigation(navigation: Promise<void>): void {
-		void navigation.finally(() => appShell.requestComposerFocus());
+	function handleChatSelect(chatId: string): void {
+		void chatNavigation.showChatInCurrentWindow(chatId, { navigate: true });
 	}
 
-	function selectAndNavigateChat(chatId: string): void {
-		sessions.setSelectedChatId(chatId);
-		requestComposerFocusAfterNavigation(gotoChat(chatId));
-	}
-
-	function handleChatSelect(chatId: string) {
-		selectAndNavigateChat(chatId);
-		void workspace.focusChat();
+	function handleOpenChatInNewWindow(chatId: string, edge?: WorkspaceWindowEdge): void {
+		void workspace.openChatInNewWindow(chatId, undefined, edge).catch((error) => {
+			notifications.error(error instanceof Error ? error.message : m.workspace_open_failed());
+		});
 	}
 
 	function handleNewChat() {
@@ -275,7 +344,7 @@
 			offset,
 		});
 		if (!targetId) return;
-		selectAndNavigateChat(targetId);
+		void chatNavigation.showChatInCurrentWindow(targetId, { navigate: true });
 	}
 
 	// Applies the same store mutations the ChatSessionDeletedWsMessage handler
@@ -283,17 +352,19 @@
 	// the sidebar and URL update without waiting for the HTTP round-trip.
 	function locallyDeleteChat(chatId: string) {
 		if (!sessions.hasChat(chatId)) return;
-		if (sessions.selectedChatId === chatId) {
-			const idx = sessions.order.indexOf(chatId);
-			const neighborId = sessions.order[idx - 1] ?? sessions.order[idx + 1] ?? null;
-			if (neighborId) {
-				selectAndNavigateChat(neighborId);
-			} else {
-				sessions.setSelectedChatId(null);
-				goto('/');
-			}
-		}
-		sessions.removeChat(chatId);
+		const wasSelected = sessions.selectedChatId === chatId;
+		const index = sessions.order.indexOf(chatId);
+		const neighborId = sessions.order[index - 1] ?? sessions.order[index + 1] ?? null;
+		void chatNavigation.reconcileDeletedChat({
+			chatId,
+			wasSelected,
+			neighborId,
+			removeLocal: () => {
+				sessions.removeChat(chatId);
+				chatDrafts.discardChat(chatId);
+			},
+			clearPresentation: () => workspace.clearDeletedChat(chatId),
+		});
 	}
 
 	function handleChatDelete(chatId: string) {
@@ -334,7 +405,7 @@
 			void workspace.focusMobileSingleton('files');
 			return;
 		}
-		void workspace.focusMostRecentTerminalOrCreate('main').catch((error) => {
+		void workspace.focusMostRecentTerminalOrCreate().catch((error) => {
 			notifications.error(error instanceof Error ? error.message : m.terminal_create_failed());
 		});
 	}
@@ -421,6 +492,9 @@
 			for (const unsubscribe of unsubscribers) unsubscribe();
 		};
 	});
+
+	onMount(() => chatDrafts.mountPersistenceLifecycle());
+	onDestroy(() => chatDrafts.destroy());
 </script>
 
 {#snippet sidebarContent(isMobile: boolean, onChatSelect: (chatId: string) => void)}
@@ -441,29 +515,33 @@
 		onForkChat={(id) => chatActionController.forkChat(id)}
 		onShareChat={requestShareChat}
 		onManageTags={requestTagsChat}
+		onOpenChatInNewWindow={isMobile ? undefined : handleOpenChatInNewWindow}
 		onShowScheduledPrompts={() => appShell.openScheduledPrompts()}
 		onShowSettings={() => appShell.openSettings()}
+		newWindowBlocked={!workspace.canOpenNewWindow}
 	/>
 {/snippet}
 
-{#snippet desktopChatList(placement: { dividerEdge: DesktopLayoutEdge })}
+{#snippet desktopChatList(dock: ChatListDock)}
+	{@const dividerEdge = chatListDividerEdge(dock)}
 	<div
-		data-desktop-layout-pane="chat-list"
 		data-workspace-chat-list
 		onfocusin={() => workspace.noteChatListFocus()}
 		onpointerdown={() => workspace.noteChatListFocus()}
 		class="relative h-full shrink-0 overflow-hidden border-border"
-		class:border-s={placement.dividerEdge === 'start' && !hideLeftSidebar}
-		class:border-e={placement.dividerEdge === 'end' && !hideLeftSidebar}
-		class:pointer-events-none={hideLeftSidebar || workspaceOverlayOpen}
+		class:order-first={dock === 'left'}
+		class:order-last={dock === 'right'}
+		class:border-s={dividerEdge === 'start' && !hideLeftSidebar}
+		class:border-e={dividerEdge === 'end' && !hideLeftSidebar}
+		class:pointer-events-none={hideLeftSidebar}
 		style:width={hideLeftSidebar ? '0px' : `${localSettings.sidebarWidth}px`}
-		aria-hidden={hideLeftSidebar || workspaceOverlayOpen}
-		inert={hideLeftSidebar || workspaceOverlayOpen}
+		aria-hidden={hideLeftSidebar}
+		inert={hideLeftSidebar}
 	>
 		{@render sidebarContent(false, handleChatSelect)}
 		{#if !hideLeftSidebar}
 			<ResizeHandle
-				edge={placement.dividerEdge}
+				edge={dividerEdge}
 				width={localSettings.sidebarWidth}
 				onResize={(width) => localSettings.set('sidebarWidth', width)}
 			/>
@@ -497,29 +575,27 @@
 		</div>
 	{/if}
 
-	<div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-		<div class="min-h-0 flex-1 overflow-hidden">
-			<WorkspaceRoot
-				{isMobile}
-				desktopLayoutOrder={localSettings.desktopLayoutOrder}
-				desktopChatListWidth={localSettings.sidebarWidth}
-				desktopChatListHidden={hideLeftSidebar}
-				{desktopChatList}
-				onMainInlineStartChange={(pixels) => (notificationDesktopInlineStartPx = pixels + 16)}
-				onMenuClick={isMobile ? toggleMobileSidebar : undefined}
-				onRegisterReload={handleRegisterReload}
-				onOverlayModalChange={(open) => (workspaceOverlayOpen = open)}
-				chatActions={workspaceChatActions}
-			/>
-		</div>
-		{#if isMobile && !mobileKeyboardVisible && !mobileTransientSurface}
-			<BottomTabBar
-				activeItem={mobileActiveTab}
-				pullRequestsAvailable={ghCapability.available}
-				onTabChange={handleMobileTabChange}
-				onMenuClick={toggleMobileSidebar}
-			/>
+	<div class="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+		{#if !isMobile}
+			{@render desktopChatList(localSettings.chatListDock)}
 		{/if}
+		<div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+			<div class="min-h-0 flex-1 overflow-hidden">
+				<WorkspaceRoot
+					{isMobile}
+					onRegisterReload={handleRegisterReload}
+					chatActions={workspaceChatActions}
+				/>
+			</div>
+			{#if isMobile && !mobileKeyboardVisible && !mobileTransientSurface}
+				<BottomTabBar
+					activeItem={mobileActiveTab}
+					pullRequestsAvailable={ghCapability.available}
+					onTabChange={handleMobileTabChange}
+					onMenuClick={toggleMobileSidebar}
+				/>
+			{/if}
+		</div>
 	</div>
 </div>
 

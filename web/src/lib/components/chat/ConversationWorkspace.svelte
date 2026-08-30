@@ -1,7 +1,7 @@
 <script lang="ts">
 	// Thin composition shell for the chat workspace. Wires extracted
-	// controllers (session, scroll, router) and renders the message
-	// pane, queue controls, and composer. All business logic lives in
+	// controllers (session, scroll, router) and renders the conversation
+	// feed, queue controls, and composer. All business logic lives in
 	// the controller modules.
 
 	import { onDestroy, onMount, untrack } from 'svelte';
@@ -23,7 +23,7 @@
 	import { searchResultNavigation } from '$lib/chat/actions/search-result-navigation.svelte.js';
 	import { ChatTranscriptCache } from '$lib/chat/transcript/chat-transcript-cache.svelte.js';
 	import { BackgroundTranscriptLoader } from '$lib/chat/transcript/background-transcript-loader.js';
-	import type { SplitPanePreviewCursor } from '$lib/chat/split/split-pane-preview-store.svelte.js';
+	import type { ChatWindowPreviewCursor } from '$lib/chat/transcript/chat-window-preview-store.svelte.js';
 	import { ComposerState } from '$lib/chat/composer/composer.svelte.js';
 	import type { ChatDraftAppend } from '$lib/chat/composer/chat-draft-append.js';
 	import type { SubagentToolbarState } from '$lib/chat/transcript/subagent-toolbar-state.svelte.js';
@@ -55,7 +55,6 @@
 		CHAT_MAX_WIDTH_DOCK_SHELL_CLASS,
 	} from '$lib/chat/conversation/chat-max-width.js';
 	import { isChatProcessing } from '$lib/chat/sessions/chat-processing.js';
-	import { CHAT_SURFACE_ID } from '$lib/workspace/surface-types.js';
 	import { registerManagedWorkspaceScrollRegion } from '$lib/workspace/workspace-scroll-region.js';
 	import {
 		composerCapReservation,
@@ -75,11 +74,13 @@
 		getReadReceiptOutbox,
 		getModelCatalog,
 		getRemoteSettings,
+		getNotifications,
 		getWorkspaceCoordinator,
 		getWorkspaceShortcuts,
 		getGitQuickSummary,
 		getGitBranchActions,
 		getChatProcessingReconciler,
+		getChatDrafts,
 	} from '$lib/context';
 	import ArrowDown from '@lucide/svelte/icons/arrow-down';
 	import ArrowUp from '@lucide/svelte/icons/arrow-up';
@@ -101,11 +102,10 @@
 		onRegisterPrepareHide?: (prepare: (() => void) | null) => void;
 		subagentToolbar: SubagentToolbarState;
 		transcriptCache?: ChatTranscriptCache;
-		reserveTopFloatingToolbar?: boolean;
-		reserveFeedTopFloatingToolbar?: boolean;
+		reserveMobileToolbar?: boolean;
 		getVisibleChatIds?: () => string[];
 		isVisiblePreviewChat?: (chatId: string) => boolean;
-		getVisiblePreviewCursor?: (chatId: string) => SplitPanePreviewCursor | null;
+		getVisiblePreviewCursor?: (chatId: string) => ChatWindowPreviewCursor | null;
 		applyVisiblePreviewMessages?: (
 			chatId: string,
 			transcriptViewId: string,
@@ -115,7 +115,6 @@
 		) => boolean | void;
 		loadVisiblePreviewSnapshot?: (chatId: string) => Promise<void> | void;
 		markVisiblePreviewStale?: (chatId: string) => void;
-		textScale?: number;
 		isVisible?: boolean;
 		isPresented?: boolean;
 	}
@@ -137,15 +136,13 @@
 		onRegisterPrepareHide,
 		subagentToolbar,
 		transcriptCache: providedTranscriptCache,
-		reserveTopFloatingToolbar = false,
-		reserveFeedTopFloatingToolbar = false,
+		reserveMobileToolbar = false,
 		getVisibleChatIds,
 		isVisiblePreviewChat,
 		getVisiblePreviewCursor,
 		applyVisiblePreviewMessages,
 		loadVisiblePreviewSnapshot,
 		markVisiblePreviewStale,
-		textScale = 1,
 		isVisible = true,
 		isPresented: isPresentedOverride,
 	}: ConversationWorkspaceProps = $props();
@@ -162,13 +159,20 @@
 	const readReceiptOutbox = getReadReceiptOutbox();
 	const modelCatalog = getModelCatalog();
 	const remoteSettings = getRemoteSettings();
+	const notifications = getNotifications();
 	const workspace = getWorkspaceCoordinator();
+	const chatSurfaceId = $derived(workspace.currentChatSurfaceId);
 	const workspaceShortcuts = getWorkspaceShortcuts();
+	const chatDrafts = getChatDrafts();
 
 	const transcriptCache = getInitialTranscriptCache();
 	const chatState = new ActiveTranscriptState(transcriptCache);
 	const backgroundTranscriptLoader = new BackgroundTranscriptLoader({ cache: transcriptCache });
-	const composerState = new ComposerState();
+	const composerState = new ComposerState(chatDrafts, {
+		get activeChatId() {
+			return sessions.selectedChatId;
+		},
+	});
 	const agentState = new AgentState();
 	const lifecycle = new ConversationLifecycleState();
 	const conversationUi = new ConversationUiState();
@@ -211,13 +215,7 @@
 		getVisibleChatCursor: (chatId) => getVisiblePreviewCursor?.(chatId) ?? null,
 		loadVisibleChatSnapshot: (chatId) => loadVisiblePreviewSnapshot?.(chatId),
 		onVisibleChatMessages: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) =>
-			applyVisiblePreviewMessages?.(
-				chatId,
-				transcriptViewId,
-				messages,
-				firstOrdinal,
-				lastOrdinal,
-			),
+			applyVisiblePreviewMessages?.(chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal),
 		markBackgroundStale: (chatId) => transcriptCache.markStale(chatId),
 		onBackgroundMessages: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) => {
 			const applied = transcriptCache.applyMessages(chatId, transcriptViewId, {
@@ -245,7 +243,7 @@
 	const scrollToTopButtonClass = $derived(
 		cn(
 			'absolute right-5 sm:right-6 z-20 w-11 h-11 rounded-full shadow-md hover:shadow-lg',
-			reserveTopFloatingToolbar ? 'top-16' : 'top-3',
+			reserveMobileToolbar ? 'top-16' : 'top-3',
 		),
 	);
 	const selectedIsProcessing = $derived(isChatProcessing(sessions.selectedChat));
@@ -315,7 +313,7 @@
 			onClose: () => quickGitBranches.closeBranchDropdown(),
 			onCreateBranch: () => {
 				if (projectPath && effectiveProjectKey) {
-					quickGitBranches.openNewBranchDialog(projectPath, CHAT_SURFACE_ID, effectiveProjectKey);
+					quickGitBranches.openNewBranchDialog(projectPath, chatSurfaceId, effectiveProjectKey);
 				}
 			},
 			onSwitchBranch: (branch) => switchCommitBranch(branch),
@@ -368,6 +366,14 @@
 		},
 		transcriptCache,
 		backgroundTranscriptLoader,
+		chatDrafts,
+		clearDeletedChat: (chatId) => {
+			void workspace.clearDeletedChat(chatId).catch((error) => {
+				notifications.error(
+					error instanceof Error ? error.message : m.notifications_delete_chat_failed(),
+				);
+			});
+		},
 		visiblePreviews: {
 			isVisible: (chatId) => isVisiblePreviewChat?.(chatId) ?? false,
 			applyMessages: (chatId, transcriptViewId, messages, firstOrdinal, lastOrdinal) =>
@@ -424,8 +430,8 @@
 					defaults.thinkingMode,
 					modelCatalog.getThinkingModes(agentId),
 				),
-					agentSettings: defaults.agentSettingsById[agentId]
-						?? modelCatalog.getDefaultAgentSettings(agentId),
+				agentSettings:
+					defaults.agentSettingsById[agentId] ?? modelCatalog.getDefaultAgentSettings(agentId),
 			};
 		},
 		appShell,
@@ -594,7 +600,7 @@
 			event.target instanceof Element &&
 			Boolean(
 				event.target.closest(
-					`[data-prompt-editor-dialog][data-workspace-surface-id="${CHAT_SURFACE_ID}"]`,
+					`[data-prompt-editor-dialog][data-workspace-surface-id="${chatSurfaceId}"]`,
 				),
 			);
 		if (
@@ -622,7 +628,7 @@
 		return false;
 	}
 
-	$effect(() => workspaceShortcuts.registerSurface(CHAT_SURFACE_ID, handleWorkspaceShortcut));
+	$effect(() => workspaceShortcuts.registerSurface(chatSurfaceId, handleWorkspaceShortcut));
 
 	function onSubmit(text?: string, images?: File[]) {
 		const chatId = sessions.selectedChatId;
@@ -726,11 +732,12 @@
 
 	function openCommit(): void {
 		if (!projectPath || !quickGitSummaryForProject) return;
-		if (appShell.isMobile) {
-			void workspace.focusMobileSingleton('commit');
-			return;
-		}
-		void workspace.openSingleton('commit', 'sidebar');
+		const opening = appShell.isMobile
+			? workspace.focusMobileSingleton('commit')
+			: workspace.openSingletonAsTab('commit', workspace.currentWindowId);
+		void opening.catch((error) => {
+			notifications.error(error instanceof Error ? error.message : m.workspace_open_failed());
+		});
 	}
 
 	function toggleCommitBranchDropdown(): void {
@@ -748,7 +755,7 @@
 			projectPath,
 			branch,
 			undefined,
-			CHAT_SURFACE_ID,
+			chatSurfaceId,
 			effectiveProjectKey,
 		);
 	}
@@ -763,10 +770,10 @@
 				onUserScrollIntent={(direction) => scroll.noteUserScrollIntent(direction)}
 				onLoadEarlier={() => void scroll.requestPage('earlier', 'button')}
 				onLoadLater={() => void scroll.requestPage('later', 'button')}
-				onPermissionDecision={(permissionOccurrenceId, decision) => (
-					controller.handlePermissionDecision(permissionOccurrenceId, decision))}
-				onExitPlanMode={(permissionOccurrenceId, choice, plan) => (
-					controller.handleExitPlanMode(permissionOccurrenceId, choice, plan))}
+				onPermissionDecision={(permissionOccurrenceId, decision) =>
+					controller.handlePermissionDecision(permissionOccurrenceId, decision)}
+				onExitPlanMode={(permissionOccurrenceId, choice, plan) =>
+					controller.handleExitPlanMode(permissionOccurrenceId, choice, plan)}
 				pendingPermissionRequests={conversationUi.pendingPermissionRequests}
 				onRetry={() => {
 					const chatId = sessions.selectedChatId;
@@ -778,7 +785,6 @@
 				}}
 				onGenerateTitleFromMessage={generateTitleFromMessage}
 				reserveComposerTraySpace={composerCapSpace.feed}
-				reserveTopFloatingToolbar={reserveFeedTopFloatingToolbar}
 				{isPreparingInitialScroll}
 				{isVisible}
 				pinnedToBottom={scroll.isPinnedToBottom}
@@ -787,7 +793,6 @@
 				{onRegisterPrepareHide}
 				onInitialEndRestored={() => scroll.completeInitialBottomRestore()}
 				isProcessing={selectedIsProcessing}
-				{textScale}
 			/>
 			{#snippet failed(error)}
 				<MessageRenderFallback {error} />

@@ -1,10 +1,10 @@
 import { planDesktopReturnMutations } from './responsive-handoff.js';
-import {
-	CHAT_SURFACE_ID,
-	type MobileReturnTarget,
-	type WorkspaceLayoutMutation,
-	type WorkspaceLayoutSnapshot,
+import type {
+	MobileReturnTarget,
+	WorkspaceLayoutMutation,
+	WorkspaceLayoutSnapshot,
 } from './surface-types.js';
+import { collectWindowNodes } from './window-tree.js';
 
 interface MobileWorkspaceContext {
 	chatId: string;
@@ -22,7 +22,7 @@ export interface MobileReturnPlan {
 }
 
 export class MobilePresentationPlanner {
-	#mostRecentSurfaceIds: string[] = [CHAT_SURFACE_ID];
+	#mostRecentSurfaceIds: string[] = [];
 
 	constructor(private readonly deps: MobilePresentationPlannerDeps) {}
 
@@ -55,6 +55,8 @@ export class MobilePresentationPlanner {
 		const routeIdentity = this.deps.getRouteIdentity();
 		const isExcluded = (surfaceId: string): boolean =>
 			typeof excluding === 'string' ? surfaceId === excluding : excluding.has(surfaceId);
+		const isAvailable = (surfaceId: string): boolean =>
+			!isExcluded(surfaceId) && Boolean(snapshot.surfaces[surfaceId]);
 		for (let index = snapshot.mobileReturnStack.length - 1; index >= 0; index -= 1) {
 			const target = snapshot.mobileReturnStack[index];
 			if (
@@ -70,12 +72,22 @@ export class MobilePresentationPlanner {
 				};
 			}
 		}
-		const recent = this.#mostRecentSurfaceIds.find(
-			(surfaceId) => !isExcluded(surfaceId) && Boolean(snapshot.surfaces[surfaceId]),
-		);
-		const activeMain = snapshot.main.activeId;
+		const recentSurfaceId = this.#mostRecentSurfaceIds.find(isAvailable);
+		const workspaceWindows = collectWindowNodes(snapshot.desktopRoot);
+		const activeWindowSurfaceId = workspaceWindows
+			.map((workspaceWindow) => workspaceWindow.tabs.activeId)
+			.find(isAvailable);
+		const recentWindowSurfaceId = workspaceWindows
+			.flatMap((workspaceWindow) => workspaceWindow.tabs.mru)
+			.find(isAvailable);
+		const currentMobileSurfaceId = isAvailable(snapshot.mobileActiveSurfaceId)
+			? snapshot.mobileActiveSurfaceId
+			: null;
+		const activeId =
+			recentSurfaceId ?? activeWindowSurfaceId ?? recentWindowSurfaceId ?? currentMobileSurfaceId;
+		if (!activeId) throw new Error('No mobile return surface is available');
 		return {
-			activeId: recent ?? (activeMain && !isExcluded(activeMain) ? activeMain : CHAT_SURFACE_ID),
+			activeId,
 			returnStack: [],
 		};
 	}

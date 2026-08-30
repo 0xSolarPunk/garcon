@@ -9,6 +9,7 @@
 	import { createAppShellStore } from '$lib/stores/app-shell.svelte.js';
 	import { createChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.js';
 	import { createLocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
+	import { setCanonicalWorkspaceLayout } from './workspace-layout-test-context.js';
 
 	interface Props {
 		rows: ChatDisplayRow[];
@@ -19,11 +20,8 @@
 		) => void;
 	}
 
-	let {
-		rows,
-		pendingPermissionRequests = [],
-		onPermissionDecision,
-	}: Props = $props();
+	let { rows, pendingPermissionRequests = [], onPermissionDecision }: Props = $props();
+	setCanonicalWorkspaceLayout();
 
 	const chatSessions = createChatSessionsStore();
 	chatSessions.createDraft({
@@ -43,7 +41,7 @@
 	setFileSessions(
 		new FileSessionRegistry({
 			getIsMobile: () => false,
-			getDefaultPlacement: () => 'main',
+			getDefaultPlacement: () => ({ type: 'window', windowId: 'window-main' }),
 			getEditorSettings: () => ({ wordWrap: false, showLineNumbers: true, fontSize: 12 }),
 			getPlacement: () => ({
 				async placeFileSession() {

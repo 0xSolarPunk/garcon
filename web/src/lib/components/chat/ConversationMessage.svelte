@@ -14,10 +14,7 @@
 		ToolResultMessage,
 		AskUserQuestionToolUseMessage,
 	} from '$shared/chat-types';
-	import type {
-		ChatMessage,
-		ToolUseChatMessage,
-	} from '$shared/chat-types';
+	import type { ChatMessage, ToolUseChatMessage } from '$shared/chat-types';
 	import type { PermissionDecisionPayload } from '$shared/chat-command-contracts';
 	import type { SessionAgentId } from '$lib/types/app';
 	import type { ConversationMessageChatContext } from '$lib/chat/transcript/conversation-message-context.js';
@@ -26,7 +23,13 @@
 	import FileText from '@lucide/svelte/icons/file-text';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import EllipsisVertical from '@lucide/svelte/icons/ellipsis-vertical';
-	import { getChatSessions, getFileSessions, getAppShell, getLocalSettings } from '$lib/context';
+	import {
+		getAppShell,
+		getChatSessions,
+		getFileSessions,
+		getLocalSettings,
+		getWorkspaceCoordinator,
+	} from '$lib/context';
 	import Markdown from './Markdown.svelte';
 	import type { MarkdownLinkNavigateEvent } from './Markdown.svelte';
 	import { resolveFileOpenTarget } from '$lib/chat/file-links/file-open-target.js';
@@ -79,11 +82,7 @@
 			permissionOccurrenceId: string,
 			decision: PermissionDecisionPayload & { message?: string },
 		) => void;
-		onExitPlanMode?: (
-			permissionOccurrenceId: string,
-			choice: string,
-			plan: string,
-		) => void;
+		onExitPlanMode?: (permissionOccurrenceId: string, choice: string, plan: string) => void;
 		agentId: SessionAgentId | string;
 		showThinking?: boolean;
 		chatContext?: ConversationMessageChatContext | null;
@@ -129,6 +128,7 @@
 	const sessions = getChatSessions();
 	const fileSessions = getFileSessions();
 	const appShell = getAppShell();
+	const workspace = getWorkspaceCoordinator();
 	const localSettings = getLocalSettings();
 
 	const projectBasePath = $derived(appShell.projectBasePath);
@@ -164,9 +164,7 @@
 			: '',
 	);
 	const userMessageCustomStyle = $derived(
-		userMessagePresentation?.style === 'custom'
-			? userMessagePresentation.customStyle
-			: null,
+		userMessagePresentation?.style === 'custom' ? userMessagePresentation.customStyle : null,
 	);
 	const asAssistant = $derived(message instanceof AssistantMessage ? message : null);
 	const asThinking = $derived(message instanceof ThinkingMessage ? message : null);
@@ -182,11 +180,7 @@
 	);
 	const exitPlanPermissionRequest = $derived(
 		asToolUse?.type === 'exit-plan-mode-tool-use'
-			? new PermissionRequestMessage(
-					message.timestamp,
-					`plan-exit-${asToolUse.toolId}`,
-					asToolUse,
-				)
+			? new PermissionRequestMessage(message.timestamp, `plan-exit-${asToolUse.toolId}`, asToolUse)
 			: null,
 	);
 	const historicalQuestion = $derived.by(() => {
@@ -422,7 +416,7 @@
 			fileRootPath: resolved.fileRootPath,
 			relativePath: resolved.relativePath,
 			mode: 'auto',
-			origin: appShell.isMobile ? 'mobile' : 'main',
+			origin: appShell.isMobile ? 'mobile' : workspace.currentWindowId,
 			reason: 'user-open',
 			line: resolved.line,
 			col: resolved.col,
@@ -443,7 +437,7 @@
 			fileRootPath: resolved.fileRootPath,
 			relativePath: resolved.relativePath,
 			mode: 'auto',
-			origin: appShell.isMobile ? 'mobile' : 'main',
+			origin: appShell.isMobile ? 'mobile' : workspace.currentWindowId,
 			reason: 'user-open',
 			line: resolved.line,
 			col: resolved.col,
@@ -620,16 +614,11 @@
 							onDecision={onPermissionDecision ?? ignorePermissionDecision}
 							{onExitPlanMode}
 							{chatContext}
-							draft={permissionDraft?.(
-								exitPlanPermissionRequest.permissionOccurrenceId,
-							)}
+							draft={permissionDraft?.(exitPlanPermissionRequest.permissionOccurrenceId)}
 							{acquireTransientActivity}
 							onDraftChange={onPermissionDraftChange
 								? (draft) =>
-										onPermissionDraftChange(
-											exitPlanPermissionRequest.permissionOccurrenceId,
-											draft,
-										)
+										onPermissionDraftChange(exitPlanPermissionRequest.permissionOccurrenceId, draft)
 								: undefined}
 						/>
 					{:else if historicalQuestion}
@@ -779,15 +768,11 @@
 							onDecision={onPermissionDecision ?? ignorePermissionDecision}
 							{onExitPlanMode}
 							{chatContext}
-							draft={permissionDraft?.(
-								asPermissionRequest.permissionOccurrenceId,
-							)}
+							draft={permissionDraft?.(asPermissionRequest.permissionOccurrenceId)}
 							{acquireTransientActivity}
 							onDraftChange={onPermissionDraftChange
-								? (draft) => onPermissionDraftChange(
-										asPermissionRequest.permissionOccurrenceId,
-										draft,
-									)
+								? (draft) =>
+										onPermissionDraftChange(asPermissionRequest.permissionOccurrenceId, draft)
 								: undefined}
 						/>
 					{/if}

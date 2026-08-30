@@ -243,9 +243,7 @@ describe('shared sidebar chat row', () => {
 		expect(timestampBadge?.className).toContain('group-hover:opacity-0');
 		expect(timestampBadge?.className).toContain('group-focus-within:opacity-0');
 		expect(timestampBadge?.className).toContain('mr-6');
-		expect(timestampBadge?.className).toContain(
-			'[@media(hover:hover)_and_(pointer:fine)]:mr-0',
-		);
+		expect(timestampBadge?.className).toContain('[@media(hover:hover)_and_(pointer:fine)]:mr-0');
 		expect(timestampBadge?.getAttribute('title')).toBeTruthy();
 
 		const stateBadge = document.querySelector<HTMLElement>(
@@ -256,9 +254,7 @@ describe('shared sidebar chat row', () => {
 		expect(stateBadge?.getAttribute('aria-hidden')).toBeNull();
 		expect(screen.getByText('Pinned').className).toContain('sr-only');
 		if (!stateBadge || !timestampBadge) throw new Error('expected badges');
-		expect(title.compareDocumentPosition(stateBadge)).toBe(
-			Node.DOCUMENT_POSITION_FOLLOWING,
-		);
+		expect(title.compareDocumentPosition(stateBadge)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
 		expect(stateBadge.compareDocumentPosition(timestampBadge)).toBe(
 			Node.DOCUMENT_POSITION_FOLLOWING,
 		);
@@ -319,9 +315,7 @@ describe('shared sidebar chat row', () => {
 		expect(processingIndicator?.parentElement?.className).toContain('ml-auto');
 		expect(processingIndicator?.parentElement?.className).toContain('pr-0.5');
 		expect(processingIndicator?.parentElement?.className).toContain('group-hover:opacity-0');
-		expect(processingIndicator?.parentElement?.className).toContain(
-			'group-focus-within:opacity-0',
-		);
+		expect(processingIndicator?.parentElement?.className).toContain('group-focus-within:opacity-0');
 		const processingLabel = screen.getByText('Chat is processing');
 		expect(processingLabel.className).toContain('sr-only');
 		expect(processingIndicator?.contains(processingLabel)).toBe(false);
@@ -483,6 +477,39 @@ describe('shared sidebar chat row', () => {
 		expect(screen.queryByRole('menuitem', { name: /change project path/i })).toBeNull();
 	});
 
+	it('opens a sidebar chat at an edge from the single new-window submenu', async () => {
+		const onOpenInNewWindow = vi.fn();
+		render(SidebarChatItemHost, {
+			session: createChat(),
+			onOpenInNewWindow,
+		});
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Chat actions' }));
+		const openSubmenu = screen.getByRole('menuitem', { name: 'Open in new window' });
+		openSubmenu.focus();
+		await fireEvent.keyDown(openSubmenu, { key: 'ArrowRight' });
+		await fireEvent.click(
+			await screen.findByRole('menuitem', { name: 'Open new window right' }),
+		);
+
+		expect(onOpenInNewWindow).toHaveBeenCalledWith('chat-1', 'right');
+		expect(screen.queryByRole('menuitem', { name: 'Open in new window at edge' })).toBeNull();
+	});
+
+	it('disables sidebar Chat window placement at the window cap', async () => {
+		render(SidebarChatItemHost, {
+			session: createChat(),
+			onOpenInNewWindow: vi.fn(),
+			newWindowBlocked: true,
+		});
+
+		await fireEvent.click(screen.getByRole('button', { name: 'Chat actions' }));
+		const openItem = screen.getByRole('menuitem', { name: 'Open in new window' });
+		expect(openItem.getAttribute('aria-disabled')).toBe('true');
+		expect(openItem.getAttribute('title')).toBe('4 windows max');
+		expect(screen.queryByRole('menuitem', { name: 'Open in new window at edge' })).toBeNull();
+	});
+
 	it('disables sidebar fork while processing when running fork is unsupported', async () => {
 		const onForkChat = vi.fn();
 		render(SidebarChatItemHost, {
@@ -542,7 +569,7 @@ describe('shared sidebar chat row', () => {
 	it('pulses processing only when system and local motion preferences allow it', () => {
 		expect(appCss).toContain('@keyframes sidebar-processing-pulse');
 		expect(appCss).toMatch(
-			/@media \(prefers-reduced-motion: no-preference\)\s*\{[\s\S]*?\.sidebar-processing-indicator\s*\{[\s\S]*?animation: sidebar-processing-pulse 1\.6s ease-in-out infinite;[\s\S]*?\}/,
+			/@media \(prefers-reduced-motion: no-preference\)\s*\{[\s\S]*?\.sidebar-processing-indicator,\s*\.workspace-chat-processing-indicator\s*\{[\s\S]*?animation: sidebar-processing-pulse 1\.6s ease-in-out infinite;[\s\S]*?\}/,
 		);
 		expect(appCss).toMatch(
 			/\.sidebar-reduce-motion \.sidebar-processing-indicator\s*\{\s*animation: none;\s*\}/,

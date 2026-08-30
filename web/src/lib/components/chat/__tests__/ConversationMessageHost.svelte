@@ -11,6 +11,7 @@
 	import { createLocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
 	import { onDestroy, untrack } from 'svelte';
 	import type { ConversationDisclosureStatePort } from '../ConversationFeedItemState.svelte.js';
+	import { setCanonicalWorkspaceLayout } from './workspace-layout-test-context.js';
 
 	type OpenAutoInput = FileOpenRequest;
 
@@ -45,6 +46,7 @@
 		alwaysExpandCliMessages = false,
 		disclosureState,
 	}: Props = $props();
+	setCanonicalWorkspaceLayout();
 	const initialHost = untrack(() => ({
 		projectBasePath,
 		chatProjectPath,
@@ -69,7 +71,7 @@
 
 	const fileSessions = new FileSessionRegistry({
 		getIsMobile: () => isMobile,
-		getDefaultPlacement: () => 'main',
+		getDefaultPlacement: () => ({ type: 'window', windowId: 'window-main' }),
 		getEditorSettings: () => ({ wordWrap: false, showLineNumbers: true, fontSize: 12 }),
 		getPlacement: () => ({
 			async placeFileSession() {

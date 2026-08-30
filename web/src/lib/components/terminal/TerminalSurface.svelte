@@ -6,7 +6,8 @@
 	import Square from '@lucide/svelte/icons/square';
 	import X from '@lucide/svelte/icons/x';
 	import { getLocalSettings, getTerminalRegistry, getWorkspaceCoordinator } from '$lib/context';
-	import { terminalSurfaceId, type HostId } from '$lib/workspace/surface-types';
+	import { terminalSurfaceId, type WorkspaceWindowId } from '$lib/workspace/surface-types';
+	import { collectWindowNodes, windowIdOfSurface } from '$lib/workspace/window-tree.js';
 	import type { TerminalToolbarKey } from '$lib/terminal/runtime/terminal-input-controls.svelte.js';
 	import { TERMINAL_SESSION_LIMIT } from '$shared/terminal';
 	import * as m from '$lib/paraglide/messages.js';
@@ -16,18 +17,26 @@
 		type ResponsiveSurfaceAction,
 	} from '$lib/components/shared/ResponsiveSurfaceActions.svelte';
 	import TerminalSettingsMenu from './TerminalSettingsMenu.svelte';
+	import type {
+		TerminalSurfaceRegistryPort,
+		TerminalSurfaceWorkspacePort,
+	} from './terminal-surface-ports.js';
 
 	let {
 		terminalId,
 		host,
 		visible = true,
+		terminals: providedTerminals,
+		workspace: providedWorkspace,
 	}: {
 		terminalId: string;
-		host: HostId | 'mobile';
+		host: WorkspaceWindowId | 'mobile';
 		visible?: boolean;
+		terminals?: TerminalSurfaceRegistryPort;
+		workspace?: TerminalSurfaceWorkspacePort;
 	} = $props();
-	const terminals = getTerminalRegistry();
-	const workspace = getWorkspaceCoordinator();
+	const terminals = untrack(() => providedTerminals) ?? getTerminalRegistry();
+	const workspace = untrack(() => providedWorkspace) ?? getWorkspaceCoordinator();
 	const localSettings = getLocalSettings();
 	const frame = getSurfaceFrameBridge();
 	let terminalHost = $state<HTMLDivElement | null>(null);
@@ -119,9 +128,12 @@
 	function placementLabel(itemTerminalId: string): string | null {
 		const surfaceId = terminalSurfaceId(itemTerminalId);
 		const snapshot = workspace.layout.snapshot;
-		if (snapshot.main.order.includes(surfaceId)) return m.workspace_main_view();
-		if (snapshot.sidebar.order.includes(surfaceId)) return m.workspace_sidebar_view();
-		return null;
+		const windowId = windowIdOfSurface(snapshot.desktopRoot, surfaceId);
+		if (!windowId) return null;
+		const index = collectWindowNodes(snapshot.desktopRoot).findIndex(
+			(workspaceWindow) => workspaceWindow.id === windowId,
+		);
+		return m.workspace_window_number({ number: index + 1 });
 	}
 
 	$effect(() => {
