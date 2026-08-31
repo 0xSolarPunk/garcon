@@ -35,6 +35,7 @@ function terminalMetadata(terminalId: string): TerminalMetadata {
 	return {
 		terminalId,
 		displaySequence: 1,
+		title: null,
 		initialWorkingDirectory: '/workspace',
 		processStatus: 'running',
 		attachmentStatus: 'attached',
@@ -878,7 +879,7 @@ describe('WorkspaceCoordinator', () => {
 		const { coordinator, layout, terminals } = createHarness({ terminate });
 		const terminalId = 'terminal-1';
 		terminals.sessions[terminalId] = {
-			metadata: terminalMetadata(terminalId),
+			metadata: { ...terminalMetadata(terminalId), title: 'Build logs' },
 			attachmentState: 'attached',
 		};
 		await coordinator.openTerminalSession(terminalId, 'window-main');
@@ -886,6 +887,7 @@ describe('WorkspaceCoordinator', () => {
 
 		const terminationRequest = coordinator.terminateTerminalSession(terminalId);
 		expect(coordinator.closeGuardRequest?.surfaceId).toBe(surfaceId);
+		expect(coordinator.closeGuardRequest?.title).toBe('Terminate Build logs?');
 		coordinator.resolveCloseGuard(true);
 		await Promise.resolve();
 		await coordinator.openSingletonInNewWindow('git-history');

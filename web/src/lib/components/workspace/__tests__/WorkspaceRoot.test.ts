@@ -222,6 +222,7 @@ function installContext() {
 			pasteFromClipboard: vi.fn(async () => true),
 		})),
 		reattach: vi.fn(),
+		rename: vi.fn(async (_terminalId: string, _title: string | null) => undefined),
 	};
 	const localSettings = {
 		terminalFontSize: '13',
@@ -313,6 +314,7 @@ describe('WorkspaceRoot', () => {
 			metadata: {
 				terminalId,
 				displaySequence: 1,
+				title: 'Dev server',
 				initialWorkingDirectory: '/workspace/project',
 				processStatus: 'running',
 				attachmentStatus: 'attached',
@@ -342,11 +344,21 @@ describe('WorkspaceRoot', () => {
 			]),
 		);
 		renderRoot();
+		expect(screen.getByRole('tab', { name: 'Dev server' })).toBeTruthy();
 
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
 
+		expect(screen.getByRole('menuitem', { name: m.terminal_rename() })).toBeTruthy();
 		expect(screen.getByRole('menuitem', { name: m.terminal_paste() })).toBeTruthy();
 		expect(screen.getByRole('menuitem', { name: /Font size 13px/ })).toBeTruthy();
+		await fireEvent.click(screen.getByRole('menuitem', { name: m.terminal_rename() }));
+		const renameInput = await screen.findByRole('textbox', { name: m.terminal_name() });
+		expect((renameInput as HTMLInputElement).value).toBe('Dev server');
+		await fireEvent.input(renameInput, { target: { value: 'Build logs' } });
+		await fireEvent.click(screen.getByRole('button', { name: m.sidebar_actions_save() }));
+		await waitFor(() => expect(terminals.rename).toHaveBeenCalledWith(terminalId, 'Build logs'));
+
+		await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
 		await fireEvent.click(screen.getByRole('menuitem', { name: m.terminal_terminate() }));
 		expect(workspace.terminateTerminalSession).toHaveBeenCalledWith(terminalId);
 	});
