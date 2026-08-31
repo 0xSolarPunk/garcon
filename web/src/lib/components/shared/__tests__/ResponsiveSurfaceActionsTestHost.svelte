@@ -6,14 +6,24 @@
 		type ResponsiveSurfaceAction,
 	} from '../ResponsiveSurfaceActions.svelte';
 
-	let { leadingContent = false }: { leadingContent?: boolean } = $props();
+	let {
+		leadingContent = false,
+		filterDisabled = false,
+		onFilter = () => {},
+	}: {
+		leadingContent?: boolean;
+		filterDisabled?: boolean;
+		onFilter?: () => void;
+	} = $props();
 
-	const actions: ResponsiveSurfaceAction[] = [
+	const actions = $derived.by<ResponsiveSurfaceAction[]>(() => [
 		{
 			id: 'filter',
 			label: 'Filter files',
+			title: filterDisabled ? 'Filtering is unavailable' : undefined,
 			icon: Search,
-			onclick: () => {},
+			onclick: onFilter,
+			disabled: filterDisabled,
 			priority: 0,
 			showLabel: true,
 		},
@@ -32,7 +42,7 @@
 			onclick: () => {},
 			priority: 2,
 		},
-	];
+	]);
 </script>
 
 {#snippet menu(overflowActions: readonly ResponsiveSurfaceAction[])}

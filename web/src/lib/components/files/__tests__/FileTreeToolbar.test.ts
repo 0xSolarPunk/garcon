@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FileTreeStore } from '$lib/files/tree/file-tree.svelte.js';
@@ -104,7 +104,7 @@ describe('FileTreeToolbar', () => {
 
 		for (const button of [filter, home, chatProject]) {
 			expect(button.textContent?.trim()).toBe('');
-			expect(button.getAttribute('title')).toBe(button.getAttribute('aria-label'));
+			expect(button.getAttribute('data-tooltip-label')).toBe(button.getAttribute('aria-label'));
 		}
 		expect(home.querySelector('svg')?.classList.contains('lucide-house')).toBe(true);
 		expect(chatProject.querySelector('svg')?.classList.contains('lucide-folder-code')).toBe(true);
@@ -133,13 +133,15 @@ describe('FileTreeToolbar', () => {
 			previous: initialResponse,
 		};
 		await tick();
-		expect(screen.getByRole('button', { name: 'Home' }).hasAttribute('disabled')).toBe(true);
+		expect(screen.getByRole('button', { name: 'Home' }).getAttribute('aria-disabled')).toBe('true');
 
 		store.navigation = { kind: 'idle' };
 		await tick();
 		const idleHome = screen.getByRole('button', { name: 'Home' });
-		expect(idleHome.hasAttribute('disabled')).toBe(true);
-		expect(idleHome.getAttribute('title')).toBe('Home');
+		expect(idleHome.getAttribute('aria-disabled')).toBe('true');
+		expect(idleHome.hasAttribute('disabled')).toBe(false);
+		await fireEvent.focus(idleHome);
+		expect((await screen.findByRole('tooltip')).textContent?.trim()).toBe('Home');
 
 		store.navigation = {
 			kind: 'ready',
@@ -156,8 +158,10 @@ describe('FileTreeToolbar', () => {
 		await tick();
 
 		const home = screen.getByRole('button', { name: 'Home' });
-		expect(home.hasAttribute('disabled')).toBe(true);
-		expect(home.getAttribute('title')).toBe('Already at home');
+		expect(home.getAttribute('aria-disabled')).toBe('true');
+		await waitFor(() => {
+			expect(screen.getByRole('tooltip').textContent?.trim()).toBe('Already at home');
+		});
 	});
 
 	it('disables Home with an unavailable title when it is outside the file root', async () => {
@@ -170,8 +174,9 @@ describe('FileTreeToolbar', () => {
 
 		const unavailableLabel = "Home directory isn't available in Files";
 		const home = screen.getByRole('button', { name: unavailableLabel });
-		expect(home.hasAttribute('disabled')).toBe(true);
-		expect(home.getAttribute('title')).toBe(unavailableLabel);
+		expect(home.getAttribute('aria-disabled')).toBe('true');
+		await fireEvent.focus(home);
+		expect((await screen.findByRole('tooltip')).textContent?.trim()).toBe(unavailableLabel);
 
 		await setWidth(60);
 		await fireEvent.click(screen.getByRole('button', { name: 'File browser actions' }));

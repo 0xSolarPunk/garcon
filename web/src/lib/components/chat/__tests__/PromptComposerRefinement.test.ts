@@ -63,12 +63,12 @@ describe('PromptComposer prompt refinement', () => {
 
 		expect(open.compareDocumentPosition(refine) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 		expect(refine.compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-		expect((refine as HTMLButtonElement).disabled).toBe(true);
+		expect(refine.getAttribute('aria-disabled')).toBe('true');
 
 		await typeDraft('A draft to improve');
-		expect((refine as HTMLButtonElement).disabled).toBe(false);
+		expect(refine.hasAttribute('aria-disabled')).toBe(false);
 		await typeDraft('x'.repeat(PROMPT_REFINEMENT_DRAFT_MAX_LENGTH + 1));
-		expect((refine as HTMLButtonElement).disabled).toBe(true);
+		expect(refine.getAttribute('aria-disabled')).toBe('true');
 	});
 
 	it('describes the composer controls with short hover tooltips', async () => {
@@ -120,9 +120,8 @@ describe('PromptComposer prompt refinement', () => {
 				.disabled,
 		).toBe(false);
 		expect(
-			(screen.getByRole('button', { name: 'Open expanded composer' }) as HTMLButtonElement)
-				.disabled,
-		).toBe(true);
+			screen.getByRole('button', { name: 'Open expanded composer' }).getAttribute('aria-disabled'),
+		).toBe('true');
 		expect(
 			(screen.getByRole('button', { name: 'Refining prompt...' }) as HTMLButtonElement).disabled,
 		).toBe(true);

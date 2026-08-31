@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installResizeObserverHarness, ResizeObserverHarness } from './resize-observer-harness.js';
 import ResponsiveSurfaceActionsTestHost from './ResponsiveSurfaceActionsTestHost.svelte';
 
@@ -125,5 +125,26 @@ describe('ResponsiveSurfaceActions', () => {
 		});
 		expect(tooltip.textContent?.trim()).toBe('Filter files');
 		expect(tooltip.classList.contains('bg-foreground')).toBe(true);
+	});
+
+	it('keeps disabled actions inert while exposing their explanation tooltip', async () => {
+		const onFilter = vi.fn();
+		render(ResponsiveSurfaceActionsTestHost, {
+			props: { filterDisabled: true, onFilter },
+		});
+		const filter = screen.getByRole('button', { name: 'Filter files' });
+
+		expect(filter.getAttribute('aria-disabled')).toBe('true');
+		expect(filter.hasAttribute('disabled')).toBe(false);
+		await fireEvent.pointerEnter(filter, { pointerType: 'mouse' });
+
+		const tooltip = await screen.findByRole('tooltip');
+		expect(tooltip.textContent?.trim()).toBe('Filtering is unavailable');
+		expect(filter.getAttribute('aria-describedby')).toBe(tooltip.id);
+
+		await fireEvent.click(filter, { detail: 1 });
+		await fireEvent.click(filter, { detail: 0 });
+		filter.click();
+		expect(onFilter).not.toHaveBeenCalled();
 	});
 });

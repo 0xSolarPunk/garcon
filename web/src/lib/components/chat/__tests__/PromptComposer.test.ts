@@ -1177,7 +1177,7 @@ describe('PromptComposer focus', () => {
 		await fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 		await screen.findByRole('button', { name: 'Expanding snippet' });
 
-		const permissionButton = screen.getAllByTitle('Default')[0];
+		const permissionButton = screen.getAllByRole('button', { name: 'Default' })[0];
 		expect(permissionButton).toBeTruthy();
 		if (!permissionButton) throw new Error('Missing permission control');
 		permissionButton.focus();

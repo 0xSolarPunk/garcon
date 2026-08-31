@@ -68,7 +68,7 @@
 
 	function actionClass(action: ResponsiveSurfaceAction): string {
 		return cn(
-			'inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50',
+			'inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50 aria-disabled:opacity-50',
 			action.showLabel ? '' : 'w-8 px-0',
 			action.variant === 'primary' &&
 				'bg-interactive-accent text-interactive-accent-foreground hover:brightness-110',
@@ -78,6 +78,11 @@
 				'text-muted-foreground hover:bg-accent hover:text-foreground',
 			action.buttonClass,
 		);
+	}
+
+	function activateAction(action: ResponsiveSurfaceAction): void {
+		if (action.disabled || action.busy) return;
+		action.onclick();
 	}
 
 	function menuClass(): string {
@@ -190,9 +195,8 @@
 				<Tooltip.Trigger
 					type="button"
 					class={actionClass(action)}
-					onclick={action.busy ? undefined : action.onclick}
-					disabled={action.disabled}
-					aria-disabled={action.busy || undefined}
+					onclick={() => activateAction(action)}
+					aria-disabled={action.disabled || action.busy || undefined}
 					aria-busy={action.busy || undefined}
 					aria-label={action.label}
 					data-tooltip-label={action.title ?? action.label}
@@ -201,7 +205,9 @@
 					<Icon class={cn('h-4 w-4', action.iconClass)} />
 					{#if action.showLabel}<span class="min-w-0 truncate">{action.label}</span>{/if}
 				</Tooltip.Trigger>
-				<Tooltip.Content sideOffset={6}>{action.title ?? action.label}</Tooltip.Content>
+				<Tooltip.Content role="tooltip" sideOffset={6}>
+					{action.title ?? action.label}
+				</Tooltip.Content>
 			</Tooltip.Root>
 		{/each}
 		{#if showMenu}
