@@ -143,6 +143,7 @@ export class CodexAppServerClient extends EventEmitter {
   #clientVersion: () => string;
   #shutdownGraceMs: number;
   #shutdownPromise: Promise<void> | null = null;
+  #shutdownRequested = false;
 
   constructor(options: CodexAppServerClientOptions = {}) {
     super();
@@ -158,6 +159,7 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   async connect(): Promise<InitializeResponse> {
+    if (this.#shutdownRequested) throw new Error('Codex app-server client is shut down');
     if (this.#ready) return this.#ready;
     this.#ready = this.#start().catch((error) => {
       this.#ready = null;
@@ -303,6 +305,7 @@ export class CodexAppServerClient extends EventEmitter {
   async #start(): Promise<InitializeResponse> {
     const startedAt = performance.now();
     const resolved = await this.#resolveCli();
+    if (this.#shutdownRequested) throw new Error('Codex app-server client is shut down');
     this.#proc = this.#spawn(resolved.command, ['app-server', '--listen', 'stdio://'], { env: this.#env });
 
     void this.#readStdout(this.#proc.stdout ?? null);
@@ -514,12 +517,17 @@ export class CodexAppServerClient extends EventEmitter {
 
   async shutdown(): Promise<void> {
     if (this.#shutdownPromise) return this.#shutdownPromise;
+    this.#shutdownRequested = true;
     const proc = this.#proc;
+    const ready = this.#ready;
     this.#proc = null;
     this.#ready = null;
-    if (!proc) return;
 
     const shutdown = (async () => {
+      if (!proc) {
+        await ready?.catch(() => undefined);
+        return;
+      }
       try {
         // Codex closes its sole stdio connection on EOF, then shuts down loaded
         // threads and their persistence writers before exiting.

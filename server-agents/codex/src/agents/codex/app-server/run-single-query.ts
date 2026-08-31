@@ -1,13 +1,22 @@
-import { promises as fs } from 'fs';
-import os from 'os';
-import path from 'path';
-import type { CodexConfigObject, CodexConfigValue, CodexProviderConfig } from '../runtime-types.js';
+import { EventEmitter } from 'events';
+import { createHash } from 'node:crypto';
 import type { PermissionMode, ThinkingMode } from '@garcon/common/chat-modes';
-import { resolveCodexCliCommand } from './cli.js';
-import { buildCodexEnv, codexSandboxSettings } from './request-builders.js';
 import { withSingleQueryControl } from '@garcon/server-agent-common/shared/single-query-control';
-
-export { resolveCodexCliCommand } from './cli.js';
+import { isApprovalRequest } from './approvals.js';
+import {
+  CodexAppServerClient,
+  type CodexAppServerClientOptions,
+} from './client.js';
+import type {
+  CodexThreadItem,
+  ItemCompletedNotification,
+  JsonRpcNotification,
+  JsonRpcServerRequest,
+  TurnCompletedNotification,
+} from './protocol.js';
+import { buildCodexEnv, mapThinkingModeToCodexEffort } from './request-builders.js';
+import { denialResponseForRequest } from './runtime-support.js';
+import type { CodexProviderConfig } from '../runtime-types.js';
 
 interface CodexSingleQueryOptions {
   cwd?: string;
@@ -21,176 +30,282 @@ interface CodexSingleQueryOptions {
   signal?: AbortSignal;
 }
 
-function mapSingleQueryThinkingModeToCodexEffort(
-  thinkingMode: ThinkingMode | undefined,
-): Exclude<ThinkingMode, 'none'> | undefined {
-  return thinkingMode && thinkingMode !== 'none' ? thinkingMode : undefined;
+interface CodexSingleQueryClient extends EventEmitter {
+  startThread(params: Record<string, unknown>): Promise<{ thread: { id: string } }>;
+  startTurn(params: Record<string, unknown>): Promise<{ turn: { id: string } }>;
+  interruptTurn(threadId: string, turnId: string): Promise<unknown>;
+  unsubscribeThread(threadId: string): Promise<unknown>;
+  shutdown(): Promise<void>;
+  respond(id: number, result: unknown): void;
+  reject(id: number, code: number, message: string): void;
 }
 
-async function runCodexExec(
-  args: string[],
-  input: string,
-  envOverrides?: Record<string, string>,
-  codexConfig?: CodexProviderConfig,
-  signal?: AbortSignal,
-): Promise<{ stdout: string; stderr: string }> {
-  const env = buildCodexExecEnv(envOverrides, codexConfig);
-  const codexCommand = await resolveCodexCliCommand();
-  const proc = Bun.spawn([codexCommand, ...args], {
-    stdin: new Blob([input]),
-    stdout: 'pipe',
-    stderr: 'pipe',
-    ...(env ? { env } : {}),
-    signal,
-  });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  signal?.throwIfAborted();
+interface CodexSingleQueryRuntimeOptions {
+  createClient?: (options?: CodexAppServerClientOptions) => CodexSingleQueryClient;
+  maxQueriesPerClient?: number;
+  clientIdleMs?: number;
+}
 
-  if (exitCode !== 0) {
-    const details = (stderr || stdout || '').trim();
-    throw new Error(`Codex exec failed with code ${exitCode}: ${details}`);
+interface ClientEntry {
+  client: CodexSingleQueryClient;
+  environmentKey: string;
+  activeQueries: number;
+  admittedQueries: number;
+  acceptingQueries: boolean;
+  retired: boolean;
+  exited: boolean;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const DEFAULT_MAX_QUERIES_PER_CLIENT = 32;
+const DEFAULT_CLIENT_IDLE_MS = 30_000;
+
+export class CodexSingleQueryRuntime {
+  readonly #clients = new Map<string, ClientEntry>();
+  readonly #drainingClients = new Set<ClientEntry>();
+  readonly #createClient: NonNullable<CodexSingleQueryRuntimeOptions['createClient']>;
+  readonly #maxQueriesPerClient: number;
+  readonly #clientIdleMs: number;
+  readonly #retirementPromises = new Set<Promise<void>>();
+  #shutdownPromise: Promise<void> | null = null;
+  #shutdownRequested = false;
+
+  constructor(options: CodexSingleQueryRuntimeOptions = {}) {
+    this.#createClient = options.createClient ?? ((clientOptions) => new CodexAppServerClient(clientOptions));
+    this.#maxQueriesPerClient = options.maxQueriesPerClient ?? DEFAULT_MAX_QUERIES_PER_CLIENT;
+    this.#clientIdleMs = options.clientIdleMs ?? DEFAULT_CLIENT_IDLE_MS;
   }
 
-  return { stdout, stderr };
-}
+  run(prompt: string, options: CodexSingleQueryOptions = {}): Promise<string> {
+    return withSingleQueryControl(options, (signal) => this.#run(prompt, options, signal));
+  }
 
-export async function runSingleQuery(prompt: string, options: CodexSingleQueryOptions = {}): Promise<string> {
-  const {
-    cwd,
-    projectPath,
-    model,
-    permissionMode = 'default',
-    thinkingMode,
-    envOverrides,
-    codexConfig,
-    timeoutMs,
-    signal,
-  } = options;
+  async #run(
+    prompt: string,
+    options: CodexSingleQueryOptions,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const workingDirectory = options.cwd || options.projectPath || process.cwd();
+    const environment = buildCodexEnv(options.envOverrides, options.codexConfig);
+    const entry = this.#acquireClient(environment);
+    const { client } = entry;
+    let threadId: string | null = null;
+    let turnId: string | null = null;
+    let output = '';
+    let settleCompletion: ((notification: TurnCompletedNotification) => void) | null = null;
+    let rejectCompletion: ((error: unknown) => void) | null = null;
+    let interruption: Promise<void> | null = null;
+    const completion = new Promise<TurnCompletedNotification>((resolve, reject) => {
+      settleCompletion = resolve;
+      rejectCompletion = reject;
+    });
+    // Startup can fail after cancellation without ever awaiting the turn result.
+    void completion.catch(() => {});
 
-  return withSingleQueryControl({ signal, timeoutMs }, async (querySignal) => {
-    const workingDirectory = cwd || projectPath || process.cwd();
-    // Every one-shot caller generates text from text: titles, commit messages,
-    // status summaries, model probes, transcript compaction. None needs to touch
-    // the workspace, and the compaction prompt carries archived transcript
-    // content that is not trusted, so the sandbox is pinned read-only rather than
-    // inheriting the chat's `workspace-write` default with approvals off.
-    const { approvalPolicy } = codexSandboxSettings(permissionMode);
-    const sandbox = 'read-only';
-    const reasoningEffort = mapSingleQueryThinkingModeToCodexEffort(thinkingMode);
+    const collectItem = (item: CodexThreadItem): void => {
+      if (item.type === 'agentMessage') output = item.text;
+    };
+    const handleNotification = (notification: JsonRpcNotification): void => {
+      if (notification.method === 'item/completed') {
+        const params = notification.params as ItemCompletedNotification;
+        if (params.threadId !== threadId || (turnId && params.turnId !== turnId)) return;
+        collectItem(params.item);
+        return;
+      }
+      if (notification.method !== 'turn/completed') return;
+      const params = notification.params as TurnCompletedNotification;
+      if (params.threadId !== threadId || (turnId && params.turn.id !== turnId)) return;
+      for (const item of params.turn.items) collectItem(item);
+      settleCompletion?.(params);
+    };
+    const handleServerRequest = (request: JsonRpcServerRequest): void => {
+      const params = request.params && typeof request.params === 'object'
+        ? request.params as Record<string, unknown>
+        : {};
+      if (params.threadId !== threadId && params.conversationId !== threadId) return;
+      if (isApprovalRequest(request)) {
+        client.respond(request.id, denialResponseForRequest(request.method));
+      } else {
+        client.reject(request.id, -32601, `Unsupported Codex app-server request: ${request.method}`);
+      }
+    };
+    const handleExit = (code: number): void => {
+      rejectCompletion?.(new Error(`Codex app-server exited with code ${code}`));
+    };
+    const interruptStartedTurn = (): Promise<void> | null => {
+      if (!threadId || !turnId || entry.exited) return null;
+      interruption ??= client.interruptTurn(threadId, turnId).then(
+        () => undefined,
+        () => undefined,
+      );
+      return interruption;
+    };
+    const handleAbort = (): void => {
+      rejectCompletion?.(signal.reason);
+      if (turnId) {
+        void interruptStartedTurn();
+      } else {
+        // Startup RPCs have no cancellation handle or usable turn identity. Retiring
+        // the shared transport prevents a late response from starting orphaned work.
+        this.#retireClient(entry, true);
+      }
+    };
 
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-single-query-'));
-    const outputPath = path.join(tmpDir, 'last-message.txt');
-    const args = [
-      'exec',
-      '--ephemeral',
-      '--skip-git-repo-check',
-      '--sandbox',
-      sandbox,
-      '--cd',
-      workingDirectory,
-      '--output-last-message',
-      outputPath,
-    ];
-
-    if (model) args.push('--model', model);
-    appendCodexConfigArgs(args, codexConfig?.config);
-    if (reasoningEffort) args.push('--config', `model_reasoning_effort="${reasoningEffort}"`);
-    if (approvalPolicy) args.push('--config', `approval_policy="${approvalPolicy}"`);
-    args.push('-');
+    client.on('notification', handleNotification);
+    client.on('serverRequest', handleServerRequest);
+    client.on('exit', handleExit);
+    signal.addEventListener('abort', handleAbort, { once: true });
 
     try {
-      const { stdout } = await runCodexExec(args, prompt, envOverrides, codexConfig, querySignal);
-      try {
-        return (await fs.readFile(outputPath, 'utf8')).trim();
-      } catch {
-        return stdout.trim();
+      signal.throwIfAborted();
+      const thread = await client.startThread({
+        ephemeral: true,
+        cwd: workingDirectory,
+        sandbox: 'read-only',
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.codexConfig?.config ? { config: options.codexConfig.config } : {}),
+      });
+      threadId = thread.thread.id;
+      signal.throwIfAborted();
+
+      const effort = mapThinkingModeToCodexEffort(options.thinkingMode, options.model);
+      const turn = await client.startTurn({
+        threadId,
+        input: [{ type: 'text', text: prompt, text_elements: [] }],
+        cwd: workingDirectory,
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        ...(options.model ? { model: options.model } : {}),
+        ...(effort ? { effort } : {}),
+      });
+      turnId = turn.turn.id;
+      if (signal.aborted) await interruptStartedTurn();
+      signal.throwIfAborted();
+
+      const terminal = await completion;
+      signal.throwIfAborted();
+      if (terminal.turn.status === 'failed') {
+        throw new Error(terminal.turn.error?.message ?? 'Codex turn failed');
       }
+      if (terminal.turn.status === 'interrupted') throw new Error('Codex turn was interrupted');
+      return output.trim();
     } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true });
-    }
-  });
-}
-
-function buildCodexExecEnv(
-  envOverrides?: Record<string, string>,
-  codexConfig?: CodexProviderConfig,
-): Record<string, string> | undefined {
-  const overrides = buildCodexEnv(envOverrides, codexConfig);
-  if (!overrides) return undefined;
-
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value;
-  }
-  return { ...env, ...overrides };
-}
-
-function appendCodexConfigArgs(args: string[], config?: CodexConfigObject): void {
-  if (!config) return;
-  for (const override of serializeCodexConfigOverrides(config)) {
-    args.push('--config', override);
-  }
-}
-
-function serializeCodexConfigOverrides(config: CodexConfigObject): string[] {
-  const overrides: string[] = [];
-  flattenCodexConfigOverrides(config, '', overrides);
-  return overrides;
-}
-
-function flattenCodexConfigOverrides(value: CodexConfigValue, prefix: string, overrides: string[]): void {
-  if (!isPlainCodexConfigObject(value)) {
-    if (!prefix) throw new Error('Codex config overrides must be a plain object');
-    overrides.push(`${prefix}=${toTomlValue(value, prefix)}`);
-    return;
-  }
-
-  const entries = Object.entries(value);
-  if (!prefix && entries.length === 0) return;
-  if (prefix && entries.length === 0) {
-    overrides.push(`${prefix}={}`);
-    return;
-  }
-
-  for (const [key, child] of entries) {
-    if (!key) throw new Error('Codex config override keys must be non-empty strings');
-    const childPath = prefix ? `${prefix}.${key}` : key;
-    if (isPlainCodexConfigObject(child)) {
-      flattenCodexConfigOverrides(child, childPath, overrides);
-    } else {
-      overrides.push(`${childPath}=${toTomlValue(child, childPath)}`);
+      signal.removeEventListener('abort', handleAbort);
+      client.off('notification', handleNotification);
+      client.off('serverRequest', handleServerRequest);
+      client.off('exit', handleExit);
+      if (signal.aborted) await interruptStartedTurn();
+      if (threadId && !entry.retired && !entry.exited) {
+        await client.unsubscribeThread(threadId).catch(() => {});
+      }
+      this.#releaseClient(entry);
     }
   }
+
+  #acquireClient(environment?: Record<string, string>): ClientEntry {
+    if (this.#shutdownRequested) throw new Error('Codex single-query runtime is shut down');
+    const environmentKey = stableEnvironmentKey(environment);
+    // Reuses process startup while each request remains an in-memory ephemeral thread.
+    const existing = this.#clients.get(environmentKey);
+    if (existing) {
+      this.#clients.delete(environmentKey);
+      this.#drainingClients.add(existing);
+      if (existing.idleTimer) clearTimeout(existing.idleTimer);
+      existing.idleTimer = null;
+      existing.activeQueries += 1;
+      existing.admittedQueries += 1;
+      if (existing.admittedQueries >= this.#maxQueriesPerClient) {
+        existing.acceptingQueries = false;
+      }
+      return existing;
+    }
+
+    const client = this.#createClient(environment ? { env: environment } : undefined);
+    const entry: ClientEntry = {
+      client,
+      environmentKey,
+      activeQueries: 1,
+      admittedQueries: 1,
+      acceptingQueries: this.#maxQueriesPerClient > 1,
+      retired: false,
+      exited: false,
+      idleTimer: null,
+    };
+    this.#drainingClients.add(entry);
+    client.once('exit', () => {
+      entry.exited = true;
+      entry.retired = true;
+      if (entry.idleTimer) clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+      if (this.#clients.get(environmentKey) === entry) this.#clients.delete(environmentKey);
+      this.#drainingClients.delete(entry);
+    });
+    return entry;
+  }
+
+  #releaseClient(entry: ClientEntry): void {
+    entry.activeQueries -= 1;
+    if (entry.retired || entry.activeQueries > 0) return;
+    this.#drainingClients.delete(entry);
+    if (!entry.acceptingQueries) {
+      this.#retireClient(entry);
+      return;
+    }
+    const available = this.#clients.get(entry.environmentKey);
+    if (available) {
+      this.#retireClient(entry);
+      return;
+    }
+    this.#clients.set(entry.environmentKey, entry);
+    entry.idleTimer = setTimeout(() => this.#retireClient(entry), this.#clientIdleMs);
+    (entry.idleTimer as { unref?: () => void }).unref?.();
+  }
+
+  #retireClient(entry: ClientEntry, force = false): void {
+    if (entry.retired || (!force && entry.activeQueries > 0)) return;
+    entry.retired = true;
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+    if (this.#clients.get(entry.environmentKey) === entry) {
+      this.#clients.delete(entry.environmentKey);
+    }
+    this.#drainingClients.delete(entry);
+    if (!entry.exited) {
+      const retirement = entry.client.shutdown().catch(() => {}).finally(() => {
+        this.#retirementPromises.delete(retirement);
+      });
+      this.#retirementPromises.add(retirement);
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.#shutdownPromise) return this.#shutdownPromise;
+    this.#shutdownRequested = true;
+    const entries = [...new Set([
+      ...this.#clients.values(),
+      ...this.#drainingClients,
+    ])];
+    this.#clients.clear();
+    this.#drainingClients.clear();
+    for (const entry of entries) {
+      entry.retired = true;
+      if (entry.idleTimer) clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+    }
+    const shutdown = Promise.allSettled([
+      ...this.#retirementPromises,
+      ...entries.map(({ client }) => client.shutdown()),
+    ]).then(() => undefined);
+    this.#shutdownPromise = shutdown;
+    await shutdown;
+  }
 }
 
-function toTomlValue(value: CodexConfigValue, pathName: string): string {
-  if (typeof value === 'string') return JSON.stringify(value);
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new Error(`Codex config override at ${pathName} must be a finite number`);
-    return String(value);
-  }
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (Array.isArray(value)) {
-    return `[${value.map((item, index) => toTomlValue(item, `${pathName}[${index}]`)).join(', ')}]`;
-  }
-  if (isPlainCodexConfigObject(value)) {
-    return `{${Object.entries(value)
-      .map(([key, child]) => `${formatTomlKey(key)} = ${toTomlValue(child, `${pathName}.${key}`)}`)
-      .join(', ')}}`;
-  }
-  throw new Error(`Unsupported Codex config override value at ${pathName}: ${typeof value}`);
-}
-
-const TOML_BARE_KEY = /^[A-Za-z0-9_-]+$/;
-
-function formatTomlKey(key: string): string {
-  return TOML_BARE_KEY.test(key) ? key : JSON.stringify(key);
-}
-
-function isPlainCodexConfigObject(value: unknown): value is CodexConfigObject {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+function stableEnvironmentKey(environment?: Record<string, string>): string {
+  const serialized = JSON.stringify(
+    Object.entries(environment ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+  );
+  return createHash('sha256').update(serialized).digest('hex');
 }

@@ -42,7 +42,7 @@ import {
 } from './agents/codex/app-server/endpoint-runtime.js';
 import { CodexAppServerClient } from './agents/codex/app-server/client.js';
 import { CodexAppServerRuntime } from './agents/codex/app-server/runtime.js';
-import { runSingleQuery } from './agents/codex/app-server/run-single-query.js';
+import { CodexSingleQueryRuntime } from './agents/codex/app-server/run-single-query.js';
 import { CodexSkillDiscovery } from './agents/codex/slash-command-discovery.js';
 import { createCodexNativeActivityProbe } from './agents/codex/native-activity.js';
 
@@ -111,6 +111,7 @@ export default class CodexAgentIntegration implements AgentIntegration {
       logger,
       skillDiscovery,
     });
+    const singleQueryRuntime = new CodexSingleQueryRuntime({ createClient });
     const login = new CliLoginController({
       command: () => ['codex', 'login', '--device-auth'],
       mode: 'device-code',
@@ -269,7 +270,7 @@ export default class CodexAgentIntegration implements AgentIntegration {
           );
         }
         try {
-          return await runSingleQuery(request.prompt, {
+          return await singleQueryRuntime.run(request.prompt, {
             projectPath: request.projectPath,
             model: request.model,
             ...singleQueryRuntimeOptions(request),
@@ -285,7 +286,10 @@ export default class CodexAgentIntegration implements AgentIntegration {
     this.lifecycle = createIntegrationLifecycle({
       start: () => runtime.startPurgeTimer(),
       stop: async () => {
-        await runtime.shutdown();
+        await Promise.all([
+          runtime.shutdown(),
+          singleQueryRuntime.shutdown(),
+        ]);
         login.stop();
         await skillDiscovery.clear();
       },
