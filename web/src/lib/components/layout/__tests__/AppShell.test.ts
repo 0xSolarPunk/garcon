@@ -447,4 +447,28 @@ describe('AppShell responsive workspace binding', () => {
 			expect(screen.queryByTestId('bottom-tab-bar-stub')).toBeNull();
 		},
 	);
+
+	it('keeps Chat Map in the persistent mobile navigation and marks it active', async () => {
+		const workspace = installContext();
+		const mobile = reduceWorkspaceLayout(workspace.layout.snapshot, [
+			{
+				type: 'register-surface',
+				surface: portableSingletonDescriptor('chat-map'),
+			},
+			{
+				type: 'set-mobile-presentation',
+				activeId: 'singleton:chat-map',
+				returnStack: [],
+			},
+		]);
+		workspace.layout.publish(workspace.layout.revision, mobile);
+		workspace.isMobile = true;
+		breakpointMediaQuery.matches = true;
+
+		render(AppShell);
+		const bottomBar = screen.getByTestId('bottom-tab-bar-stub');
+		expect(bottomBar.getAttribute('data-active-item')).toBe('chat-map');
+		await fireEvent.click(screen.getByRole('button', { name: 'Select Map tab' }));
+		expect(workspace.focusedMobileSingletons).toContain('chat-map');
+	});
 });

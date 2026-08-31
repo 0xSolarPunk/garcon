@@ -126,6 +126,7 @@
 		if (surface?.type === 'chat') return 'chat';
 		if (surface?.type === 'singleton') {
 			if (surface.kind === 'pull-requests') return 'pull-requests';
+			if (surface.kind === 'chat-map') return 'chat-map';
 			if (surface.kind === 'git' || surface.kind === 'files') {
 				return surface.kind;
 			}
@@ -405,16 +406,8 @@
 			void workspace.focusChat();
 			return;
 		}
-		if (tab === 'git') {
-			void workspace.focusMobileSingleton('git');
-			return;
-		}
-		if (tab === 'pull-requests') {
-			void workspace.focusMobileSingleton('pull-requests');
-			return;
-		}
-		if (tab === 'files') {
-			void workspace.focusMobileSingleton('files');
+		if (tab !== 'terminal') {
+			void workspace.focusMobileSingleton(tab);
 			return;
 		}
 		void workspace.focusMostRecentTerminalOrCreate().catch((error) => {

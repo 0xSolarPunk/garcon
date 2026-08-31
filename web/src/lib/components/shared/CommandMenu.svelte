@@ -105,6 +105,16 @@
 						: workspace.openSingletonInNewWindow('files').catch(reportOpenError)),
 			},
 			{
+				id: 'workspace-chat-map',
+				label: m.workspace_open_chat_map(),
+				description: m.command_open_panel({ panel: m.workspace_surface_chat_map() }),
+				category: categories.workspace,
+				action: () =>
+					void (workspace.isMobile
+						? workspace.focusMobileSingleton('chat-map')
+						: workspace.openSingletonInNewWindow('chat-map').catch(reportOpenError)),
+			},
+			{
 				id: 'workspace-terminal',
 				label: m.command_switch_to_terminal(),
 				description: m.command_open_panel({ panel: m.workspace_surface_terminal() }),
