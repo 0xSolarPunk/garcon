@@ -142,13 +142,10 @@ export class CodexSingleQueryRuntime {
     };
     const handleAbort = (): void => {
       rejectCompletion?.(signal.reason);
-      if (turnId) {
-        void interruptStartedTurn();
-      } else {
-        // Startup RPCs have no cancellation handle or usable turn identity. Retiring
-        // the shared transport prevents a late response from starting orphaned work.
-        this.#retireClient(entry, true);
-      }
+      // Cancellation exclusively retires this request's transport. Provider cleanup
+      // RPCs can stall indefinitely and must not keep the process available for reuse.
+      this.#retireClient(entry, true);
+      void interruptStartedTurn();
     };
 
     client.on('notification', handleNotification);
@@ -181,7 +178,7 @@ export class CodexSingleQueryRuntime {
         ...(effort ? { effort } : {}),
       });
       turnId = turn.turn.id;
-      if (signal.aborted) await interruptStartedTurn();
+      if (signal.aborted) void interruptStartedTurn();
       signal.throwIfAborted();
 
       const terminal = await completion;
@@ -196,9 +193,12 @@ export class CodexSingleQueryRuntime {
       client.off('notification', handleNotification);
       client.off('serverRequest', handleServerRequest);
       client.off('exit', handleExit);
-      if (signal.aborted) await interruptStartedTurn();
-      if (threadId && !entry.retired && !entry.exited) {
-        await client.unsubscribeThread(threadId).catch(() => {});
+      if (signal.aborted) {
+        this.#retireClient(entry, true);
+        void interruptStartedTurn();
+      } else if (threadId && !entry.retired && !entry.exited) {
+        // Thread cleanup is best-effort and cannot hold the exclusive client lease.
+        void client.unsubscribeThread(threadId).catch(() => {});
       }
       this.#releaseClient(entry);
     }
@@ -299,7 +299,18 @@ export class CodexSingleQueryRuntime {
       ...entries.map(({ client }) => client.shutdown()),
     ]).then(() => undefined);
     this.#shutdownPromise = shutdown;
-    await shutdown;
+    try {
+      await shutdown;
+    } finally {
+      if (this.#shutdownPromise === shutdown) this.#shutdownPromise = null;
+    }
+  }
+
+  start(): void {
+    if (this.#shutdownPromise) {
+      throw new Error('Codex single-query runtime shutdown is still in progress');
+    }
+    this.#shutdownRequested = false;
   }
 }
 

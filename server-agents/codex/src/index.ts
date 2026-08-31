@@ -284,7 +284,10 @@ export default class CodexAgentIntegration implements AgentIntegration {
       },
     };
     this.lifecycle = createIntegrationLifecycle({
-      start: () => runtime.startPurgeTimer(),
+      start: () => {
+        singleQueryRuntime.start();
+        runtime.startPurgeTimer();
+      },
       stop: async () => {
         await Promise.all([
           runtime.shutdown(),

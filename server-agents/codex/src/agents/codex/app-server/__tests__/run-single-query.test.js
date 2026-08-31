@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { describe, expect, it, mock } from 'bun:test';
+import { createIntegrationLifecycle } from '@garcon/server-agent-common/lifecycle/integration-lifecycle';
 import { resolveCodexCli, resolveCodexCliCommand } from '../cli.js';
 import { CodexAppServerClient } from '../client.js';
 import { CodexSingleQueryRuntime } from '../run-single-query.js';
@@ -125,7 +126,7 @@ describe('Codex single-query runtime', () => {
     ]);
   });
 
-  it('interrupts only the aborted query and unsubscribes its ephemeral thread', async () => {
+  it('interrupts an aborted query and retires its exclusive client', async () => {
     const client = new FakeClient();
     const turnStarted = deferred();
     client.startTurn = mock(async (params) => {
@@ -143,7 +144,56 @@ describe('Codex single-query runtime', () => {
     await expect(query).rejects.toThrow('cancelled');
     await Promise.resolve();
     expect(client.interruptTurn).toHaveBeenCalledWith('thread-1', 'turn-thread-1');
-    expect(client.unsubscribeThread).toHaveBeenCalledWith('thread-1');
+    expect(client.shutdown).toHaveBeenCalledTimes(1);
+    expect(client.unsubscribeThread).not.toHaveBeenCalled();
+  });
+
+  it('does not strand an exclusive client when abort cleanup never resolves', async () => {
+    const clients = [];
+    const runtime = new CodexSingleQueryRuntime({
+      createClient: () => {
+        const client = new FakeClient();
+        if (clients.length === 0) {
+          client.interruptTurn = mock(() => new Promise(() => {}));
+        }
+        clients.push(client);
+        return client;
+      },
+    });
+    const controller = new AbortController();
+
+    const aborted = runtime.run('cancel me', { signal: controller.signal });
+    while (clients[0]?.startTurn.mock.calls.length === 0) await Promise.resolve();
+    controller.abort(new Error('cancelled'));
+    await expect(aborted).rejects.toThrow('cancelled');
+
+    const next = runtime.run('continue');
+    while (clients[1]?.startTurn.mock.calls.length === 0) await Promise.resolve();
+    clients[1].complete('thread-1', 'continued');
+
+    await expect(next).resolves.toBe('continued');
+    expect(clients[0].interruptTurn).toHaveBeenCalledTimes(1);
+    expect(clients[0].shutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not strand a client when thread cleanup never resolves', async () => {
+    const client = new FakeClient();
+    client.unsubscribeThread = mock(() => new Promise(() => {}));
+    const runtime = new CodexSingleQueryRuntime({ createClient: () => client });
+
+    const first = runtime.run('first');
+    await Promise.resolve();
+    await Promise.resolve();
+    client.complete('thread-1', 'first');
+    await expect(first).resolves.toBe('first');
+
+    const second = runtime.run('second');
+    await Promise.resolve();
+    await Promise.resolve();
+    client.complete('thread-2', 'second');
+
+    await expect(second).resolves.toBe('second');
+    expect(client.unsubscribeThread).toHaveBeenCalledTimes(2);
   });
 
   it('interrupts a turn whose start response arrives after cancellation', async () => {
@@ -333,6 +383,69 @@ describe('Codex single-query runtime', () => {
 
     await runtime.shutdown();
     expect(clients.every((client) => client.shutdown.mock.calls.length === 1)).toBe(true);
+  });
+
+  it('restarts with a fresh client after shutdown', async () => {
+    const clients = [];
+    const runtime = new CodexSingleQueryRuntime({
+      createClient: () => {
+        const client = new FakeClient();
+        clients.push(client);
+        return client;
+      },
+    });
+    const lifecycle = createIntegrationLifecycle({
+      start: () => runtime.start(),
+      stop: () => runtime.shutdown(),
+    });
+
+    await lifecycle.start();
+    const first = runtime.run('first');
+    await Promise.resolve();
+    await Promise.resolve();
+    clients[0].complete('thread-1', 'first');
+    await first;
+    await lifecycle.stop();
+
+    await lifecycle.start();
+    const second = runtime.run('second');
+    await Promise.resolve();
+    await Promise.resolve();
+    clients[1].complete('thread-1', 'second');
+
+    await expect(second).resolves.toBe('second');
+    expect(clients).toHaveLength(2);
+  });
+
+  it('restarts after a failed lifecycle start rolls back', async () => {
+    const clients = [];
+    const runtime = new CodexSingleQueryRuntime({
+      createClient: () => {
+        const client = new FakeClient();
+        clients.push(client);
+        return client;
+      },
+    });
+    let failStart = true;
+    const lifecycle = createIntegrationLifecycle({
+      async start() {
+        runtime.start();
+        if (failStart) {
+          failStart = false;
+          throw new Error('startup failed');
+        }
+      },
+      stop: () => runtime.shutdown(),
+    });
+
+    await expect(lifecycle.start()).rejects.toThrow('startup failed');
+    await lifecycle.start();
+    const query = runtime.run('retry');
+    await Promise.resolve();
+    await Promise.resolve();
+    clients[0].complete('thread-1', 'retried');
+
+    await expect(query).resolves.toBe('retried');
   });
 });
 
