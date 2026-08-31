@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installResizeObserverHarness, ResizeObserverHarness } from './resize-observer-harness.js';
 import ResponsiveSurfaceActionsTestHost from './ResponsiveSurfaceActionsTestHost.svelte';
@@ -111,5 +111,19 @@ describe('ResponsiveSurfaceActions', () => {
 		expect(ResizeObserverHarness.instances.every((observer) => observer.observed.size === 0)).toBe(
 			true,
 		);
+	});
+
+	it('renders a styled tooltip without an ambient provider', async () => {
+		render(ResponsiveSurfaceActionsTestHost);
+
+		await fireEvent.focus(screen.getByRole('button', { name: 'Filter files' }));
+
+		const tooltip = await waitFor(() => {
+			const content = document.querySelector<HTMLElement>('[data-slot="tooltip-content"]');
+			expect(content).toBeTruthy();
+			return content as HTMLElement;
+		});
+		expect(tooltip.textContent?.trim()).toBe('Filter files');
+		expect(tooltip.classList.contains('bg-foreground')).toBe(true);
 	});
 });

@@ -19,6 +19,7 @@
 	import Send from '@lucide/svelte/icons/send';
 	import * as m from '$lib/paraglide/messages.js';
 	import ComposerAddMenu from './ComposerAddMenu.svelte';
+	import * as Tooltip from '$lib/components/ui/tooltip';
 
 	interface Props {
 		canAttachImages: boolean;
@@ -96,6 +97,7 @@
 			actions.push({
 				id: 'expanded-composer',
 				label: m.chat_composer_open_expanded_editor(),
+				title: m.chat_composer_expand_tooltip(),
 				icon: Maximize2,
 				onclick: onOpenExpandedEditor,
 				disabled: addMenuDisabled || isPromptTransformPending,
@@ -109,6 +111,9 @@
 				id: 'refine-prompt',
 				renderKey: isPromptRefinementPending ? 'cancel-refinement' : 'refine-prompt',
 				label: promptRefinementActionLabel,
+				title: isPromptRefinementPending
+					? m.prompt_refinement_cancel()
+					: m.prompt_refinement_tooltip(),
 				icon: isPromptRefinementPending ? Square : Sparkles,
 				onclick: onRefinePrompt,
 				disabled: !isPromptRefinementPending && (!canRefinePrompt || isPromptTransformPending),
@@ -144,68 +149,91 @@
 				/>
 			{/if}
 
-			<DropdownMenu>
-				<DropdownMenuTrigger
-					class="inline-flex size-9 items-center justify-center rounded-lg border transition-colors {activePermission?.toneClass}"
-					title={activePermission?.label ?? m.chat_composer_permission_mode()}
-				>
-					{#if activePermission}
-						<ComposerModeIcon iconId={activePermission.iconId} class="size-4" />
-					{/if}
-				</DropdownMenuTrigger>
-				<DropdownMenuContent align="start">
-					{#each permissionOptions as option (option.value)}
-						<DropdownMenuItem onclick={() => onPermissionSelect(option.value)} class="items-start">
-							<ComposerModeIcon iconId={option.iconId} class="mt-0.5 size-4" />
-							<div class="min-w-0">
-								<div class="font-medium">{option.label}</div>
-								<div class="text-xs text-muted-foreground">{option.description}</div>
-							</div>
-						</DropdownMenuItem>
-					{/each}
-				</DropdownMenuContent>
-			</DropdownMenu>
-
-			<DropdownMenu>
-				<DropdownMenuTrigger
-					data-slot="thinking-mode-trigger"
-					data-rainbow={activeThinking?.rainbow ? 'true' : undefined}
-					class="inline-flex size-9 items-center justify-center rounded-lg border transition-colors {activeThinking?.toneClass}"
-					title={activeThinking?.label ?? m.chat_composer_thinking_effort()}
-				>
-					{#if activeThinking}
-						<ComposerModeIcon
-							iconId={activeThinking.iconId}
-							rainbow={activeThinking.rainbow}
-							class="size-4"
-						/>
-					{/if}
-				</DropdownMenuTrigger>
-				<DropdownMenuContent align="start">
-					{#each thinkingOptions as option (option.value)}
-						<DropdownMenuItem
-							onclick={() => onThinkingSelect(option.value)}
-							class={option.rainbow ? 'rainbow-ultra-surface items-start' : 'items-start'}
-							data-thinking-mode={option.value}
-							data-rainbow={option.rainbow ? 'true' : undefined}
-						>
-							<ComposerModeIcon
-								iconId={option.iconId}
-								rainbow={option.rainbow}
-								class="mt-0.5 size-4"
-							/>
-							<div class="min-w-0">
-								<div class="font-medium">{option.label}</div>
-								<div
-									class={option.rainbow ? 'text-xs text-white' : 'text-xs text-muted-foreground'}
+			<Tooltip.Provider>
+				<DropdownMenu>
+					<Tooltip.Root>
+						<Tooltip.Trigger data-tooltip-label={m.chat_composer_permission_tooltip()}>
+							{#snippet child({ props })}
+								<DropdownMenuTrigger
+									{...props}
+									class="inline-flex size-9 items-center justify-center rounded-lg border transition-colors {activePermission?.toneClass}"
+									aria-label={activePermission?.label ?? m.chat_composer_permission_mode()}
 								>
-									{option.description}
+									{#if activePermission}
+										<ComposerModeIcon iconId={activePermission.iconId} class="size-4" />
+									{/if}
+								</DropdownMenuTrigger>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content sideOffset={6}>{m.chat_composer_permission_tooltip()}</Tooltip.Content>
+					</Tooltip.Root>
+					<DropdownMenuContent align="start">
+						{#each permissionOptions as option (option.value)}
+							<DropdownMenuItem
+								onclick={() => onPermissionSelect(option.value)}
+								class="items-start"
+							>
+								<ComposerModeIcon iconId={option.iconId} class="mt-0.5 size-4" />
+								<div class="min-w-0">
+									<div class="font-medium">{option.label}</div>
+									<div class="text-xs text-muted-foreground">{option.description}</div>
 								</div>
-							</div>
-						</DropdownMenuItem>
-					{/each}
-				</DropdownMenuContent>
-			</DropdownMenu>
+							</DropdownMenuItem>
+						{/each}
+					</DropdownMenuContent>
+				</DropdownMenu>
+			</Tooltip.Provider>
+
+			<Tooltip.Provider>
+				<DropdownMenu>
+					<Tooltip.Root>
+						<Tooltip.Trigger data-tooltip-label={m.chat_composer_thinking_tooltip()}>
+							{#snippet child({ props })}
+								<DropdownMenuTrigger
+									{...props}
+									data-slot="thinking-mode-trigger"
+									data-rainbow={activeThinking?.rainbow ? 'true' : undefined}
+									class="inline-flex size-9 items-center justify-center rounded-lg border transition-colors {activeThinking?.toneClass}"
+									aria-label={activeThinking?.label ?? m.chat_composer_thinking_effort()}
+								>
+									{#if activeThinking}
+										<ComposerModeIcon
+											iconId={activeThinking.iconId}
+											rainbow={activeThinking.rainbow}
+											class="size-4"
+										/>
+									{/if}
+								</DropdownMenuTrigger>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content sideOffset={6}>{m.chat_composer_thinking_tooltip()}</Tooltip.Content>
+					</Tooltip.Root>
+					<DropdownMenuContent align="start">
+						{#each thinkingOptions as option (option.value)}
+							<DropdownMenuItem
+								onclick={() => onThinkingSelect(option.value)}
+								class={option.rainbow ? 'rainbow-ultra-surface items-start' : 'items-start'}
+								data-thinking-mode={option.value}
+								data-rainbow={option.rainbow ? 'true' : undefined}
+							>
+								<ComposerModeIcon
+									iconId={option.iconId}
+									rainbow={option.rainbow}
+									class="mt-0.5 size-4"
+								/>
+								<div class="min-w-0">
+									<div class="font-medium">{option.label}</div>
+									<div
+										class={option.rainbow ? 'text-xs text-white' : 'text-xs text-muted-foreground'}
+									>
+										{option.description}
+									</div>
+								</div>
+							</DropdownMenuItem>
+						{/each}
+					</DropdownMenuContent>
+				</DropdownMenu>
+			</Tooltip.Provider>
 
 			{#if agentSettings}
 				{@render agentSettings()}
@@ -235,20 +263,25 @@
 			{/if}
 
 			{#if showSendButton}
-				<button
-					type="button"
-					onclick={onSend}
-					disabled={!canSend || isPromptTransformPending}
-					class="inline-flex size-9 shrink-0 items-center justify-center rounded-full border transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background disabled:bg-muted disabled:text-muted-foreground disabled:border-border disabled:cursor-not-allowed {sendButtonClass}"
-					title={sendActionLabel}
-					aria-label={sendActionLabel}
-				>
-					{#if isPromptTransformPending}
-						<Loader2 class="size-4 animate-spin" aria-hidden="true" />
-					{:else}
-						<Send class="size-4" aria-hidden="true" />
-					{/if}
-				</button>
+				<Tooltip.Provider>
+					<Tooltip.Root>
+						<Tooltip.Trigger
+							type="button"
+							onclick={onSend}
+							disabled={!canSend || isPromptTransformPending}
+							class="inline-flex size-9 shrink-0 items-center justify-center rounded-full border transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background disabled:bg-muted disabled:text-muted-foreground disabled:border-border disabled:cursor-not-allowed {sendButtonClass}"
+							aria-label={sendActionLabel}
+							data-tooltip-label={sendActionLabel}
+						>
+							{#if isPromptTransformPending}
+								<Loader2 class="size-4 animate-spin" aria-hidden="true" />
+							{:else}
+								<Send class="size-4" aria-hidden="true" />
+							{/if}
+						</Tooltip.Trigger>
+						<Tooltip.Content sideOffset={6}>{sendActionLabel}</Tooltip.Content>
+					</Tooltip.Root>
+				</Tooltip.Provider>
 			{/if}
 		</div>
 	</div>

@@ -3,6 +3,7 @@
 	import { onMount } from 'svelte';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import * as Popover from '$lib/components/ui/popover';
+	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { getModelCatalog } from '$lib/context';
 	import { cn } from '$lib/utils/cn.js';
 	import * as m from '$lib/paraglide/messages.js';
@@ -29,6 +30,7 @@
 		side?: 'top' | 'right' | 'bottom' | 'left';
 		triggerClass?: string;
 		contentClass?: string;
+		tooltipLabel?: string;
 	}
 
 	let {
@@ -43,6 +45,7 @@
 		side = 'bottom',
 		triggerClass,
 		contentClass,
+		tooltipLabel,
 	}: Props = $props();
 
 	const modelCatalog = getModelCatalog();
@@ -171,60 +174,78 @@
 	<ChevronDown class="size-3.5 shrink-0 text-muted-foreground" />
 {/snippet}
 
-{#if isCompactLayout}
-	<Dialog.Root open={selector.open} onOpenChange={handleOpenChange}>
-		<Dialog.Trigger
-			bind:ref={triggerNode}
-			{disabled}
-			title={selector.triggerTitle}
-			aria-label={selector.triggerTitle || m.model_selector_unavailable()}
-			class={cn(triggerBaseClass, triggerClass)}
-		>
-			{@render triggerContent()}
-		</Dialog.Trigger>
-		<Dialog.Content
-			bind:ref={contentNode}
-			class={cn(
-				'safe-viewport-dialog top-[var(--app-viewport-center-y)] h-[min(32rem,calc(var(--app-height)-1rem))] overflow-hidden p-0',
-				contentClass,
-			)}
-			showCloseButton={false}
-		>
-			<ModelSelectorCompactLayout
-				{selector}
-				{showAgent}
-				showSource={sourceSelectionEnabled}
-				{modelListId}
-				onCancel={() => selector.discardAndClose()}
-				onDone={() => selector.commitAndClose()}
-			/>
-		</Dialog.Content>
-	</Dialog.Root>
-{:else}
-	<Popover.Root open={selector.open} onOpenChange={handleOpenChange}>
-		<Popover.Trigger
-			bind:ref={triggerNode}
-			{disabled}
-			title={selector.triggerTitle}
-			aria-label={selector.triggerTitle || m.model_selector_unavailable()}
-			class={cn(triggerBaseClass, triggerClass)}
-		>
-			{@render triggerContent()}
-		</Popover.Trigger>
-		<Popover.Content
-			bind:ref={contentNode}
-			{align}
-			{side}
-			sideOffset={8}
-			collisionPadding={8}
-			class={cn(
-				contentWidthClass,
-				contentHeightClass,
-				'max-h-(--bits-popover-content-available-height) overflow-hidden p-0',
-				contentClass,
-			)}
-		>
-			<ModelSelectorColumnsLayout {selector} {showAgent} {showSource} {modelListId} />
-		</Popover.Content>
-	</Popover.Root>
-{/if}
+<Tooltip.Provider>
+	{#if isCompactLayout}
+		<Dialog.Root open={selector.open} onOpenChange={handleOpenChange}>
+			<Tooltip.Root disabled={!tooltipLabel}>
+				<Tooltip.Trigger data-tooltip-label={tooltipLabel}>
+					{#snippet child({ props })}
+						<Dialog.Trigger
+							{...props}
+							bind:ref={triggerNode}
+							{disabled}
+							title={tooltipLabel ? undefined : selector.triggerTitle}
+							aria-label={selector.triggerTitle || m.model_selector_unavailable()}
+							class={cn(triggerBaseClass, triggerClass)}
+						>
+							{@render triggerContent()}
+						</Dialog.Trigger>
+					{/snippet}
+				</Tooltip.Trigger>
+				{#if tooltipLabel}<Tooltip.Content sideOffset={6}>{tooltipLabel}</Tooltip.Content>{/if}
+			</Tooltip.Root>
+			<Dialog.Content
+				bind:ref={contentNode}
+				class={cn(
+					'safe-viewport-dialog top-[var(--app-viewport-center-y)] h-[min(32rem,calc(var(--app-height)-1rem))] overflow-hidden p-0',
+					contentClass,
+				)}
+				showCloseButton={false}
+			>
+				<ModelSelectorCompactLayout
+					{selector}
+					{showAgent}
+					showSource={sourceSelectionEnabled}
+					{modelListId}
+					onCancel={() => selector.discardAndClose()}
+					onDone={() => selector.commitAndClose()}
+				/>
+			</Dialog.Content>
+		</Dialog.Root>
+	{:else}
+		<Popover.Root open={selector.open} onOpenChange={handleOpenChange}>
+			<Tooltip.Root disabled={!tooltipLabel}>
+				<Tooltip.Trigger data-tooltip-label={tooltipLabel}>
+					{#snippet child({ props })}
+						<Popover.Trigger
+							{...props}
+							bind:ref={triggerNode}
+							{disabled}
+							title={tooltipLabel ? undefined : selector.triggerTitle}
+							aria-label={selector.triggerTitle || m.model_selector_unavailable()}
+							class={cn(triggerBaseClass, triggerClass)}
+						>
+							{@render triggerContent()}
+						</Popover.Trigger>
+					{/snippet}
+				</Tooltip.Trigger>
+				{#if tooltipLabel}<Tooltip.Content sideOffset={6}>{tooltipLabel}</Tooltip.Content>{/if}
+			</Tooltip.Root>
+			<Popover.Content
+				bind:ref={contentNode}
+				{align}
+				{side}
+				sideOffset={8}
+				collisionPadding={8}
+				class={cn(
+					contentWidthClass,
+					contentHeightClass,
+					'max-h-(--bits-popover-content-available-height) overflow-hidden p-0',
+					contentClass,
+				)}
+			>
+				<ModelSelectorColumnsLayout {selector} {showAgent} {showSource} {modelListId} />
+			</Popover.Content>
+		</Popover.Root>
+	{/if}
+</Tooltip.Provider>

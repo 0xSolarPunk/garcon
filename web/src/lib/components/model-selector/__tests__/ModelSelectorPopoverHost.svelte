@@ -28,6 +28,7 @@
 		selectableAgentIds?: readonly SessionAgentId[];
 		recents?: ModelSelectorRecentOption[];
 		preferRecentsOnOpen?: boolean;
+		tooltipLabel?: string;
 	}
 
 	let {
@@ -42,6 +43,7 @@
 		selectableAgentIds,
 		recents = [],
 		preferRecentsOnOpen = false,
+		tooltipLabel,
 	}: Props = $props();
 
 	let claudeModels = $derived.by<ModelOption[]>(() => {
@@ -181,4 +183,5 @@
 	{recents}
 	{preferRecentsOnOpen}
 	{selectableAgentIds}
+	{tooltipLabel}
 />

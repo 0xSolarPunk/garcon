@@ -162,6 +162,39 @@ describe('ModelSelectorPopover', () => {
 		}
 	});
 
+	it('renders a styled tooltip without an ambient provider', async () => {
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { agent: 'fixed', source: 'hidden', surface: 'composer' },
+			onChange: vi.fn(),
+			tooltipLabel: 'Change model',
+		});
+
+		const trigger = screen.getByRole('button', { name: /Claude .* Model 0/ });
+		expect(trigger.getAttribute('title')).toBeNull();
+		await fireEvent.focus(trigger);
+
+		const tooltip = await waitFor(() => {
+			const content = document.querySelector<HTMLElement>('[data-slot="tooltip-content"]');
+			expect(content).toBeTruthy();
+			return content as HTMLElement;
+		});
+		expect(tooltip.textContent?.trim()).toBe('Change model');
+		expect(tooltip.classList.contains('bg-foreground')).toBe(true);
+	});
+
+	it('retains the native title when no styled tooltip is requested', () => {
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { agent: 'fixed', source: 'hidden', surface: 'settings' },
+			onChange: vi.fn(),
+		});
+
+		expect(screen.getByRole('button', { name: /Claude .* Model 0/ }).getAttribute('title')).toBe(
+			'Claude / Model 0',
+		);
+	});
+
 	it('commits normal model selection immediately and closes', async () => {
 		const onChange = vi.fn();
 

@@ -71,6 +71,28 @@ describe('PromptComposer prompt refinement', () => {
 		expect((refine as HTMLButtonElement).disabled).toBe(true);
 	});
 
+	it('describes the composer controls with short hover tooltips', async () => {
+		render(PromptComposerTestHost, { selectedChatId: 'chat-control-tooltips' });
+		await typeDraft('A draft with enabled actions');
+
+		expect(
+			screen.getByRole('button', { name: /Claude .* Opus/ }).getAttribute('data-tooltip-label'),
+		).toBe('Change model');
+		expect(
+			screen
+				.getByRole('button', { name: 'Open expanded composer' })
+				.getAttribute('data-tooltip-label'),
+		).toBe('Expand composer');
+		expect(
+			screen.getByRole('button', { name: 'Refine prompt' }).getAttribute('data-tooltip-label'),
+		).toBe('Refine with AI');
+		expect(
+			screen.getByRole('button', { name: 'Send message' }).getAttribute('data-tooltip-label'),
+		).toBe('Send message');
+		expect(document.querySelector('[data-tooltip-label="Change permissions"]')).toBeTruthy();
+		expect(document.querySelector('[data-tooltip-label="Change thinking effort"]')).toBeTruthy();
+	});
+
 	it('locks compact draft mutations and cancellation preserves text and attachments', async () => {
 		const pending = deferredRefinement();
 		vi.mocked(refinementApi.refinePrompt).mockReturnValueOnce(pending.promise);

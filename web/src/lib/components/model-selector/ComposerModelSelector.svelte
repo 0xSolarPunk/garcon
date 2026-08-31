@@ -7,6 +7,7 @@
 		ModelSelectorRecentOption,
 		ModelSelectorValue,
 	} from './model-selector-types';
+	import * as m from '$lib/paraglide/messages.js';
 
 	interface Props {
 		value: ModelSelectorValue;
@@ -43,4 +44,5 @@
 	{disabled}
 	{align}
 	{side}
+	tooltipLabel={m.chat_composer_model_tooltip()}
 />

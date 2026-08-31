@@ -8,6 +8,7 @@
 		DropdownMenuSeparator,
 		DropdownMenuTrigger,
 	} from '$lib/components/ui/dropdown-menu';
+	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { cn } from '$lib/utils/cn';
 	import { selectVisibleSurfaceActionIds } from './responsive-surface-actions.js';
 
@@ -169,69 +170,88 @@
 	</button>
 {/snippet}
 
-<div
-	bind:this={root}
-	class={cn(
-		'relative flex min-w-8 flex-1 items-center justify-end gap-1 overflow-hidden',
-		className,
-	)}
-	data-responsive-surface-actions
->
-	{#if fixed}
-		<div bind:this={fixedControl} class="flex min-w-0 shrink items-center gap-1">
-			{@render fixed()}
-		</div>
-	{/if}
-	{#each visibleActions as action (action.renderKey ?? action.id)}
-		{@render actionButton(action)}
-	{/each}
-	{#if showMenu}
-		<DropdownMenu>
-			<DropdownMenuTrigger
-				class={menuClass()}
-				aria-label={menuLabel}
-				title={menuLabel}
-				data-responsive-surface-menu-trigger
-			>
-				<MenuIcon class="h-4 w-4" />
-			</DropdownMenuTrigger>
-			<DropdownMenuContent align="end" class={hasPersistentMenuContent ? 'w-64' : 'w-56'}>
-				{#if menuLeadingContent}
-					{@render menuLeadingContent()}
-					{#if overflowActions.length > 0 || menuContent}
-						<DropdownMenuSeparator />
-					{/if}
-				{/if}
-				{#if menuContent}
-					{@render menuContent(overflowActions)}
-				{:else}
-					{#each overflowActions as action (action.renderKey ?? action.id)}
-						{@const Icon = action.icon}
-						<DropdownMenuItem
-							variant={action.variant === 'destructive' ? 'destructive' : undefined}
-							disabled={action.disabled || action.busy}
-							aria-busy={action.busy || undefined}
-							onclick={action.onclick}
-						>
-							<Icon class={cn('h-4 w-4', action.iconClass)} />
-							<span class="min-w-0 truncate">{action.label}</span>
-						</DropdownMenuItem>
-					{/each}
-				{/if}
-			</DropdownMenuContent>
-		</DropdownMenu>
-	{/if}
-
+<Tooltip.Provider>
 	<div
-		bind:this={measurementRail}
-		class="pointer-events-none invisible absolute -left-[10000px] top-0 flex items-center gap-1"
-		aria-hidden="true"
+		bind:this={root}
+		class={cn(
+			'relative flex min-w-8 flex-1 items-center justify-end gap-1 overflow-hidden',
+			className,
+		)}
+		data-responsive-surface-actions
 	>
-		{#each actions as action (action.renderKey ?? action.id)}
-			{@render actionButton(action, true)}
+		{#if fixed}
+			<div bind:this={fixedControl} class="flex min-w-0 shrink items-center gap-1">
+				{@render fixed()}
+			</div>
+		{/if}
+		{#each visibleActions as action (action.renderKey ?? action.id)}
+			{@const Icon = action.icon}
+			<Tooltip.Root>
+				<Tooltip.Trigger
+					type="button"
+					class={actionClass(action)}
+					onclick={action.busy ? undefined : action.onclick}
+					disabled={action.disabled}
+					aria-disabled={action.busy || undefined}
+					aria-busy={action.busy || undefined}
+					aria-label={action.label}
+					data-tooltip-label={action.title ?? action.label}
+					data-surface-action-id={action.id}
+				>
+					<Icon class={cn('h-4 w-4', action.iconClass)} />
+					{#if action.showLabel}<span class="min-w-0 truncate">{action.label}</span>{/if}
+				</Tooltip.Trigger>
+				<Tooltip.Content sideOffset={6}>{action.title ?? action.label}</Tooltip.Content>
+			</Tooltip.Root>
 		{/each}
-		<button type="button" tabindex="-1" class={menuClass()} data-surface-action-overflow-measure>
-			<MenuIcon class="h-4 w-4" />
-		</button>
+		{#if showMenu}
+			<DropdownMenu>
+				<DropdownMenuTrigger
+					class={menuClass()}
+					aria-label={menuLabel}
+					title={menuLabel}
+					data-responsive-surface-menu-trigger
+				>
+					<MenuIcon class="h-4 w-4" />
+				</DropdownMenuTrigger>
+				<DropdownMenuContent align="end" class={hasPersistentMenuContent ? 'w-64' : 'w-56'}>
+					{#if menuLeadingContent}
+						{@render menuLeadingContent()}
+						{#if overflowActions.length > 0 || menuContent}
+							<DropdownMenuSeparator />
+						{/if}
+					{/if}
+					{#if menuContent}
+						{@render menuContent(overflowActions)}
+					{:else}
+						{#each overflowActions as action (action.renderKey ?? action.id)}
+							{@const Icon = action.icon}
+							<DropdownMenuItem
+								variant={action.variant === 'destructive' ? 'destructive' : undefined}
+								disabled={action.disabled || action.busy}
+								aria-busy={action.busy || undefined}
+								onclick={action.onclick}
+							>
+								<Icon class={cn('h-4 w-4', action.iconClass)} />
+								<span class="min-w-0 truncate">{action.label}</span>
+							</DropdownMenuItem>
+						{/each}
+					{/if}
+				</DropdownMenuContent>
+			</DropdownMenu>
+		{/if}
+
+		<div
+			bind:this={measurementRail}
+			class="pointer-events-none invisible absolute -left-[10000px] top-0 flex items-center gap-1"
+			aria-hidden="true"
+		>
+			{#each actions as action (action.renderKey ?? action.id)}
+				{@render actionButton(action, true)}
+			{/each}
+			<button type="button" tabindex="-1" class={menuClass()} data-surface-action-overflow-measure>
+				<MenuIcon class="h-4 w-4" />
+			</button>
+		</div>
 	</div>
-</div>
+</Tooltip.Provider>
