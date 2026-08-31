@@ -179,7 +179,9 @@ describe('FileSurface', () => {
 			dirty: true,
 		});
 
-		expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+		const save = screen.getByRole('button', { name: 'Save' });
+		expect(save.getAttribute('aria-disabled')).toBe('true');
+		expect(save.hasAttribute('disabled')).toBe(false);
 	});
 
 	it('refreshes from the toolbar action', async () => {

@@ -168,14 +168,14 @@ describe('NewChatForm composer actions', () => {
 
 		expect(open.compareDocumentPosition(refine) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 		expect(refine.compareDocumentPosition(start) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-		expect((refine as HTMLButtonElement).disabled).toBe(true);
+		expect(refine.getAttribute('aria-disabled')).toBe('true');
 
 		await fireEvent.input(messageInput, { target: { value: 'A draft to improve' } });
-		expect((refine as HTMLButtonElement).disabled).toBe(false);
+		expect(refine.hasAttribute('aria-disabled')).toBe(false);
 		await fireEvent.input(messageInput, {
 			target: { value: 'x'.repeat(PROMPT_REFINEMENT_DRAFT_MAX_LENGTH + 1) },
 		});
-		expect((refine as HTMLButtonElement).disabled).toBe(true);
+		expect(refine.getAttribute('aria-disabled')).toBe('true');
 	});
 
 	it('moves secondary actions into a working overflow menu when space is constrained', async () => {
@@ -243,9 +243,8 @@ describe('NewChatForm composer actions', () => {
 		expect(messageInput.readOnly).toBe(true);
 		expect(fileInput.disabled).toBe(true);
 		expect(
-			(screen.getByRole('button', { name: 'Open expanded composer' }) as HTMLButtonElement)
-				.disabled,
-		).toBe(true);
+			screen.getByRole('button', { name: 'Open expanded composer' }).getAttribute('aria-disabled'),
+		).toBe('true');
 		expect(
 			(screen.getByRole('button', { name: 'Refining prompt...' }) as HTMLButtonElement).disabled,
 		).toBe(true);

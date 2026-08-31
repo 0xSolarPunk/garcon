@@ -191,22 +191,25 @@ describe('QueueControls', () => {
 		await view.rerender({ queue: makeQueueWithIds(['q1', 'q0']) });
 
 		expect(screen.getByText('queued q0')).toBeTruthy();
-		expect(screen.getByRole('button', { name: m.chat_queue_steer() }).getAttribute('aria-busy')).toBe(
-			'true',
-		);
+		expect(
+			screen.getByRole('button', { name: m.chat_queue_steer() }).getAttribute('aria-busy'),
+		).toBe('true');
 
 		await view.rerender({ queue: makeQueueWithIds(['q1']) });
 		const nextHeadSteer = screen.getByRole('button', { name: m.chat_queue_steer() });
 		expect(screen.getByText('queued q1')).toBeTruthy();
 		expect(nextHeadSteer.getAttribute('aria-busy')).toBeNull();
-		expect(nextHeadSteer.hasAttribute('disabled')).toBe(true);
+		expect(nextHeadSteer.getAttribute('aria-disabled')).toBe('true');
 		expect(nextHeadSteer).not.toBe(steer);
 		expect(steer.isConnected).toBe(false);
 		expect(document.activeElement).not.toBe(nextHeadSteer);
 
 		pending.resolve();
-		await waitFor(() => expect(nextHeadSteer.hasAttribute('disabled')).toBe(false));
-		await fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Enter', code: 'Enter' });
+		await waitFor(() => expect(nextHeadSteer.hasAttribute('aria-disabled')).toBe(false));
+		await fireEvent.keyDown(document.activeElement ?? document.body, {
+			key: 'Enter',
+			code: 'Enter',
+		});
 		expect(onSteer).toHaveBeenCalledOnce();
 	});
 
@@ -227,9 +230,9 @@ describe('QueueControls', () => {
 		expect(onSteer).toHaveBeenNthCalledWith(2, expect.objectContaining({ id: 'b0' }), 0);
 
 		await view.rerender({ chatId: 'chat-1', queue: makeQueueWithIds(['a0']) });
-		expect(screen.getByRole('button', { name: m.chat_queue_steer() }).getAttribute('aria-busy')).toBe(
-			'true',
-		);
+		expect(
+			screen.getByRole('button', { name: m.chat_queue_steer() }).getAttribute('aria-busy'),
+		).toBe('true');
 		pending.resolve();
 	});
 
@@ -251,10 +254,11 @@ describe('QueueControls', () => {
 			m.chat_queue_remove_from_queue(),
 			m.chat_queue_previous_message(),
 			m.chat_queue_next_message(),
-			m.chat_queue_edit_queue(),
-			m.chat_queue_pause(),
 		]) {
 			expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
+		}
+		for (const name of [m.chat_queue_edit_queue(), m.chat_queue_pause()]) {
+			expect(screen.getByRole('button', { name }).getAttribute('aria-disabled')).toBe('true');
 		}
 
 		const reordered = makeQueueWithIds(['q1', 'q0']);
@@ -287,9 +291,9 @@ describe('QueueControls', () => {
 		await fireEvent.click(button);
 
 		expect(mutation).toHaveBeenCalledOnce();
-		expect((button as HTMLButtonElement).disabled).toBe(true);
+		expect(button.getAttribute('aria-disabled')).toBe('true');
 		pendingMutation.resolve();
-		await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+		await waitFor(() => expect(button.hasAttribute('aria-disabled')).toBe(false));
 	});
 
 	it('resumes with the rendered pause ID and hides interrupt while paused', async () => {
