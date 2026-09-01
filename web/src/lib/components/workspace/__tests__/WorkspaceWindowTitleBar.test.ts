@@ -325,13 +325,12 @@ describe('WorkspaceWindowTitleBar', () => {
 			name: m.workspace_close_named_tab({ title: 'Tests' }),
 		});
 		expect(terminalClose).toBeTruthy();
-		expect(fileClose.className).toContain('opacity-100');
+		expect(fileClose.className).toContain('opacity-0');
+		expect(fileClose.className).toContain('pointer-events-none');
 		expect(fileClose.className).toContain(
 			'[@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:opacity-100',
 		);
-		expect(fileClose.className).toContain(
-			'[@media(hover:hover)_and_(pointer:fine)]:group-focus-within/window-tab:opacity-100',
-		);
+		expect(fileClose.className).toContain('group-focus-within/window-tab:opacity-100');
 		expect(fileClose.closest('[draggable="true"]')).toBeNull();
 
 		const priorFocus = document.createElement('button');
@@ -380,6 +379,36 @@ describe('WorkspaceWindowTitleBar', () => {
 		} finally {
 			priorFocus.remove();
 		}
+	});
+
+	it('composes touch long-press context-menu and tab focus handlers', async () => {
+		runtime.surfaces = {
+			[chatSurface.id]: chatSurface,
+			[fileSurface.id]: fileSurface,
+		};
+		renderTitleBar(workspaceWindow([chatSurface.id, fileSurface.id], chatSurface.id));
+		const fileTab = screen.getByRole('tab', { name: 'README.md' });
+
+		await fireEvent.pointerDown(fileTab, {
+			pointerType: 'touch',
+			pointerId: 1,
+			isPrimary: true,
+			clientX: 40,
+			clientY: 20,
+		});
+		const closeItem = await screen.findByRole(
+			'menuitem',
+			{ name: m.workspace_close_tab() },
+			{ timeout: 1_000 },
+		);
+		await fireEvent.pointerUp(fileTab, {
+			pointerType: 'touch',
+			pointerId: 1,
+			isPrimary: true,
+		});
+
+		expect(closeItem).toBeTruthy();
+		expect(noteWindowChromeFocus).toHaveBeenCalledWith('window-main', fileSurface.id);
 	});
 
 	it('disables an inline close control when its surface close is blocked', async () => {

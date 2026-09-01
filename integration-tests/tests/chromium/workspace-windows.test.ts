@@ -1158,7 +1158,7 @@ describe('Chromium workspace windows', () => {
       await fixture.page.mouse.move(0, 0);
       await waitForCloseOpacity('0');
 
-      markPhase('keeping the close control visible without hover on touch devices');
+      markPhase('keeping the close control hidden and menu close available on touch devices');
       const cdp = await fixture.context.newCDPSession(fixture.page);
       await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
       expect(
@@ -1166,7 +1166,23 @@ describe('Chromium workspace windows', () => {
           () => matchMedia('(hover: none) and (pointer: coarse)').matches,
         ),
       ).toBe(true);
-      await waitForCloseOpacity('1');
+      await waitForCloseOpacity('0');
+      const terminalBounds = await terminalTab.boundingBox();
+      if (!terminalBounds) throw new Error('Terminal tab has no touch target bounds.');
+      const touchPoint = {
+        x: terminalBounds.x + terminalBounds.width / 2,
+        y: terminalBounds.y + terminalBounds.height / 2,
+      };
+      await cdp.send('Input.dispatchTouchEvent', {
+        type: 'touchStart',
+        touchPoints: [touchPoint],
+      });
+      await fixture.page.waitForTimeout(800);
+      await fixture.page
+        .getByRole('menuitem', { name: 'Close tab', exact: true })
+        .waitFor({ state: 'visible' });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await fixture.page.keyboard.press('Escape');
       await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
 
       markPhase('using the context menu when the tab rail becomes icon-only');

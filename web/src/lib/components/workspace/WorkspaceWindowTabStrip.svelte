@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { tick, untrack } from 'svelte';
+	import { mergeProps } from 'bits-ui';
 	import { ContextMenu, ContextMenuTrigger } from '$lib/components/ui/context-menu';
 	import { getChatSessions, getNotifications, getWorkspaceCoordinator } from '$lib/context';
 	import type {
@@ -245,12 +246,15 @@
 {#snippet tabButton(surfaceId: string, measurement: boolean, triggerProps: Record<string, unknown>)}
 	{@const dropPosition = measurement ? null : tabDropPosition(surfaceId)}
 	{@const renderedLabelMode: WindowTabLabelMode = measurement ? 'full' : labelMode}
+	{@const composedTriggerProps = measurement
+		? triggerProps
+		: mergeProps(triggerProps, { onpointerdown: () => onFocus?.(surfaceId) })}
 	{@const chatIsProcessing = !measurement && isChatProcessing(surfaceId)}
 	{@const processingStatusId = `${windowId}-tab-${surfaceId}-processing`}
 	{@const isSelected = !measurement && tabs.activeId === surfaceId}
 	{@const showSelectedBackground = isSelected && tabs.order.length > 1}
 	<button
-		{...triggerProps}
+		{...composedTriggerProps}
 		type="button"
 		role={measurement ? undefined : 'tab'}
 		id={measurement ? undefined : `${windowId}-tab-${surfaceId}`}
@@ -277,7 +281,6 @@
 		ondragend={!measurement ? () => dnd.endDrag() : undefined}
 		onclick={measurement ? undefined : () => onSelect(surfaceId)}
 		onfocus={measurement ? undefined : () => onFocus?.(surfaceId)}
-		onpointerdown={measurement ? undefined : () => onFocus?.(surfaceId)}
 		onkeydown={measurement ? undefined : (event) => handleKeydown(event, surfaceId)}
 	>
 		{#if dropPosition}
@@ -334,7 +337,7 @@
 		{#if !measurement && showInlineClose}
 			<button
 				type="button"
-				class="absolute right-0.5 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground opacity-100 transition-[color,background-color,opacity] hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:hover)_and_(pointer:fine)]:pointer-events-none [@media(hover:hover)_and_(pointer:fine)]:opacity-0 [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:pointer-events-auto [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:opacity-100 [@media(hover:hover)_and_(pointer:fine)]:group-focus-within/window-tab:pointer-events-auto [@media(hover:hover)_and_(pointer:fine)]:group-focus-within/window-tab:opacity-100 disabled:cursor-not-allowed disabled:text-muted-foreground/40"
+				class="pointer-events-none absolute right-0.5 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground opacity-0 transition-[color,background-color,opacity] hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-focus-within/window-tab:pointer-events-auto group-focus-within/window-tab:opacity-100 [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:pointer-events-auto [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:opacity-100 disabled:cursor-not-allowed disabled:text-muted-foreground/40"
 				aria-label={m.workspace_close_named_tab({ title: labelFor(surfaceId) })}
 				title={m.workspace_close_named_tab({ title: labelFor(surfaceId) })}
 				disabled={workspace.isSurfaceCloseBlocked(surfaceId)}
