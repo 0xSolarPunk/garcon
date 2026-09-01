@@ -60,6 +60,9 @@
 					id="username"
 					bind:value={username}
 					placeholder={m.auth_login_placeholders_username()}
+					autocomplete="username"
+					autocapitalize="none"
+					spellcheck="false"
 					required
 					disabled={isSubmitting}
 				/>
@@ -75,6 +78,7 @@
 						id="password"
 						bind:value={password}
 						placeholder={m.auth_login_placeholders_password()}
+						autocomplete="current-password"
 						required
 						disabled={isSubmitting}
 						class="pr-10"
