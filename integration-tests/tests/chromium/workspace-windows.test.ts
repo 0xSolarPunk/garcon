@@ -5,6 +5,7 @@ import type { Locator, Page } from 'playwright';
 import { withChromiumFixture, type ChromiumFixture } from '../../support/chromium-fixture.js';
 
 const WINDOW_SELECTOR = '[data-workspace-window-id]';
+const TWO_TRUNCATED_CLOSABLE_TABS_WIDTH = 178;
 
 function conversationPanel(page: Page, windowId: string): Locator {
   return page.locator(
@@ -196,7 +197,7 @@ async function verifyAdaptiveTabLabels(page: Page, windowId: string): Promise<vo
     .count();
   expect(measuredCount).toBe(2);
 
-  await setTabRailWidth(page, windowId, 130);
+  await setTabRailWidth(page, windowId, TWO_TRUNCATED_CLOSABLE_TABS_WIDTH);
   await waitForTabLabelMode(page, windowId, 'truncated');
   expect(await tabViewport.locator('[role="tab"]').count()).toBe(2);
 
