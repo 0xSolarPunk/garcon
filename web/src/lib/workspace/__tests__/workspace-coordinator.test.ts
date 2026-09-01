@@ -645,6 +645,27 @@ describe('WorkspaceCoordinator', () => {
 		expect(coordinator.lastFocusedWindowId).toBe('window-main');
 	});
 
+	it('preserves current-window and composer ownership when an inactive window tab closes', async () => {
+		const { coordinator, layout } = createHarness();
+		await coordinator.openSingletonInNewWindow('git-history');
+		const historyWindowId = windowIdOfSurface(
+			layout.snapshot.desktopRoot,
+			'singleton:git-history',
+		)!;
+		await coordinator.openSingletonAsTab('files', historyWindowId);
+		await coordinator.focusChat();
+		const ownerBefore = coordinator.focusOwner;
+		const composerAnchorBefore = coordinator.composerAnchorSurfaceId;
+
+		await expect(coordinator.closeSurface('singleton:files')).resolves.toBe(true);
+
+		expect(coordinator.currentWindowId).toBe('window-main');
+		expect(coordinator.lastFocusedSurfaceId).toBe(CANONICAL_CHAT_SURFACE_ID);
+		expect(coordinator.focusOwner).toEqual(ownerBefore);
+		expect(coordinator.composerAnchorSurfaceId).toBe(composerAnchorBefore);
+		expect(windowTabs(layout.snapshot, historyWindowId).activeId).toBe('singleton:git-history');
+	});
+
 	it('cancels workspace drag before fullscreen and preserves topology on publication failure', async () => {
 		const successful = createHarness();
 		const cancel = vi.spyOn(successful.workspaceInteractionGate, 'cancelBeforeInertTransition');

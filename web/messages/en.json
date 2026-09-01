@@ -904,6 +904,7 @@
 	"workspace_pop_out": "Pop out",
 	"workspace_close_view": "Close view",
 	"workspace_close_tab": "Close tab",
+	"workspace_close_named_tab": "Close {title}",
 	"workspace_fullscreen": "Fullscreen",
 	"workspace_exit_fullscreen": "Exit fullscreen",
 	"workspace_back": "Back",

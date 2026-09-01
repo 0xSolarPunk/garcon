@@ -121,6 +121,16 @@ const gitSurface = {
 	type: 'singleton',
 	kind: 'git',
 } as const satisfies SurfaceDescriptor;
+const fileSurface = {
+	id: 'file:file-a',
+	type: 'file',
+	fileSessionId: 'file-a',
+} as const satisfies SurfaceDescriptor;
+const terminalSurface = {
+	id: 'terminal:terminal-a',
+	type: 'terminal',
+	terminalId: 'terminal-a',
+} as const satisfies SurfaceDescriptor;
 const otherChatSurface = {
 	id: 'chat-view:window-two',
 	type: 'chat',
@@ -216,6 +226,8 @@ function labelFor(surfaceId: string): string {
 	if (surfaceId === chatSurface.id) return 'Chat A';
 	if (surfaceId === otherChatSurface.id) return 'Chat B';
 	if (surfaceId === gitSurface.id) return 'Git';
+	if (surfaceId === fileSurface.id) return 'README.md';
+	if (surfaceId === terminalSurface.id) return 'Tests';
 	return surfaceId;
 }
 
@@ -294,6 +306,96 @@ describe('WorkspaceWindowTitleBar', () => {
 		expect(screen.getByRole('tab', { name: 'Git' }).getAttribute('aria-selected')).toBe('true');
 		expect(screen.getByRole('tab', { name: 'Chat A' }).getAttribute('aria-selected')).toBe('false');
 		expect(tablist.closest('header')?.classList.contains('h-10')).toBe(true);
+	});
+
+	it('offers isolated inline close controls for closable labeled tabs', async () => {
+		runtime.surfaces = {
+			[chatSurface.id]: chatSurface,
+			[fileSurface.id]: fileSurface,
+			[terminalSurface.id]: terminalSurface,
+		};
+		renderTitleBar(
+			workspaceWindow([chatSurface.id, fileSurface.id, terminalSurface.id], chatSurface.id),
+		);
+
+		const fileClose = screen.getByRole('button', {
+			name: m.workspace_close_named_tab({ title: 'README.md' }),
+		});
+		const terminalClose = screen.getByRole('button', {
+			name: m.workspace_close_named_tab({ title: 'Tests' }),
+		});
+		expect(terminalClose).toBeTruthy();
+		expect(fileClose.className).toContain('opacity-100');
+		expect(fileClose.className).toContain(
+			'[@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:opacity-100',
+		);
+		expect(fileClose.className).toContain(
+			'[@media(hover:hover)_and_(pointer:fine)]:group-focus-within/window-tab:opacity-100',
+		);
+		expect(fileClose.closest('[draggable="true"]')).toBeNull();
+
+		const priorFocus = document.createElement('button');
+		priorFocus.textContent = 'Active surface control';
+		document.body.append(priorFocus);
+		try {
+			priorFocus.focus();
+			await fireEvent.pointerDown(fileClose);
+			fileClose.focus();
+			await fireEvent.click(fileClose);
+
+			expect(closeSurface).toHaveBeenCalledWith(fileSurface.id);
+			expect(focusSurface).not.toHaveBeenCalled();
+			await waitFor(() => expect(document.activeElement).toBe(priorFocus));
+			expect(noteWindowChromeFocus).not.toHaveBeenCalled();
+		} finally {
+			priorFocus.remove();
+		}
+	});
+
+	it('preserves focus and window ownership when an inactive window closes a tab', async () => {
+		runtime.windowCount = 2;
+		runtime.surfaces = {
+			[chatSurface.id]: chatSurface,
+			[fileSurface.id]: fileSurface,
+		};
+		const priorFocus = document.createElement('button');
+		priorFocus.textContent = 'Current window control';
+		document.body.append(priorFocus);
+		try {
+			renderTitleBar(workspaceWindow([chatSurface.id, fileSurface.id], chatSurface.id), false);
+			priorFocus.focus();
+			const close = screen.getByRole('button', {
+				name: m.workspace_close_named_tab({ title: 'README.md' }),
+			});
+
+			close.focus();
+			expect(noteWindowChromeFocus).not.toHaveBeenCalled();
+			await fireEvent.click(close);
+
+			expect(closeSurface).toHaveBeenCalledWith(fileSurface.id);
+			await waitFor(() => expect(document.activeElement).toBe(priorFocus));
+			expect(activateWindow).not.toHaveBeenCalled();
+			expect(focusSurface).not.toHaveBeenCalled();
+			expect(noteWindowChromeFocus).not.toHaveBeenCalled();
+		} finally {
+			priorFocus.remove();
+		}
+	});
+
+	it('disables an inline close control when its surface close is blocked', async () => {
+		runtime.surfaceCloseBlocked = true;
+		runtime.surfaces = {
+			[chatSurface.id]: chatSurface,
+			[fileSurface.id]: fileSurface,
+		};
+		renderTitleBar(workspaceWindow([chatSurface.id, fileSurface.id], chatSurface.id));
+
+		const close = screen.getByRole('button', {
+			name: m.workspace_close_named_tab({ title: 'README.md' }),
+		});
+		expect((close as HTMLButtonElement).disabled).toBe(true);
+		await fireEvent.click(close);
+		expect(closeSurface).not.toHaveBeenCalled();
 	});
 
 	it('replaces an inactive background Chat tab icon while that Chat is processing', () => {

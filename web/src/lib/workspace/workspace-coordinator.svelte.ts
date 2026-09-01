@@ -547,6 +547,8 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 	async closeSurface(surfaceId: string): Promise<boolean> {
 		const surface = this.layout.surface(surfaceId);
 		if (!surface || this.isSurfaceCloseBlocked(surfaceId)) return false;
+		const ownedFocus =
+			this.focusOwner.kind !== 'chat-list' && this.focusOwner.surfaceId === surfaceId;
 		this.#reservedSurfaceIds.add(surfaceId);
 		try {
 			if (surface.type === 'singleton' && surface.kind === 'commit') {
@@ -611,7 +613,7 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 				if (surface.kind === 'commit') this.#deps.singletons.commitIfPresent()?.discardDrafts();
 				this.#deps.singletons.disposeSurface(surface.kind);
 			}
-			if (!current) return true;
+			if (!current || !ownedFocus) return true;
 			const sourceWindowActive = sourceWindowId
 				? windowNodeById(this.layout.snapshot.desktopRoot, sourceWindowId)?.tabs.activeId
 				: null;

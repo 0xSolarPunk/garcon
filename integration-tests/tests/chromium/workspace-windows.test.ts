@@ -991,6 +991,220 @@ describe('Chromium workspace windows', () => {
     });
   });
 
+  test('reveals and isolates inline close controls on multiplexed tabs', async () => {
+    await withChromiumFixture('workspace-tab-inline-close', async (fixture, markPhase) => {
+      await createGitFixture(fixture.integration.dirs.project);
+      const filePath = join(fixture.integration.dirs.project, 'inline-close.ts');
+      await writeFile(filePath, 'export const closable = true;\n', 'utf8');
+      const chatId = await createChat(fixture, 'workspace-tab-inline-close');
+      await openChat(fixture, chatId);
+      const windowId = await fixture.page
+        .locator('[data-workspace-window-current="true"]')
+        .getAttribute('data-workspace-window-id');
+      if (!windowId) throw new Error('Missing current workspace window.');
+
+      markPhase('opening a file as a workspace tab');
+      await openWindowTab(fixture.page, windowId, 'Open Files');
+      await fixture.page.locator('[data-file-tree-grid]').waitFor({ state: 'visible' });
+      await fixture.page
+        .locator(`[data-file-tree-row] [role="rowheader"][title="${filePath}"]`)
+        .locator('..')
+        .click();
+      const fileTab = fixture.page.getByRole('tab', { name: 'inline-close.ts', exact: true });
+      await fileTab.waitFor({ state: 'visible' });
+      const panelId = await fileTab.getAttribute('aria-controls');
+      if (!panelId) throw new Error('File tab has no controlled panel.');
+      const surfaceId = panelId.slice(`${windowId}-panel-`.length);
+      const closeSelector = `[data-workspace-window-tab-close="${surfaceId}"]`;
+      const closeButton = fixture.page.locator(closeSelector);
+      const waitForCloseOpacity = (opacity: string) =>
+        fixture.page.waitForFunction(
+          ({ selector, expectedOpacity }) => {
+            const close = document.querySelector(selector);
+            return close !== null && getComputedStyle(close).opacity === expectedOpacity;
+          },
+          { selector: closeSelector, expectedOpacity: opacity },
+        );
+      await closeButton.waitFor({ state: 'attached' });
+
+      markPhase('checking hover and keyboard visibility without tab movement');
+      const widthBefore = (await fileTab.boundingBox())?.width;
+      expect(widthBefore).toBeGreaterThan(0);
+      await waitForCloseOpacity('0');
+      await fileTab.hover();
+      await waitForCloseOpacity('1');
+      expect((await fileTab.boundingBox())?.width).toBe(widthBefore);
+      await fixture.page.mouse.move(0, 0);
+      await fileTab.focus();
+      await waitForCloseOpacity('1');
+
+      markPhase('preserving active Files focus after a same-window pointer close');
+      await fixture.page.locator(`[id="${windowId}-tab-singleton:files"]`).click();
+      await fixture.page.waitForFunction(
+        (expectedWindowId) =>
+          document
+            .querySelector(`[data-workspace-window-id="${expectedWindowId}"]`)
+            ?.getAttribute('data-workspace-window-active-surface') === 'singleton:files',
+        windowId,
+      );
+      const activeFilesRow = fixture.page
+        .locator(`[data-file-tree-row] [role="rowheader"][title="${filePath}"]`)
+        .locator('..');
+      await activeFilesRow.focus();
+      await fileTab.hover();
+      await closeButton.click();
+      await closeButton.waitFor({ state: 'detached' });
+      await fixture.page.waitForFunction(
+        (expectedPath) =>
+          document.activeElement
+            ?.querySelector('[role="rowheader"]')
+            ?.getAttribute('title') === expectedPath,
+        filePath,
+      );
+
+      markPhase('reopening the file before creating a second window');
+      await activeFilesRow.click();
+      await fileTab.waitFor({ state: 'visible' });
+      const keyboardPanelId = await fileTab.getAttribute('aria-controls');
+      if (!keyboardPanelId) throw new Error('Reopened file tab has no controlled panel.');
+      const keyboardSurfaceId = keyboardPanelId.slice(`${windowId}-panel-`.length);
+      const keyboardCloseButton = fixture.page.locator(
+        `[data-workspace-window-tab-close="${keyboardSurfaceId}"]`,
+      );
+      await keyboardCloseButton.waitFor({ state: 'attached' });
+      await fixture.page.locator(`[id="${windowId}-tab-singleton:files"]`).click();
+
+      markPhase('creating a second window while keeping the reopened file inactive');
+      const currentWindowId = await openNewWindow(fixture.page, 'Open Git History');
+      const currentTab = fixture.page.locator(
+        `[data-workspace-window-id="${currentWindowId}"] [role="tab"][aria-selected="true"]`,
+      );
+      await currentTab.focus();
+
+      markPhase('closing the inactive-window file from the keyboard without stealing ownership');
+      await keyboardCloseButton.focus();
+      expect(
+        await fixture.page
+          .locator('[data-workspace-window-current="true"]')
+          .getAttribute('data-workspace-window-id'),
+      ).toBe(currentWindowId);
+      await keyboardCloseButton.press('Enter');
+      await keyboardCloseButton.waitFor({ state: 'detached' });
+      expect(
+        await fixture.page
+          .locator(`[data-workspace-window-id="${windowId}"]`)
+          .getAttribute('data-workspace-window-active-surface'),
+      ).toBe('singleton:files');
+      expect(
+        await fixture.page
+          .locator('[data-workspace-window-current="true"]')
+          .getAttribute('data-workspace-window-id'),
+      ).toBe(currentWindowId);
+      await fixture.page.waitForFunction(
+        (expectedWindowId) => {
+          const active = document.activeElement;
+          return (
+            active?.getAttribute('role') === 'tab' &&
+            active.closest('[data-workspace-window-id]')?.getAttribute('data-workspace-window-id') ===
+              expectedWindowId
+          );
+        },
+        currentWindowId,
+      );
+      fixture.assertNoBrowserErrors();
+    });
+  });
+
+  test('keeps terminal close controls accessible across touch and narrow tab rails', async () => {
+    await withChromiumFixture('workspace-terminal-inline-close', async (fixture, markPhase) => {
+      const chatId = await createChat(fixture, 'workspace-terminal-inline-close');
+      await openChat(fixture, chatId);
+      const windowId = await fixture.page
+        .locator('[data-workspace-window-current="true"]')
+        .getAttribute('data-workspace-window-id');
+      if (!windowId) throw new Error('Missing current workspace window.');
+
+      markPhase('opening a running terminal as a labeled tab');
+      await openWindowTab(fixture.page, windowId, 'New Terminal');
+      await fixture.page.waitForFunction(
+        (expectedWindowId) =>
+          document
+            .querySelector(`[data-workspace-window-id="${expectedWindowId}"]`)
+            ?.getAttribute('data-workspace-window-active-surface')
+            ?.startsWith('terminal:') === true,
+        windowId,
+      );
+      const terminalSurfaceId = await fixture.page
+        .locator(`[data-workspace-window-id="${windowId}"]`)
+        .getAttribute('data-workspace-window-active-surface');
+      if (!terminalSurfaceId?.startsWith('terminal:')) {
+        throw new Error('Terminal surface is missing.');
+      }
+      const terminalTab = fixture.page.locator(`[id="${windowId}-tab-${terminalSurfaceId}"]`);
+      const terminalLabel = await terminalTab.getAttribute('aria-label');
+      if (!terminalLabel) throw new Error('Terminal tab label is missing.');
+      const closeSelector = `[data-workspace-window-tab-close="${terminalSurfaceId}"]`;
+      const closeButton = fixture.page.locator(closeSelector);
+      const waitForCloseOpacity = (opacity: string) =>
+        fixture.page.waitForFunction(
+          ({ selector, expectedOpacity }) => {
+            const close = document.querySelector(selector);
+            return close !== null && getComputedStyle(close).opacity === expectedOpacity;
+          },
+          { selector: closeSelector, expectedOpacity: opacity },
+        );
+      await closeButton.waitFor({ state: 'attached' });
+      await fixture.page.mouse.move(0, 0);
+      await waitForCloseOpacity('0');
+
+      markPhase('keeping the close control visible without hover on touch devices');
+      const cdp = await fixture.context.newCDPSession(fixture.page);
+      await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+      expect(
+        await fixture.page.evaluate(
+          () => matchMedia('(hover: none) and (pointer: coarse)').matches,
+        ),
+      ).toBe(true);
+      await waitForCloseOpacity('1');
+      await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+
+      markPhase('using the context menu when the tab rail becomes icon-only');
+      const tabViewport = fixture.page.locator(`[data-workspace-window-tabs="${windowId}"]`);
+      await tabViewport.evaluate((element) => {
+        element.style.flex = '0 0 60px';
+        element.style.width = '60px';
+      });
+      await fixture.page.waitForFunction(
+        (expectedWindowId) =>
+          document
+            .querySelector(`[data-workspace-window-tabs="${expectedWindowId}"]`)
+            ?.getAttribute('data-workspace-tab-label-mode') === 'icon-only',
+        windowId,
+      );
+      await closeButton.waitFor({ state: 'detached' });
+      await terminalTab.click({ button: 'right' });
+      await fixture.page
+        .getByRole('menuitem', { name: 'Close tab', exact: true })
+        .waitFor({ state: 'visible' });
+      await fixture.page.keyboard.press('Escape');
+      await tabViewport.evaluate((element) => {
+        element.style.removeProperty('flex');
+        element.style.removeProperty('width');
+      });
+      await closeButton.waitFor({ state: 'attached' });
+
+      markPhase('detaching the running terminal through its inline close control');
+      await terminalTab.hover();
+      await closeButton.click();
+      await closeButton.waitFor({ state: 'detached' });
+      await fixture.page.locator(`[data-workspace-window-add-trigger="${windowId}"]`).click();
+      await fixture.page
+        .getByRole('menuitem', { name: terminalLabel, exact: true })
+        .waitFor({ state: 'visible' });
+      fixture.assertNoBrowserErrors();
+    }, undefined, { serverEnvironment: { GARCON_TERMINAL_SHELL: '/usr/bin/cat' } });
+  });
+
   test('truncates long move destinations in both window menus', async () => {
     await withChromiumFixture('workspace-window-long-move-label', async (fixture, markPhase) => {
       const content = 'workspace-window-chat-with-a-deliberately-long-move-destination-title';
