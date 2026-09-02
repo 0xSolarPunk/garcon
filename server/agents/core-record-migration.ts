@@ -6,9 +6,11 @@ import type { AgentLegacySettingsScope } from '@garcon/server-agent-interface';
 import { isRecord, type JsonObject, type JsonValue } from '@garcon/common/json';
 import type { IntegrationRegistry } from './integration-registry.js';
 
-const MIGRATION_ID = 'agent-integration-v1';
+const LEGACY_MIGRATION_ID = 'agent-integration-v1';
+const SETTINGS_REFRESH_MIGRATION_ID = 'agent-integration-settings-v2';
 const CHAT_SCHEMA_VERSION = 3;
 const CORE_RECORD_PATHS = new Set([
+  'agent-ownership-journal.json',
   'chats.json',
   'project-settings.json',
   'scheduled-prompts.json',
@@ -22,7 +24,7 @@ interface MigrationFile {
 }
 
 interface MigrationManifest {
-  readonly id: typeof MIGRATION_ID;
+  readonly id: string;
   readonly state: 'prepared' | 'committing' | 'committed';
   readonly files: readonly MigrationFile[];
 }
@@ -32,10 +34,36 @@ export async function migrateAgentIntegrationCoreRecords(options: {
   integrations: IntegrationRegistry;
   signal?: AbortSignal;
 }): Promise<void> {
+  await migrateCoreRecords(options, 'legacy');
+}
+
+export async function refreshAgentIntegrationCoreRecords(options: {
+  workspaceDir: string;
+  integrations: IntegrationRegistry;
+  signal?: AbortSignal;
+}): Promise<void> {
+  await migrateCoreRecords(options, 'settings-refresh');
+}
+
+async function migrateCoreRecords(
+  options: {
+    workspaceDir: string;
+    integrations: IntegrationRegistry;
+    signal?: AbortSignal;
+  },
+  migrationKind: 'legacy' | 'settings-refresh',
+): Promise<void> {
   const signal = options.signal ?? new AbortController().signal;
-  const journalDir = path.join(options.workspaceDir, 'migration-journals', MIGRATION_ID);
-  await recoverCoreRecordMigration(options.workspaceDir, journalDir);
-  const targets = await createMigrationTargets(options.workspaceDir, options.integrations, signal);
+  const refreshSettings = migrationKind === 'settings-refresh';
+  const migrationId = refreshSettings ? SETTINGS_REFRESH_MIGRATION_ID : LEGACY_MIGRATION_ID;
+  const journalDir = path.join(options.workspaceDir, 'migration-journals', migrationId);
+  await recoverCoreRecordMigration(options.workspaceDir, journalDir, migrationId);
+  const targets = await createMigrationTargets(
+    options.workspaceDir,
+    options.integrations,
+    signal,
+    refreshSettings,
+  );
   if (targets.length === 0) return;
 
   await fs.mkdir(journalDir, { recursive: true });
@@ -61,14 +89,18 @@ export async function migrateAgentIntegrationCoreRecords(options: {
     });
   }
   await fsyncDirectory(journalDir);
-  await writeManifest(journalDir, { id: MIGRATION_ID, state: 'prepared', files });
-  await writeManifest(journalDir, { id: MIGRATION_ID, state: 'committing', files });
+  await writeManifest(journalDir, { id: migrationId, state: 'prepared', files });
+  await writeManifest(journalDir, { id: migrationId, state: 'committing', files });
   await applyStagedTargets(options.workspaceDir, journalDir, files);
-  await writeManifest(journalDir, { id: MIGRATION_ID, state: 'committed', files });
+  await writeManifest(journalDir, { id: migrationId, state: 'committed', files });
 }
 
-async function recoverCoreRecordMigration(workspaceDir: string, journalDir: string): Promise<void> {
-  const manifest = await readManifest(journalDir);
+async function recoverCoreRecordMigration(
+  workspaceDir: string,
+  journalDir: string,
+  migrationId: string,
+): Promise<void> {
+  const manifest = await readManifest(journalDir, migrationId);
   if (!manifest) return;
   if (manifest.state === 'committed') return;
   if (manifest.state === 'prepared') {
@@ -84,10 +116,11 @@ async function createMigrationTargets(
   workspaceDir: string,
   integrations: IntegrationRegistry,
   signal: AbortSignal,
+  refreshSettings: boolean,
 ): Promise<Array<{ relativePath: string; value: JsonValue }>> {
   const targets: Array<{ relativePath: string; value: JsonValue }> = [];
   const chats = await readJson(path.join(workspaceDir, 'chats.json'));
-  if (isRecord(chats) && isRecord(chats.sessions) && needsChatMigration(chats)) {
+  if (isRecord(chats) && isRecord(chats.sessions) && (refreshSettings || needsChatMigration(chats))) {
     const sessions: Record<string, JsonValue> = {};
     for (const [chatId, value] of Object.entries(chats.sessions)) {
       signal.throwIfAborted();
@@ -96,13 +129,19 @@ async function createMigrationTargets(
       if (!agentId) throw new Error(`Chat ${chatId} has no integration ID`);
       const integration = integrations.require(agentId);
       const projectPath = stringValue(value.projectPath) ?? '';
-      const model = stringValue(value.model) ?? '';
+      const model = await integration.migration.translateLegacyModel({
+        scope: { kind: 'chat', recordId: chatId, selectedAgentId: agentId },
+        model: stringValue(value.model) ?? '',
+        signal,
+      });
       const agentSessionId = stringValue(value.agentSessionId)
         ?? stringValue(value.providerSessionId);
-      const shouldTranslateNativeSession = chats.version !== CHAT_SCHEMA_VERSION
+      const shouldTranslateNativeSession = !refreshSettings && (
+        chats.version !== CHAT_SCHEMA_VERSION
         || 'provider' in value
         || 'providerSessionId' in value
-        || 'nativePath' in value;
+        || 'nativePath' in value
+      );
       const nativeSession = shouldTranslateNativeSession
         ? await integration.migration.translateLegacyNativeSession({
             chatId,
@@ -124,6 +163,7 @@ async function createMigrationTargets(
       sessions[chatId] = withoutKeys({
         ...value,
         agentId,
+        model,
         agentSessionId,
         nativeSession: asJsonValue(nativeSession),
         agentSettingsById,
@@ -138,12 +178,16 @@ async function createMigrationTargets(
     }
     targets.push({
       relativePath: 'chats.json',
-      value: { ...chats, version: CHAT_SCHEMA_VERSION, sessions },
+      value: {
+        ...chats,
+        version: refreshSettings ? chats.version : CHAT_SCHEMA_VERSION,
+        sessions,
+      },
     });
   }
 
   const settings = await readJson(path.join(workspaceDir, 'project-settings.json'));
-  if (isRecord(settings) && needsSettingsMigration(settings)) {
+  if (isRecord(settings) && (refreshSettings || needsSettingsMigration(settings))) {
     const executionDefaults = isRecord(settings.executionDefaults) ? settings.executionDefaults : {};
     const global = isRecord(executionDefaults.global) ? executionDefaults.global : {};
     const legacyRootDefaults = legacyRootExecutionDefaults(settings);
@@ -178,10 +222,16 @@ async function createMigrationTargets(
         signal,
       );
     }
+    const recentAgentSettings = await migrateRecentAgentSettings(
+      integrations,
+      settings.recentAgentSettings,
+      signal,
+    );
     targets.push({
       relativePath: 'project-settings.json',
       value: withoutKeys({
         ...settings,
+        recentAgentSettings,
         executionDefaults: { global: migratedGlobal, byAgent },
       }, [
         'lastPermissionMode',
@@ -190,6 +240,29 @@ async function createMigrationTargets(
         'lastAmpAgentMode',
       ]),
     });
+  }
+
+  if (refreshSettings) {
+    const ownershipJournal = await readJson(path.join(workspaceDir, 'agent-ownership-journal.json'));
+    if (isRecord(ownershipJournal) && Array.isArray(ownershipJournal.ownershipIntents)) {
+      const ownershipIntents: JsonValue[] = [];
+      for (const candidate of ownershipJournal.ownershipIntents) {
+        signal.throwIfAborted();
+        if (!isRecord(candidate) || candidate.kind !== 'handoff') {
+          ownershipIntents.push(candidate as JsonValue);
+          continue;
+        }
+        ownershipIntents.push(await migrateHandoffIntent(
+          integrations,
+          candidate as JsonObject,
+          signal,
+        ));
+      }
+      targets.push({
+        relativePath: 'agent-ownership-journal.json',
+        value: { ...ownershipJournal, ownershipIntents },
+      });
+    }
   }
 
   const scheduled = await readJson(path.join(workspaceDir, 'scheduled-prompts.json'));
@@ -204,12 +277,18 @@ async function createMigrationTargets(
       }
       const target = candidate.target;
       const hasLegacySettings = 'claudeThinkingMode' in target || 'ampAgentMode' in target;
-      if (isRecord(target.agentSettingsById) && !hasLegacySettings) {
+      if (!refreshSettings && isRecord(target.agentSettingsById) && !hasLegacySettings) {
         prompts.push(candidate);
         continue;
       }
       const agentId = stringValue(target.agentId);
       if (!agentId) throw new Error(`Scheduled prompt ${String(candidate.id)} has no integration ID`);
+      const integration = integrations.require(agentId);
+      const model = await integration.migration.translateLegacyModel({
+        scope: { kind: 'scheduled-prompt', recordId: String(candidate.id), selectedAgentId: agentId },
+        model: stringValue(target.model) ?? '',
+        signal,
+      });
       const agentSettingsById = await translateSettings(
         integrations,
         { kind: 'scheduled-prompt', recordId: String(candidate.id), selectedAgentId: agentId },
@@ -218,7 +297,7 @@ async function createMigrationTargets(
       );
       prompts.push({
         ...candidate,
-        target: withoutKeys({ ...target, agentSettingsById }, ['claudeThinkingMode', 'ampAgentMode']),
+        target: withoutKeys({ ...target, model, agentSettingsById }, ['claudeThinkingMode', 'ampAgentMode']),
       });
       changed = true;
     }
@@ -228,6 +307,77 @@ async function createMigrationTargets(
     });
   }
   return targets;
+}
+
+async function migrateRecentAgentSettings(
+  integrations: IntegrationRegistry,
+  raw: JsonValue | undefined,
+  signal: AbortSignal,
+): Promise<JsonValue> {
+  if (!Array.isArray(raw)) return raw ?? [];
+  const result: JsonValue[] = [];
+  for (const [index, candidate] of raw.entries()) {
+    signal.throwIfAborted();
+    if (!isRecord(candidate)) {
+      result.push(candidate as JsonValue);
+      continue;
+    }
+    const agentId = stringValue(asJsonValue(candidate.agentId));
+    const model = stringValue(asJsonValue(candidate.model));
+    const integration = agentId
+      ? integrations.list().find((entry) => entry.descriptor.id === agentId)
+      : null;
+    if (!agentId || model === null || !integration) {
+      result.push(asJsonValue(candidate));
+      continue;
+    }
+    result.push({
+      ...candidate,
+      model: await integration.migration.translateLegacyModel({
+        scope: { kind: 'recent-agent-setting', recordId: String(index), selectedAgentId: agentId },
+        model,
+        signal,
+      }),
+    });
+  }
+  return result;
+}
+
+async function migrateHandoffIntent(
+  integrations: IntegrationRegistry,
+  intent: JsonObject,
+  signal: AbortSignal,
+): Promise<JsonObject> {
+  if (!isRecord(intent.target) || !isRecord(intent.target.execution)) {
+    throw new Error(`Invalid handoff intent ${String(intent.operationId)}`);
+  }
+  const execution = intent.target.execution;
+  const agentId = stringValue(execution.agentId);
+  const model = stringValue(execution.model);
+  if (!agentId || model === null) {
+    throw new Error(`Invalid handoff target ${String(intent.operationId)}`);
+  }
+  const integration = integrations.require(agentId);
+  const migratedSettings = await integration.settings.migrate(
+    parseSettingsEnvelope(agentId, asJsonValue(execution.agentSettings)),
+  );
+  const agentSettings = integration.settings.parse(migratedSettings);
+  assertSettingsOwner(agentId, agentSettings);
+  return {
+    ...intent,
+    target: {
+      ...intent.target,
+      execution: {
+        ...execution,
+        model: await integration.migration.translateLegacyModel({
+          scope: { kind: 'handoff', recordId: String(intent.operationId), selectedAgentId: agentId },
+          model,
+          signal,
+        }),
+        agentSettings: asJsonValue(agentSettings),
+      },
+    },
+  };
 }
 
 async function migrateExecutionDefaults(
@@ -403,10 +553,10 @@ async function writeManifest(journalDir: string, manifest: MigrationManifest): P
   );
 }
 
-async function readManifest(journalDir: string): Promise<MigrationManifest | null> {
+async function readManifest(journalDir: string, migrationId: string): Promise<MigrationManifest | null> {
   try {
     const value = JSON.parse(await fs.readFile(path.join(journalDir, 'manifest.json'), 'utf8')) as unknown;
-    return parseManifest(value);
+    return parseManifest(value, migrationId);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
@@ -450,8 +600,8 @@ function asJsonValue(value: unknown): JsonValue {
   return value as JsonValue;
 }
 
-function parseManifest(value: unknown): MigrationManifest {
-  if (!isRecord(value) || value.id !== MIGRATION_ID || !['prepared', 'committing', 'committed'].includes(String(value.state))) {
+function parseManifest(value: unknown, migrationId: string): MigrationManifest {
+  if (!isRecord(value) || value.id !== migrationId || !['prepared', 'committing', 'committed'].includes(String(value.state))) {
     throw new Error('Invalid core migration manifest');
   }
   if (!Array.isArray(value.files)) throw new Error('Invalid core migration manifest');
@@ -477,7 +627,7 @@ function parseManifest(value: unknown): MigrationManifest {
     return { relativePath, existed, backupSha256, targetSha256 };
   });
   return {
-    id: MIGRATION_ID,
+    id: migrationId,
     state: value.state as MigrationManifest['state'],
     files,
   };

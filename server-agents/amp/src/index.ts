@@ -1,4 +1,3 @@
-import { PERMISSION_MODE_VALUES, THINKING_MODE_VALUES } from '@garcon/common/chat-modes';
 import { AMP_MODELS } from '@garcon/common/models';
 import {
   AgentIntegrationError,
@@ -30,9 +29,9 @@ const AMP_DESCRIPTOR = {
   id: 'amp',
   label: 'Amp',
   icon: null,
-  supportedPermissionModes: PERMISSION_MODE_VALUES.filter((mode) => mode !== 'plan'),
-  supportedThinkingModes: THINKING_MODE_VALUES,
-  supportsImages: false,
+  supportedPermissionModes: ['bypassPermissions'],
+  supportedThinkingModes: [],
+  supportsImages: true,
   supportsProjectPathUpdate: false,
   requiresNativePathForProjectPathUpdate: false,
   supportedEndpointProtocols: [],
@@ -43,7 +42,9 @@ export default class AmpAgentIntegration implements AgentIntegration {
   static readonly integrationId = 'amp';
   static readonly apiVersion = 5 as const;
   readonly descriptor = AMP_DESCRIPTOR;
-  readonly attachments = null;
+  readonly attachments = {
+    fileMimeTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
+  } as const;
   readonly execution;
   readonly legacyHistoryImport;
   readonly nativeHistoryImport;
@@ -59,7 +60,7 @@ export default class AmpAgentIntegration implements AgentIntegration {
   readonly commands = null;
   readonly compaction = null;
   readonly forking = null;
-  readonly steering = null;
+  readonly steering: NonNullable<AgentIntegration['steering']>;
   readonly goals = null;
   readonly endpoints = null;
   readonly singleQuery: NonNullable<AgentIntegration['singleQuery']>;
@@ -72,18 +73,10 @@ export default class AmpAgentIntegration implements AgentIntegration {
 
     this.settings = createVersionedSettings({
       ownerId: 'amp',
-      schemaVersion: 1,
-      defaults: { ampAgentMode: 'smart' },
-      descriptors: [{
-        key: 'ampAgentMode',
-        type: 'enum',
-        label: 'Mode',
-        labelKey: 'mode',
-        options: [
-          { value: 'smart', label: 'Smart', labelKey: 'smart' },
-          { value: 'deep', label: 'Deep', labelKey: 'deep' },
-        ],
-      }],
+      schemaVersion: 2,
+      defaults: {},
+      descriptors: [],
+      migrateValues: async () => ({}),
     });
     const providerExecution = new AmpExecution(runtime, nativeSessions);
     const nativeEvidence = createAmpNativeEvidence(runtime, nativeSessions);
@@ -110,7 +103,15 @@ export default class AmpAgentIntegration implements AgentIntegration {
       requiresStrictModelDiscovery: false,
       generation: { priority: 70, model: AMP_MODELS.DEFAULT },
     });
-    this.migration = createVersion1RecordMigration({ settings: this.settings, nativeSessions });
+    this.migration = createVersion1RecordMigration({
+      settings: this.settings,
+      nativeSessions,
+      translateLegacyModel: (model) => model === 'smart'
+        ? AMP_MODELS.DEFAULT
+        : model === 'deep'
+          ? AMP_MODELS.DEFAULT
+          : model,
+    });
     this.auth = {
       async status(signal) {
         signal.throwIfAborted();
@@ -144,6 +145,10 @@ export default class AmpAgentIntegration implements AgentIntegration {
           );
         }
       },
+    };
+    this.steering = {
+      captureTarget: (request) => runtime.captureSteerTarget(request.agentSessionId),
+      steer: (request) => runtime.steer(request),
     };
     this.lifecycle = createIntegrationLifecycle({
       start: () => runtime.startPurgeTimer(),
