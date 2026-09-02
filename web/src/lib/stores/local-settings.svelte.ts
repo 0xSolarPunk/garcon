@@ -31,6 +31,27 @@ export type ChatMaxWidth = (typeof CHAT_MAX_WIDTH_VALUES)[number];
 export const SIDEBAR_SORT_MODE_VALUES = ['manual', 'recent'] as const;
 export type SidebarSortMode = (typeof SIDEBAR_SORT_MODE_VALUES)[number];
 
+export const SIDEBAR_CHAT_GROUPING_VALUES = [
+	'none',
+	'project',
+	'project-and-activity',
+	'activity',
+] as const;
+export type SidebarChatGrouping = (typeof SIDEBAR_CHAT_GROUPING_VALUES)[number];
+
+export const SIDEBAR_INACTIVITY_DURATION_VALUES = [
+	'2-days',
+	'3-days',
+	'4-days',
+	'5-days',
+	'1-week',
+	'2-weeks',
+	'1-month',
+	'2-months',
+	'3-months',
+] as const;
+export type SidebarInactivityDuration = (typeof SIDEBAR_INACTIVITY_DURATION_VALUES)[number];
+
 export const SIDEBAR_CHAT_ITEM_LAYOUT_VALUES = ['default', 'compact', 'single-line'] as const;
 export type SidebarChatItemLayout = (typeof SIDEBAR_CHAT_ITEM_LAYOUT_VALUES)[number];
 export type FileOpenPlacementPreference = 'same-window' | 'new-window' | 'dialog';
@@ -114,7 +135,8 @@ export interface LocalSettingsSnapshot {
 	chatListDock: ChatListDock;
 	sidebarVisible: boolean;
 	sidebarWidth: number;
-	sidebarGroupByProject: boolean;
+	sidebarGrouping: SidebarChatGrouping;
+	sidebarInactivityDuration: SidebarInactivityDuration;
 	sidebarGroupNestedProjectPaths: boolean;
 	sidebarChatItemLayout: SidebarChatItemLayout;
 	sidebarSortMode: SidebarSortMode;
@@ -150,7 +172,6 @@ type BooleanLocalSettingKey =
 	| 'steerWithCtrlEnter'
 	| 'chatListAutohide'
 	| 'sidebarVisible'
-	| 'sidebarGroupByProject'
 	| 'sidebarGroupNestedProjectPaths'
 	| 'codeEditorWordWrap'
 	| 'codeEditorLineNumbers';
@@ -174,7 +195,8 @@ const DEFAULTS: LocalSettingsSnapshot = {
 	chatListDock: DEFAULT_CHAT_LIST_DOCK,
 	sidebarVisible: true,
 	sidebarWidth: 320,
-	sidebarGroupByProject: true,
+	sidebarGrouping: 'project',
+	sidebarInactivityDuration: '3-days',
 	sidebarGroupNestedProjectPaths: false,
 	sidebarChatItemLayout: 'default',
 	sidebarSortMode: 'manual',
@@ -250,6 +272,24 @@ function parseSidebarSortMode(value: unknown): SidebarSortMode {
 		: DEFAULTS.sidebarSortMode;
 }
 
+function parseSidebarChatGrouping(value: unknown): SidebarChatGrouping {
+	return typeof value === 'string' &&
+		SIDEBAR_CHAT_GROUPING_VALUES.includes(value as SidebarChatGrouping)
+		? (value as SidebarChatGrouping)
+		: DEFAULTS.sidebarGrouping;
+}
+
+export function isSidebarInactivityDuration(value: unknown): value is SidebarInactivityDuration {
+	return (
+		typeof value === 'string' &&
+		SIDEBAR_INACTIVITY_DURATION_VALUES.includes(value as SidebarInactivityDuration)
+	);
+}
+
+function parseSidebarInactivityDuration(value: unknown): SidebarInactivityDuration {
+	return isSidebarInactivityDuration(value) ? value : DEFAULTS.sidebarInactivityDuration;
+}
+
 function parseSidebarChatItemLayout(value: unknown): SidebarChatItemLayout {
 	return typeof value === 'string' &&
 		SIDEBAR_CHAT_ITEM_LAYOUT_VALUES.includes(value as SidebarChatItemLayout)
@@ -306,9 +346,9 @@ function parseFromRaw(parsed: Record<string, unknown>): LocalSettingsSnapshot {
 		chatListDock: normalizeChatListDock(parsed.chatListDock),
 		sidebarVisible: parseBoolean(parsed.sidebarVisible, DEFAULTS.sidebarVisible),
 		sidebarWidth: parseSidebarWidth(parsed.sidebarWidth),
-		sidebarGroupByProject: parseBoolean(
-			parsed.sidebarGroupByProject,
-			DEFAULTS.sidebarGroupByProject,
+		sidebarGrouping: parseSidebarChatGrouping(parsed.sidebarGrouping),
+		sidebarInactivityDuration: parseSidebarInactivityDuration(
+			parsed.sidebarInactivityDuration,
 		),
 		sidebarGroupNestedProjectPaths: parseBoolean(
 			parsed.sidebarGroupNestedProjectPaths,
@@ -392,7 +432,10 @@ export class LocalSettingsStore {
 	chatListDock = $state<ChatListDock>(DEFAULTS.chatListDock);
 	sidebarVisible = $state(DEFAULTS.sidebarVisible);
 	sidebarWidth = $state(DEFAULTS.sidebarWidth);
-	sidebarGroupByProject = $state(DEFAULTS.sidebarGroupByProject);
+	sidebarGrouping = $state<SidebarChatGrouping>(DEFAULTS.sidebarGrouping);
+	sidebarInactivityDuration = $state<SidebarInactivityDuration>(
+		DEFAULTS.sidebarInactivityDuration,
+	);
 	sidebarGroupNestedProjectPaths = $state(DEFAULTS.sidebarGroupNestedProjectPaths);
 	sidebarChatItemLayout = $state<SidebarChatItemLayout>(DEFAULTS.sidebarChatItemLayout);
 	sidebarSortMode = $state<SidebarSortMode>(DEFAULTS.sidebarSortMode);
@@ -489,7 +532,8 @@ export class LocalSettingsStore {
 			chatListDock: this.chatListDock,
 			sidebarVisible: this.sidebarVisible,
 			sidebarWidth: this.sidebarWidth,
-			sidebarGroupByProject: this.sidebarGroupByProject,
+			sidebarGrouping: this.sidebarGrouping,
+			sidebarInactivityDuration: this.sidebarInactivityDuration,
 			sidebarGroupNestedProjectPaths: this.sidebarGroupNestedProjectPaths,
 			sidebarChatItemLayout: this.sidebarChatItemLayout,
 			sidebarSortMode: this.sidebarSortMode,
@@ -531,7 +575,8 @@ export class LocalSettingsStore {
 		this.chatListDock = snap.chatListDock;
 		this.sidebarVisible = snap.sidebarVisible;
 		this.sidebarWidth = snap.sidebarWidth;
-		this.sidebarGroupByProject = snap.sidebarGroupByProject;
+		this.sidebarGrouping = snap.sidebarGrouping;
+		this.sidebarInactivityDuration = snap.sidebarInactivityDuration;
 		this.sidebarGroupNestedProjectPaths = snap.sidebarGroupNestedProjectPaths;
 		this.sidebarChatItemLayout = snap.sidebarChatItemLayout;
 		this.sidebarSortMode = snap.sidebarSortMode;

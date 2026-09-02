@@ -3,6 +3,7 @@
 	import {
 		setAppShell,
 		setLocalSettings,
+		setMinuteClock,
 		setModelCatalog,
 		setNotifications,
 		setReadReceiptOutbox,
@@ -16,7 +17,11 @@
 		type SidebarSearchStore,
 	} from '$lib/sidebar/search/sidebar-search-store.svelte.js';
 	import type { ChatSessionRecord } from '$lib/types/chat-session';
-	import type { SidebarChatItemLayout } from '$lib/stores/local-settings.svelte';
+	import type {
+		SidebarChatGrouping,
+		SidebarChatItemLayout,
+		SidebarInactivityDuration,
+	} from '$lib/stores/local-settings.svelte';
 	import type { ChatListDock } from '$lib/layout/desktop-layout.js';
 	import { setWorkspaceWindowDndTestContext } from './workspace-window-dnd-test-context.js';
 
@@ -27,7 +32,8 @@
 		selectedChatId?: string | null;
 		sidebarSearch?: SidebarSearchStore;
 		autoLoadSavedSearches?: boolean;
-		sidebarGroupByProject?: boolean;
+		sidebarGrouping?: SidebarChatGrouping;
+		sidebarInactivityDuration?: SidebarInactivityDuration;
 		sidebarGroupNestedProjectPaths?: boolean;
 		sidebarChatItemLayout?: SidebarChatItemLayout;
 		chatListAutohide?: boolean;
@@ -44,7 +50,8 @@
 		selectedChatId = null,
 		sidebarSearch,
 		autoLoadSavedSearches = true,
-		sidebarGroupByProject = true,
+		sidebarGrouping = 'project',
+		sidebarInactivityDuration = '3-days',
 		sidebarGroupNestedProjectPaths = false,
 		sidebarChatItemLayout = 'default',
 		chatListAutohide = false,
@@ -97,8 +104,11 @@
 		},
 	} as never);
 	setLocalSettings({
-		get sidebarGroupByProject() {
-			return sidebarGroupByProject;
+		get sidebarGrouping() {
+			return sidebarGrouping;
+		},
+		get sidebarInactivityDuration() {
+			return sidebarInactivityDuration;
 		},
 		get sidebarGroupNestedProjectPaths() {
 			return sidebarGroupNestedProjectPaths;
@@ -115,17 +125,22 @@
 		get reduceMotion() {
 			return reduceMotion;
 		},
-		toggle(key: 'sidebarGroupByProject' | 'sidebarGroupNestedProjectPaths') {
-			if (key === 'sidebarGroupByProject') {
-				sidebarGroupByProject = !sidebarGroupByProject;
-				return;
-			}
+		toggle(_key: 'sidebarGroupNestedProjectPaths') {
 			sidebarGroupNestedProjectPaths = !sidebarGroupNestedProjectPaths;
 		},
 		set(
-			key: 'sidebarChatItemLayout' | 'sidebarSortMode' | 'chatListAutohide' | 'chatListDock',
+			key:
+				| 'sidebarGrouping'
+				| 'sidebarChatItemLayout'
+				| 'sidebarSortMode'
+				| 'chatListAutohide'
+				| 'chatListDock',
 			value: string | boolean,
 		) {
+			if (key === 'sidebarGrouping') {
+				sidebarGrouping = value as SidebarChatGrouping;
+				return;
+			}
 			if (key === 'sidebarChatItemLayout') {
 				sidebarChatItemLayout = value as SidebarChatItemLayout;
 				return;
@@ -134,6 +149,8 @@
 			if (key === 'chatListDock') chatListDock = value as ChatListDock;
 		},
 	} as never);
+
+	setMinuteClock({ currentTime: new Date('2025-01-02T00:00:00.000Z') } as never);
 
 	setSidebarProjectCollapse({
 		get collapsedProjectKeys() {

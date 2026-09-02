@@ -251,7 +251,7 @@ describe('SidebarVirtualSortableChatList', () => {
 				makeChat(index, { projectPath: `/tmp/project-${index % 20}` }),
 			),
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -277,7 +277,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -304,7 +304,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -326,7 +326,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: true,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -350,7 +350,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: true,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -372,11 +372,12 @@ describe('SidebarVirtualSortableChatList', () => {
 	function readVirtualRowOrder(): string[] {
 		return Array.from(
 			document.querySelectorAll<HTMLElement>(
-				'[data-sidebar-project-header], [data-sidebar-virtual-row]',
+				'[data-sidebar-project-header], [data-sidebar-section-header], [data-sidebar-virtual-row]',
 			),
 		).map(
 			(element) =>
 				element.getAttribute('data-sidebar-project-header') ??
+				element.getAttribute('data-sidebar-section-header') ??
 				element.getAttribute('data-sidebar-virtual-row') ??
 				'',
 		);
@@ -395,7 +396,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'recent',
@@ -423,7 +424,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'recent',
@@ -432,6 +433,197 @@ describe('SidebarVirtualSortableChatList', () => {
 
 		expect(readVirtualRowOrder()).toEqual(['chat-1', 'chat-3', 'chat-0', 'chat-2']);
 	});
+
+	it('keeps collapsed activity sections expandable across the reconciled reorder pass', async () => {
+		const chats = [
+			makeChat(0, {
+				status: 'running',
+				projectPath: '/tmp/project-a',
+				lastActivityAt: '2024-12-20T00:00:00.000Z',
+			}),
+			makeChat(1, {
+				status: 'running',
+				projectPath: '/tmp/project-b',
+				lastActivityAt: '2024-12-21T00:00:00.000Z',
+			}),
+			makeChat(2, { status: 'running', projectPath: '/tmp/project-a', isArchived: true }),
+		];
+		const displayOptions = {
+			grouping: 'project-and-activity',
+			inactivityDuration: '3-days',
+			groupNestedProjectPaths: false,
+			chatItemLayout: 'default',
+			sortMode: 'manual',
+		} as const;
+		let collapsedProjectKeys = new Set<string>();
+		const toggleCollapsed = (key: string) => {
+			const next = new Set(collapsedProjectKeys);
+			if (next.has(key)) next.delete(key);
+			else next.add(key);
+			collapsedProjectKeys = next;
+		};
+
+		const view = render(SidebarChatListHost, {
+			chats,
+			displayOptions,
+			collapsedProjectKeys,
+			onToggleProjectCollapsed: toggleCollapsed,
+		});
+
+		const sectionHeader = (section: string): HTMLElement => {
+			const element = document.querySelector<HTMLElement>(
+				`[data-sidebar-section-header="${section}"]`,
+			);
+			if (!element) throw new Error(`missing section header: ${section}`);
+			return element;
+		};
+
+		expect(readVirtualRowOrder()).toEqual([
+			'inactive',
+			'chat-0',
+			'chat-1',
+			'archived',
+			'chat-2',
+		]);
+
+		await fireEvent.click(sectionHeader('inactive'));
+		await view.rerender({ chats, displayOptions, collapsedProjectKeys, onToggleProjectCollapsed: toggleCollapsed });
+		expect(readVirtualRowOrder()).toEqual(['inactive', 'archived', 'chat-2']);
+
+		await fireEvent.click(sectionHeader('archived'));
+		await view.rerender({ chats, displayOptions, collapsedProjectKeys, onToggleProjectCollapsed: toggleCollapsed });
+		expect(readVirtualRowOrder()).toEqual(['inactive', 'archived']);
+
+		await fireEvent.click(sectionHeader('inactive'));
+		await fireEvent.click(sectionHeader('archived'));
+		await view.rerender({ chats, displayOptions, collapsedProjectKeys, onToggleProjectCollapsed: toggleCollapsed });
+		expect(readVirtualRowOrder()).toEqual([
+			'inactive',
+			'chat-0',
+			'chat-1',
+			'archived',
+			'chat-2',
+		]);
+	});
+
+	it('collapses and re-expands Active, Inactive, and Archived activity groups', async () => {
+		const chats = [
+			makeChat(0, {
+				status: 'running',
+				isPinned: true,
+				projectPath: '/tmp/pinned-project',
+				lastActivityAt: '2024-12-01T00:00:00.000Z',
+			}),
+			makeChat(1, {
+				status: 'running',
+				projectPath: '/tmp/active-project',
+				lastActivityAt: '2025-01-01T02:00:00.000Z',
+			}),
+			makeChat(2, {
+				status: 'running',
+				projectPath: '/tmp/inactive-project',
+				lastActivityAt: '2024-12-20T00:00:00.000Z',
+			}),
+			makeChat(3, {
+				status: 'running',
+				isArchived: true,
+				projectPath: '/tmp/archived-project',
+			}),
+		];
+		const displayOptions = {
+			grouping: 'activity',
+			inactivityDuration: '3-days',
+		} as const;
+		let collapsedProjectKeys = new Set<string>();
+		const toggleCollapsed = (key: string) => {
+			const next = new Set(collapsedProjectKeys);
+			if (next.has(key)) next.delete(key);
+			else next.add(key);
+			collapsedProjectKeys = next;
+		};
+		const view = render(SidebarChatListHost, {
+			chats,
+			displayOptions,
+			collapsedProjectKeys,
+			onToggleProjectCollapsed: toggleCollapsed,
+		});
+		const sectionHeader = (section: string): HTMLElement => {
+			const element = document.querySelector<HTMLElement>(
+				`[data-sidebar-section-header="${section}"]`,
+			);
+			if (!element) throw new Error(`missing section header: ${section}`);
+			return element;
+		};
+		const rerender = async (): Promise<void> => {
+			await view.rerender({
+				chats,
+				displayOptions,
+				collapsedProjectKeys,
+				onToggleProjectCollapsed: toggleCollapsed,
+			});
+		};
+
+		expect(readVirtualRowOrder()).toEqual([
+			'active',
+			'chat-0',
+			'chat-1',
+			'inactive',
+			'chat-2',
+			'archived',
+			'chat-3',
+		]);
+		for (const projectPath of [
+			'/tmp/pinned-project',
+			'/tmp/active-project',
+			'/tmp/inactive-project',
+			'/tmp/archived-project',
+		]) {
+			expect(querySummaryProjectPath(projectPath)).toBeTruthy();
+		}
+
+		for (const section of ['active', 'inactive', 'archived']) {
+			await fireEvent.click(sectionHeader(section));
+			await rerender();
+		}
+		expect(readVirtualRowOrder()).toEqual(['active', 'inactive', 'archived']);
+
+		for (const section of ['active', 'inactive', 'archived']) {
+			await fireEvent.click(sectionHeader(section));
+			await rerender();
+		}
+		expect(readVirtualRowOrder()).toEqual([
+			'active',
+			'chat-0',
+			'chat-1',
+			'inactive',
+			'chat-2',
+			'archived',
+			'chat-3',
+		]);
+	});
+
+	it.each(['project-and-activity', 'activity'] as const)(
+		'preserves the metadata-free single-line layout for %s grouping',
+		(grouping) => {
+			const projectPath = '/tmp/inactive-project';
+			render(SidebarChatListHost, {
+				chats: [
+					makeChat(0, {
+						status: 'running',
+						projectPath,
+						lastActivityAt: '2024-12-20T00:00:00.000Z',
+					}),
+				],
+				displayOptions: {
+					grouping,
+					inactivityDuration: '3-days',
+					chatItemLayout: 'single-line',
+				},
+			});
+
+			expect(querySummaryProjectPath(projectPath)).toBeNull();
+		},
+	);
 
 	it('renders a timestamp-less local draft first under recent sort', () => {
 		const chats = [
@@ -449,7 +641,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'recent',
@@ -470,7 +662,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -496,7 +688,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarChatListHost, {
 			chats,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -542,7 +734,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarVirtualSortableChatListHost, {
 			rows: makeRows(20),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'compact',
 				sortMode: 'manual',
@@ -560,7 +752,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarVirtualSortableChatListHost, {
 			rows: makeRows(20),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'single-line',
 				sortMode: 'manual',
@@ -578,7 +770,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		render(SidebarVirtualSortableChatListHost, {
 			rows: makeRows(20),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'single-line',
 				sortMode: 'manual',
@@ -596,7 +788,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		const view = render(SidebarVirtualSortableChatListHost, {
 			rows: makeRows(20),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -611,7 +803,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		await view.rerender({
 			rows: makeRows(20),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'single-line',
 				sortMode: 'manual',
@@ -627,7 +819,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		const view = render(SidebarVirtualSortableChatListHost, {
 			rows: makeRows(60),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -646,7 +838,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		await view.rerender({
 			rows: makeRows(60),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'single-line',
 				sortMode: 'manual',
@@ -678,7 +870,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			rows: makeRows(60),
 			rowHeight: 88,
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -698,7 +890,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			rows: makeRows(60),
 			rowHeight: 88,
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'single-line',
 				sortMode: 'manual',
@@ -727,7 +919,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		const view = render(SidebarVirtualSortableChatListHost, {
 			rows: groupedRows(),
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -748,7 +940,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		await view.rerender({
 			rows: groupedRows(),
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'single-line',
 				sortMode: 'manual',
@@ -772,7 +964,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		const view = render(SidebarVirtualSortableChatListHost, {
 			rows: makeRows(60),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -793,7 +985,7 @@ describe('SidebarVirtualSortableChatList', () => {
 		await view.rerender({
 			rows: makeRows(60),
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'single-line',
 				sortMode: 'manual',
@@ -1080,7 +1272,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			rows: makeRows(20),
 			rowHeight,
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'recent',
@@ -1134,7 +1326,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			rows: makeRows(500),
 			rowHeight,
 			displayOptions: {
-				groupByProject: false,
+				grouping: 'none',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'recent',
@@ -1470,7 +1662,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			isMobile: true,
 			rowHeight,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
@@ -1515,7 +1707,7 @@ describe('SidebarVirtualSortableChatList', () => {
 			isMobile: true,
 			rowHeight,
 			displayOptions: {
-				groupByProject: true,
+				grouping: 'project',
 				groupNestedProjectPaths: false,
 				chatItemLayout: 'default',
 				sortMode: 'manual',
