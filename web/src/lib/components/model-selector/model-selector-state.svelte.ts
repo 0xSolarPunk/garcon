@@ -92,7 +92,7 @@ export class ModelSelectorState {
 
 	get effortSelectionEnabled(): boolean {
 		return (
-			this.mode.effort === 'select' && this.modelCatalog.getThinkingModes(this.agentId).length > 0
+			this.mode.effort === 'select' && this.modelCatalog.getThinkingModes(this.agentId).length > 1
 		);
 	}
 
