@@ -1,9 +1,8 @@
 <script lang="ts">
 	import * as m from '$lib/paraglide/messages.js';
-	import ChevronDown from '@lucide/svelte/icons/chevron-down';
-	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import { cn } from '$lib/utils/cn';
 	import { sidebarSectionKey, type SidebarVirtualSectionHeaderRow } from './sidebar-virtual-chat-list';
+	import SidebarGroupHeaderContent from './SidebarGroupHeaderContent.svelte';
 
 	interface SidebarSectionHeaderRowProps {
 		row: SidebarVirtualSectionHeaderRow;
@@ -30,11 +29,11 @@
 	}
 </script>
 
-<div class="h-full border-b border-border/70 bg-card" role="heading" aria-level="3">
+<div class="h-full bg-card" role="heading" aria-level="3">
 	<button
 		type="button"
 		class={cn(
-			'flex h-full w-full items-center gap-2 px-3 text-left text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-sidebar-chat-item-hover-bg hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+			'flex h-full w-full items-center gap-2 px-2.5 text-left text-xs font-semibold text-muted-foreground transition-colors hover:bg-sidebar-chat-item-hover-bg hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
 			containsSelectedChat &&
 				'bg-sidebar-chat-item-selected-bg text-sidebar-chat-item-selected-foreground',
 		)}
@@ -44,19 +43,11 @@
 		data-sidebar-section-key={sectionKey}
 		data-sidebar-section-collapsed={row.isCollapsed ? 'true' : 'false'}
 	>
-		{#if row.isCollapsed}
-			<ChevronRight class="size-3 shrink-0" aria-hidden="true" />
-		{:else}
-			<ChevronDown class="size-3 shrink-0" aria-hidden="true" />
-		{/if}
-		<span class="min-w-0 flex-1 truncate">{label}</span>
-		<span
-			class={cn(
-				'shrink-0 rounded border border-border px-1 text-[10px] font-medium text-muted-foreground',
-				containsSelectedChat && 'text-sidebar-chat-item-selected-foreground/80',
-			)}
-		>
-			{row.count}
-		</span>
+		<SidebarGroupHeaderContent
+			{label}
+			count={row.count}
+			isCollapsed={row.isCollapsed}
+			{containsSelectedChat}
+		/>
 	</button>
 </div>
