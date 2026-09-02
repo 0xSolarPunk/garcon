@@ -718,10 +718,11 @@ describe('WorkspaceCoordinator', () => {
 
 	it('destroys a mobile file session and returns to Chat when it is closed', async () => {
 		const confirmDestructive = vi.fn(async () => true);
-		const { coordinator, files, layout } = createHarness({ confirmDestructive });
+		const { coordinator, files, layout, appShell } = createHarness({ confirmDestructive });
 		await coordinator.enterMobilePresentation();
 		await coordinator.placeFileSession('mobile-file');
 		const surfaceId = fileSurfaceId('mobile-file');
+		appShell.requestComposerFocus.mockClear();
 
 		await expect(coordinator.closeSurface(surfaceId)).resolves.toBe(true);
 
@@ -730,6 +731,8 @@ describe('WorkspaceCoordinator', () => {
 		expect(layout.surface(surfaceId)).toBeNull();
 		expect(layout.snapshot.mobileOnlySurfaceIds).not.toContain(surfaceId);
 		expect(layout.snapshot.mobileActiveSurfaceId).toBe(CANONICAL_CHAT_SURFACE_ID);
+		expect(coordinator.lastFocusedSurfaceId).toBe(CANONICAL_CHAT_SURFACE_ID);
+		expect(appShell.requestComposerFocus).toHaveBeenCalledOnce();
 	});
 
 	it('keeps a dirty mobile file visible when destructive Close is cancelled', async () => {
@@ -746,6 +749,34 @@ describe('WorkspaceCoordinator', () => {
 		expect(layout.surface(surfaceId)).not.toBeNull();
 		expect(layout.snapshot.mobileOnlySurfaceIds).toContain(surfaceId);
 		expect(layout.snapshot.mobileActiveSurfaceId).toBe(surfaceId);
+	});
+
+	it('restores the dialog return surface when an inactive popped-out file closes', async () => {
+		const { coordinator, appShell, layout } = createHarness();
+		await coordinator.placeFileSession('inactive-dialog', {
+			type: 'window',
+			windowId: 'window-main',
+		});
+		const surfaceId = fileSurfaceId('inactive-dialog');
+		await coordinator.focusChat();
+		await expect(coordinator.popOutFile(surfaceId)).resolves.toBe(true);
+		expect(coordinator.focusOwner).toEqual({
+			kind: 'surface',
+			surfaceId: CANONICAL_CHAT_SURFACE_ID,
+		});
+		expect(coordinator.lastFocusedSurfaceId).toBe(surfaceId);
+		appShell.requestComposerFocus.mockClear();
+
+		await expect(coordinator.closeSurface(surfaceId)).resolves.toBe(true);
+
+		expect(layout.snapshot.dialogFileSurfaceId).toBeNull();
+		expect(layout.surface(surfaceId)).toBeNull();
+		expect(coordinator.lastFocusedSurfaceId).toBe(CANONICAL_CHAT_SURFACE_ID);
+		expect(coordinator.focusOwner).toEqual({
+			kind: 'surface',
+			surfaceId: CANONICAL_CHAT_SURFACE_ID,
+		});
+		expect(appShell.requestComposerFocus).toHaveBeenCalledOnce();
 	});
 
 	it('serializes dialog replacements without stacking and revalidates each occupant', async () => {

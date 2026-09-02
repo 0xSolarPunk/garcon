@@ -169,6 +169,12 @@
 			event.preventDefault();
 			onSelect(surfaceId);
 			return;
+		} else if (event.key === 'Delete' && supportsInlineClose(surfaceId)) {
+			event.preventDefault();
+			if (!workspace.isSurfaceCloseBlocked(surfaceId)) {
+				void closeTab(surfaceId, event.currentTarget as HTMLButtonElement);
+			}
+			return;
 		} else return;
 		event.preventDefault();
 		buttons[nextIndex]?.focus();
@@ -217,28 +223,45 @@
 	}
 
 	function rememberCloseFocusReturnTarget(target: EventTarget | null): void {
-		if (target instanceof HTMLElement && !target.hasAttribute('data-workspace-window-tab-close')) {
+		if (target instanceof HTMLElement && !target.closest('[data-workspace-window-tab-close]')) {
 			closeFocusReturnTarget = target;
 		}
+	}
+
+	function isInlineCloseTarget(target: EventTarget | null, surfaceId: string): boolean {
+		return (
+			target instanceof Element &&
+			target.closest<HTMLElement>('[data-workspace-window-tab-close]')?.dataset
+				.workspaceWindowTabClose === surfaceId
+		);
+	}
+
+	function restoreFocusAfterClose(
+		trigger: HTMLButtonElement,
+		returnTarget: HTMLElement | null,
+	): void {
+		if (trigger.isConnected) return;
+		if (document.activeElement !== trigger && document.activeElement !== document.body) return;
+		if (returnTarget?.isConnected) {
+			returnTarget.focus();
+			return;
+		}
+		if (!isCurrent) return;
+		const activeTab = Array.from(
+			tabViewport?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
+		).find((button) => button.getAttribute('aria-selected') === 'true');
+		activeTab?.focus();
 	}
 
 	async function closeTab(surfaceId: string, trigger: HTMLButtonElement): Promise<void> {
 		const returnTarget = closeFocusReturnTarget;
 		try {
-			if (!(await workspace.closeSurface(surfaceId))) return;
-			await tick();
-			if (document.activeElement !== trigger && document.activeElement !== document.body) return;
-			if (returnTarget?.isConnected) {
-				returnTarget.focus();
-				return;
-			}
-			if (!isCurrent) return;
-			const activeTab = Array.from(
-				tabViewport?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
-			).find((button) => button.getAttribute('aria-selected') === 'true');
-			activeTab?.focus();
+			await workspace.closeSurface(surfaceId);
 		} catch (error) {
 			notifyFailure(error);
+		} finally {
+			await tick();
+			restoreFocusAfterClose(trigger, returnTarget);
 		}
 	}
 </script>
@@ -248,7 +271,17 @@
 	{@const renderedLabelMode: WindowTabLabelMode = measurement ? 'full' : labelMode}
 	{@const composedTriggerProps = measurement
 		? triggerProps
-		: mergeProps(triggerProps, { onpointerdown: () => onFocus?.(surfaceId) })}
+		: mergeProps(triggerProps, {
+				onpointerdown: (event: PointerEvent) => {
+					if (isInlineCloseTarget(event.target, surfaceId)) {
+						event.preventDefault();
+						event.stopPropagation();
+						rememberCloseFocusReturnTarget(document.activeElement);
+						return;
+					}
+					onFocus?.(surfaceId);
+				},
+			})}
 	{@const chatIsProcessing = !measurement && isChatProcessing(surfaceId)}
 	{@const processingStatusId = `${windowId}-tab-${surfaceId}-processing`}
 	{@const isSelected = !measurement && tabs.activeId === surfaceId}
@@ -262,6 +295,7 @@
 		aria-selected={measurement ? undefined : tabs.activeId === surfaceId}
 		aria-label={measurement ? undefined : labelFor(surfaceId)}
 		aria-describedby={chatIsProcessing ? processingStatusId : undefined}
+		aria-keyshortcuts={!measurement && supportsInlineClose(surfaceId) ? 'Delete' : undefined}
 		tabindex={measurement ? -1 : tabs.activeId === surfaceId ? 0 : -1}
 		data-workspace-tab-label-mode={measurement ? undefined : renderedLabelMode}
 		class={cn(
@@ -279,8 +313,24 @@
 			: undefined}
 		ondrop={!measurement ? (event) => void commitTabDrop(surfaceId, event) : undefined}
 		ondragend={!measurement ? () => dnd.endDrag() : undefined}
-		onclick={measurement ? undefined : () => onSelect(surfaceId)}
-		onfocus={measurement ? undefined : () => onFocus?.(surfaceId)}
+		onclick={measurement
+			? undefined
+			: (event) => {
+					if (!isInlineCloseTarget(event.target, surfaceId)) {
+						onSelect(surfaceId);
+						return;
+					}
+					event.stopPropagation();
+					if (!workspace.isSurfaceCloseBlocked(surfaceId)) {
+						void closeTab(surfaceId, event.currentTarget);
+					}
+				}}
+		onfocus={measurement
+			? undefined
+			: (event) => {
+					rememberCloseFocusReturnTarget(event.relatedTarget);
+					onFocus?.(surfaceId);
+				}}
 		onkeydown={measurement ? undefined : (event) => handleKeydown(event, surfaceId)}
 	>
 		{#if dropPosition}
@@ -303,6 +353,16 @@
 				renderedLabelMode === 'icon-only' && 'sr-only',
 			)}>{labelFor(surfaceId)}</span
 		>
+		{#if !measurement && supportsInlineClose(surfaceId) && renderedLabelMode !== 'icon-only'}
+			<span
+				aria-hidden="true"
+				data-workspace-window-tab-close={surfaceId}
+				data-disabled={workspace.isSurfaceCloseBlocked(surfaceId) ? '' : undefined}
+				class="pointer-events-none absolute right-0.5 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground opacity-0 transition-[color,background-color,opacity] group-focus-within/window-tab:pointer-events-auto group-focus-within/window-tab:opacity-100 [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:pointer-events-auto [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:opacity-100 hover:bg-accent hover:text-foreground data-[disabled]:cursor-not-allowed data-[disabled]:text-muted-foreground/40"
+			>
+				<X class="h-3.5 w-3.5" />
+			</span>
+		{/if}
 	</button>
 {/snippet}
 
@@ -333,30 +393,6 @@
 					{surfaceMenuItems}
 				/>
 			</ContextMenu>
-		{/if}
-		{#if !measurement && showInlineClose}
-			<button
-				type="button"
-				class="pointer-events-none absolute right-0.5 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground opacity-0 transition-[color,background-color,opacity] hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-focus-within/window-tab:pointer-events-auto group-focus-within/window-tab:opacity-100 [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:pointer-events-auto [@media(hover:hover)_and_(pointer:fine)]:group-hover/window-tab:opacity-100 disabled:cursor-not-allowed disabled:text-muted-foreground/40"
-				aria-label={m.workspace_close_named_tab({ title: labelFor(surfaceId) })}
-				title={m.workspace_close_named_tab({ title: labelFor(surfaceId) })}
-				disabled={workspace.isSurfaceCloseBlocked(surfaceId)}
-				data-workspace-window-tab-close={surfaceId}
-				onfocusin={(event) => {
-					event.stopPropagation();
-					rememberCloseFocusReturnTarget(event.relatedTarget);
-				}}
-				onpointerdown={(event) => {
-					event.stopPropagation();
-					rememberCloseFocusReturnTarget(document.activeElement);
-				}}
-				onclick={(event) => {
-					event.stopPropagation();
-					void closeTab(surfaceId, event.currentTarget);
-				}}
-			>
-				<X class="h-3.5 w-3.5" aria-hidden="true" />
-			</button>
 		{/if}
 	</div>
 {/snippet}

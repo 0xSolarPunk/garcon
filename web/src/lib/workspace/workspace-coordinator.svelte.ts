@@ -576,6 +576,7 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 			}
 			const sourceWindowId = this.#presentation.windowOf(surfaceId);
 			const wasDialog = this.layout.snapshot.dialogFileSurfaceId === surfaceId;
+			const dialogReturnSurfaceId = wasDialog ? this.#fileDialog.returnSurfaceId : null;
 			let mobileFallbackId: string | null = null;
 			let removalBlocked = false;
 			const removalPlan = (latest: WorkspaceLayoutSnapshot): WorkspaceLayoutMutation[] => {
@@ -613,15 +614,15 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 				if (surface.kind === 'commit') this.#deps.singletons.commitIfPresent()?.discardDrafts();
 				this.#deps.singletons.disposeSurface(surface.kind);
 			}
-			if (!current || !ownedFocus) return true;
+			if (!current) return true;
+			const shouldRestorePresentation = ownedFocus || wasDialog || mobileFallbackId !== null;
+			if (!shouldRestorePresentation) return true;
 			const sourceWindowActive = sourceWindowId
 				? windowNodeById(this.layout.snapshot.desktopRoot, sourceWindowId)?.tabs.activeId
 				: null;
 			const fallbackSurfaceId =
 				mobileFallbackId ??
-				(wasDialog
-					? this.#presentation.eligibleDesktopReturn(this.#fileDialog.returnSurfaceId)
-					: null) ??
+				(wasDialog ? this.#presentation.eligibleDesktopReturn(dialogReturnSurfaceId) : null) ??
 				sourceWindowActive ??
 				this.defaultActiveId;
 			this.lastFocusedSurfaceId = fallbackSurfaceId;

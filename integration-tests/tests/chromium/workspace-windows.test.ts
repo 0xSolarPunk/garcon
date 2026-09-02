@@ -1035,9 +1035,24 @@ describe('Chromium workspace windows', () => {
       await fileTab.hover();
       await waitForCloseOpacity('1');
       expect((await fileTab.boundingBox())?.width).toBe(widthBefore);
+
+      markPhase('routing the hover close region through the tab context menu');
+      await closeButton.click({ button: 'right' });
+      await fixture.page.getByRole('menuitem', { name: 'Close tab' }).waitFor({ state: 'visible' });
+      expect(await fileTab.count()).toBe(1);
+      await fixture.page.keyboard.press('Escape');
+
       await fixture.page.mouse.move(0, 0);
       await fileTab.focus();
       await waitForCloseOpacity('1');
+      await fixture.page.keyboard.press('Tab');
+      expect(
+        await fixture.page
+          .locator(`[data-workspace-window-add-trigger="${windowId}"]`)
+          .evaluate((element) => document.activeElement === element),
+      ).toBe(true);
+      await fixture.page.keyboard.press('Shift+Tab');
+      expect(await fileTab.evaluate((element) => document.activeElement === element)).toBe(true);
 
       markPhase('preserving active Files focus after a same-window pointer close');
       await fixture.page.locator(`[id="${windowId}-tab-singleton:files"]`).click();
@@ -1082,14 +1097,14 @@ describe('Chromium workspace windows', () => {
       );
       await currentTab.focus();
 
-      markPhase('closing the inactive-window file from the keyboard without stealing ownership');
-      await keyboardCloseButton.focus();
+      markPhase('closing the inactive-window file from its hover region without stealing ownership');
+      await keyboardCloseButton.hover();
       expect(
         await fixture.page
           .locator('[data-workspace-window-current="true"]')
           .getAttribute('data-workspace-window-id'),
       ).toBe(currentWindowId);
-      await keyboardCloseButton.press('Enter');
+      await keyboardCloseButton.click();
       await keyboardCloseButton.waitFor({ state: 'detached' });
       expect(
         await fixture.page
