@@ -26,8 +26,9 @@
 	import { createDrainCursor } from '$lib/ws/drain';
 	import { ChatReconnectCoordinator } from '$lib/ws/reconnect-coordinator.svelte';
 	import { mountConversationRouter } from '$lib/chat/conversation/conversation-router-adapter.svelte.js';
-	import { selectPreviewFromBatch } from '$lib/events/router.svelte';
+	import { applyChatMessageBatchActivity } from '$lib/chat/sessions/chat-message-batch-activity.js';
 	import { ConversationSessionController } from '$lib/chat/conversation/conversation-session-controller.svelte.js';
+	import { requiresQueuedSubmission } from '$lib/chat/conversation/submission-classifier.js';
 	import { CurrentConversationPanelTranscript } from '$lib/chat/conversation/current-conversation-panel-transcript.js';
 	import { CurrentConversationLifecycle } from '$lib/chat/conversation/current-conversation-lifecycle.js';
 	import {
@@ -151,6 +152,13 @@
 	let reloadInProgress = $state(false);
 	const dialogControl = $derived(conversationUi.getExecutionControl(queuedInputsDialogChatId));
 	const dialogQueue = $derived(dialogControl?.queue ?? null);
+	const composerRequiresQueuedSubmission = $derived.by(() => {
+		const chatId = sessions.selectedChatId;
+		return requiresQueuedSubmission({
+			isProcessing: isChatProcessing(sessions.selectedChat),
+			control: conversationUi.getExecutionControl(chatId),
+		});
+	});
 	const queuedInputEditor = new QueuedInputEditorState({
 		get queue() {
 			return dialogQueue;
@@ -173,8 +181,11 @@
 				lastOrdinal,
 			});
 			if (applied.status !== 'applied') return false;
-			const preview = selectPreviewFromBatch(messages.map((entry) => entry.message));
-			if (preview) sessions.patchPreview(chatId, preview.content, preview.timestamp);
+			applyChatMessageBatchActivity(
+				sessions,
+				chatId,
+				messages.map((entry) => entry.message),
+			);
 			return true;
 		},
 	});
@@ -680,6 +691,7 @@
 			{isVisible}
 			{isPresented}
 			{directAdmissionPending}
+			requiresQueuedSubmission={composerRequiresQueuedSubmission}
 			{composerEditorOpenRequestId}
 			onsubmit={onSubmit}
 			{onSteerPreferredSubmit}

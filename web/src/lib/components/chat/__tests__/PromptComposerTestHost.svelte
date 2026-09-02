@@ -68,6 +68,7 @@
 		quickCommitRefreshing?: boolean;
 		quickCommitSummary?: GitQuickSummaryReady | null;
 		directAdmissionPending?: boolean;
+		requiresQueuedSubmission?: boolean;
 		onsubmit?: () => void;
 		onSteerPreferredSubmit?: () => void;
 		onAbort?: () => void;
@@ -97,6 +98,7 @@
 		quickCommitRefreshing = false,
 		quickCommitSummary = null,
 		directAdmissionPending = false,
+		requiresQueuedSubmission: requiresQueuedSubmissionOverride,
 		onsubmit = () => {},
 		onSteerPreferredSubmit = () => {},
 		onAbort = () => {},
@@ -117,6 +119,10 @@
 	const agent = new AgentState();
 	const lifecycle = new ConversationLifecycleState();
 	const appShell = new AppShellStore();
+	let sidebarRecenterRequestCount = $state(0);
+	const unsubscribeSidebarRecenter = appShell.onSidebarRecenterRequested(() => {
+		sidebarRecenterRequestCount += 1;
+	});
 	const notifications = createNotificationsStore();
 	let snippetLoadCount = $state(0);
 	const modelOptionsByAgent: Record<string, ModelOption[]> = {
@@ -139,6 +145,9 @@
 		amp: 'Amp',
 	};
 	const selectedModel = $derived(modelOptionsFor(selectedAgentId)[0]?.value ?? 'opus');
+	const requiresQueuedSubmission = $derived(
+		requiresQueuedSubmissionOverride ?? selectedIsProcessing,
+	);
 	const remoteSettingsSnapshot = $derived<RemoteSettingsSnapshot>({
 		version: 1,
 		features: {
@@ -361,7 +370,10 @@
 	const transientLayers = new TransientLayerRegistry(new WorkspaceInteractionGate());
 	setTransientLayers(transientLayers);
 	setCanonicalWorkspaceLayout();
-	onDestroy(() => chatDrafts.destroy());
+	onDestroy(() => {
+		unsubscribeSidebarRecenter();
+		chatDrafts.destroy();
+	});
 	const shortcutWorkspace = {
 		focusOwner: { kind: 'surface' as const, surfaceId: CANONICAL_CHAT_SURFACE_ID },
 		isSurfacePresented: () => true,
@@ -416,6 +428,7 @@
 	{isPresented}
 	{composerEditorOpenRequestId}
 	{directAdmissionPending}
+	{requiresQueuedSubmission}
 	resendCandidates={transcript.resendCandidates}
 	onExcludeResendCandidate={(ordinal) => transcript.excludeResendCandidate(ordinal)}
 />
@@ -434,6 +447,7 @@
 
 <div data-testid="snippet-load-count">{snippetLoadCount}</div>
 <div data-testid="composer-attachment-count">{composer.images.length}</div>
+<div data-testid="sidebar-recenter-request-count">{sidebarRecenterRequestCount}</div>
 {#each notifications.items as notification (notification.id)}
 	<div data-testid="notification">{notification.message}</div>
 {/each}
