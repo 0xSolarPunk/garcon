@@ -79,11 +79,13 @@ describe('ClaudeAgentIntegration', () => {
       signal: new AbortController().signal,
     });
 
-    expect(catalog.models).toContainEqual({
-      value: 'claude-fable-5-1',
-      label: 'Fable 5.1',
-      supportsImages: true,
-    });
+    expect(catalog.models.filter(({ value }) => value.includes('fable'))).toEqual([
+      {
+        value: 'claude-fable-5-1',
+        label: 'Fable 5.1',
+        supportsImages: true,
+      },
+    ]);
   });
 
   it('preserves version 1 settings and native-session migration envelopes', async () => {
