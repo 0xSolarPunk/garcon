@@ -175,8 +175,8 @@ function sandboxPolicyMatches(
     && (left.excludeSlashTmp ?? false) === (right.excludeSlashTmp ?? false);
 }
 
-// Preserves xhigh compatibility for older models while allowing GPT-5.6 to use
-// the max effort introduced for that model family.
+// Preserves xhigh compatibility for older models while allowing models that
+// advertise max reasoning to receive that effort explicitly.
 export function mapThinkingModeToCodexEffort(
   thinkingMode: ThinkingMode | undefined,
   model?: string,
@@ -186,7 +186,11 @@ export function mapThinkingModeToCodexEffort(
     case 'medium': return 'medium';
     case 'high': return 'high';
     case 'xhigh': return 'xhigh';
-    case 'max': return model === 'gpt-5.6' || model?.startsWith('gpt-5.6-') ? 'max' : 'xhigh';
+    case 'max': return model === 'gpt-6-astra'
+      || model === 'gpt-5.6'
+      || model?.startsWith('gpt-5.6-')
+      ? 'max'
+      : 'xhigh';
     case 'ultra': return 'ultra';
     default: return undefined;
   }
