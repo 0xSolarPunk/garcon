@@ -72,7 +72,7 @@ describe('ClaudeAgentIntegration', () => {
     expect(host.environment.get).not.toHaveBeenCalled();
   });
 
-  it('exposes the pinned Fable 5.1 model in the fallback catalog', async () => {
+  it('exposes only Fable 5.1 under the fable selection', async () => {
     const integration = new ClaudeAgentIntegration(createHost());
     const catalog = await integration.catalog.snapshot({
       strict: false,
@@ -81,7 +81,7 @@ describe('ClaudeAgentIntegration', () => {
 
     expect(catalog.models.filter(({ value }) => value.includes('fable'))).toEqual([
       {
-        value: 'claude-fable-5-1',
+        value: 'fable',
         label: 'Fable 5.1',
         supportsImages: true,
       },

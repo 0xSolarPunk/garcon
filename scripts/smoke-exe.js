@@ -253,7 +253,7 @@ async function run() {
           tags: [],
           agentSessionId: 'smoke-session',
           projectPath: workspaceDir,
-          model: 'claude-fable-5-1',
+          model: 'fable',
         },
       },
     }));

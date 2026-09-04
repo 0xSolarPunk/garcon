@@ -259,11 +259,11 @@ describe('ClaudeTurnSteeringState', () => {
 
 describe('buildClaudeCLIArgs', () => {
 
-  it('forwards the pinned Fable 5.1 model ID', () => {
+  it('forwards the Fable 5.1 selection', () => {
     expect(buildClaudeCLIArgs({
-      model: 'claude-fable-5-1',
+      model: 'fable',
       prompt: 'hi',
-    })).toContain('claude-fable-5-1');
+    })).toContain('fable');
   });
 
   it('forwards explicit canonical effort exactly and omits Default', () => {
