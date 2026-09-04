@@ -72,6 +72,20 @@ describe('ClaudeAgentIntegration', () => {
     expect(host.environment.get).not.toHaveBeenCalled();
   });
 
+  it('exposes the pinned Fable 5.1 model in the fallback catalog', async () => {
+    const integration = new ClaudeAgentIntegration(createHost());
+    const catalog = await integration.catalog.snapshot({
+      strict: false,
+      signal: new AbortController().signal,
+    });
+
+    expect(catalog.models).toContainEqual({
+      value: 'claude-fable-5-1',
+      label: 'Fable 5.1',
+      supportsImages: true,
+    });
+  });
+
   it('preserves version 1 settings and native-session migration envelopes', async () => {
     const integration = new ClaudeAgentIntegration(createHost());
     const signal = new AbortController().signal;
