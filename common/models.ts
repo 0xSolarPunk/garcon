@@ -7,12 +7,14 @@ export interface SharedModelOption {
   supportsImages?: boolean;
 }
 
+export const CLAUDE_FABLE_5_1_MODEL = 'claude-fable-5-1';
+
 export const CLAUDE_MODELS = {
   OPTIONS: [
     { value: 'opus', label: 'Opus', supportsImages: true },
     { value: 'sonnet', label: 'Sonnet', supportsImages: true },
     { value: 'haiku', label: 'Haiku', supportsImages: true },
-    { value: 'claude-fable-5-1', label: 'Fable 5.1', supportsImages: true },
+    { value: CLAUDE_FABLE_5_1_MODEL, label: 'Fable 5.1', supportsImages: true },
   ] satisfies SharedModelOption[],
   DEFAULT: 'opus',
 };

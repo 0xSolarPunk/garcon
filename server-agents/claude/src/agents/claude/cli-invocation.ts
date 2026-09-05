@@ -1,3 +1,4 @@
+import { CLAUDE_FABLE_5_1_MODEL } from '@garcon/common/models';
 import { normalizeThinkingMode } from '@garcon/common/chat-modes';
 import type {
   ClaudeThinkingMode,
@@ -16,6 +17,8 @@ const NOOP_LOGGER: AgentLogger = {
   warn() {},
   error() {},
 };
+
+const LEGACY_CLAUDE_FABLE_MODEL = 'fable';
 
 interface ClaudeCLIArgOptions {
   model?: string;
@@ -64,6 +67,11 @@ function mapThinkingModeToClaudeEffort(
   return normalizedMode;
 }
 
+// Normalizes the legacy persisted alias so existing chats also use the pinned model.
+function canonicalClaudeModel(model: string): string {
+  return model === LEGACY_CLAUDE_FABLE_MODEL ? CLAUDE_FABLE_5_1_MODEL : model;
+}
+
 export function buildClaudeCLIArgs({
   model,
   permissionMode,
@@ -83,7 +91,7 @@ export function buildClaudeCLIArgs({
       ]
     : ['--print', '--no-session-persistence'];
 
-  if (model) args.push('--model', model);
+  if (model) args.push('--model', canonicalClaudeModel(model));
 
   const effectiveMode = permissionMode || 'default';
   const providerMode = providerStartupPermissionMode(effectiveMode);

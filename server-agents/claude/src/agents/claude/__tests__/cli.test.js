@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { buildClaudeCLIArgs, buildClaudePermissionApprovalResponse, convertCLIMessageToChatMessages } from '../claude-cli.js';
 import { getNativeMessageRevisionSource } from '@garcon/server-agent-common/shared/native-message-source';
+import { CLAUDE_FABLE_5_1_MODEL } from '@garcon/common/models';
 import {
   ClaudeTurnState,
   claudeBackgroundTaskCount,
@@ -259,11 +260,15 @@ describe('ClaudeTurnSteeringState', () => {
 
 describe('buildClaudeCLIArgs', () => {
 
-  it('forwards the Fable 5.1 selection', () => {
-    expect(buildClaudeCLIArgs({
-      model: 'claude-fable-5-1',
-      prompt: 'hi',
-    })).toContain('claude-fable-5-1');
+  it('pins new and legacy Fable selections to the exact Fable 5.1 model argument', () => {
+    for (const model of [CLAUDE_FABLE_5_1_MODEL, 'fable']) {
+      const args = buildClaudeCLIArgs({ model, prompt: 'hi' });
+      const modelIndex = args.indexOf('--model');
+      expect(args.slice(modelIndex, modelIndex + 2)).toEqual([
+        '--model',
+        CLAUDE_FABLE_5_1_MODEL,
+      ]);
+    }
   });
 
   it('forwards explicit canonical effort exactly and omits Default', () => {
