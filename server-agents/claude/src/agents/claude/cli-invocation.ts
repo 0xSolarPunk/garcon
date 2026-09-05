@@ -71,7 +71,7 @@ function mapThinkingModeToClaudeEffort(
 }
 
 // Normalizes the legacy persisted alias so existing chats also use the pinned model.
-function canonicalClaudeModel(model: string, modelSource: ClaudeModelSource): string {
+export function canonicalClaudeModel(model: string, modelSource: ClaudeModelSource): string {
   return modelSource === 'native' && model === LEGACY_CLAUDE_FABLE_MODEL
     ? CLAUDE_FABLE_5_1_MODEL
     : model;

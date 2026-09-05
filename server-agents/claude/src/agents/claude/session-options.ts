@@ -49,7 +49,7 @@ export function createClaudeSessionOptions(request: ClaudeSessionRequest): Claud
     chatId,
     projectPath,
     model,
-    modelSource,
+    modelSource: modelSource ?? 'native',
     permissionMode,
     thinkingMode,
     claudeThinkingMode,

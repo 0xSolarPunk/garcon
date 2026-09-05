@@ -29,6 +29,7 @@ import { ClaudeProcessRetirementTracker } from './process-retirements.js';
 import { ClaudeControlBroker } from './cli-control.js';
 import {
   buildClaudeCLIArgs,
+  canonicalClaudeModel,
   runSingleQuery,
   type ClaudeCliDependencies,
 } from './cli-invocation.js';
@@ -965,7 +966,7 @@ class ClaudeCliRuntime {
     session.process = proc;
     session.currentThinkingMode = options.thinkingMode || 'none';
     session.currentClaudeThinkingMode = normalizeClaudeThinkingModeForState(options.claudeThinkingMode);
-    session.currentModel = options.model || '';
+    session.currentModel = canonicalClaudeModel(options.model || '', options.modelSource);
     session.currentEnvOverrides = options.envOverrides;
     const transport = new ClaudeProcessTransport<ClaudeCLIMessage>({
       process: proc,
@@ -1200,7 +1201,10 @@ class ClaudeCliRuntime {
       const desiredClaudeThinkingMode = normalizeClaudeThinkingModeForState(
         session.options.claudeThinkingMode,
       );
-      const desiredModel = session.options.model || '';
+      const desiredModel = canonicalClaudeModel(
+        session.options.model || '',
+        session.options.modelSource,
+      );
       const desiredPermissionMode = session.options.permissionMode || 'default';
       const previousProviderPermissionMode = session.process
         ? providerStartupPermissionMode(session.currentPermissionMode)
