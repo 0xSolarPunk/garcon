@@ -260,15 +260,26 @@ describe('ClaudeTurnSteeringState', () => {
 
 describe('buildClaudeCLIArgs', () => {
 
-  it('pins new and legacy Fable selections to the exact Fable 5.1 model argument', () => {
+  it('pins native Fable selections and preserves endpoint model IDs', () => {
     for (const model of [CLAUDE_FABLE_5_1_MODEL, 'fable']) {
-      const args = buildClaudeCLIArgs({ model, prompt: 'hi' });
+      const args = buildClaudeCLIArgs({ model, modelSource: 'native', prompt: 'hi' });
       const modelIndex = args.indexOf('--model');
       expect(args.slice(modelIndex, modelIndex + 2)).toEqual([
         '--model',
         CLAUDE_FABLE_5_1_MODEL,
       ]);
     }
+
+    const endpointArgs = buildClaudeCLIArgs({
+      model: 'fable',
+      modelSource: 'endpoint',
+      prompt: 'hi',
+    });
+    const endpointModelIndex = endpointArgs.indexOf('--model');
+    expect(endpointArgs.slice(endpointModelIndex, endpointModelIndex + 2)).toEqual([
+      '--model',
+      'fable',
+    ]);
   });
 
   it('forwards explicit canonical effort exactly and omits Default', () => {

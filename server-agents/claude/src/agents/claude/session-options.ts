@@ -3,6 +3,7 @@ import type {
   PermissionMode,
   ThinkingMode,
 } from '@garcon/common/chat-modes';
+import type { ClaudeModelSource } from './runtime-types.js';
 
 export interface ClaudeSessionOptions {
   agentSessionId: string;
@@ -10,6 +11,7 @@ export interface ClaudeSessionOptions {
   chatId: string;
   projectPath: string;
   model: string;
+  modelSource: ClaudeModelSource;
   permissionMode: PermissionMode;
   thinkingMode: ThinkingMode;
   claudeThinkingMode?: ClaudeThinkingMode;
@@ -26,6 +28,7 @@ export function mergeClaudeSessionOptions(
     chatId: next.chatId ?? current.chatId,
     projectPath: next.projectPath ?? current.projectPath,
     model: next.model ?? current.model,
+    modelSource: next.modelSource ?? current.modelSource,
     permissionMode: next.permissionMode ?? current.permissionMode,
     thinkingMode: next.thinkingMode ?? current.thinkingMode,
     claudeThinkingMode: next.claudeThinkingMode ?? current.claudeThinkingMode,
