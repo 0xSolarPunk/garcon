@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import type { AgentAttachment } from '@garcon/common/agent-execution';
 import type { PermissionMode, ThinkingMode } from '@garcon/common/chat-modes';
+import { GPT_6_ASTRA_MODEL } from '@garcon/common/models';
 import type { CodexProviderConfig, CodexStartRequest } from '../runtime-types.js';
 import type { CodexSkillRef } from '../slash-command-discovery.js';
 import type { ThreadInjectItemsParams } from './protocol.js';
@@ -182,11 +183,12 @@ export function mapThinkingModeToCodexEffort(
   model?: string,
 ): string | undefined {
   switch (thinkingMode) {
+    case 'none': return model === GPT_6_ASTRA_MODEL ? 'low' : undefined;
     case 'low': return 'low';
     case 'medium': return 'medium';
     case 'high': return 'high';
     case 'xhigh': return 'xhigh';
-    case 'max': return model === 'gpt-6-astra'
+    case 'max': return model === GPT_6_ASTRA_MODEL
       || model === 'gpt-5.6'
       || model?.startsWith('gpt-5.6-')
       ? 'max'

@@ -1,4 +1,5 @@
 import { receiptForCarriedContext } from '@garcon/common/transcript-seed';
+import { GPT_6_ASTRA_MODEL } from '@garcon/common/models';
 import {
   AgentIntegrationError,
   type AgentEstablishedSession,
@@ -127,7 +128,11 @@ export class CodexExecution implements AgentRuntimeExecution {
     configuration: Parameters<import('@garcon/server-agent-interface').AgentSessionConfigurationUpdates['apply']>[1],
     previousConfiguration: Parameters<import('@garcon/server-agent-interface').AgentSessionConfigurationUpdates['apply']>[2],
   ): Promise<void> {
-    if (previousConfiguration.thinkingMode !== 'none' && configuration.thinkingMode === 'none') {
+    if (
+      previousConfiguration.thinkingMode !== 'none'
+      && configuration.thinkingMode === 'none'
+      && configuration.model !== GPT_6_ASTRA_MODEL
+    ) {
       throw new AgentIntegrationError(
         'INVALID_SETTINGS',
         'Codex cannot clear a concrete reasoning effort on an established session',

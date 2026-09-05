@@ -983,7 +983,7 @@ describe('Codex app-server request builders', () => {
     expect(mapThinkingModeToCodexEffort('ultra')).toBe('ultra');
   });
 
-  it('omits the unsupported none effort for GPT-6 Astra', () => {
+  it('maps provider-default thinking to GPT-6 Astra low effort', () => {
     const params = buildTurnStartParams({
       threadId: 'thread-1',
       command: 'hello',
@@ -993,7 +993,12 @@ describe('Codex app-server request builders', () => {
       thinkingMode: 'none',
     });
 
-    expect(params).not.toHaveProperty('effort');
+    expect(params.effort).toBe('low');
+    expect(codexThreadSettingsTarget({
+      model: 'gpt-6-astra',
+      permissionMode: 'default',
+      thinkingMode: 'none',
+    }).effort).toBe('low');
   });
 
   it('builds one complete subsequent-turn settings update', () => {
