@@ -1,5 +1,4 @@
 import { receiptForCarriedContext } from '@garcon/common/transcript-seed';
-import { GPT_6_ASTRA_MODEL } from '@garcon/common/models';
 import {
   AgentIntegrationError,
   type AgentEstablishedSession,
@@ -21,6 +20,7 @@ import {
   buildCodexHostEnvironment,
 } from './app-server/endpoint-runtime.js';
 import { codexOperation } from './app-server/operation-routes.js';
+import { mapThinkingModeToCodexEffort } from './app-server/request-builders.js';
 import type { CodexAppServerRuntime } from './app-server/runtime.js';
 import { parseCodexGoalCommand, type CodexGoalCommand } from './goal-command.js';
 import type {
@@ -128,11 +128,15 @@ export class CodexExecution implements AgentRuntimeExecution {
     configuration: Parameters<import('@garcon/server-agent-interface').AgentSessionConfigurationUpdates['apply']>[1],
     previousConfiguration: Parameters<import('@garcon/server-agent-interface').AgentSessionConfigurationUpdates['apply']>[2],
   ): Promise<void> {
-    if (
-      previousConfiguration.thinkingMode !== 'none'
-      && configuration.thinkingMode === 'none'
-      && configuration.model !== GPT_6_ASTRA_MODEL
-    ) {
+    const previousEffort = mapThinkingModeToCodexEffort(
+      previousConfiguration.thinkingMode,
+      previousConfiguration.model,
+    );
+    const nextEffort = mapThinkingModeToCodexEffort(
+      configuration.thinkingMode,
+      configuration.model,
+    );
+    if (previousEffort !== undefined && nextEffort === undefined) {
       throw new AgentIntegrationError(
         'INVALID_SETTINGS',
         'Codex cannot clear a concrete reasoning effort on an established session',
