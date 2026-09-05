@@ -3,7 +3,7 @@ import type {
   PermissionMode,
   ThinkingMode,
 } from '@garcon/common/chat-modes';
-import type { ClaudeModelSource } from './runtime-types.js';
+import type { ClaudeModelSource, ClaudeStartRequest } from './runtime-types.js';
 
 export interface ClaudeSessionOptions {
   agentSessionId: string;
@@ -16,6 +16,45 @@ export interface ClaudeSessionOptions {
   thinkingMode: ThinkingMode;
   claudeThinkingMode?: ClaudeThinkingMode;
   envOverrides?: Record<string, string>;
+}
+
+type ClaudeSessionRequest = Pick<
+  ClaudeStartRequest,
+  | 'agentSessionId'
+  | 'chatId'
+  | 'projectPath'
+  | 'model'
+  | 'modelSource'
+  | 'permissionMode'
+  | 'thinkingMode'
+  | 'claudeThinkingMode'
+  | 'envOverrides'
+>;
+
+export function createClaudeSessionOptions(request: ClaudeSessionRequest): ClaudeSessionOptions {
+  const {
+    agentSessionId,
+    chatId,
+    projectPath,
+    model,
+    modelSource,
+    permissionMode,
+    thinkingMode,
+    claudeThinkingMode,
+    envOverrides,
+  } = request;
+  return {
+    agentSessionId,
+    sessionId: agentSessionId,
+    chatId,
+    projectPath,
+    model,
+    modelSource,
+    permissionMode,
+    thinkingMode,
+    claudeThinkingMode,
+    envOverrides,
+  };
 }
 
 export function mergeClaudeSessionOptions(
