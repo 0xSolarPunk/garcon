@@ -81,7 +81,7 @@ describe('ClaudeAgentIntegration', () => {
 
     expect(catalog.models.filter(({ value }) => value.includes('fable'))).toEqual([
       {
-        value: 'fable',
+        value: 'claude-fable-5-1',
         label: 'Fable 5.1',
         supportsImages: true,
       },

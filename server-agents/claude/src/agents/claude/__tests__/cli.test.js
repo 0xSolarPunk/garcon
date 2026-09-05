@@ -261,9 +261,9 @@ describe('buildClaudeCLIArgs', () => {
 
   it('forwards the Fable 5.1 selection', () => {
     expect(buildClaudeCLIArgs({
-      model: 'fable',
+      model: 'claude-fable-5-1',
       prompt: 'hi',
-    })).toContain('fable');
+    })).toContain('claude-fable-5-1');
   });
 
   it('forwards explicit canonical effort exactly and omits Default', () => {
