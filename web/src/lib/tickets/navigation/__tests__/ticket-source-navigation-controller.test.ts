@@ -1,4 +1,9 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import type { ConversationPanelRegistration } from '$lib/chat/conversation/conversation-panel-registry.svelte.js';
+import {
+	TranscriptNavigationController,
+	type TranscriptNavigationDeps,
+} from '$lib/chat/actions/transcript-navigation-controller.js';
 import {
 	TicketSourceNavigationController,
 	type TicketSourceNavigationDeps,
@@ -31,12 +36,10 @@ function fixture() {
 	let exists = true;
 	const panel = {
 		chatId: source.chatId,
-		navigateToTranscriptRow: vi.fn<
-			NonNullable<
-				ReturnType<TicketSourceNavigationDeps['panels']['panel']>
-			>['navigateToTranscriptRow']
-		>(async () => 'completed'),
-	};
+		navigateToTranscriptRow: vi.fn<ConversationPanelRegistration['navigateToTranscriptRow']>(
+			async () => 'completed',
+		),
+	} satisfies Pick<ConversationPanelRegistration, 'chatId' | 'navigateToTranscriptRow'>;
 	const deps = {
 		workspace: {
 			layout: {
@@ -67,23 +70,25 @@ function fixture() {
 			kind: 'found',
 			target,
 		})),
-	} satisfies TicketSourceNavigationDeps;
-	const navigator = new TicketSourceNavigationController(deps);
+	} satisfies TranscriptNavigationDeps &
+		Pick<TicketSourceNavigationDeps, 'notifications' | 'resolve'>;
+	const navigation = new TranscriptNavigationController(deps);
+	const navigator = new TicketSourceNavigationController({ ...deps, navigation });
 	return {
 		deps,
 		panel,
-		navigator,
+		navigator: navigation,
 		open: () => navigator.open(source, 'window-one', () => partition),
 		setAuthority: (value: string | null) => {
 			authority = value;
-			navigator.reconcile();
+			navigation.reconcile();
 		},
 		setPartition: (value: typeof partition) => {
 			partition = value;
 		},
 		remove: () => {
 			exists = false;
-			navigator.reconcile();
+			navigation.reconcile();
 		},
 	};
 }
