@@ -3,7 +3,12 @@
 	import { mergeProps } from 'bits-ui';
 	import { tabbable } from 'tabbable';
 	import { ContextMenu, ContextMenuTrigger } from '$lib/components/ui/context-menu';
-	import { getChatSessions, getNotifications, getWorkspaceCoordinator } from '$lib/context';
+	import {
+		getChatSessions,
+		getFileSessions,
+		getNotifications,
+		getWorkspaceCoordinator,
+	} from '$lib/context';
 	import type {
 		ActiveSurfaceKind,
 		WorkspaceWindowId,
@@ -57,6 +62,7 @@
 
 	const workspace = getWorkspaceCoordinator();
 	const sessions = getChatSessions();
+	const files = getFileSessions();
 	const notifications = getNotifications();
 	let tabViewport: HTMLDivElement | null = $state(null);
 	let measurementRail: HTMLDivElement | null = $state(null);
@@ -115,6 +121,9 @@
 	function tooltipFor(surfaceId: string): string {
 		const label = labelFor(surfaceId);
 		const surface = workspace.layout.surface(surfaceId);
+		if (surface?.type === 'file') {
+			return files.get(surface.fileSessionId)?.fullPath ?? label;
+		}
 		if (surface?.type !== 'chat' || !surface.chatId) return label;
 		const projectPath = sessions.byId[surface.chatId]?.projectPath;
 		if (!projectPath) return label;
@@ -172,7 +181,6 @@
 		tabPresentation = resolveWindowTabPresentation({
 			order: tabs.order,
 			activeId: tabs.activeId,
-			pinnedIds: [],
 			availableWidth: capacity.contentWidth,
 			widths,
 			gap: tabGap,

@@ -7,16 +7,19 @@
 		setNotifications,
 		setSurfaceFrames,
 		setWorkspaceCoordinator,
+		setWorkbenchCommands,
 	} from '$lib/context';
 	import { SurfaceFrameRegistry } from '$lib/workspace/surface-frame-registry.svelte';
 	import { fileSurfaceId, type WorkspaceWindowId } from '$lib/workspace/surface-types';
-	import { FileSession } from '$lib/files/sessions/file-session.svelte.js';
+	import type { FileSessionRegistry } from '$lib/files/sessions/file-session-registry.svelte.js';
+	import { FileSession } from '$lib/files/sessions/__tests__/file-session-fixture.js';
 	import { createLocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
 	import {
 		createNotificationsStore,
 		type NotificationsStore,
 	} from '$lib/stores/notifications.svelte.js';
 	import FileDialogHost from '../FileDialogHost.svelte';
+	import type { WorkbenchCommandRegistry } from '$lib/workspace/workbench-commands.svelte.js';
 
 	let {
 		request,
@@ -26,7 +29,7 @@
 		onMove = () => undefined,
 		notifications = createNotificationsStore(),
 	}: {
-		request: 'guard' | 'refresh' | 'overwrite' | 'threshold' | 'file';
+		request: 'guard' | 'refresh' | 'overwrite' | 'threshold' | 'file' | 'draft';
 		onResolve?: (choice: string) => void;
 		isMobile?: boolean;
 		moveError?: Error;
@@ -56,7 +59,18 @@
 			: null,
 	);
 	let overwriteRequest = $state(
-		initialRequest === 'overwrite' ? { sessionId: 'file-session', fileName: 'dirty.ts' } : null,
+		initialRequest === 'overwrite'
+			? {
+					sessionId: 'file-session',
+					fileName: 'dirty.ts',
+					baseContent: 'base',
+					localContent: 'local',
+					diskContent: 'disk',
+					diskRevision: 'v1:disk',
+					localBufferVersion: 1,
+					lineSeparator: '\n' as const,
+				}
+			: null,
 	);
 	let thresholdRequest = $state(
 		initialRequest === 'threshold'
@@ -69,6 +83,7 @@
 				}
 			: null,
 	);
+	let draftRequest = $state(initialRequest === 'draft' ? { fileName: 'draft.txt' } : null);
 	const localSettings = createLocalSettingsStore();
 
 	setAppShell({
@@ -79,6 +94,11 @@
 	setLocalSettings(localSettings);
 	setNotifications(untrack(() => notifications));
 	setSurfaceFrames(new SurfaceFrameRegistry());
+	const commands: Pick<WorkbenchCommandRegistry, 'execute' | 'registerFileSurface'> = {
+		execute: async () => false,
+		registerFileSurface: () => () => undefined,
+	};
+	setWorkbenchCommands(commands as WorkbenchCommandRegistry);
 	setWorkspaceCoordinator({
 		layout: {
 			snapshot: { dialogFileSurfaceId: dialogSurfaceId },
@@ -98,7 +118,25 @@
 		frameVersion: () => 0,
 		retryPresentation: async () => undefined,
 	} as never);
-	setFileSessions({
+	const files: Pick<
+		FileSessionRegistry,
+		| 'get'
+		| 'guardRequest'
+		| 'thresholdRequest'
+		| 'overwriteRequest'
+		| 'draftRequest'
+		| 'resolveGuard'
+		| 'resolveOverwrite'
+		| 'resolveThreshold'
+		| 'resolveDraft'
+	> = {
+		get draftRequest() {
+			return draftRequest;
+		},
+		resolveDraft: (choice) => {
+			draftRequest = null;
+			onResolve(choice);
+		},
 		get guardRequest() {
 			return guardRequest;
 		},
@@ -121,7 +159,8 @@
 			thresholdRequest = null;
 			onResolve(choice);
 		},
-	} as never);
+	};
+	setFileSessions(files as FileSessionRegistry);
 	onDestroy(() => localSettings.destroy());
 </script>
 

@@ -21,7 +21,10 @@
 	} from '$lib/workspace/surface-frame-context.js';
 	import * as m from '$lib/paraglide/messages.js';
 	import { shouldWaitForFileRenderer } from './file-renderer-frame.js';
+	import FileConflictComparison from './FileConflictComparison.svelte';
+	import type { ChatDraftAppend } from '$lib/chat/composer/chat-draft-append.js';
 
+	let { onAppendToChatDraft }: { onAppendToChatDraft?: ChatDraftAppend } = $props();
 	const files = getFileSessions();
 	const appShell = getAppShell();
 	const notifications = getNotifications();
@@ -124,7 +127,7 @@
 									{m.file_session_loading()}
 								</div>
 							{:then FileSurface}
-								<FileSurface {session} presentation="dialog" />
+								<FileSurface {session} presentation="dialog" {onAppendToChatDraft} />
 							{:catch error}
 								<SurfaceErrorState
 									message={error instanceof Error
@@ -187,7 +190,7 @@
 	open={Boolean(files.overwriteRequest)}
 	requestClose={() => files.resolveOverwrite('cancel')}
 >
-	<Dialog.Content class="sm:max-w-md" showCloseButton={false}>
+	<Dialog.Content class="max-w-[calc(100vw-2rem)] sm:max-w-5xl" showCloseButton={false}>
 		<Dialog.Header>
 			<Dialog.Title>{m.file_session_overwrite_title()}</Dialog.Title>
 			<Dialog.Description>
@@ -196,14 +199,17 @@
 				})}
 			</Dialog.Description>
 		</Dialog.Header>
-		<Dialog.Footer>
-			<Button variant="ghost" onclick={() => files.resolveOverwrite('cancel')}
-				>{m.file_session_cancel()}</Button
-			>
-			<Button variant="destructive" onclick={() => files.resolveOverwrite('overwrite')}
-				>{m.file_session_save_anyway()}</Button
-			>
-		</Dialog.Footer>
+		{#if files.overwriteRequest}
+			<FileConflictComparison
+				baseContent={files.overwriteRequest.baseContent}
+				localContent={files.overwriteRequest.localContent}
+				diskContent={files.overwriteRequest.diskContent}
+				lineSeparator={files.overwriteRequest.lineSeparator}
+				onCancel={() => files.resolveOverwrite('cancel')}
+				onAcceptDisk={() => files.resolveOverwrite('accept-disk')}
+				onSaveChecked={(content) => files.resolveOverwrite('save-checked', content)}
+			/>
+		{/if}
 	</Dialog.Content>
 </Dialog.Root>
 
@@ -223,6 +229,28 @@
 				>{m.file_session_cancel()}</Button
 			>
 			<Button onclick={() => files.resolveThreshold('open')}>{m.file_session_open_anyway()}</Button>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>
+
+<Dialog.Root open={Boolean(files.draftRequest)} requestClose={() => files.resolveDraft('cancel')}>
+	<Dialog.Content class="sm:max-w-md" showCloseButton={false}>
+		<Dialog.Header>
+			<Dialog.Title>{m.file_recovery_draft_title()}</Dialog.Title>
+			<Dialog.Description
+				>{m.file_recovery_draft_description({
+					fileName: files.draftRequest?.fileName ?? '',
+				})}</Dialog.Description
+			>
+		</Dialog.Header>
+		<Dialog.Footer>
+			<Button variant="ghost" onclick={() => files.resolveDraft('cancel')}
+				>{m.common_cancel()}</Button
+			>
+			<Button variant="outline" onclick={() => files.resolveDraft('discard')}
+				>{m.file_session_discard()}</Button
+			>
+			<Button onclick={() => files.resolveDraft('resume')}>{m.file_recovery_resume()}</Button>
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>

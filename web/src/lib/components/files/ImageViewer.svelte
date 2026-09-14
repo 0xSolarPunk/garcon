@@ -11,11 +11,11 @@
 		type ZoomPoint,
 		type ZoomSize,
 	} from '$lib/components/shared/zoom-viewport.js';
-	import type { FileSession } from '$lib/files/sessions/file-session.svelte.js';
+	import type { FileViewSession } from '$lib/files/sessions/file-view-session.svelte.js';
 	import { nativeWorkspaceScrollRegion } from '$lib/workspace/workspace-scroll-region.js';
 	import * as m from '$lib/paraglide/messages.js';
 
-	let { session }: { session: FileSession } = $props();
+	let { session }: { session: FileViewSession } = $props();
 	let imageElement: HTMLImageElement | null = $state(null);
 	let viewportElement: HTMLDivElement | null = $state(null);
 

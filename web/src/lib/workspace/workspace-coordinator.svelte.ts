@@ -155,7 +155,6 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 			responsiveGeneration: () => this.#presentation.responsiveGeneration,
 			defaultActiveId: () => this.defaultActiveId,
 			lastFocusedSurfaceId: () => this.lastFocusedSurfaceId,
-			windowOf: (surfaceId) => this.#presentation.windowOf(surfaceId),
 			eligibleDesktopReturn: (surfaceId) => this.#presentation.eligibleDesktopReturn(surfaceId),
 			present: (surfaceId) => this.#presentation.presentSurface(surfaceId),
 			placeOnMobile: (sessionId, surfaceId, publication) =>
@@ -577,6 +576,7 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 			this.focusOwner.kind !== 'chat-list' && this.focusOwner.surfaceId === surfaceId;
 		this.#reservedSurfaceIds.add(surfaceId);
 		let releaseCanvasClose: (() => void) | null = null;
+		let releaseFileClose: (() => void) | null = null;
 		try {
 			if (surface.type === 'singleton' && surface.kind === 'tickets') {
 				const tickets = this.#deps.singletons.ticketsIfPresent();
@@ -620,8 +620,11 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 				}
 			}
 			if (surface.type === 'file') {
-				if (!(await this.#deps.files.confirmDestructive(surface.fileSessionId, 'close')))
-					return false;
+				releaseFileClose = await this.#deps.files.prepareDestructiveViews(
+					[surface.fileSessionId],
+					'close',
+				);
+				if (!releaseFileClose) return false;
 			}
 			const sourceWindowId = this.#presentation.windowOf(surfaceId);
 			const wasDialog = this.layout.snapshot.dialogFileSurfaceId === surfaceId;
@@ -662,7 +665,7 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 			if (removalBlocked) return false;
 			this.#presentation.clearAttachmentError(surfaceId);
 			if (wasDialog) this.#fileDialog.clearReturnSurface();
-			if (surface.type === 'file') this.#deps.files.destroy(surface.fileSessionId);
+			if (surface.type === 'file') await this.#deps.files.destroy(surface.fileSessionId);
 			if (surface.type === 'terminal-launcher') this.#deps.onTerminalLauncherDismissed?.();
 			if (surface.type === 'singleton') {
 				if (surface.kind === 'commit') this.#deps.singletons.commitIfPresent()?.discardDrafts();
@@ -684,6 +687,7 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 			return true;
 		} finally {
 			releaseCanvasClose?.();
+			releaseFileClose?.();
 			this.#reservedSurfaceIds.delete(surfaceId);
 			if (surface.type === 'terminal') {
 				await this.#terminalPlacement.afterPlacementReleased(surface.terminalId);
@@ -747,7 +751,9 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 		publication?: { publish(): void; rollback(): void },
 	): Promise<FilePlacementResult> {
 		const surfaceId = fileSurfaceId(sessionId);
+		const surface = { id: surfaceId, type: 'file' as const, fileSessionId: sessionId };
 		if (this.layout.surface(surfaceId)) {
+			publication?.publish();
 			await this.focusFileSession(sessionId);
 			return 'placed';
 		}
@@ -771,7 +777,7 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 					return [
 						{
 							type: 'register-surface-in-new-window',
-							surface: { id: surfaceId, type: 'file', fileSessionId: sessionId },
+							surface,
 							targetWindowId: anchor,
 							edge,
 							newWindowId,
@@ -793,10 +799,10 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 				return [
 					{
 						type: 'register-surface',
-						surface: { id: surfaceId, type: 'file', fileSessionId: sessionId },
+						surface,
 						windowId,
 					},
-					{ type: 'activate-window-tab', windowId, surfaceId },
+					{ type: 'activate-window-tab' as const, windowId, surfaceId },
 				];
 			},
 			{ publication },
@@ -823,12 +829,6 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 			return;
 		}
 		await this.focusSurface(surfaceId);
-	}
-
-	async popOutFile(surfaceId: string): Promise<boolean> {
-		const surface = this.layout.surface(surfaceId);
-		if (!surface || surface.type !== 'file') return false;
-		return this.#fileDialog.pop(surfaceId);
 	}
 
 	async moveDialogFileToWindow(destinationWindowId: WorkspaceWindowId): Promise<void> {
@@ -953,20 +953,13 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 		snapshot: WorkspaceLayoutSnapshot,
 		preferredWindowId: WorkspaceWindowId | null | undefined,
 	): WorkspaceWindowId {
-		if (
-			preferredWindowId &&
-			windowNodeById(snapshot.desktopRoot, preferredWindowId) &&
-			!this.#reservedWindowIds.has(preferredWindowId)
-		) {
-			return preferredWindowId;
-		}
-		const lastFocusedWindowId = this.#presentation.lastFocusedWindowId;
-		if (
-			lastFocusedWindowId &&
-			windowNodeById(snapshot.desktopRoot, lastFocusedWindowId) &&
-			!this.#reservedWindowIds.has(lastFocusedWindowId)
-		) {
-			return lastFocusedWindowId;
+		for (const candidate of [preferredWindowId, this.#presentation.lastFocusedWindowId]) {
+			if (
+				candidate &&
+				windowNodeById(snapshot.desktopRoot, candidate) &&
+				!this.#reservedWindowIds.has(candidate)
+			)
+				return candidate;
 		}
 		const first = collectWindowNodes(snapshot.desktopRoot).find(
 			(workspaceWindow) => !this.#reservedWindowIds.has(workspaceWindow.id),

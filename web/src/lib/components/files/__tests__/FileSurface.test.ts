@@ -5,14 +5,14 @@ import {
 	installResizeObserverHarness,
 	ResizeObserverHarness,
 } from '$lib/components/shared/__tests__/resize-observer-harness.js';
-import type { FileOpenRequest } from '$lib/files/sessions/file-session-registry.svelte.js';
+import { type FileOpenRequest } from '$lib/files/sessions/file-session-registry.svelte.js';
 import * as m from '$lib/paraglide/messages.js';
 import FileSurfaceTestHost from './FileSurfaceTestHost.svelte';
 
 afterEach(cleanup);
 
 describe('FileSurface', () => {
-	const portablePresentations = ['window-main', 'window-sidebar', 'mobile'] as const;
+	const portablePresentations = ['dialog', 'mobile'] as const;
 	const rendererModes = ['code', 'markdown', 'image'] as const;
 	const closeCases = portablePresentations.flatMap((presentation) =>
 		rendererModes.map((rendererMode) => ({ presentation, rendererMode })),
@@ -37,7 +37,7 @@ describe('FileSurface', () => {
 	it('invokes and disables the supplied Close intent', async () => {
 		const onClose = vi.fn();
 		const rendered = render(FileSurfaceTestHost, {
-			presentation: 'window-main',
+			presentation: 'mobile',
 			onClose,
 			closeDisabled: false,
 		});
@@ -46,7 +46,7 @@ describe('FileSurface', () => {
 		expect(onClose).toHaveBeenCalledOnce();
 
 		await rendered.rerender({
-			presentation: 'window-main',
+			presentation: 'mobile',
 			onClose,
 			closeDisabled: true,
 		});
@@ -65,7 +65,7 @@ describe('FileSurface', () => {
 		const restoreResizeObserver = installResizeObserverHarness();
 		try {
 			const { container } = render(FileSurfaceTestHost, {
-				presentation: 'window-main',
+				presentation: 'dialog',
 				rendererMode: 'code',
 				dirty: true,
 				onClose: vi.fn(),
@@ -91,9 +91,6 @@ describe('FileSurface', () => {
 						width: widths[element.dataset.surfaceActionMeasure ?? ''] ?? 0,
 					}) as DOMRect;
 			}
-			const fixedControl = root.firstElementChild as HTMLElement | null;
-			if (!fixedControl) throw new Error('Expected fixed editor settings control');
-			fixedControl.getBoundingClientRect = () => ({ width: 32 }) as DOMRect;
 			const menuMeasure = container.querySelector<HTMLElement>(
 				'[data-surface-action-overflow-measure]',
 			);
@@ -111,7 +108,7 @@ describe('FileSurface', () => {
 			expect(screen.getByRole('button', { name: m.file_session_refresh() })).toBeTruthy();
 			expect(header.lastElementChild).toBe(close);
 
-			await setWidth(130);
+			await setWidth(80);
 			expect(screen.getByRole('button', { name: m.file_session_close() })).toBe(close);
 			expect(screen.queryByRole('button', { name: m.editor_actions_save() })).toBeNull();
 			expect(screen.getByRole('button', { name: m.file_session_refresh() })).toBeTruthy();
@@ -170,6 +167,120 @@ describe('FileSurface', () => {
 		expect((refresh as HTMLButtonElement).disabled).toBe(false);
 	});
 
+	it('opens the full editor status as a touch-sized mobile sheet', async () => {
+		render(FileSurfaceTestHost, {
+			presentation: 'mobile',
+			rendererMode: 'code',
+			loading: false,
+		});
+
+		const trigger = screen.getByRole('button', { name: 'Show full editor status' });
+		await fireEvent.click(trigger);
+
+		const details = screen.getByRole('group', { name: 'Full editor status' });
+		expect(trigger.getAttribute('aria-controls')).toBe(details.id);
+		expect(trigger.getAttribute('aria-expanded')).toBe('true');
+		expect(trigger.getAttribute('aria-label')).toBe('Hide full editor status');
+		const close = within(details).getByRole('button', { name: 'Close' });
+		expect(close.className).toContain('text-base');
+		close.focus();
+		await fireEvent.click(close);
+		expect(screen.queryByRole('group', { name: 'Full editor status' })).toBeNull();
+		expect(document.activeElement).toBe(trigger);
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
+	});
+
+	it.each(['loading', 'failed'] as const)('omits editor status while %s', async (phase) => {
+		render(FileSurfaceTestHost, {
+			presentation: 'mobile',
+			rendererMode: 'code',
+			loading: phase === 'loading',
+			onReady: (session) => {
+				if (phase === 'failed') session.loadError = 'Read failed';
+			},
+		});
+		await tick();
+		expect(screen.queryByRole('group', { name: 'Editor status' })).toBeNull();
+	});
+
+	it('omits the status disclosure without an editor status', async () => {
+		render(FileSurfaceTestHost, {
+			presentation: 'mobile',
+			rendererMode: 'code',
+			loading: false,
+			onReady: (session) => {
+				session.editor?.dispose();
+				session.editor = null;
+			},
+		});
+		await tick();
+		expect(screen.queryByRole('button', { name: 'Show full editor status' })).toBeNull();
+	});
+
+	it.each(['window-main', 'mobile', 'dialog'] as const)(
+		'does not offer Open to Side in the %s presentation',
+		(presentation) => {
+			render(FileSurfaceTestHost, {
+				presentation,
+				rendererMode: 'code',
+				loading: false,
+			});
+
+			expect(screen.queryByRole('button', { name: 'Open to Side' })).toBeNull();
+		},
+	);
+
+	it.each(['window-main', 'window-sidebar'] as const)('uses tab Close in %s', (presentation) => {
+		render(FileSurfaceTestHost, { presentation, onClose: vi.fn() });
+		expect(screen.queryByRole('button', { name: m.file_session_close() })).toBeNull();
+	});
+
+	it('shows the absolute path and keeps editor settings immediately before Close', () => {
+		const { container } = render(FileSurfaceTestHost, {
+			presentation: 'dialog',
+			rendererMode: 'code',
+			onClose: vi.fn(),
+		});
+		expect(screen.getByRole('heading', { level: 2 }).title).toBe('/workspace/src/file.ts');
+		const header = container.querySelector('header')!;
+		const buttons = within(header).getAllByRole('button');
+		expect(buttons.at(-2)?.getAttribute('aria-label')).toBe(m.editor_settings_button_label());
+		expect(buttons.at(-1)?.getAttribute('aria-label')).toBe(m.file_session_close());
+	});
+
+	it('uses checkable settings and a font-size submenu', async () => {
+		localStorage.clear();
+		render(FileSurfaceTestHost, { presentation: 'window-main', rendererMode: 'code' });
+		await fireEvent.click(screen.getByRole('button', { name: m.editor_settings_button_label() }));
+		const vim = screen.getByRole('menuitemcheckbox', { name: 'Vim mode' });
+		expect(vim.getAttribute('aria-checked')).toBe('false');
+		await fireEvent.click(vim);
+		expect(vim.getAttribute('aria-checked')).toBe('true');
+		expect(screen.getByRole('menuitemcheckbox', { name: /Word wrap/i })).toBeTruthy();
+		const font = screen.getByRole('menuitem', { name: /Font size/i });
+		await fireEvent.keyDown(font, { key: 'ArrowRight' });
+		await waitFor(() => expect(screen.getByRole('menuitemradio', { name: '16px' })).toBeTruthy());
+		await fireEvent.click(screen.getByRole('menuitemradio', { name: '16px' }));
+		expect(screen.getByRole('menuitemradio', { name: '16px' }).getAttribute('aria-checked')).toBe(
+			'true',
+		);
+	});
+
+	it('keeps Save available when browser backup fails', async () => {
+		render(FileSurfaceTestHost, {
+			presentation: 'window-main',
+			rendererMode: 'code',
+			loading: false,
+			dirty: true,
+			onReady: (session) => {
+				session.document.recoveryError = 'Storage unavailable';
+			},
+		});
+		expect(await screen.findByText('Local recovery unavailable: Storage unavailable')).toBeTruthy();
+		const save = screen.getByRole<HTMLButtonElement>('button', { name: 'Save' });
+		expect(save.disabled).toBe(false);
+	});
+
 	it('disables Save while a refresh is pending', () => {
 		render(FileSurfaceTestHost, {
 			presentation: 'window-main',
@@ -181,6 +292,28 @@ describe('FileSurface', () => {
 
 		expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
 	});
+
+	it.each(['readOnly', 'mixedLineEndings', 'missingRevision'] as const)(
+		'disables Save for %s documents',
+		async (guard) => {
+			render(FileSurfaceTestHost, {
+				presentation: 'window-main',
+				rendererMode: 'code',
+				loading: false,
+				dirty: true,
+				onReady: (session) => {
+					if (guard === 'missingRevision') session.loadedRevision = null;
+					else session.document[guard] = true;
+				},
+			});
+
+			await waitFor(() =>
+				expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(
+					true,
+				),
+			);
+		},
+	);
 
 	it('refreshes from the toolbar action', async () => {
 		const onRefresh = vi.fn();
@@ -194,14 +327,30 @@ describe('FileSurface', () => {
 		expect(onRefresh).toHaveBeenCalledOnce();
 	});
 
-	it('checks freshness immediately when the surface mounts', async () => {
-		const onCheckFreshness = vi.fn();
+	it('switches a Markdown preview into its source editor', async () => {
 		render(FileSurfaceTestHost, {
 			presentation: 'window-main',
-			onCheckFreshness,
+			rendererMode: 'markdown',
+			loading: false,
 		});
 
-		await waitFor(() => expect(onCheckFreshness).toHaveBeenCalledOnce());
+		await fireEvent.click(screen.getByRole('button', { name: m.file_session_edit() }));
+
+		expect(screen.getByRole('button', { name: m.file_session_view() })).toBeTruthy();
+	});
+
+	it('keeps cursor position and controls outside the save-state live region', () => {
+		render(FileSurfaceTestHost, {
+			presentation: 'mobile',
+			rendererMode: 'code',
+			loading: false,
+			dirty: true,
+		});
+		const footer = screen.getByRole('group', { name: 'Editor status' });
+		const announcement = within(footer).getByRole('status');
+		expect(announcement.textContent?.trim()).toBe('Modified');
+		expect(announcement.contains(within(footer).getByText('Ln 1, Col 1'))).toBe(false);
+		expect(announcement.querySelector('button')).toBeNull();
 	});
 
 	it('passes the dialog presentation to Markdown link navigation', async () => {

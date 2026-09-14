@@ -1,7 +1,8 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import Markdown, { type MarkdownLinkNavigateEvent } from '$lib/components/chat/Markdown.svelte';
 	import { resolveFileLinkFromFile } from '$lib/chat/file-links/file-link-resolver.js';
-	import type { FileSession } from '$lib/files/sessions/file-session.svelte.js';
+	import type { FileViewSession } from '$lib/files/sessions/file-view-session.svelte.js';
 	import {
 		getFileSessions,
 		getLocalSettings,
@@ -12,7 +13,7 @@
 	import { nativeWorkspaceScrollRegion } from '$lib/workspace/workspace-scroll-region.js';
 	import * as m from '$lib/paraglide/messages.js';
 
-	let { session, presentation }: { session: FileSession; presentation: PresentationHostId } =
+	let { session, presentation }: { session: FileViewSession; presentation: PresentationHostId } =
 		$props();
 	const files = getFileSessions();
 	const localSettings = getLocalSettings();
@@ -20,9 +21,30 @@
 	const workspaceLayout = getWorkspaceLayout();
 	const primaryScrollRegion = nativeWorkspaceScrollRegion('primary');
 	let contentElement: HTMLDivElement;
+	let previewRevision = $state(0);
+	const source = $derived.by(() => {
+		const document = session.document;
+		previewRevision;
+		return untrack(() => document.currentContent());
+	});
 	const markdownFontSize = $derived(
 		Number.parseInt(localSettings.markdownViewerFontSize, 10) || 12,
 	);
+
+	$effect(() => {
+		const document = session.document;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const unsubscribe = document.onChange(() => {
+			timer ??= setTimeout(() => {
+				timer = undefined;
+				previewRevision += 1;
+			}, 100);
+		});
+		return () => {
+			unsubscribe();
+			clearTimeout(timer);
+		};
+	});
 
 	$effect(() => {
 		const element = contentElement;
@@ -78,7 +100,7 @@
 	onscroll={(event) => captureScroll(event.currentTarget)}
 >
 	<Markdown
-		source={session.content}
+		{source}
 		variant="assistant"
 		fileLinkBasePath={session.canonicalFileRootPath}
 		onLinkNavigate={navigateFileLink}

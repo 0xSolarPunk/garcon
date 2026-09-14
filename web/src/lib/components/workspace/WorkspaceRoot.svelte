@@ -77,6 +77,7 @@
 		ChatDraftAppend,
 		ChatDraftAppendResult,
 	} from '$lib/chat/composer/chat-draft-append.js';
+	import FileDialogHost from '$lib/components/files/FileDialogHost.svelte';
 	import { surfaceFrame } from '$lib/workspace/surface-frame-action.js';
 	import {
 		renderedPortablePresentations,
@@ -698,6 +699,8 @@
 		{/each}
 	{/if}
 </div>
+
+<FileDialogHost onAppendToChatDraft={appendToChatDraft} />
 
 {#if gitBranchActions.showNewBranchModal}
 	<NewBranchModal

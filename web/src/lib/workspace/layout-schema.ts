@@ -63,7 +63,8 @@ function parseV2Ref(value: unknown): PersistedWorkspaceSurfaceRef | null {
 }
 
 function globalRefKey(ref: Exclude<PersistedWorkspaceSurfaceRef, { type: 'chat' }>): string {
-	return ref.type === 'singleton' ? `singleton:${ref.kind}` : terminalSurfaceId(ref.terminalId);
+	if (ref.type === 'singleton') return `singleton:${ref.kind}`;
+	return terminalSurfaceId(ref.terminalId);
 }
 
 function descriptorForGlobalRef(

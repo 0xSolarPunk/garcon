@@ -2,7 +2,7 @@ import * as m from '$lib/paraglide/messages.js';
 import type { AppShellStore } from '$lib/stores/app-shell.svelte.js';
 import type { ChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.js';
 import { FileSessionRegistry } from '$lib/files/sessions/file-session-registry.svelte.js';
-import type { FileRendererMode } from '$lib/files/sessions/file-session.svelte.js';
+import type { FileRendererMode } from '$lib/files/sessions/file-view-session.svelte.js';
 import type { GhCapabilityStore } from '$lib/stores/gh-capability.svelte.js';
 import { GitQuickSummaryStore } from '$lib/git/surface/git-quick-summary.svelte.js';
 import { gitProjectInvalidations } from '$lib/git/surface/git-project-invalidation.svelte.js';
@@ -40,6 +40,8 @@ import { WorkspaceDomainBindings } from './workspace-domain-bindings.svelte.js';
 import { TerminalLayoutBinding } from './terminal-layout-binding.js';
 import { WorkspaceLayoutPersistence } from './workspace-layout-persistence.js';
 import { WorkspaceShortcutDispatcher } from './workspace-shortcuts.js';
+import { WorkbenchCommandRegistry } from './workbench-commands.svelte.js';
+import { FILE_RECOVERY_DEPLOYMENT_ID } from '$lib/files/persistence/file-recovery-identity.js';
 import { WorkspaceTransitionArbiter } from './workspace-transition-arbiter.js';
 import { WorkspaceWindowDndController } from './window-dnd.svelte.js';
 import { WorkspaceHostGeometryState } from './workspace-host-geometry.svelte.js';
@@ -53,6 +55,7 @@ import {
 } from './window-geometry-policy.js';
 import { computeWindowRects } from './window-tree.js';
 import {
+	fileSurfaceId,
 	singletonSurfaceId,
 	type DesktopPlacement,
 	type WorkspaceWindowId,
@@ -124,6 +127,7 @@ export interface WorkspaceServices {
 	windowDnd: WorkspaceWindowDndController;
 	hostGeometry: WorkspaceHostGeometryState;
 	shortcuts: WorkspaceShortcutDispatcher;
+	commands: WorkbenchCommandRegistry;
 	destroy(): void;
 }
 
@@ -352,6 +356,9 @@ export function createWorkspaceServices(deps: WorkspaceRootDependencies): Worksp
 				placement?.defaultWindowId ?? 'window-main',
 			),
 		getEditorSettings: () => ({
+			get vimMode() {
+				return deps.localSettings.codeEditorVimMode;
+			},
 			get wordWrap() {
 				return deps.localSettings.codeEditorWordWrap;
 			},
@@ -362,9 +369,25 @@ export function createWorkspaceServices(deps: WorkspaceRootDependencies): Worksp
 				return Number.parseInt(deps.localSettings.codeEditorFontSize, 10) || 12;
 			},
 		}),
-		getPlacement: (): WorkspaceCoordinator => {
+		getPlacement: () => {
 			if (!placement) throw new Error('Workspace placement is not ready');
 			return placement;
+		},
+		deploymentId: FILE_RECOVERY_DEPLOYMENT_ID,
+		onRecoveryError: (document, error) => {
+			deps.notifications.error(
+				m.file_recovery_checkpoint_failed({ fileName: document.fileName, detail: error.message }),
+				{
+					key: `file-recovery:${document.id}`,
+					timeoutMs: null,
+					action: {
+						label: m.file_recovery_retry(),
+						onClick: () => {
+							void files.flushRecovery();
+						},
+					},
+				},
+			);
 		},
 		onOpenError: (request, error) => {
 			console.error('Failed to resolve file identity', error);
@@ -376,6 +399,10 @@ export function createWorkspaceServices(deps: WorkspaceRootDependencies): Worksp
 			);
 		},
 		openMainInert: (commitOpen) => transientLayers.open('main-inert', commitOpen),
+		isDocumentVisible: (documentId) =>
+			[...(files.documents[documentId]?.viewIds ?? [])].some((viewId) =>
+				placement?.isSurfacePresented(fileSurfaceId(viewId)),
+			),
 	});
 	const coordinator = new WorkspaceCoordinator({
 		arbiter: new WorkspaceTransitionArbiter(layout, layout),
@@ -394,6 +421,7 @@ export function createWorkspaceServices(deps: WorkspaceRootDependencies): Worksp
 		onLayoutChanged: (snapshot) => {
 			hostGeometry.layoutPublished();
 			persistence.schedule(snapshot);
+			for (const session of files.all) files.viewVisibilityChanged(session.id);
 		},
 		onTerminalLauncherDismissed: deps.onTerminalLauncherDismissed,
 		getRouteIdentity: deps.getRouteIdentity,
@@ -411,12 +439,24 @@ export function createWorkspaceServices(deps: WorkspaceRootDependencies): Worksp
 			});
 		},
 	});
+	const commands = new WorkbenchCommandRegistry({
+		workspace: coordinator,
+		files,
+		terminals,
+		appShell: deps.appShell,
+		ghCapability: deps.ghCapability,
+		filesSurface: () => singletonSurfaces.files(),
+		filesSurfaceIfPresent: () => singletonSurfaces.filesIfPresent(),
+		onError: (error) =>
+			deps.notifications.error(error instanceof Error ? error.message : m.workspace_open_failed()),
+		onInfo: (message) => deps.notifications.info(message, { key: 'file-command-feedback' }),
+	});
 	const shortcuts = new WorkspaceShortcutDispatcher({
 		workspace: coordinator,
 		transients: transientLayers,
 		appShell: deps.appShell,
 		navigation: deps.navigation,
-		files,
+		commands,
 		localSettings: deps.localSettings,
 	});
 
@@ -440,12 +480,14 @@ export function createWorkspaceServices(deps: WorkspaceRootDependencies): Worksp
 		windowDnd,
 		hostGeometry,
 		shortcuts,
+		commands,
 		destroy() {
 			windowDnd.endDrag();
 			unregisterWorkspaceInteraction();
 			domainBindings.destroy();
 			terminalLayoutBinding?.destroy();
 			terminals.destroy();
+			void files.destroyAll();
 			surfaceFrames.destroy();
 			singletonSurfaces.destroy();
 			gitQuickSummary.destroy();

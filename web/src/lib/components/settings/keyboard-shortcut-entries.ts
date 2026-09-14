@@ -36,6 +36,21 @@ export const GLOBAL_SHORTCUTS: readonly ShortcutEntry[] = [
 	{ id: 'open-settings', label: m.settings_shortcut_open_settings },
 	{ id: 'scroll-half-page-up', label: m.settings_shortcut_scroll_half_page_up },
 	{ id: 'scroll-half-page-down', label: m.settings_shortcut_scroll_half_page_down },
+	{ id: 'file-save', label: m.editor_actions_save },
+	{ id: 'editor-find', label: m.settings_shortcut_editor_find },
+	{ id: 'editor-replace', label: m.settings_shortcut_editor_replace },
+	{ id: 'editor-go-to-line', label: m.editor_command_go_to_line },
+	{ id: 'editor-go-to-matching-bracket', label: m.editor_command_matching_bracket },
+	{ id: 'editor-indent', label: m.editor_command_indent },
+	{ id: 'editor-outdent', label: m.editor_command_outdent },
+	{ id: 'editor-toggle-comment', label: m.editor_command_toggle_comment },
+	{ id: 'editor-duplicate-line-up', label: m.editor_command_duplicate_line_up },
+	{ id: 'editor-duplicate-line-down', label: m.editor_command_duplicate_line_down },
+	{ id: 'editor-move-line-up', label: m.editor_command_move_line_up },
+	{ id: 'editor-move-line-down', label: m.editor_command_move_line_down },
+	{ id: 'editor-delete-line', label: m.editor_command_delete_line },
+	{ id: 'file-navigate-back', label: m.file_command_history_back },
+	{ id: 'file-navigate-forward', label: m.file_command_history_forward },
 ];
 
 export const CONFIGURABLE_SHORTCUTS: readonly ShortcutEntry[] = [

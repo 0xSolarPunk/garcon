@@ -38,6 +38,7 @@ import type { WorkspaceCoordinator } from '$lib/workspace/workspace-coordinator.
 import type { TransientLayerRegistry } from '$lib/workspace/transient-layers.svelte';
 import type { SurfaceFrameRegistry } from '$lib/workspace/surface-frame-registry.svelte';
 import type { WorkspaceShortcutDispatcher } from '$lib/workspace/workspace-shortcuts';
+import type { WorkbenchCommandRegistry } from '$lib/workspace/workbench-commands.svelte.js';
 import type { GitQuickSummaryStore } from '$lib/git/surface/git-quick-summary.svelte.js';
 import type { GitBranchSelectorState } from '$lib/git/targets/git-branch-selector-state.svelte.js';
 import type { GitMutationCoordinator } from '$lib/git/surface/git-mutations.svelte.js';
@@ -100,8 +101,19 @@ export function getOptionalTransientLayers(): TransientLayerRegistry | null {
 	}
 }
 export const [getSurfaceFrames, setSurfaceFrames] = createContext<SurfaceFrameRegistry>();
-export const [getWorkspaceShortcuts, setWorkspaceShortcuts] =
+const [getRequiredWorkspaceShortcuts, setWorkspaceShortcutsContext] =
 	createContext<WorkspaceShortcutDispatcher>();
+export const getWorkspaceShortcuts = getRequiredWorkspaceShortcuts;
+export const setWorkspaceShortcuts = setWorkspaceShortcutsContext;
+export function getOptionalWorkspaceShortcuts(): WorkspaceShortcutDispatcher | null {
+	try {
+		return getRequiredWorkspaceShortcuts();
+	} catch {
+		return null;
+	}
+}
+export const [getWorkbenchCommands, setWorkbenchCommands] =
+	createContext<WorkbenchCommandRegistry>();
 export const [getGitQuickSummary, setGitQuickSummary] = createContext<GitQuickSummaryStore>();
 export const [getGitBranchActions, setGitBranchActions] = createContext<GitBranchSelectorState>();
 export const [getGitMutations, setGitMutations] = createContext<GitMutationCoordinator>();

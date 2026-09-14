@@ -22,7 +22,7 @@ import type { TerminalMetadata } from '$shared/terminal';
 import type { TerminalAttachmentState } from '$lib/terminal/sessions/terminal-registry.svelte.js';
 import { SurfaceFrameRegistry } from '../surface-frame-registry.svelte';
 import { SurfaceFrameBridge } from '../surface-frame-context';
-import { WorkspaceShortcutDispatcher } from '../workspace-shortcuts';
+import { WorkspaceShortcutDispatcher, type WorkspaceShortcutDeps } from '../workspace-shortcuts';
 import type { WorkspaceLayoutSnapshot } from '../surface-types';
 import type {
 	WorkspacePartitionRatioBoundsResolver,
@@ -74,7 +74,7 @@ function windowCountOf(snapshot: WorkspaceLayoutSnapshot): number {
 
 function createHarness(
 	options: {
-		confirmDestructive?: (sessionId: string) => Promise<boolean>;
+		confirmDestructive?: (sessionId: string, reason?: string) => Promise<boolean>;
 		terminate?: (terminalId: string, requestId: string) => Promise<void>;
 		surfaceFrames?: SurfaceFrameRegistry;
 		fileEditor?: { prepareRendererTransfer(): void };
@@ -131,14 +131,28 @@ function createHarness(
 		);
 	}
 	const workspaceInteractionGate = new WorkspaceInteractionGate();
+	const confirmDestructive = options.confirmDestructive ?? vi.fn(async () => true);
+	const fileCloseReleases: Array<ReturnType<typeof vi.fn>> = [];
+	const confirmDestructiveViews = vi.fn(async (sessionIds: readonly string[]) => {
+		for (const sessionId of sessionIds)
+			if (!(await confirmDestructive(sessionId, 'close'))) return false;
+		return true;
+	});
 	const files = {
-		confirmDestructive: options.confirmDestructive ?? vi.fn(async () => true),
+		confirmDestructive,
+		confirmDestructiveViews,
+		prepareDestructiveViews: vi.fn(async (sessionIds: readonly string[]) => {
+			if (!(await confirmDestructiveViews(sessionIds))) return null;
+			const release = vi.fn();
+			fileCloseReleases.push(release);
+			return release;
+		}),
 		destroy: vi.fn(),
 		get: vi.fn(() =>
 			options.fileEditor || options.filePendingMutationCount !== undefined
 				? {
 						editor: options.fileEditor ?? null,
-						pendingMutationCount: options.filePendingMutationCount ?? 0,
+						mutationGuarded: (options.filePendingMutationCount ?? 0) > 0,
 					}
 				: null,
 		),
@@ -220,6 +234,7 @@ function createHarness(
 	return {
 		coordinator,
 		files,
+		fileCloseReleases,
 		layout,
 		terminals,
 		appShell,
@@ -227,6 +242,28 @@ function createHarness(
 		workspaceInteractionGate,
 		transientLayers,
 	};
+}
+
+function createShortcutDispatcher(
+	workspace: WorkspaceCoordinator,
+	transients: TransientLayerRegistry,
+	overrides: Partial<Omit<WorkspaceShortcutDeps, 'workspace' | 'transients'>> = {},
+): WorkspaceShortcutDispatcher {
+	return new WorkspaceShortcutDispatcher({
+		workspace,
+		transients,
+		appShell: {
+			openSettings: vi.fn(),
+			requestNewChat: vi.fn(),
+			openSidebarSearch: vi.fn(),
+			requestDeleteSelectedChat: vi.fn(),
+			requestRenameSelectedChat: vi.fn(),
+		},
+		navigation: { requestNavigateChatAbove: vi.fn(), requestNavigateChatBelow: vi.fn() },
+		commands: { execute: vi.fn(async () => true), isEnabled: () => true },
+		localSettings: { globalShortcuts: {} },
+		...overrides,
+	});
 }
 
 describe('WorkspaceCoordinator', () => {
@@ -256,12 +293,11 @@ describe('WorkspaceCoordinator', () => {
 			try {
 				const { coordinator, layout, singletons } = createHarness({ tickets: controller });
 				await coordinator.openSingletonAsTab('tickets', 'window-files');
-				const close = () =>
-					kind === 'tab'
-						? coordinator.closeSurface('singleton:tickets')
-						: kind === 'window'
-							? coordinator.closeWindow('window-files')
-							: coordinator.closeOtherWindows('window-main');
+				const close = () => {
+					if (kind === 'tab') return coordinator.closeSurface('singleton:tickets');
+					if (kind === 'window') return coordinator.closeWindow('window-files');
+					return coordinator.closeOtherWindows('window-main');
+				};
 				const canceled = close();
 				await vi.waitFor(() =>
 					expect(coordinator.closeGuardRequest?.surfaceId).toBe('singleton:tickets'),
@@ -1197,7 +1233,9 @@ describe('WorkspaceCoordinator', () => {
 
 	it('destroys a mobile file session and returns to Chat when it is closed', async () => {
 		const confirmDestructive = vi.fn(async () => true);
-		const { coordinator, files, layout, appShell } = createHarness({ confirmDestructive });
+		const { coordinator, files, fileCloseReleases, layout, appShell } = createHarness({
+			confirmDestructive,
+		});
 		await coordinator.enterMobilePresentation();
 		await coordinator.placeFileSession('mobile-file');
 		const surfaceId = fileSurfaceId('mobile-file');
@@ -1212,6 +1250,26 @@ describe('WorkspaceCoordinator', () => {
 		expect(layout.snapshot.mobileActiveSurfaceId).toBe(CANONICAL_CHAT_SURFACE_ID);
 		expect(coordinator.lastFocusedSurfaceId).toBe(CANONICAL_CHAT_SURFACE_ID);
 		expect(appShell.requestComposerFocus).toHaveBeenCalledOnce();
+		expect(fileCloseReleases).toHaveLength(1);
+		expect(fileCloseReleases[0]).toHaveBeenCalledOnce();
+	});
+
+	it('releases file close admission when layout publication fails', async () => {
+		const { coordinator, files, fileCloseReleases, layout } = createHarness({
+			failLayoutPublishAt: 2,
+		});
+		await coordinator.placeFileSession('publication-failure', {
+			type: 'window',
+			windowId: 'window-main',
+		});
+		const surfaceId = fileSurfaceId('publication-failure');
+
+		await expect(coordinator.closeSurface(surfaceId)).resolves.toBe(true);
+
+		expect(layout.surface(surfaceId)).toBeNull();
+		expect(files.destroy).toHaveBeenCalledWith('publication-failure');
+		expect(fileCloseReleases).toHaveLength(1);
+		expect(fileCloseReleases[0]).toHaveBeenCalledOnce();
 	});
 
 	it('keeps a dirty mobile file visible when destructive Close is cancelled', async () => {
@@ -1230,15 +1288,12 @@ describe('WorkspaceCoordinator', () => {
 		expect(layout.snapshot.mobileActiveSurfaceId).toBe(surfaceId);
 	});
 
-	it('restores the dialog return surface when an inactive popped-out file closes', async () => {
+	it('restores the dialog return surface when a file dialog closes', async () => {
 		const { coordinator, appShell, layout } = createHarness();
 		await coordinator.placeFileSession('inactive-dialog', {
-			type: 'window',
-			windowId: 'window-main',
+			type: 'dialog',
 		});
 		const surfaceId = fileSurfaceId('inactive-dialog');
-		await coordinator.focusChat();
-		await expect(coordinator.popOutFile(surfaceId)).resolves.toBe(true);
 		expect(coordinator.focusOwner).toEqual({
 			kind: 'surface',
 			surfaceId: CANONICAL_CHAT_SURFACE_ID,
@@ -1849,17 +1904,96 @@ describe('WorkspaceCoordinator', () => {
 		expect(gitVisibility.at(-1)).toEqual(['git', false]);
 	});
 
-	it('does not route shortcuts through a stale hidden surface owner', () => {
-		const { coordinator, transientLayers, appShell, files } = createHarness();
-		coordinator.focusOwner = { kind: 'surface', surfaceId: 'singleton:pull-requests' };
-		const dispatcher = new WorkspaceShortcutDispatcher({
-			workspace: coordinator,
-			transients: transientLayers,
-			appShell: appShell as never,
-			navigation: {} as never,
-			files: files as never,
-			localSettings: { globalShortcuts: {} },
+	it('routes configurable file shortcuts through the command registry', async () => {
+		const { coordinator, transientLayers } = createHarness();
+		await coordinator.placeFileSession('shortcut-file', {
+			type: 'window',
+			windowId: 'window-main',
 		});
+		coordinator.focusOwner = {
+			kind: 'surface',
+			surfaceId: fileSurfaceId('shortcut-file'),
+		};
+		const execute = vi.fn(async () => true);
+		const dispatcher = createShortcutDispatcher(coordinator, transientLayers, {
+			commands: { execute, isEnabled: () => true },
+			localSettings: { globalShortcuts: { 'file-save': { key: 'k', ctrl: true } } },
+		});
+		const event = new KeyboardEvent('keydown', {
+			key: 'k',
+			ctrlKey: true,
+			cancelable: true,
+		});
+
+		dispatcher.handle(event);
+
+		expect(event.defaultPrevented).toBe(true);
+		expect(execute).toHaveBeenCalledWith('file.save', {
+			viewId: 'shortcut-file',
+			surfaceId: fileSurfaceId('shortcut-file'),
+		});
+	});
+
+	it('routes core editor shortcuts through the command registry', async () => {
+		const { coordinator, transientLayers } = createHarness();
+		await coordinator.placeFileSession('shortcut-file', {
+			type: 'window',
+			windowId: 'window-main',
+		});
+		coordinator.focusOwner = {
+			kind: 'surface',
+			surfaceId: fileSurfaceId('shortcut-file'),
+		};
+		const execute = vi.fn(async () => true);
+		const dispatcher = createShortcutDispatcher(coordinator, transientLayers, {
+			commands: { execute, isEnabled: () => true },
+		});
+		const event = new KeyboardEvent('keydown', {
+			key: 'ArrowDown',
+			altKey: true,
+			cancelable: true,
+		});
+
+		dispatcher.handle(event);
+
+		expect(event.defaultPrevented).toBe(true);
+		expect(execute).toHaveBeenCalledWith('editor.move-line-down', {
+			viewId: 'shortcut-file',
+			surfaceId: fileSurfaceId('shortcut-file'),
+		});
+	});
+
+	it('leaves composing editor shortcuts to the input method', async () => {
+		const { coordinator, transientLayers } = createHarness();
+		await coordinator.placeFileSession('shortcut-file', {
+			type: 'window',
+			windowId: 'window-main',
+		});
+		coordinator.focusOwner = {
+			kind: 'surface',
+			surfaceId: fileSurfaceId('shortcut-file'),
+		};
+		const execute = vi.fn(async () => true);
+		const dispatcher = createShortcutDispatcher(coordinator, transientLayers, {
+			commands: { execute, isEnabled: () => true },
+		});
+		const event = new KeyboardEvent('keydown', {
+			key: 'ArrowDown',
+			altKey: true,
+			cancelable: true,
+		});
+		Object.defineProperty(event, 'isComposing', { value: true });
+
+		dispatcher.handle(event);
+
+		expect(event.defaultPrevented).toBe(false);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it('does not route shortcuts through a stale hidden surface owner', () => {
+		const { coordinator, transientLayers } = createHarness();
+		coordinator.focusOwner = { kind: 'surface', surfaceId: 'singleton:pull-requests' };
+		const dispatcher = createShortcutDispatcher(coordinator, transientLayers);
 		const handler = vi.fn(() => true);
 		dispatcher.registerSurface('singleton:pull-requests', handler);
 
@@ -1869,18 +2003,13 @@ describe('WorkspaceCoordinator', () => {
 	});
 
 	it('routes chat navigation shortcuts within a main-inert chat list', () => {
-		const { coordinator, transientLayers, appShell, files } = createHarness();
+		const { coordinator, transientLayers } = createHarness();
 		const requestNavigateChatBelow = vi.fn();
-		const dispatcher = new WorkspaceShortcutDispatcher({
-			workspace: coordinator,
-			transients: transientLayers,
-			appShell: appShell as never,
+		const dispatcher = createShortcutDispatcher(coordinator, transientLayers, {
 			navigation: {
 				requestNavigateChatAbove: vi.fn(),
 				requestNavigateChatBelow,
-			} as never,
-			files: files as never,
-			localSettings: { globalShortcuts: {} },
+			},
 		});
 		const chatList = document.createElement('div');
 		chatList.dataset.workspaceChatList = '';
@@ -3248,22 +3377,6 @@ describe('WorkspaceCoordinator', () => {
 
 		expect(layout.surface(surfaceId)).toBeNull();
 		expect(terminals.disposeTerminatedSession).toHaveBeenCalledWith(terminalId);
-	});
-
-	it('reserves a dialog source while a dirty collision is pending', async () => {
-		const confirmation = deferred<boolean>();
-		const confirmDestructive = vi.fn(() => confirmation.promise);
-		const { coordinator, layout } = createHarness({ confirmDestructive });
-		await coordinator.placeFileSession('dialog', { type: 'dialog' });
-		await coordinator.placeFileSession('source', { type: 'window', windowId: 'window-main' });
-
-		const popOut = coordinator.popOutFile(fileSurfaceId('source'));
-		await vi.waitFor(() => expect(confirmDestructive).toHaveBeenCalledOnce());
-		await expect(coordinator.closeSurface(fileSurfaceId('source'))).resolves.toBe(false);
-		expect(windowTabs(layout.snapshot, 'window-main').order).toContain(fileSurfaceId('source'));
-
-		confirmation.resolve(false);
-		await expect(popOut).resolves.toBe(false);
 	});
 
 	it('transfers a dialog renderer through mobile and back to the dialog frame', async () => {

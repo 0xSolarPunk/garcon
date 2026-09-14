@@ -580,6 +580,30 @@ describe('KeyboardShortcuts', () => {
 		expect(appShell.requestNewChat).not.toHaveBeenCalled();
 	});
 
+	it('lets a locally owned editor close Find before its file dialog', () => {
+		const onTransientEscape = vi.fn();
+		const onLocalKeydown = vi.fn();
+		render(KeyboardShortcutsHost, {
+			appShell: createMockAppShell(),
+			navigation: createMockNavigation(),
+			focusOwner: 'chat',
+			transientKind: 'file-dialog',
+			transientSurface: true,
+			localShortcutOwner: (event) => event.key === 'Escape',
+			onLocalKeydown,
+			onTransientEscape,
+		});
+
+		screen
+			.getByRole('textbox', { name: 'Transient input' })
+			.dispatchEvent(
+				new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+			);
+
+		expect(onLocalKeydown).toHaveBeenCalledOnce();
+		expect(onTransientEscape).not.toHaveBeenCalled();
+	});
+
 	it('lets the top transient consume Escape before a local editor owner', () => {
 		const onTransientEscape = vi.fn();
 		const onLocalKeydown = vi.fn();
@@ -861,6 +885,59 @@ describe('KeyboardShortcuts', () => {
 
 		expect(navigation.requestNavigateChatAbove).not.toHaveBeenCalled();
 		expect(navigation.requestNavigateChatBelow).not.toHaveBeenCalled();
+	});
+
+	it.each(['f', '/', '[', ']'])(
+		'leaves disabled file shortcut Ctrl-%s to the browser or focused content',
+		(key) => {
+			const execute = vi.fn(async () => false);
+			render(KeyboardShortcutsHost, {
+				appShell: createMockAppShell(),
+				navigation: createMockNavigation(),
+				focusOwner: 'file',
+				commands: { execute, isEnabled: () => false },
+			});
+			const event = new KeyboardEvent('keydown', { key, ctrlKey: true, cancelable: true });
+
+			window.dispatchEvent(event);
+
+			expect(event.defaultPrevented).toBe(false);
+			expect(execute).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each([
+		['ArrowLeft', 'file.navigate-back'],
+		['ArrowRight', 'file.navigate-forward'],
+	])('suppresses browser navigation for disabled file history %s', (key, command) => {
+		const execute = vi.fn(async () => false);
+		render(KeyboardShortcutsHost, {
+			appShell: createMockAppShell(),
+			navigation: createMockNavigation(),
+			focusOwner: 'file',
+			commands: { execute, isEnabled: () => false },
+		});
+		const event = new KeyboardEvent('keydown', { key, altKey: true, cancelable: true });
+		window.dispatchEvent(event);
+		expect(event.defaultPrevented).toBe(true);
+		expect(execute).toHaveBeenCalledWith(command, {
+			viewId: 'file-session',
+			surfaceId: 'file:file-session',
+		});
+	});
+
+	it('still suppresses native Save when the file command is disabled', () => {
+		render(KeyboardShortcutsHost, {
+			appShell: createMockAppShell(),
+			navigation: createMockNavigation(),
+			focusOwner: 'file',
+			commands: { execute: vi.fn(async () => false), isEnabled: () => false },
+		});
+		const event = new KeyboardEvent('keydown', { key: 's', ctrlKey: true, cancelable: true });
+
+		window.dispatchEvent(event);
+
+		expect(event.defaultPrevented).toBe(true);
 	});
 
 	it('does not route Ctrl-S to Chat while a confirmation owns focus', async () => {

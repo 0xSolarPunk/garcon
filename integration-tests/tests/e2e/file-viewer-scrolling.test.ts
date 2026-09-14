@@ -139,7 +139,7 @@ async function waitForActiveTarget(
       const surface = [
         ...document.querySelectorAll<HTMLElement>('[data-workspace-surface-id^="file:"]'),
       ].find(
-        (candidate) => candidate.querySelector('h2')?.textContent?.trim() === expectedFileName,
+        (candidate) => candidate.querySelector('h2')?.title.endsWith(`/${expectedFileName}`),
       );
       if (!surface) return false;
       if (expectedTarget === 'markdown')
@@ -164,15 +164,18 @@ async function setScrollOffset(
       const surface = [
         ...document.querySelectorAll<HTMLElement>('[data-workspace-surface-id^="file:"]'),
       ].find(
-        (candidate) => candidate.querySelector('h2')?.textContent?.trim() === expectedFileName,
+        (candidate) => candidate.querySelector('h2')?.title.endsWith(`/${expectedFileName}`),
       );
-      const element =
-        expectedTarget === 'markdown'
-          ? surface?.querySelector<HTMLElement>('.markdown-viewer-content')
-          : expectedTarget === 'editor'
-            ? surface?.querySelector<HTMLElement>('.cm-scroller')
-            : surface?.querySelector<HTMLImageElement>(`img[alt="${expectedFileName}"]`)
-                ?.closest<HTMLElement>('.overflow-auto');
+      let element: HTMLElement | null | undefined;
+      if (expectedTarget === 'markdown') {
+        element = surface?.querySelector<HTMLElement>('.markdown-viewer-content');
+      } else if (expectedTarget === 'editor') {
+        element = surface?.querySelector<HTMLElement>('.cm-scroller');
+      } else {
+        element = surface
+          ?.querySelector<HTMLImageElement>(`img[alt="${expectedFileName}"]`)
+          ?.closest<HTMLElement>('.overflow-auto');
+      }
       if (!element)
         throw new Error(`Missing ${expectedTarget} scroll target for ${expectedFileName}`);
       element.scrollTop = expectedOffset;
@@ -198,15 +201,18 @@ async function expectRestoredOffset(
       const surface = [
         ...document.querySelectorAll<HTMLElement>('[data-workspace-surface-id^="file:"]'),
       ].find(
-        (candidate) => candidate.querySelector('h2')?.textContent?.trim() === expectedFileName,
+        (candidate) => candidate.querySelector('h2')?.title.endsWith(`/${expectedFileName}`),
       );
-      const element =
-        expectedTarget === 'markdown'
-          ? surface?.querySelector<HTMLElement>('.markdown-viewer-content')
-          : expectedTarget === 'editor'
-            ? surface?.querySelector<HTMLElement>('.cm-scroller')
-            : surface?.querySelector<HTMLImageElement>(`img[alt="${expectedFileName}"]`)
-                ?.closest<HTMLElement>('.overflow-auto');
+      let element: HTMLElement | null | undefined;
+      if (expectedTarget === 'markdown') {
+        element = surface?.querySelector<HTMLElement>('.markdown-viewer-content');
+      } else if (expectedTarget === 'editor') {
+        element = surface?.querySelector<HTMLElement>('.cm-scroller');
+      } else {
+        element = surface
+          ?.querySelector<HTMLImageElement>(`img[alt="${expectedFileName}"]`)
+          ?.closest<HTMLElement>('.overflow-auto');
+      }
       const tolerance = expectedTarget === 'image' ? 4 : 1;
       return element != null && Math.abs(element.scrollTop - expected) <= tolerance;
     },
@@ -223,7 +229,7 @@ async function prepareScrollableImage(page: Page, fileName: string): Promise<voi
   await page.evaluate((expectedFileName) => {
     const surface = [
       ...document.querySelectorAll<HTMLElement>('[data-workspace-surface-id^="file:"]'),
-    ].find((candidate) => candidate.querySelector('h2')?.textContent?.trim() === expectedFileName);
+    ].find((candidate) => candidate.querySelector('h2')?.title.endsWith(`/${expectedFileName}`));
     const target = surface?.querySelector<HTMLImageElement>(`img[alt="${expectedFileName}"]`);
     if (!target) throw new Error(`Missing image: ${expectedFileName}`);
     // Supplies layout dimensions because Lightpanda does not decode blob-backed SVG metadata.

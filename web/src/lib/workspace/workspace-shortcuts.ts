@@ -1,10 +1,10 @@
 import type { AppShellStore } from '$lib/stores/app-shell.svelte.js';
-import type { FileSessionRegistry } from '$lib/files/sessions/file-session-registry.svelte.js';
 import type { NavigationStore } from '$lib/stores/navigation.svelte.js';
 import type { WorkspaceCoordinator } from './workspace-coordinator.svelte.js';
 import type { TransientLayerRegistry } from './transient-layers.svelte.js';
 import type { LocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
 import type { FocusOwner } from './surface-types.js';
+import type { WorkbenchCommandRegistry } from './workbench-commands.svelte.js';
 import {
 	getEffectiveGlobalShortcut,
 	globalShortcutMatchesEvent,
@@ -22,6 +22,24 @@ export type WorkspaceSurfaceShortcutHandler = (event: KeyboardEvent) => boolean;
 export type WorkspaceLocalShortcutOwner = (event: KeyboardEvent) => boolean;
 type WorkspaceScrollInteraction = 'focus' | 'pointer' | 'wheel';
 
+export const FILE_SHORTCUT_COMMANDS: readonly (readonly [GlobalShortcutId, string])[] = [
+	['file-save', 'file.save'],
+	['editor-find', 'editor.find'],
+	['editor-replace', 'editor.replace'],
+	['editor-go-to-line', 'editor.go-to-line'],
+	['editor-go-to-matching-bracket', 'editor.go-to-matching-bracket'],
+	['editor-indent', 'editor.indent'],
+	['editor-outdent', 'editor.outdent'],
+	['editor-toggle-comment', 'editor.toggle-comment'],
+	['editor-duplicate-line-up', 'editor.duplicate-line-up'],
+	['editor-duplicate-line-down', 'editor.duplicate-line-down'],
+	['editor-move-line-up', 'editor.move-line-up'],
+	['editor-move-line-down', 'editor.move-line-down'],
+	['editor-delete-line', 'editor.delete-line'],
+	['file-navigate-back', 'file.navigate-back'],
+	['file-navigate-forward', 'file.navigate-forward'],
+];
+
 export interface WorkspaceShortcutDeps {
 	workspace: Pick<
 		WorkspaceCoordinator,
@@ -33,7 +51,7 @@ export interface WorkspaceShortcutDeps {
 	> & { layout: Pick<WorkspaceCoordinator['layout'], 'surface'> };
 	transients: Pick<
 		TransientLayerRegistry,
-		'makesMainInert' | 'handleEscape' | 'ownsTopModalTarget'
+		'makesMainInert' | 'handleEscape' | 'ownsTopModalTarget' | 'topVisibleKind'
 	>;
 	appShell: Pick<
 		AppShellStore,
@@ -44,8 +62,8 @@ export interface WorkspaceShortcutDeps {
 		| 'requestRenameSelectedChat'
 	>;
 	navigation: Pick<NavigationStore, 'requestNavigateChatAbove' | 'requestNavigateChatBelow'>;
-	files: Pick<FileSessionRegistry, 'save'>;
 	localSettings: Pick<LocalSettingsStore, 'globalShortcuts'>;
+	commands: Pick<WorkbenchCommandRegistry, 'execute' | 'isEnabled'>;
 }
 
 export class WorkspaceShortcutDispatcher {
@@ -128,7 +146,15 @@ export class WorkspaceShortcutDispatcher {
 	}
 
 	handle(event: KeyboardEvent): void {
-		if (event.defaultPrevented) return;
+		if (event.defaultPrevented || event.isComposing) return;
+		const topTransientKind = this.deps.transients.topVisibleKind();
+		if (
+			event.key === 'Escape' &&
+			topTransientKind === 'file-dialog' &&
+			this.#isLocallyOwned(event)
+		) {
+			return;
+		}
 		if (event.key === 'Escape' && this.deps.transients.handleEscape(event)) return;
 		const matches = (id: GlobalShortcutId) => this.matchesGlobalShortcut(id, event);
 		const explicitOwner = this.#ownerForTarget(event.target);
@@ -163,11 +189,9 @@ export class WorkspaceShortcutDispatcher {
 			this.deps.appShell.requestNewChat();
 			return;
 		}
-		const halfPageDirection: WorkspaceHalfPageDirection | null = matches('scroll-half-page-up')
-			? 'earlier'
-			: matches('scroll-half-page-down')
-				? 'later'
-				: null;
+		let halfPageDirection: WorkspaceHalfPageDirection | null = null;
+		if (matches('scroll-half-page-up')) halfPageDirection = 'earlier';
+		else if (matches('scroll-half-page-down')) halfPageDirection = 'later';
 		if (halfPageDirection) {
 			// Terminal input is the sole exception; editable targets still use workspace scrolling.
 			if (ownerDescriptor?.type === 'terminal') return;
@@ -205,13 +229,22 @@ export class WorkspaceShortcutDispatcher {
 			if (!this.deps.workspace.isSurfacePresented(owner.surfaceId)) return;
 			const descriptor = this.deps.workspace.layout.surface(owner.surfaceId);
 			if (descriptor?.type === 'terminal') return;
-			if (
-				descriptor?.type === 'file' &&
-				globalShortcutMatchesEvent({ key: 's', primary: true }, event)
-			) {
-				event.preventDefault();
-				void this.deps.files.save(descriptor.fileSessionId);
-				return;
+			if (descriptor?.type === 'file') {
+				const commandContext = { viewId: descriptor.fileSessionId, surfaceId: descriptor.id };
+				const fileCommand = FILE_SHORTCUT_COMMANDS.find(([id]) => matches(id))?.[1] ?? null;
+				if (fileCommand) {
+					// File history must not fall through to browser navigation at its boundaries.
+					const ownsBrowserShortcut =
+						fileCommand === 'file.save' ||
+						fileCommand === 'file.navigate-back' ||
+						fileCommand === 'file.navigate-forward';
+					if (!ownsBrowserShortcut && !this.deps.commands.isEnabled(fileCommand, commandContext)) {
+						return;
+					}
+					event.preventDefault();
+					void this.deps.commands.execute(fileCommand, commandContext);
+					return;
+				}
 			}
 			if (descriptor?.type === 'chat' && matches('open-sidebar-search')) {
 				event.preventDefault();

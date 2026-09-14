@@ -1,12 +1,13 @@
 <script lang="ts">
-	import { onDestroy, untrack } from 'svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import {
 		setFileSessions,
 		setLocalSettings,
 		setNotifications,
 		setWorkspaceLayout,
+		setWorkbenchCommands,
 	} from '$lib/context';
-	import { FileSession } from '$lib/files/sessions/file-session.svelte.js';
+	import { FileSession } from '$lib/files/sessions/__tests__/file-session-fixture.js';
 	import {
 		FileSessionRegistry,
 		type FileOpenRequest,
@@ -18,6 +19,7 @@
 	import { setSurfaceFrameBridge, SurfaceFrameBridge } from '$lib/workspace/surface-frame-context';
 	import { createWorkspaceLayoutStore } from '$lib/workspace/workspace-layout.svelte.js';
 	import FileSurface from '../FileSurface.svelte';
+	import type { WorkbenchCommandRegistry } from '$lib/workspace/workbench-commands.svelte.js';
 
 	let {
 		presentation,
@@ -29,8 +31,8 @@
 		refreshError = null,
 		content = '# Heading',
 		onRefresh = () => undefined,
-		onCheckFreshness = () => undefined,
 		onOpen = () => {},
+		onReady,
 		onClose,
 		closeDisabled = false,
 	}: {
@@ -43,8 +45,8 @@
 		refreshError?: string | null;
 		content?: string;
 		onRefresh?: (sessionId: string) => void;
-		onCheckFreshness?: (sessionId: string) => void;
 		onOpen?: (request: FileOpenRequest) => void;
+		onReady?: (session: FileSession, frame: SurfaceFrameBridge) => void;
 		onClose?: () => void;
 		closeDisabled?: boolean;
 	} = $props();
@@ -94,10 +96,15 @@
 		readContent: async () => ({ blob: new Blob(), revision: 'v1:image' }),
 	});
 	fileSessions.refresh = async (sessionId: string) => onRefresh(sessionId);
-	fileSessions.checkFreshness = async (sessionId: string) => onCheckFreshness(sessionId);
 	fileSessions.open = async (request) => {
 		onOpen(request);
 		return null;
+	};
+	fileSessions.showSource = async (sessionId) => {
+		if (sessionId !== session.id) return false;
+		session.markdownMode = 'source';
+		session.rendererMode = 'code';
+		return Boolean(session.editor);
 	};
 
 	localSettings.codeEditorWordWrap = false;
@@ -105,24 +112,23 @@
 	localSettings.codeEditorFontSize = '12';
 	localSettings.markdownViewerFontSize = '14';
 
+	let relativePath = 'src/file.ts';
+	let contentKind: FileSession['contentKind'] = 'text';
+	if (initial.rendererMode === 'image') {
+		relativePath = 'assets/image.png';
+		contentKind = 'image';
+	} else if (initial.rendererMode === 'markdown') {
+		relativePath = 'docs/current.md';
+		contentKind = 'markdown';
+	}
 	const session = new FileSession(
 		{
 			canonicalFileRootPath: '/workspace',
-			normalizedRelativePath:
-				initial.rendererMode === 'image'
-					? 'assets/image.png'
-					: initial.rendererMode === 'markdown'
-						? 'docs/current.md'
-						: 'src/file.ts',
+			normalizedRelativePath: relativePath,
 		},
 		'file-surface-test',
 	);
-	session.contentKind =
-		initial.rendererMode === 'image'
-			? 'image'
-			: initial.rendererMode === 'markdown'
-				? 'markdown'
-				: 'text';
+	session.contentKind = contentKind;
 	session.rendererMode = initial.rendererMode;
 	session.loading = initial.loading;
 	session.loadedRevision = 'v1:loaded';
@@ -135,9 +141,18 @@
 	if (session.rendererMode !== 'image') {
 		session.editor = new CodeEditorController(session, {
 			editorThemeId: 'standard-light',
-			wordWrap: false,
-			showLineNumbers: true,
-			fontSize: 12,
+			get wordWrap() {
+				return localSettings.codeEditorWordWrap;
+			},
+			get showLineNumbers() {
+				return localSettings.codeEditorLineNumbers;
+			},
+			get fontSize() {
+				return Number(localSettings.codeEditorFontSize);
+			},
+			get vimMode() {
+				return localSettings.codeEditorVimMode;
+			},
 		});
 	}
 
@@ -146,7 +161,18 @@
 	setLocalSettings(localSettings);
 	setNotifications(notifications);
 	setWorkspaceLayout(workspaceLayout);
-	onDestroy(() => localSettings.destroy());
+	const commands: Pick<WorkbenchCommandRegistry, 'execute' | 'registerFileSurface'> = {
+		execute: async (id, context) =>
+			id === 'file.save' && context?.viewId ? fileSessions.save(context.viewId) : false,
+		registerFileSurface: () => () => undefined,
+	};
+	setWorkbenchCommands(commands as WorkbenchCommandRegistry);
+	onMount(() => onReady?.(session, frameBridge));
+	onDestroy(() => {
+		frameBridge.deactivate();
+		session.editor?.dispose();
+		localSettings.destroy();
+	});
 </script>
 
 <FileSurface {session} {presentation} {onClose} {closeDisabled} />

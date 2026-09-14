@@ -61,6 +61,7 @@
 		setTransientLayers,
 		setSurfaceFrames,
 		setWorkspaceShortcuts,
+		setWorkbenchCommands,
 		setGitQuickSummary,
 		setGitBranchActions,
 		setGitMutations,
@@ -166,6 +167,7 @@
 	const fileSessions = workspaceServices.files;
 	const workspace = workspaceServices.coordinator;
 	const workspaceShortcuts = workspaceServices.shortcuts;
+	const workbenchCommands = workspaceServices.commands;
 	const sidebarProjectCollapse = createSidebarProjectCollapseStore();
 	const minuteClock = createMinuteClockStore();
 	const themeController = new ThemeController({
@@ -207,6 +209,7 @@
 	setTransientLayers(transientLayers);
 	setSurfaceFrames(surfaceFrames);
 	setWorkspaceShortcuts(workspaceShortcuts);
+	setWorkbenchCommands(workbenchCommands);
 	setGitQuickSummary(gitQuickSummary);
 	setGitBranchActions(gitBranchActions);
 	setGitMutations(gitMutations);
@@ -242,10 +245,21 @@
 	// Connects WebSocket after authentication.
 	// Uses untrack to prevent the effect from re-running when connect() mutates
 	// internal $state fields (which would cause an infinite reconnect loop).
+	let fileRecoveryInitialized = false;
 	$effect(() => {
 		if (auth.isAuthenticated) {
 			const token = auth.token;
 			const authDisabled = auth.authDisabled;
+			if (!fileRecoveryInitialized) {
+				const userId = untrack(() => auth.user?.id);
+				if (authDisabled || userId) {
+					fileRecoveryInitialized = true;
+					const namespace = authDisabled ? 'local' : `user:${userId}`;
+					untrack(() => {
+						void fileSessions.initializeRecovery(namespace);
+					});
+				}
+			}
 			untrack(() => ws.connect(token, authDisabled));
 		}
 	});

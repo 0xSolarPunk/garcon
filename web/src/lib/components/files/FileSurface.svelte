@@ -12,28 +12,37 @@
 	import ImageViewer from './ImageViewer.svelte';
 	import EditorSettingsMenu from './EditorSettingsMenu.svelte';
 	import MarkdownViewerSettingsMenu from './MarkdownViewerSettingsMenu.svelte';
-	import type { FileSession } from '$lib/files/sessions/file-session.svelte.js';
+	import type { FileViewSession } from '$lib/files/sessions/file-view-session.svelte.js';
 	import type { PresentationHostId } from '$lib/workspace/surface-types.js';
-	import { getFileSessions } from '$lib/context';
+	import { getFileSessions, getWorkbenchCommands } from '$lib/context';
 	import * as m from '$lib/paraglide/messages.js';
 	import { fileSurfaceId } from '$lib/workspace/surface-types.js';
 	import ResponsiveSurfaceActions, {
 		type ResponsiveSurfaceAction,
 	} from '$lib/components/shared/ResponsiveSurfaceActions.svelte';
-	import CopyFilePathButton from './CopyFilePathButton.svelte';
+	import FilePathTitle from './FilePathTitle.svelte';
 	import FileFreshnessBanner from './FileFreshnessBanner.svelte';
-	import { startVisibilityPolling } from '$lib/components/shared/visibility-polling.js';
-	import { FILE_FRESHNESS_POLL_MS } from '$lib/files/sessions/file-freshness.js';
+	import FileEditorStatus from './FileEditorStatus.svelte';
+	import type { ChatDraftAppend } from '$lib/chat/composer/chat-draft-append.js';
+	import { canSaveFileChanges } from '$lib/files/persistence/file-write-policy.js';
 
 	interface Props {
-		session: FileSession;
+		session: FileViewSession;
 		presentation: PresentationHostId;
 		onClose?: () => void;
 		closeDisabled?: boolean;
+		onAppendToChatDraft?: ChatDraftAppend;
 	}
 
-	let { session, presentation, onClose, closeDisabled = false }: Props = $props();
+	let {
+		session,
+		presentation,
+		onClose,
+		closeDisabled = false,
+		onAppendToChatDraft,
+	}: Props = $props();
 	const files = getFileSessions();
+	const commands = getWorkbenchCommands();
 	const compact = $derived(presentation === 'mobile');
 	const toolbarActions = $derived.by<ResponsiveSurfaceAction[]>(() => {
 		const actions: ResponsiveSurfaceAction[] = [];
@@ -54,8 +63,12 @@
 				label: session.saving ? m.editor_actions_saving() : m.editor_actions_save(),
 				icon: session.saving ? LoaderCircle : Save,
 				iconClass: session.saving ? 'animate-spin' : undefined,
-				onclick: () => void files.save(session.id),
-				disabled: session.loading || session.saving || session.refreshing || !session.dirty,
+				onclick: () =>
+					void commands.execute('file.save', {
+						viewId: session.id,
+						surfaceId: fileSurfaceId(session.id),
+					}),
+				disabled: !canSaveFileChanges(session),
 				priority: 0,
 				showLabel: true,
 				variant: 'primary',
@@ -66,21 +79,30 @@
 			label: m.file_session_refresh(),
 			icon: RefreshCw,
 			onclick: () => void files.refresh(session.id),
-			disabled: session.loading || session.saving,
+			disabled: session.loading || session.mutationGuarded,
 			busy: session.refreshing,
 			priority: 2,
 			iconClass: session.refreshing ? 'animate-spin' : undefined,
 		});
+		if (session.isExternallyStale && session.contentKind !== 'image' && !session.mutationGuarded) {
+			actions.push({
+				id: 'compare-file',
+				label: m.file_session_compare(),
+				icon: Eye,
+				onclick: () => void files.showConflict(session.id),
+				priority: 1,
+			});
+		}
+		if (session.dirty) {
+			actions.push({
+				id: 'export-file',
+				label: m.file_session_export_local_copy(),
+				icon: Save,
+				onclick: () => void files.exportContent(session.id),
+				priority: 3,
+			});
+		}
 		return actions;
-	});
-
-	$effect(() => {
-		const sessionId = session.id;
-		return startVisibilityPolling({
-			intervalMs: FILE_FRESHNESS_POLL_MS,
-			pollImmediately: true,
-			poll: () => void files.checkFreshness(sessionId),
-		});
 	});
 
 	function showMarkdown(): void {
@@ -89,48 +111,37 @@
 	}
 
 	function showSource(): void {
-		session.markdownMode = 'source';
-		session.rendererMode = 'code';
+		void files.showSource(session.id);
 	}
+
+	$effect(() => {
+		return commands.registerFileSurface(session.id, {
+			appendToChatDraft: (block) => onAppendToChatDraft?.(block) ?? 'unavailable',
+		});
+	});
 </script>
 
 <div
 	data-workspace-surface-id={fileSurfaceId(session.id)}
 	class="flex h-full min-h-0 min-w-0 flex-col bg-background"
+	onfocusin={() => session.noteFocused()}
 >
 	<header
 		class="surface-toolbar flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border px-3"
 		style="container-name: surface-toolbar; container-type: inline-size;"
 	>
-		<div class="min-w-0 flex-1">
-			<div class="flex min-w-0 items-center gap-1.5">
-				<h2 class="truncate text-sm font-medium text-foreground">{session.fileName}</h2>
-				<CopyFilePathButton path={session.relativePath} />
-				{#if session.dirty}<span
-						class="text-status-warning-foreground"
-						aria-label={m.file_session_unsaved()}>*</span
-					>{/if}
-			</div>
-			{#if !compact}
-				<p class="truncate text-xs text-muted-foreground" title={session.relativePath}>
-					{session.relativePath}
-				</p>
-			{/if}
-		</div>
+		<FilePathTitle path={session.fullPath} fileName={session.fileName} dirty={session.dirty} />
 		<ResponsiveSurfaceActions
 			actions={toolbarActions}
 			menuLabel={m.workspace_surface_actions()}
 			class="ml-2"
-		>
-			{#snippet fixed()}
-				{#if session.rendererMode === 'markdown'}
-					<MarkdownViewerSettingsMenu />
-				{:else if session.rendererMode === 'code'}
-					<EditorSettingsMenu />
-				{/if}
-			{/snippet}
-		</ResponsiveSurfaceActions>
-		{#if onClose}
+		/>
+		{#if session.rendererMode === 'markdown'}
+			<MarkdownViewerSettingsMenu />
+		{:else if session.rendererMode === 'code'}
+			<EditorSettingsMenu />
+		{/if}
+		{#if onClose && (compact || presentation === 'dialog')}
 			<Button
 				variant="ghost"
 				size="icon-sm"
@@ -144,13 +155,28 @@
 		{/if}
 	</header>
 
-	{#if session.isExternallyStale || session.refreshError}
+	{#if session.isExternallyStale || session.refreshError || session.freshnessError}
 		<FileFreshnessBanner
 			changed={session.isExternallyStale}
 			isRefreshing={session.refreshing}
-			refreshError={session.refreshError}
+			refreshError={session.refreshError ?? session.freshnessError}
 			onRefresh={() => files.refresh(session.id)}
 		/>
+	{/if}
+
+	{#if session.document.recoveryError}
+		<div
+			class="flex shrink-0 items-center gap-2 border-b border-status-warning-border bg-status-warning px-3 py-2 text-xs text-status-warning-foreground"
+			role="status"
+		>
+			<TriangleAlert class="h-4 w-4 shrink-0" />
+			<span class="min-w-0 flex-1"
+				>{m.file_recovery_failed({ detail: session.document.recoveryError })}</span
+			>
+			<Button variant="outline" size="sm" onclick={() => void files.flushRecovery()}
+				>{m.common_retry()}</Button
+			>
+		</div>
 	{/if}
 
 	{#if session.saveError}
@@ -158,7 +184,7 @@
 			class="flex shrink-0 items-center gap-2 border-b border-status-error-border bg-status-error px-3 py-2 text-xs text-status-error-foreground"
 		>
 			<TriangleAlert class="h-4 w-4 shrink-0" />
-			<span class="truncate">{session.saveError}</span>
+			<span class="min-w-0 break-words">{session.saveError}</span>
 		</div>
 	{/if}
 
@@ -189,4 +215,7 @@
 			<CodeEditor {session} />
 		{/if}
 	</div>
+	{#if session.rendererMode === 'code' && !session.loading && !session.loadError}
+		<FileEditorStatus {session} {compact} />
+	{/if}
 </div>

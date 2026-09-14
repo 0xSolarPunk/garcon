@@ -14,6 +14,7 @@ import type {
 	WorkspaceWindowNode,
 } from '$lib/workspace/surface-types.js';
 import type { ChatSessionRecord } from '$lib/types/chat-session';
+import type { FileViewSession } from '$lib/files/sessions/file-view-session.svelte.js';
 import {
 	installResizeObserverHarness,
 	ResizeObserverHarness,
@@ -61,6 +62,7 @@ const {
 		surfaceCloseBlocked: false,
 		processingChatIds: new Set<string>(),
 		chatSessions: {} as Record<string, Pick<ChatSessionRecord, 'projectPath'>>,
+		fileSessions: {} as Record<string, Pick<FileViewSession, 'fullPath'>>,
 		terminalSessions: [] as Array<{
 			metadata: { terminalId: string; displaySequence: number; title: string | null };
 		}>,
@@ -120,6 +122,7 @@ vi.mock('$lib/context', () => ({
 		},
 		isChatProcessing: (chatId: string) => runtime.processingChatIds.has(chatId),
 	}),
+	getFileSessions: () => ({ get: (id: string) => runtime.fileSessions[id] ?? null }),
 	getNotifications: () => ({ error: notificationError }),
 	getTerminalRegistry: () => ({
 		get orderedSessions() {
@@ -281,6 +284,7 @@ describe('WorkspaceWindowTitleBar', () => {
 		runtime.surfaceCloseBlocked = false;
 		runtime.processingChatIds.clear();
 		runtime.chatSessions = { 'chat-a': { projectPath: '/workspace/project-a' } };
+		runtime.fileSessions = {};
 		runtime.terminalSessions = [];
 		runtime.surfaces = { [chatSurface.id]: chatSurface, [gitSurface.id]: gitSurface };
 		vi.stubGlobal('ResizeObserver', undefined);
@@ -323,6 +327,18 @@ describe('WorkspaceWindowTitleBar', () => {
 		expect(chatTab.getAttribute('aria-label')).toBe('Chat A');
 		expect(chatTab.getAttribute('title')).toBe('Chat A\n/workspace/project-a\nchat-a');
 		expect(screen.getByRole('tab', { name: 'Git' }).getAttribute('title')).toBe('Git');
+	});
+
+	it('shows the full file path on hover without expanding the tab label', () => {
+		runtime.surfaces[fileSurface.id] = fileSurface;
+		runtime.fileSessions[fileSurface.fileSessionId] = {
+			fullPath: '/workspace/project-a/README.md',
+		};
+		renderTitleBar(workspaceWindow([chatSurface.id, fileSurface.id]));
+
+		const tab = screen.getByRole('tab', { name: 'README.md' });
+		expect(tab.textContent?.trim()).toBe('README.md');
+		expect(tab.title).toBe('/workspace/project-a/README.md');
 	});
 
 	it('uses a window-local tablist when multiple tabs exist', () => {
@@ -1506,16 +1522,49 @@ describe('WorkspaceWindowTitleBar', () => {
 		await waitFor(() => expect(trigger.getAttribute('aria-expanded')).toBe('false'));
 	});
 
+	it.each(['dropdown', 'context'] as const)(
+		'copies the target file path from the %s menu',
+		async (kind) => {
+			const path = '/workspace/clients/acme/products/garcon/README.md';
+			runtime.surfaces[fileSurface.id] = fileSurface;
+			runtime.fileSessions[fileSurface.fileSessionId] = { fullPath: path };
+			renderTitleBar(
+				workspaceWindow(
+					[chatSurface.id, fileSurface.id],
+					kind === 'dropdown' ? fileSurface.id : chatSurface.id,
+				),
+			);
+			if (kind === 'dropdown') {
+				await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
+			} else {
+				await fireEvent.contextMenu(screen.getByRole('tab', { name: 'README.md' }));
+			}
+			const item = await screen.findByRole('menuitem', { name: `Copy file path: ${path}` });
+			const value = within(item).getByText('…/acme/products/garcon/README.md');
+			expect(value.title).toBe(path);
+			expect(value.classList).toContain('text-muted-foreground');
+			expect(item.querySelector('svg')).not.toBeNull();
+			expect(
+				item.previousElementSibling?.hasAttribute('data-workspace-window-tab-actions-separator'),
+			).toBe(true);
+			await fireEvent.click(item);
+			await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(path));
+			await waitFor(() =>
+				expect(screen.queryByRole('menuitem', { name: `Copy file path: ${path}` })).toBeNull(),
+			);
+		},
+	);
+
 	it('uses the clicked tab as the full context-menu target', async () => {
 		const projectPath = '/workspace/project-a';
 		runtime.chatSessions = { 'chat-a': { projectPath } };
 		renderTitleBar(workspaceWindow([chatSurface.id, gitSurface.id], gitSurface.id));
 
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
-		expect(document.querySelector('[data-workspace-chat-metadata-field]')).toBeNull();
+		expect(document.querySelector('[data-workspace-copy-item]')).toBeNull();
 		await fireEvent.keyDown(document, { key: 'Escape' });
 		await waitFor(() =>
-			expect(screen.queryByRole('menuitem', { name: m.workspace_pop_out() })).toBeNull(),
+			expect(document.querySelector('[data-workspace-window-tab-menu="dropdown"]')).toBeNull(),
 		);
 
 		await fireEvent.contextMenu(screen.getByRole('tab', { name: 'Chat A' }));
@@ -1525,7 +1574,6 @@ describe('WorkspaceWindowTitleBar', () => {
 		const contextMenu = projectPathItem.closest<HTMLElement>(
 			`[data-workspace-window-tab-context-menu="${chatSurface.id}"]`,
 		)!;
-		expect(within(contextMenu).queryByRole('menuitem', { name: m.workspace_pop_out() })).toBeNull();
 		expect(
 			Array.from(
 				contextMenu.querySelectorAll<HTMLElement>('[data-workspace-window-tab-action]'),
@@ -1537,10 +1585,28 @@ describe('WorkspaceWindowTitleBar', () => {
 		await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith(projectPath));
 	});
 
+	it.each([chatSurface, fileSurface, gitSurface, terminalSurface])(
+		'omits Pop out for $type tabs while keeping maximize',
+		async (surface) => {
+			runtime.surfaces[surface.id] = surface;
+			renderTitleBar(workspaceWindow([surface.id]));
+			expect(screen.getByRole('button', { name: m.workspace_fullscreen() })).toBeTruthy();
+			await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
+			expect(screen.queryByRole('menuitem', { name: 'Pop out' })).toBeNull();
+			await fireEvent.keyDown(document, { key: 'Escape' });
+			await waitFor(() =>
+				expect(document.querySelector('[data-workspace-window-tab-menu="dropdown"]')).toBeNull(),
+			);
+			await fireEvent.contextMenu(screen.getByRole('tab'));
+			await screen.findByRole('menuitem', { name: m.workspace_close_tab() });
+			expect(screen.queryByRole('menuitem', { name: 'Pop out' })).toBeNull();
+		},
+	);
+
 	it('closes the active movable tab from the window menu', async () => {
 		renderTitleBar(workspaceWindow([chatSurface.id, gitSurface.id], gitSurface.id));
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
-		expect(document.querySelector('[data-workspace-chat-metadata-field]')).toBeNull();
+		expect(document.querySelector('[data-workspace-copy-item]')).toBeNull();
 		await fireEvent.click(screen.getByRole('menuitem', { name: m.workspace_close_tab() }));
 
 		expect(closeSurface).toHaveBeenCalledWith(gitSurface.id);

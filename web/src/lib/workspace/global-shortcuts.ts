@@ -13,6 +13,21 @@ export const GLOBAL_SHORTCUT_IDS = [
 	'open-settings',
 	'scroll-half-page-up',
 	'scroll-half-page-down',
+	'file-save',
+	'editor-find',
+	'editor-replace',
+	'editor-go-to-line',
+	'editor-go-to-matching-bracket',
+	'editor-indent',
+	'editor-outdent',
+	'editor-toggle-comment',
+	'editor-duplicate-line-up',
+	'editor-duplicate-line-down',
+	'editor-move-line-up',
+	'editor-move-line-down',
+	'editor-delete-line',
+	'file-navigate-back',
+	'file-navigate-forward',
 ] as const;
 
 export type GlobalShortcutId = (typeof GLOBAL_SHORTCUT_IDS)[number];
@@ -32,46 +47,169 @@ export type GlobalShortcutOverrides = Partial<
 
 export interface GlobalShortcutDefinition {
 	id: GlobalShortcutId;
+	context: 'workspace' | 'chat' | 'file';
 	defaultBinding: GlobalShortcutBinding;
 }
 
 export const GLOBAL_SHORTCUT_DEFINITIONS: readonly GlobalShortcutDefinition[] = [
-	{ id: 'toggle-command-palette', defaultBinding: { key: 'p', primary: true } },
-	{ id: 'open-sidebar-search', defaultBinding: { key: 's', primary: true } },
-	{ id: 'new-chat', defaultBinding: { key: 'n', ctrl: true } },
+	{
+		id: 'toggle-command-palette',
+		context: 'workspace',
+		defaultBinding: { key: 'p', primary: true },
+	},
+	{ id: 'open-sidebar-search', context: 'chat', defaultBinding: { key: 's', primary: true } },
+	{ id: 'new-chat', context: 'workspace', defaultBinding: { key: 'n', ctrl: true } },
 	{
 		id: 'open-composer-editor',
+		context: 'chat',
 		defaultBinding: { key: 'e', ctrl: true, shift: true },
 	},
-	{ id: 'rename-chat', defaultBinding: { key: 'r', ctrl: true } },
-	{ id: 'delete-chat', defaultBinding: { key: 'd', ctrl: true, shift: true } },
-	{ id: 'navigate-tab-left', defaultBinding: { key: 'j', ctrl: true, shift: true } },
-	{ id: 'navigate-tab-right', defaultBinding: { key: 'l', ctrl: true, shift: true } },
-	{ id: 'navigate-chat-above', defaultBinding: { key: 'p', ctrl: true, shift: true } },
-	{ id: 'navigate-chat-below', defaultBinding: { key: 'n', ctrl: true, shift: true } },
+	{ id: 'rename-chat', context: 'chat', defaultBinding: { key: 'r', ctrl: true } },
+	{ id: 'delete-chat', context: 'chat', defaultBinding: { key: 'd', ctrl: true, shift: true } },
+	{
+		id: 'navigate-tab-left',
+		context: 'workspace',
+		defaultBinding: { key: 'j', ctrl: true, shift: true },
+	},
+	{
+		id: 'navigate-tab-right',
+		context: 'workspace',
+		defaultBinding: { key: 'l', ctrl: true, shift: true },
+	},
+	{
+		id: 'navigate-chat-above',
+		context: 'chat',
+		defaultBinding: { key: 'p', ctrl: true, shift: true },
+	},
+	{
+		id: 'navigate-chat-below',
+		context: 'chat',
+		defaultBinding: { key: 'n', ctrl: true, shift: true },
+	},
 	{
 		id: 'cycle-window-focus',
+		context: 'workspace',
 		defaultBinding: { key: 'o', ctrl: true, shift: true },
 	},
-	{ id: 'open-settings', defaultBinding: { key: ',', ctrl: true } },
-	{ id: 'scroll-half-page-up', defaultBinding: { key: 'u', ctrl: true } },
-	{ id: 'scroll-half-page-down', defaultBinding: { key: 'd', ctrl: true } },
+	{ id: 'open-settings', context: 'workspace', defaultBinding: { key: ',', ctrl: true } },
+	{ id: 'scroll-half-page-up', context: 'workspace', defaultBinding: { key: 'u', ctrl: true } },
+	{ id: 'scroll-half-page-down', context: 'workspace', defaultBinding: { key: 'd', ctrl: true } },
+	{ id: 'file-save', context: 'file', defaultBinding: { key: 's', primary: true } },
+	{ id: 'editor-find', context: 'file', defaultBinding: { key: 'f', primary: true } },
+	{ id: 'editor-replace', context: 'file', defaultBinding: { key: 'f', primary: true, alt: true } },
+	{
+		id: 'editor-go-to-line',
+		context: 'file',
+		defaultBinding: { key: 'g', primary: true, alt: true },
+	},
+	{
+		id: 'editor-go-to-matching-bracket',
+		context: 'file',
+		defaultBinding: { key: '\\', primary: true, shift: true },
+	},
+	{ id: 'editor-indent', context: 'file', defaultBinding: { key: ']', primary: true } },
+	{ id: 'editor-outdent', context: 'file', defaultBinding: { key: '[', primary: true } },
+	{ id: 'editor-toggle-comment', context: 'file', defaultBinding: { key: '/', primary: true } },
+	{
+		id: 'editor-duplicate-line-up',
+		context: 'file',
+		defaultBinding: { key: 'arrowup', alt: true, shift: true },
+	},
+	{
+		id: 'editor-duplicate-line-down',
+		context: 'file',
+		defaultBinding: { key: 'arrowdown', alt: true, shift: true },
+	},
+	{ id: 'editor-move-line-up', context: 'file', defaultBinding: { key: 'arrowup', alt: true } },
+	{ id: 'editor-move-line-down', context: 'file', defaultBinding: { key: 'arrowdown', alt: true } },
+	{
+		id: 'editor-delete-line',
+		context: 'file',
+		defaultBinding: { key: 'k', primary: true, shift: true },
+	},
+	{ id: 'file-navigate-back', context: 'file', defaultBinding: { key: 'arrowleft', alt: true } },
+	{
+		id: 'file-navigate-forward',
+		context: 'file',
+		defaultBinding: { key: 'arrowright', alt: true },
+	},
 ];
 
 const definitionById = new Map(
 	GLOBAL_SHORTCUT_DEFINITIONS.map((definition) => [definition.id, definition]),
 );
 const MODIFIER_KEYS = new Set(['alt', 'altgraph', 'control', 'meta', 'shift']);
+const SHIFTED_PUNCTUATION_BY_CODE: Readonly<Record<string, string>> = {
+	Backquote: '`',
+	Backslash: '\\',
+	BracketLeft: '[',
+	BracketRight: ']',
+	Comma: ',',
+	Digit0: '0',
+	Digit1: '1',
+	Digit2: '2',
+	Digit3: '3',
+	Digit4: '4',
+	Digit5: '5',
+	Digit6: '6',
+	Digit7: '7',
+	Digit8: '8',
+	Digit9: '9',
+	Equal: '=',
+	Minus: '-',
+	Period: '.',
+	Quote: "'",
+	Semicolon: ';',
+	Slash: '/',
+};
+const UNSHIFTED_PUNCTUATION: Readonly<Record<string, string>> = {
+	'~': '`',
+	'!': '1',
+	'@': '2',
+	'#': '3',
+	$: '4',
+	'%': '5',
+	'^': '6',
+	'&': '7',
+	'*': '8',
+	'(': '9',
+	')': '0',
+	_: '-',
+	'+': '=',
+	'{': '[',
+	'}': ']',
+	'|': '\\',
+	':': ';',
+	'"': "'",
+	'<': ',',
+	'>': '.',
+	'?': '/',
+};
 
 function normalizeKey(key: string): string {
 	return key === ' ' ? 'space' : key.toLowerCase();
+}
+
+function normalizeEventKey(event: KeyboardEvent): string {
+	if (event.shiftKey && SHIFTED_PUNCTUATION_BY_CODE[event.code]) {
+		return SHIFTED_PUNCTUATION_BY_CODE[event.code];
+	}
+	return normalizeKey(event.key);
+}
+
+function isMacKeyboard(): boolean {
+	return typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 }
 
 function normalizeBinding(value: unknown): GlobalShortcutBinding | null {
 	if (!value || typeof value !== 'object') return null;
 	const candidate = value as Record<string, unknown>;
 	if (typeof candidate.key !== 'string') return null;
-	const key = normalizeKey(candidate.key);
+	const normalizedKey = normalizeKey(candidate.key);
+	const key =
+		candidate.shift === true
+			? (UNSHIFTED_PUNCTUATION[normalizedKey] ?? normalizedKey)
+			: normalizedKey;
 	if (!key || MODIFIER_KEYS.has(key)) return null;
 
 	const binding: GlobalShortcutBinding = { key };
@@ -81,7 +219,10 @@ function normalizeBinding(value: unknown): GlobalShortcutBinding | null {
 	return binding;
 }
 
-export function sanitizeGlobalShortcutOverrides(value: unknown): GlobalShortcutOverrides {
+export function sanitizeGlobalShortcutOverrides(
+	value: unknown,
+	isMac = isMacKeyboard(),
+): GlobalShortcutOverrides {
 	if (!value || typeof value !== 'object') return {};
 	const candidate = value as Record<string, unknown>;
 	const overrides: GlobalShortcutOverrides = {};
@@ -99,13 +240,26 @@ export function sanitizeGlobalShortcutOverrides(value: unknown): GlobalShortcutO
 	// Preserves persisted custom bindings when a later release adds or moves a default.
 	for (const definition of GLOBAL_SHORTCUT_DEFINITIONS) {
 		if (Object.hasOwn(overrides, definition.id)) continue;
+		const defaultBinding = getDefaultGlobalShortcut(definition.id, isMac);
+		if (!defaultBinding) continue;
 		const conflictsWithOverride = GLOBAL_SHORTCUT_IDS.some((id) => {
 			const binding = overrides[id];
-			return binding ? globalShortcutBindingsConflict(definition.defaultBinding, binding) : false;
+			return binding && globalShortcutContextsOverlap(definition.id, id)
+				? globalShortcutBindingsConflict(defaultBinding, binding)
+				: false;
 		});
 		if (conflictsWithOverride) overrides[definition.id] = null;
 	}
 	return overrides;
+}
+
+export function getDefaultGlobalShortcut(
+	id: GlobalShortcutId,
+	isMac = isMacKeyboard(),
+): GlobalShortcutBinding | null {
+	if (isMac && id === 'file-navigate-back') return { key: '-', ctrl: true };
+	if (isMac && id === 'file-navigate-forward') return { key: '-', ctrl: true, shift: true };
+	return definitionById.get(id)?.defaultBinding ?? null;
 }
 
 export function getEffectiveGlobalShortcut(
@@ -113,11 +267,11 @@ export function getEffectiveGlobalShortcut(
 	overrides: GlobalShortcutOverrides,
 ): GlobalShortcutBinding | null {
 	if (Object.hasOwn(overrides, id)) return overrides[id] ?? null;
-	return definitionById.get(id)?.defaultBinding ?? null;
+	return getDefaultGlobalShortcut(id);
 }
 
 export function globalShortcutBindingFromEvent(event: KeyboardEvent): GlobalShortcutBinding | null {
-	const key = normalizeKey(event.key);
+	const key = normalizeEventKey(event);
 	if (!key || MODIFIER_KEYS.has(key)) return null;
 
 	const binding: GlobalShortcutBinding = { key };
@@ -146,7 +300,7 @@ export function globalShortcutMatchesEvent(
 		? event.ctrlKey !== event.metaKey
 		: event.ctrlKey === Boolean(binding.ctrl) && event.metaKey === Boolean(binding.meta);
 	return (
-		normalizeKey(event.key) === binding.key &&
+		normalizeEventKey(event) === binding.key &&
 		primaryMatches &&
 		event.altKey === Boolean(binding.alt) &&
 		event.shiftKey === Boolean(binding.shift)
@@ -174,6 +328,17 @@ export function globalShortcutBindingsConflict(
 	return modifierSignatures(first).some((signature) => secondSignatures.has(signature));
 }
 
+export function globalShortcutContextsOverlap(
+	first: GlobalShortcutId,
+	second: GlobalShortcutId,
+): boolean {
+	const firstContext = definitionById.get(first)!.context;
+	const secondContext = definitionById.get(second)!.context;
+	return (
+		firstContext === 'workspace' || secondContext === 'workspace' || firstContext === secondContext
+	);
+}
+
 function bindingsEqual(first: GlobalShortcutBinding, second: GlobalShortcutBinding): boolean {
 	return (
 		first.key === second.key &&
@@ -187,7 +352,7 @@ function bindingsEqual(first: GlobalShortcutBinding, second: GlobalShortcutBindi
 
 export interface AssignGlobalShortcutResult {
 	overrides: GlobalShortcutOverrides;
-	unassignedId: GlobalShortcutId | null;
+	unassignedIds: GlobalShortcutId[];
 }
 
 export function assignGlobalShortcut(
@@ -196,23 +361,24 @@ export function assignGlobalShortcut(
 	binding: GlobalShortcutBinding,
 ): AssignGlobalShortcutResult {
 	const overrides = { ...current };
-	let unassignedId: GlobalShortcutId | null = null;
+	const unassignedIds: GlobalShortcutId[] = [];
 
 	for (const definition of GLOBAL_SHORTCUT_DEFINITIONS) {
-		if (definition.id === targetId) continue;
+		if (definition.id === targetId || !globalShortcutContextsOverlap(definition.id, targetId))
+			continue;
 		const effective = getEffectiveGlobalShortcut(definition.id, overrides);
 		if (!effective || !globalShortcutBindingsConflict(effective, binding)) continue;
 		overrides[definition.id] = null;
-		unassignedId = definition.id;
+		unassignedIds.push(definition.id);
 	}
 
-	const defaultBinding = definitionById.get(targetId)?.defaultBinding;
+	const defaultBinding = getDefaultGlobalShortcut(targetId);
 	if (defaultBinding && bindingsEqual(defaultBinding, binding)) {
 		delete overrides[targetId];
 	} else {
 		overrides[targetId] = binding;
 	}
-	return { overrides, unassignedId };
+	return { overrides, unassignedIds };
 }
 
 export function disableGlobalShortcut(
@@ -226,8 +392,8 @@ export function resetGlobalShortcut(
 	current: GlobalShortcutOverrides,
 	id: GlobalShortcutId,
 ): AssignGlobalShortcutResult {
-	const defaultBinding = definitionById.get(id)?.defaultBinding;
-	if (!defaultBinding) return { overrides: { ...current }, unassignedId: null };
+	const defaultBinding = getDefaultGlobalShortcut(id);
+	if (!defaultBinding) return { overrides: { ...current }, unassignedIds: [] };
 	return assignGlobalShortcut(current, id, defaultBinding);
 }
 
