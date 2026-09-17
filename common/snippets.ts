@@ -69,6 +69,7 @@ export const SNIPPET_ERROR_CODES = {
   nameConflict: 'SNIPPET_NAME_CONFLICT',
   revisionConflict: 'SNIPPET_REVISION_CONFLICT',
   revisionExhausted: 'SNIPPET_REVISION_EXHAUSTED',
+  catalogSaveUnknown: 'SNIPPET_CATALOG_SAVE_UNKNOWN',
   limitReached: 'SNIPPET_LIMIT_REACHED',
   expansionTooLong: 'SNIPPET_EXPANSION_TOO_LONG',
   chatNotFound: 'SNIPPET_CHAT_NOT_FOUND',
@@ -134,8 +135,9 @@ export interface ExpandSnippetRequest {
 
 export interface ExpandSnippetResponse {
   success: true;
-  snippetId: string;
-  snippetUpdatedAt: string;
+  source: 'snippet' | 'preamble';
+  sourceId: string;
+  sourceUpdatedAt: string;
   shortName: string;
   contextProjectPath: string;
   expandedText: string;
@@ -319,14 +321,15 @@ export function normalizeExpandSnippetRequest(value: unknown): ExpandSnippetRequ
 
 export function normalizeExpandSnippetResponse(value: unknown): ExpandSnippetResponse | null {
   const raw = asRecord(value);
-  const snippetId = requiredString(raw?.snippetId);
-  const snippetUpdatedAt = isoTimestamp(raw?.snippetUpdatedAt);
+  const sourceId = requiredString(raw?.sourceId);
+  const sourceUpdatedAt = isoTimestamp(raw?.sourceUpdatedAt);
   const contextProjectPath = requiredString(raw?.contextProjectPath);
   if (
     !raw ||
     raw.success !== true ||
-    !snippetId ||
-    !snippetUpdatedAt ||
+    (raw.source !== 'snippet' && raw.source !== 'preamble') ||
+    !sourceId ||
+    !sourceUpdatedAt ||
     !isSnippetShortName(raw.shortName) ||
     !contextProjectPath ||
     typeof raw.expandedText !== 'string' ||
@@ -336,8 +339,9 @@ export function normalizeExpandSnippetResponse(value: unknown): ExpandSnippetRes
   }
   return {
     success: true,
-    snippetId,
-    snippetUpdatedAt,
+    source: raw.source,
+    sourceId,
+    sourceUpdatedAt,
     shortName: raw.shortName,
     contextProjectPath,
     expandedText: raw.expandedText,

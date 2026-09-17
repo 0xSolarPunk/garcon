@@ -79,6 +79,38 @@ describe('ComposerSnippetPalette', () => {
 		expect(screen.getByTestId('cancel-count').textContent).toBe('0');
 	});
 
+	it('does not keyboard-select a hidden preamble while snippets are loading', async () => {
+		render(ComposerSnippetPaletteTestHost, {
+			count: 0,
+			deferSnippetLoad: true,
+			preambleShortName: 'manual_context',
+		});
+		const search = await screen.findByRole('combobox', { name: 'Search snippets' });
+		await screen.findByText('Loading snippets...');
+
+		await fireEvent.keyDown(search, { key: 'Enter' });
+
+		expect(screen.getByTestId('selected-snippet').textContent).toBe('');
+		expect(screen.getByTestId('palette-open').textContent).toBe('true');
+		await fireEvent.click(screen.getByTestId('resolve-snippet-load'));
+		expect(await screen.findByRole('option', { name: /manual_context/ })).toBeTruthy();
+	});
+
+	it('does not keyboard-select a hidden preamble after a partial catalog failure', async () => {
+		render(ComposerSnippetPaletteTestHost, {
+			count: 0,
+			failLoads: true,
+			preambleShortName: 'manual_context',
+		});
+		const search = await screen.findByRole('combobox', { name: 'Search snippets' });
+		await screen.findByText('Snippets and preambles could not be loaded.');
+
+		await fireEvent.keyDown(search, { key: 'Enter' });
+
+		expect(screen.getByTestId('selected-snippet').textContent).toBe('');
+		expect(screen.getByTestId('palette-open').textContent).toBe('true');
+	});
+
 	it('does not insert while the search input is composing', async () => {
 		render(ComposerSnippetPaletteTestHost);
 		const search = await screen.findByRole('combobox', { name: 'Search snippets' });
@@ -168,6 +200,22 @@ describe('ComposerSnippetPalette', () => {
 		expect(screen.getByLabelText('Uses the {{chat_id}} placeholder').textContent).toBe(
 			'{{chat_id}}',
 		);
+	});
+
+	it('selects named preambles without exposing snippet-only token behavior', async () => {
+		render(ComposerSnippetPaletteTestHost, {
+			count: 0,
+			preambleShortName: 'manual_context',
+		});
+
+		const option = await screen.findByRole('option', { name: /manual_context/ });
+		expect(option.textContent).toContain('preamble');
+		expect(screen.queryByLabelText('Uses the {{arguments}} placeholder')).toBeNull();
+		expect(screen.queryByLabelText('Uses the {{chat_id}} placeholder')).toBeNull();
+		await fireEvent.click(option);
+
+		await waitFor(() => expect(screen.getByTestId('selected-snippet').textContent).toBe('manual_context'));
+		expect(screen.queryByRole('textbox', { name: 'Arguments' })).toBeNull();
 	});
 
 	it('collects arguments before inserting a snippet that uses them', async () => {

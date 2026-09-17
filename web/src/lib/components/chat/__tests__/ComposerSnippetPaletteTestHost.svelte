@@ -1,9 +1,16 @@
 <script lang="ts">
 	import ComposerSnippetPalette from '../ComposerSnippetPalette.svelte';
 	import { onDestroy, untrack } from 'svelte';
-	import { setAppShell, setLocalSettings, setSnippets, setTransientLayers } from '$lib/context';
+	import {
+		setAppShell,
+		setLocalSettings,
+		setPreambles,
+		setSnippets,
+		setTransientLayers,
+	} from '$lib/context';
 	import { AppShellStore } from '$lib/stores/app-shell.svelte.js';
 	import { createSnippetsStore } from '$lib/snippets/snippets-store.svelte.js';
+	import { createPreamblesStore } from '$lib/preambles/preambles-store.svelte.js';
 	import { WorkspaceInteractionGate } from '$lib/workspace/workspace-interaction-gate.svelte.js';
 	import { TransientLayerRegistry } from '$lib/workspace/transient-layers.svelte.js';
 	import type { Snippet } from '$shared/snippets';
@@ -13,6 +20,7 @@
 	interface Props {
 		count?: number;
 		failLoads?: boolean;
+		deferSnippetLoad?: boolean;
 		firstTemplate?: string;
 		firstDefaultArguments?: string;
 		refreshedDefaultArguments?: string;
@@ -21,11 +29,14 @@
 		insertionResult?: SnippetInsertionResult;
 		mobile?: boolean;
 		keyboardHeight?: number;
+		preambleShortName?: string;
+		preambleContent?: string;
 	}
 
 	let {
 		count = 12,
 		failLoads = false,
+		deferSnippetLoad = false,
 		firstTemplate,
 		firstDefaultArguments = '',
 		refreshedDefaultArguments,
@@ -34,6 +45,8 @@
 		insertionResult = 'inserted',
 		mobile = false,
 		keyboardHeight = 0,
+		preambleShortName,
+		preambleContent = 'Preamble {{arguments}} for {{chat_id}}',
 	}: Props = $props();
 
 	let open = $state(true);
@@ -44,6 +57,7 @@
 	let editCount = $state(0);
 	let loadCount = $state(0);
 	let composerInput = $state<HTMLInputElement>();
+	let resolveSnippetLoad = $state<(() => void) | null>(null);
 
 	const entries: Snippet[] = Array.from({ length: untrack(() => count) }, (_, index) => ({
 		id: `snippet-${index}`,
@@ -73,10 +87,38 @@
 		get: async () => {
 			loadCount += 1;
 			if (failLoads) throw new Error('offline');
+			if (deferSnippetLoad) {
+				await new Promise<void>((resolve) => {
+					resolveSnippetLoad = resolve;
+				});
+			}
 			return { revision: 1, snippets: entries };
 		},
 	});
 	setSnippets(snippetStore);
+	setPreambles(
+		createPreamblesStore({
+			get: async () => ({
+				revision: preambleShortName ? 1 : 0,
+				preambles: preambleShortName
+					? [
+							{
+								id: '00000000-0000-4000-8000-000000000001',
+								enabled: false,
+								title: 'Manual preamble',
+								snippetShortName: preambleShortName,
+								content: preambleContent,
+								scope: { type: 'global' },
+								agentIds: [],
+								tagFilter: { mode: 'any', tags: [] },
+								createdAt: '2026-01-01T00:00:00.000Z',
+								updatedAt: '2026-01-01T00:00:00.000Z',
+							},
+						]
+					: [],
+			}),
+		}),
+	);
 	const mainInert = $derived(transientLayers.makesMainInert);
 </script>
 
@@ -103,6 +145,11 @@
 	/>
 </div>
 
+<button
+	type="button"
+	data-testid="resolve-snippet-load"
+	onclick={() => resolveSnippetLoad?.()}>Resolve snippet load</button
+>
 <button
 	type="button"
 	data-testid="change-interaction-key"

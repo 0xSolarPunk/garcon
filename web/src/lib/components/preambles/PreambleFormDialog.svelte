@@ -147,7 +147,7 @@
 
 		<div
 			data-slot="preambles-scroll-body"
-			class="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5 sm:px-6"
+			class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-5 sm:px-6"
 			inert={form.saving}
 			aria-busy={form.saving}
 		>
@@ -176,6 +176,28 @@
 				/>
 				<p id="preamble-title-error" class="min-h-4 text-xs text-destructive">
 					{form.titleError ?? ''}
+				</p>
+			</div>
+
+			<div class="space-y-1.5">
+				<label for="preamble-snippet-short-name" class="text-sm font-medium text-foreground">
+					{m.preambles_snippet_short_name_label()}
+				</label>
+				<input
+					id="preamble-snippet-short-name"
+					type="text"
+					bind:value={form.snippetShortName}
+					autocomplete="off"
+					placeholder={m.preambles_snippet_short_name_placeholder()}
+					aria-invalid={Boolean(form.snippetShortNameError)}
+					aria-describedby="preamble-snippet-short-name-help preamble-snippet-short-name-error"
+					class="h-10 w-full rounded-md border border-input bg-background px-3 text-base outline-none focus-visible:ring-2 focus-visible:ring-ring sm:pointer-fine:text-sm"
+				/>
+				<p id="preamble-snippet-short-name-help" class="text-xs text-muted-foreground">
+					{m.preambles_snippet_short_name_help()}
+				</p>
+				<p id="preamble-snippet-short-name-error" class="min-h-4 text-xs text-destructive">
+					{form.snippetShortNameError ?? ''}
 				</p>
 			</div>
 
