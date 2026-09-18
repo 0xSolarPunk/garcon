@@ -11,6 +11,10 @@ import type {
   SteerCommandRequest,
   SteerCommandResponse,
   PermissionDecisionCommandRequest,
+  ForkChatCommandRequest,
+  ForkChatResponse,
+  ForkRunCommandRequest,
+  ForkRunCommandResponse,
 } from '@garcon/common/chat-command-contracts';
 import {
   parseAddChatRowResponse,
@@ -114,6 +118,7 @@ export class GarconHttpError extends CliError {
     readonly errorCode: string | null,
     readonly retryable: boolean,
     readonly retryAfterMs: number | null = null,
+    readonly responseError: string | null = null,
   ) {
     super(
       phase,
@@ -225,27 +230,74 @@ function parseRequiredParentChat(raw: Record<string, unknown> | null): ParentCha
   return parsed;
 }
 
+function parentChatRefsEqual(
+  left: ParentChatRef | null,
+  right: ParentChatRef | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  if (left.chatId !== right.chatId || left.relation !== right.relation) return false;
+  if (left.relation === 'delegation' || right.relation === 'delegation') return true;
+  return left.transcriptViewId === right.transcriptViewId
+    && left.ordinal === right.ordinal;
+}
+
 function parseStartResponse(value: unknown): StartChatCommandResponse {
   const accepted = parseAcceptedResponse(value);
   const raw = record(value);
   if (!raw || !Object.hasOwn(raw, 'chat')) {
     throw new CliError('submission', 'server returned an invalid started chat', 3);
   }
-  let chat: ChatListResponse['sessions'][number] | null;
-  if (raw.chat === null) {
-    chat = null;
-  } else {
-    try {
-      chat = parseChatListResponse({
-        sessions: [raw.chat],
-        total: 1,
-        lastSelectedChatId: null,
-      }).sessions[0]!;
-    } catch (error) {
-      throw new CliError('submission', 'server returned an invalid started chat', 3, { cause: error });
-    }
-  }
+  const chat = raw.chat === null
+    ? null
+    : parseCommandChat(raw.chat, 'server returned an invalid started chat');
   return { ...accepted, chat };
+}
+
+function parseCommandChat(value: unknown, message: string): ChatListResponse['sessions'][number] {
+  try {
+    return parseChatListResponse({
+      sessions: [value],
+      total: 1,
+      lastSelectedChatId: null,
+    }).sessions[0]!;
+  } catch (error) {
+    throw new CliError('submission', message, 3, { cause: error });
+  }
+}
+
+function parseForkResponse(value: unknown): ForkChatResponse {
+  const raw = record(value);
+  if (raw?.success !== true || !Object.hasOwn(raw, 'chat')) {
+    throw new CliError('submission', 'server returned an invalid forked chat', 3);
+  }
+  return {
+    success: true,
+    chat: parseCommandChat(raw.chat, 'server returned an invalid forked chat'),
+  };
+}
+
+function parseForkRunResponse(value: unknown): ForkRunCommandResponse {
+  const accepted = parseCommandAcceptedResponse(value);
+  const raw = record(value);
+  if (
+    !raw
+    || typeof accepted.chatId !== 'string'
+    || typeof accepted.turnId !== 'string'
+    || !Object.hasOwn(raw, 'chat')
+  ) {
+    throw new CliError('submission', 'server returned an invalid forked chat', 3);
+  }
+  const chat = parseCommandChat(raw.chat, 'server returned an invalid forked chat');
+  const responseParentChat = Object.hasOwn(raw, 'parentChat')
+    ? parseRequiredParentChat(raw)
+    : undefined;
+  return {
+    ...accepted,
+    chatId: accepted.chatId,
+    turnId: accepted.turnId,
+    parentChat: responseParentChat === undefined ? chat.parentChat : responseParentChat,
+    chat,
+  };
 }
 
 function parseStopResponse(value: unknown): AgentStopResponse {
@@ -662,6 +714,70 @@ export class GarconClient {
     );
   }
 
+  async forkChat(
+    request: ForkChatCommandRequest,
+    signal?: AbortSignal,
+  ): Promise<ForkChatResponse> {
+    try {
+      const response = parseForkResponse(await this.#request(
+        'submission',
+        'POST',
+        '/api/v1/chats/fork',
+        request,
+        signal,
+        null,
+      ));
+      if (
+        response.chat.id !== request.chatId
+        || response.chat.parentChat?.chatId !== request.sourceChatId
+        || response.chat.parentChat.relation !== 'fork'
+      ) {
+        throw new CliError('submission', 'server returned an uncorrelated forked chat', 3);
+      }
+      return response;
+    } catch (error) {
+      if (!signal?.aborted && isAmbiguousSubmissionError(error)) {
+        throw new CliError(
+          'transport recovery',
+          `the fork into chat ${request.chatId} may have reached Garcon; inspect that chat before retrying`,
+          3,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  forkRun(
+    request: ForkRunCommandRequest,
+    signal?: AbortSignal,
+  ): Promise<ForkRunCommandResponse> {
+    return this.#submitTurn(
+      '/api/v1/chats/fork-run',
+      'fork-run',
+      request,
+      signal,
+      isAmbiguousSubmissionError,
+      null,
+      (value) => {
+        const response = parseForkRunResponse(value);
+        const responseParentChat = response.parentChat ?? null;
+        const chatParentChat = response.chat.parentChat ?? null;
+        if (
+          response.chat.id !== request.chatId
+          || responseParentChat?.chatId !== request.sourceChatId
+          || responseParentChat.relation !== 'fork'
+          || chatParentChat?.chatId !== request.sourceChatId
+          || chatParentChat.relation !== 'fork'
+          || !parentChatRefsEqual(responseParentChat, chatParentChat)
+        ) {
+          throw new CliError('submission', 'server returned an uncorrelated fork-run response', 3);
+        }
+        return response;
+      },
+    );
+  }
+
   steerChat(request: SteerCommandRequest, signal?: AbortSignal): Promise<SteerCommandResponse> {
     return this.#submitTurn(
       '/api/v1/chats/steer',
@@ -891,11 +1007,11 @@ export class GarconClient {
 
   async #submitTurn<TResponse extends AgentTurnCommandResponse>(
     route: string,
-    commandType: 'chat-start' | 'agent-run' | 'steer',
-    request: StartChatCommandRequest | AgentRunCommandRequest | SteerCommandRequest,
+    commandType: 'chat-start' | 'agent-run' | 'steer' | 'fork-run',
+    request: StartChatCommandRequest | AgentRunCommandRequest | SteerCommandRequest | ForkRunCommandRequest,
     signal: AbortSignal | undefined,
     ambiguous: (error: unknown) => boolean,
-    timeoutMs = REQUEST_TIMEOUT_MS,
+    timeoutMs: number | null = REQUEST_TIMEOUT_MS,
     parse: (value: unknown) => TResponse,
   ): Promise<TResponse> {
     return this.#submitCorrelated({
@@ -924,7 +1040,7 @@ export class GarconClient {
       correlates: (response: TResponse, request: TRequest) => boolean;
       ambiguityDescription: string;
       ambiguous?: (error: unknown) => boolean;
-      timeoutMs?: number;
+      timeoutMs?: number | null;
     },
     signal?: AbortSignal,
   ): Promise<TResponse> {
@@ -1066,8 +1182,9 @@ export class GarconClient {
     if (!response.ok) {
       const envelope = record(value) as ErrorEnvelope | null;
       const errorCode = typeof envelope?.errorCode === 'string' ? envelope.errorCode : null;
-      const message = typeof envelope?.error === 'string'
-        ? envelope.error
+      const responseError = typeof envelope?.error === 'string' ? envelope.error : null;
+      const message = responseError
+        ? responseError
         : `Garcon server returned HTTP ${response.status}`;
       throw new GarconHttpError(
         response.status === 401 || response.status === 403 ? 'authentication' : phase,
@@ -1076,6 +1193,7 @@ export class GarconClient {
         errorCode,
         envelope?.retryable === true || response.status >= 500,
         retryAfterMilliseconds(response.headers.get('Retry-After')),
+        responseError,
       );
     }
     if (value === null) throw new CliError(phase, 'server returned invalid JSON', 3);
