@@ -1,5 +1,5 @@
 export type ColorScheme = 'light' | 'dark';
-export type RendererPalette = 'standard' | 'colorblind';
+export type RendererPalette = 'standard' | 'colorblind' | 'owl' | 'neko';
 
 export interface ThemeRendererPresentation {
 	readonly colorScheme: ColorScheme;
@@ -49,6 +49,30 @@ export const THEME_PROFILES = [
 		colorScheme: 'dark',
 		browserThemeColor: '#0c1117',
 		rendererPalette: 'colorblind',
+	},
+	{
+		id: 'owl-light',
+		colorScheme: 'light',
+		browserThemeColor: '#fbfbfb',
+		rendererPalette: 'owl',
+	},
+	{
+		id: 'owl-dark',
+		colorScheme: 'dark',
+		browserThemeColor: '#011627',
+		rendererPalette: 'owl',
+	},
+	{
+		id: 'neko-light',
+		colorScheme: 'light',
+		browserThemeColor: '#eff1f5',
+		rendererPalette: 'neko',
+	},
+	{
+		id: 'neko-dark',
+		colorScheme: 'dark',
+		browserThemeColor: '#1e1e2e',
+		rendererPalette: 'neko',
 	},
 ] as const satisfies readonly ThemeProfileDescriptor[];
 

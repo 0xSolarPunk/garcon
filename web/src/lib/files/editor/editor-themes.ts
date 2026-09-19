@@ -136,11 +136,155 @@ const COLORBLIND_DARK_THEME: Extension = [
 	),
 ];
 
+const OWL_LIGHT_THEME: Extension = [
+	EditorView.theme(
+		{
+			'&': { color: '#403f53', backgroundColor: '#fbfbfb' },
+			'.cm-content': { caretColor: '#08757a' },
+			'.cm-cursor, .cm-dropCursor': { borderLeftColor: '#08757a' },
+			'&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
+				backgroundColor: '#d3e8f8',
+			},
+			'.cm-activeLine': { backgroundColor: '#f0f0f0' },
+			'.cm-gutters': { color: '#5f6b73', backgroundColor: '#f0f0f0' },
+			'.cm-activeLineGutter': { color: '#403f53', backgroundColor: '#dfe8ec' },
+		},
+		{ dark: false },
+	),
+	syntaxHighlighting(
+		HighlightStyle.define([
+			{ tag: tags.comment, color: '#5f6b73', fontStyle: 'italic' },
+			{ tag: tags.invalid, color: '#9f2f2f', textDecoration: 'underline wavy' },
+			{ tag: [tags.keyword, tags.operatorKeyword], color: '#7b349b' },
+			{ tag: [tags.string, tags.regexp, tags.inserted], color: '#315fbd' },
+			{ tag: [tags.number, tags.bool, tags.null, tags.atom], color: '#8c176f' },
+			{ tag: [tags.typeName, tags.className], color: '#315fbd' },
+			{
+				tag: [tags.function(tags.variableName), tags.definition(tags.variableName)],
+				color: '#7b349b',
+			},
+			{ tag: [tags.operator, tags.special(tags.string)], color: '#08757a' },
+			{ tag: tags.deleted, color: '#9f2f2f' },
+			{ tag: tags.strong, fontWeight: 'bold' },
+			{ tag: tags.emphasis, fontStyle: 'italic' },
+		]),
+	),
+];
+
+const OWL_DARK_THEME: Extension = [
+	EditorView.theme(
+		{
+			'&': { color: '#d6deeb', backgroundColor: '#011627' },
+			'.cm-content': { caretColor: '#7fdbca' },
+			'.cm-cursor, .cm-dropCursor': { borderLeftColor: '#7fdbca' },
+			'&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
+				backgroundColor: '#1d3b53',
+			},
+			'.cm-activeLine': { backgroundColor: '#0b253a' },
+			'.cm-gutters': { color: '#90a7b2', backgroundColor: '#00111f' },
+			'.cm-activeLineGutter': { color: '#d6deeb', backgroundColor: '#0b2942' },
+		},
+		{ dark: true },
+	),
+	syntaxHighlighting(
+		HighlightStyle.define([
+			{ tag: tags.comment, color: '#90a7b2', fontStyle: 'italic' },
+			{ tag: tags.invalid, color: '#ef5350', textDecoration: 'underline wavy' },
+			{ tag: [tags.keyword, tags.operatorKeyword], color: '#c792ea' },
+			{ tag: [tags.string, tags.regexp, tags.inserted], color: '#ecc48d' },
+			{ tag: [tags.number, tags.bool, tags.null, tags.atom], color: '#f78c6c' },
+			{ tag: [tags.typeName, tags.className], color: '#7fdbca' },
+			{
+				tag: [tags.function(tags.variableName), tags.definition(tags.variableName)],
+				color: '#82aaff',
+			},
+			{ tag: [tags.operator, tags.special(tags.string)], color: '#7fdbca' },
+			{ tag: tags.deleted, color: '#ef5350' },
+			{ tag: tags.strong, fontWeight: 'bold' },
+			{ tag: tags.emphasis, fontStyle: 'italic' },
+		]),
+	),
+];
+
+const NEKO_LIGHT_THEME: Extension = [
+	EditorView.theme(
+		{
+			'&': { color: '#4c4f69', backgroundColor: '#eff1f5' },
+			'.cm-content': { caretColor: '#8839ef' },
+			'.cm-cursor, .cm-dropCursor': { borderLeftColor: '#8839ef' },
+			'&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
+				backgroundColor: '#dce0e8',
+			},
+			'.cm-activeLine': { backgroundColor: '#e6e9ef' },
+			'.cm-gutters': { color: '#6c6f85', backgroundColor: '#e6e9ef' },
+			'.cm-activeLineGutter': { color: '#4c4f69', backgroundColor: '#ccd0da' },
+		},
+		{ dark: false },
+	),
+	syntaxHighlighting(
+		HighlightStyle.define([
+			{ tag: tags.comment, color: '#5c5f77', fontStyle: 'italic' },
+			{ tag: tags.invalid, color: '#d20f39', textDecoration: 'underline wavy' },
+			{ tag: [tags.keyword, tags.operatorKeyword], color: '#6220a8' },
+			{ tag: [tags.string, tags.regexp, tags.inserted], color: '#1b5214' },
+			{ tag: [tags.number, tags.bool, tags.null, tags.atom], color: '#853500' },
+			{ tag: [tags.typeName, tags.className], color: '#095e63' },
+			{
+				tag: [tags.function(tags.variableName), tags.definition(tags.variableName)],
+				color: '#1d479a',
+			},
+			{ tag: [tags.operator, tags.special(tags.string)], color: '#6220a8' },
+			{ tag: tags.deleted, color: '#d20f39' },
+			{ tag: tags.strong, fontWeight: 'bold' },
+			{ tag: tags.emphasis, fontStyle: 'italic' },
+		]),
+	),
+];
+
+const NEKO_DARK_THEME: Extension = [
+	EditorView.theme(
+		{
+			'&': { color: '#cdd6f4', backgroundColor: '#1e1e2e' },
+			'.cm-content': { caretColor: '#cba6f7' },
+			'.cm-cursor, .cm-dropCursor': { borderLeftColor: '#cba6f7' },
+			'&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
+				backgroundColor: '#45475a',
+			},
+			'.cm-activeLine': { backgroundColor: '#313244' },
+			'.cm-gutters': { color: '#9399b2', backgroundColor: '#181825' },
+			'.cm-activeLineGutter': { color: '#cdd6f4', backgroundColor: '#45475a' },
+		},
+		{ dark: true },
+	),
+	syntaxHighlighting(
+		HighlightStyle.define([
+			{ tag: tags.comment, color: '#a6adc8', fontStyle: 'italic' },
+			{ tag: tags.invalid, color: '#f38ba8', textDecoration: 'underline wavy' },
+			{ tag: [tags.keyword, tags.operatorKeyword], color: '#cba6f7' },
+			{ tag: [tags.string, tags.regexp, tags.inserted], color: '#a6e3a1' },
+			{ tag: [tags.number, tags.bool, tags.null, tags.atom], color: '#fab387' },
+			{ tag: [tags.typeName, tags.className], color: '#94e2d5' },
+			{
+				tag: [tags.function(tags.variableName), tags.definition(tags.variableName)],
+				color: '#89b4fa',
+			},
+			{ tag: [tags.operator, tags.special(tags.string)], color: '#f5c2e7' },
+			{ tag: tags.deleted, color: '#f38ba8' },
+			{ tag: tags.strong, fontWeight: 'bold' },
+			{ tag: tags.emphasis, fontStyle: 'italic' },
+		]),
+	),
+];
+
 const EDITOR_THEME_EXTENSIONS: Record<EditorThemeId, Extension> = {
 	'standard-light': STANDARD_LIGHT_CONTRAST_STYLE,
 	'standard-dark': STANDARD_DARK_THEME,
 	'colorblind-light': COLORBLIND_LIGHT_THEME,
 	'colorblind-dark': COLORBLIND_DARK_THEME,
+	'owl-light': OWL_LIGHT_THEME,
+	'owl-dark': OWL_DARK_THEME,
+	'neko-light': NEKO_LIGHT_THEME,
+	'neko-dark': NEKO_DARK_THEME,
 };
 
 export function resolveEditorThemeId(presentation: ThemeRendererPresentation): EditorThemeId {

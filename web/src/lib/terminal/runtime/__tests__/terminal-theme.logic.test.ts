@@ -40,6 +40,10 @@ const PRESENTATIONS: TerminalThemePresentation[] = [
 	{ colorScheme: 'dark', rendererPalette: 'standard', background: '#1e1e1e' },
 	{ colorScheme: 'light', rendererPalette: 'colorblind', background: '#ffffff' },
 	{ colorScheme: 'dark', rendererPalette: 'colorblind', background: '#1e1e1e' },
+	{ colorScheme: 'light', rendererPalette: 'owl', background: '#fbfbfb' },
+	{ colorScheme: 'dark', rendererPalette: 'owl', background: '#011627' },
+	{ colorScheme: 'light', rendererPalette: 'neko', background: '#eff1f5' },
+	{ colorScheme: 'dark', rendererPalette: 'neko', background: '#1e1e2e' },
 ];
 
 describe('terminal themes', () => {
