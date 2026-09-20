@@ -9,6 +9,7 @@ import {
 } from '$lib/components/shared/__tests__/resize-observer-harness.js';
 import { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte.js';
 import { makeRemoteSettingsSnapshot } from '$lib/stores/__tests__/remote-settings-snapshot-fixture.js';
+import { LOCAL_STORAGE_KEYS } from '$lib/utils/local-persistence.js';
 
 async function showFeedScrollbar(container: HTMLElement): Promise<{
 	scrollbar: HTMLElement;
@@ -110,9 +111,105 @@ describe('ConversationFeed', () => {
 		expect(screen.getByTestId('sidebar-recenter-request-count').textContent).toBe('0');
 	});
 
+	it('combines ordinary tool rows behind an accessible disclosure without changing the off path', async () => {
+		const { container } = render(ConversationFeedTestHost, { transcriptScenario: 'tool-run' });
+		await waitFor(() => expect(container.querySelectorAll('[data-chat-row-id]')).toHaveLength(3));
+		expect(container.querySelector('[data-chat-tool-group]')).toBeNull();
+		await fireEvent.click(screen.getByRole('button', { name: 'Toggle combination' }));
+		const group = await screen.findByRole('button', { name: 'Execute 3 commands' });
+		expect(group.getAttribute('aria-expanded')).toBe('false');
+		expect(group.hasAttribute('aria-controls')).toBe(false);
+		expect(group.firstElementChild?.querySelector('svg')).not.toBeNull();
+		expect(container.querySelectorAll('[data-chat-row-id]')).toHaveLength(0);
+		await fireEvent.click(group);
+		await waitFor(() => expect(container.querySelectorAll('[data-chat-row-id]')).toHaveLength(3));
+		expect(group.getAttribute('aria-expanded')).toBe('true');
+		expect(group.nextElementSibling?.classList.contains('h-2')).toBe(true);
+		await fireEvent.click(group);
+		await waitFor(() => expect(container.querySelectorAll('[data-chat-row-id]')).toHaveLength(0));
+		expect(group.getAttribute('aria-expanded')).toBe('false');
+	});
+
+	it('moves focus to a surviving member when combination is disabled in another tab', async () => {
+		const { container } = render(ConversationFeedTestHost, { transcriptScenario: 'tool-run' });
+		await fireEvent.click(screen.getByRole('button', { name: 'Toggle combination' }));
+		const group = await screen.findByRole('button', { name: 'Execute 3 commands' });
+		group.focus();
+
+		const snapshot = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEYS.localSettings) ?? '{}');
+		const newValue = JSON.stringify({ ...snapshot, combineToolUseMessages: false });
+		localStorage.setItem(LOCAL_STORAGE_KEYS.localSettings, newValue);
+		window.dispatchEvent(new StorageEvent('storage', {
+			key: LOCAL_STORAGE_KEYS.localSettings,
+			newValue,
+			storageArea: localStorage,
+		}));
+
+		await waitFor(() => expect(container.querySelector('[data-chat-tool-group]')).toBeNull());
+		await waitFor(() => {
+			expect(document.activeElement).not.toBe(document.body);
+			expect((document.activeElement as HTMLElement).dataset.chatRowId).toBe('generation-1:1');
+		});
+	});
+
+	it('moves focus from a member to the summary before explicitly collapsing', async () => {
+		const { container } = render(ConversationFeedTestHost, { transcriptScenario: 'tool-run' });
+		await fireEvent.click(screen.getByRole('button', { name: 'Toggle combination' }));
+		const group = await screen.findByRole('button', { name: 'Execute 3 commands' });
+		await fireEvent.click(group);
+		await waitFor(() => expect(container.querySelectorAll('[data-chat-row-id]')).toHaveLength(3));
+		const member = container.querySelector<HTMLElement>('[data-chat-row-id]');
+		expect(member).not.toBeNull();
+		member!.tabIndex = -1;
+		member?.focus();
+
+		group.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+		await waitFor(() => expect(group.getAttribute('aria-expanded')).toBe('false'));
+		expect(container.querySelectorAll('[data-chat-row-id]')).toHaveLength(0);
+		expect(document.activeElement).toBe(group);
+	});
+
+	it('keeps a large expanded tool run individually virtualized', async () => {
+		const { container } = render(ConversationFeedTestHost, { transcriptScenario: 'large-tool-run' });
+		await fireEvent.click(screen.getByRole('button', { name: 'Toggle combination' }));
+		const group = await screen.findByRole('button', { name: 'Execute 200 commands' });
+		expect(screen.getByRole('button', { name: 'Load earlier messages' })).toBeTruthy();
+		expect(Number(container.querySelector('[data-chat-virtual-sizer]')?.getAttribute('data-chat-virtual-model-count'))).toBe(4);
+		await fireEvent.click(group);
+		await waitFor(() => {
+			const sizer = container.querySelector('[data-chat-virtual-sizer]');
+			expect(Number(sizer?.getAttribute('data-chat-virtual-model-count'))).toBe(203);
+			expect(Number(sizer?.getAttribute('data-chat-virtual-count'))).toBeLessThan(100);
+		});
+		expect(screen.queryByRole('button', { name: 'Load earlier messages' })).toBeNull();
+	});
+
+	it('restores a collapsed summary but reveals exact durable members for row navigation', async () => {
+		const { container } = render(ConversationFeedTestHost, { transcriptScenario: 'tool-run' });
+		await fireEvent.click(screen.getByRole('button', { name: 'Toggle combination' }));
+		const group = await screen.findByRole('button', { name: 'Execute 3 commands' });
+		await fireEvent.click(screen.getByRole('button', { name: 'Restore group summary' }));
+		await waitFor(() => expect(screen.getByTestId('tool-navigation-result').textContent).toBe('completed'));
+		expect(group.getAttribute('aria-expanded')).toBe('false');
+		for (const [name, ordinal] of [
+			['Navigate first tool', 1],
+			['Navigate middle tool', 2],
+			['Navigate last tool', 3],
+		] as const) {
+			await fireEvent.click(screen.getByRole('button', { name }));
+			await waitFor(() => {
+				expect(screen.getByTestId('tool-navigation-result').textContent).toBe('completed');
+				expect(container.querySelector(`[data-chat-row-id="generation-1:${ordinal}"]`)).toBeTruthy();
+			});
+		}
+		expect(group.getAttribute('aria-expanded')).toBe('true');
+	});
+
 	afterEach(() => {
 		cleanup();
 		vi.restoreAllMocks();
+		localStorage.removeItem(LOCAL_STORAGE_KEYS.localSettings);
 		if (originalOffsetHeight) {
 			Object.defineProperty(HTMLElement.prototype, 'offsetHeight', originalOffsetHeight);
 		}

@@ -22,7 +22,9 @@ import {
 	buildConversationVirtualFeedModel,
 	estimateConversationFeedItemSize,
 	appendConversationVirtualTranscriptTail,
+	type ConversationEarlierBoundaryMode,
 	type ConversationVirtualFeedModel,
+	type ToolGroupVirtualFeedItem,
 } from './conversation-feed-virtual-items.js';
 
 export interface ConversationFeedProjectionInput {
@@ -34,11 +36,14 @@ export interface ConversationFeedProjectionInput {
 	showThinking: boolean;
 	isLiveWindow: boolean;
 	showRefreshError: boolean;
-	showEarlierBoundary: boolean;
+	earlierBoundary: ConversationEarlierBoundaryMode;
 	showLaterBoundary: boolean;
 	reserveComposerTraySpace: boolean;
 	transcriptViewId: string;
 	pendingPermissions: PendingPermissionRequest[];
+	combineToolUseMessages: boolean;
+	expandedToolMemberIds: ReadonlySet<string>;
+	protectedVirtualKeys: readonly string[];
 }
 
 export interface ConversationVirtualGeometrySnapshot {
@@ -62,6 +67,44 @@ function arraysEqual<T>(left: readonly T[], right: readonly T[]): boolean {
 	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function toolGroups(model: ConversationVirtualFeedModel): ToolGroupVirtualFeedItem[] {
+	return model.items.filter((item): item is ToolGroupVirtualFeedItem => item.kind === 'tool-group');
+}
+
+function sameToolGroupPresentation(
+	left: ToolGroupVirtualFeedItem,
+	right: ToolGroupVirtualFeedItem,
+): boolean {
+	if (
+		left.key !== right.key ||
+		left.expanded !== right.expanded ||
+		left.members.length !== right.members.length
+	) {
+		return false;
+	}
+	return left.members.every((member, index) => {
+		const other = right.members[index];
+		if (member.item.id !== other.item.id) return false;
+		if (member.item.kind !== 'message' || other.item.kind !== 'message') return true;
+		return member.item.message.type === other.item.message.type;
+	});
+}
+
+function toolGroupPresentationChanged(
+	previous: ConversationVirtualFeedModel | undefined,
+	next: ConversationVirtualFeedModel,
+): boolean {
+	if (!previous) return true;
+	const before = toolGroups(previous);
+	const after = toolGroups(next);
+	if (before.length !== after.length) return true;
+	for (const [index, group] of before.entries()) {
+		const current = after[index];
+		if (!current || !sameToolGroupPresentation(group, current)) return true;
+	}
+	return false;
+}
+
 function sameInput(
 	left: ConversationFeedProjectionInput | null,
 	right: ConversationFeedProjectionInput,
@@ -75,9 +118,13 @@ function sameInput(
 		left.hiddenToolTypes === right.hiddenToolTypes &&
 		left.hiddenBashCommands === right.hiddenBashCommands &&
 		left.showThinking === right.showThinking &&
+		left.combineToolUseMessages === right.combineToolUseMessages &&
+		(!right.combineToolUseMessages ||
+			(left.expandedToolMemberIds === right.expandedToolMemberIds &&
+				left.protectedVirtualKeys === right.protectedVirtualKeys)) &&
 		left.isLiveWindow === right.isLiveWindow &&
 		left.showRefreshError === right.showRefreshError &&
-		left.showEarlierBoundary === right.showEarlierBoundary &&
+		left.earlierBoundary === right.earlierBoundary &&
 		left.showLaterBoundary === right.showLaterBoundary &&
 		left.reserveComposerTraySpace === right.reserveComposerTraySpace &&
 		left.pendingPermissions === right.pendingPermissions,
@@ -94,9 +141,13 @@ function sameProjectionConfiguration(
 		left.hiddenToolTypes === right.hiddenToolTypes &&
 		left.hiddenBashCommands === right.hiddenBashCommands &&
 		left.showThinking === right.showThinking &&
+		left.combineToolUseMessages === right.combineToolUseMessages &&
+		(!right.combineToolUseMessages ||
+			(left.expandedToolMemberIds === right.expandedToolMemberIds &&
+				left.protectedVirtualKeys === right.protectedVirtualKeys)) &&
 		left.isLiveWindow === right.isLiveWindow &&
 		left.showRefreshError === right.showRefreshError &&
-		left.showEarlierBoundary === right.showEarlierBoundary &&
+		left.earlierBoundary === right.earlierBoundary &&
 		left.showLaterBoundary === right.showLaterBoundary &&
 		left.reserveComposerTraySpace === right.reserveComposerTraySpace &&
 		left.pendingPermissions.length === right.pendingPermissions.length &&
@@ -128,12 +179,15 @@ export class ConversationFeedProjectionState {
 		const model = buildConversationVirtualFeedModel({
 			surfaceIdentity: input.surfaceIdentity,
 			showRefreshError: input.showRefreshError,
-			showEarlierBoundary: input.showEarlierBoundary,
+			earlierBoundary: input.earlierBoundary,
 			showLaterBoundary: input.showLaterBoundary,
 			reserveComposerTraySpace: input.reserveComposerTraySpace,
 			transcriptItems: visibleTranscriptItems,
 			transcriptViewId: input.transcriptViewId,
 			pendingPermissions: input.pendingPermissions,
+			combineToolUseMessages: input.combineToolUseMessages,
+			expandedToolMemberIds: input.expandedToolMemberIds,
+			protectedVirtualKeys: input.protectedVirtualKeys,
 		});
 		const keys = model.items.map((item) => item.key);
 		const estimates = model.items.map(estimateConversationFeedItemSize);
@@ -143,7 +197,9 @@ export class ConversationFeedProjectionState {
 			!previousGeometry ||
 			identityChanged ||
 			!arraysEqual(previousGeometry.keys, keys) ||
-			!arraysEqual(previousGeometry.estimates, estimates);
+			!arraysEqual(previousGeometry.estimates, estimates) ||
+			(input.combineToolUseMessages &&
+				toolGroupPresentationChanged(this.#lastProjection?.model, model));
 
 		if (!previousGeometry) mutationKinds.add('initial');
 		else if (geometryChanged && mutationKinds.size === 0) {
@@ -171,6 +227,7 @@ export class ConversationFeedProjectionState {
 		mutationKinds: Set<ConversationFeedMutationKind>,
 	): ConversationFeedProjection | null {
 		const previous = this.#lastProjection;
+		if (input.combineToolUseMessages) return null;
 		if (!previous || !sameProjectionConfiguration(this.#lastInput, input)) return null;
 
 		let model: ConversationVirtualFeedModel;

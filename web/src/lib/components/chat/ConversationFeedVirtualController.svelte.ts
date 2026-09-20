@@ -13,7 +13,6 @@ import type {
 import { VirtualListController } from '$lib/virt/virtual-list-controller.svelte.js';
 import type {
 	VirtualListSnapshot,
-	VirtualMutationAnchor,
 	VirtualResumeTarget,
 	VirtualTransactionRecord,
 } from '$lib/virt/virtual-list-types.js';
@@ -39,8 +38,16 @@ import {
 	settleConversationEndRestore,
 	settleConversationTarget,
 } from './conversation-feed-virtual-runtime.js';
+import {
+	conversationProjectionMutationAnchor,
+	remapConversationAnchor,
+} from './conversation-feed-anchor-remapping.js';
 import type { ConversationPanelRestoreTarget } from '$lib/chat/transcript/conversation-panel-restore-target.js';
-import type { ConversationVirtualFeedModel } from './conversation-feed-virtual-items.js';
+import type {
+	ConversationVirtualFeedModel,
+	ConversationVirtualTarget,
+	ToolGroupVirtualFeedItem,
+} from './conversation-feed-virtual-items.js';
 
 export const CHAT_VIRTUAL_OVERSCAN = 6;
 const CHAT_FALLBACK_VIEWPORT_HEIGHT = 720;
@@ -57,6 +64,7 @@ interface ConversationFeedVirtualControllerOptions {
 	get visible(): boolean;
 	get pinned(): boolean;
 	get retention(): ConversationFeedRetentionState;
+	revealToolGroup?(memberRowId: string): Promise<'applied' | 'cancelled'>;
 	onInitialEndRestored?(): void;
 	onTransaction?(record: VirtualTransactionRecord): void;
 }
@@ -65,6 +73,21 @@ interface ConversationProjectionApplication {
 	readonly next: ConversationFeedProjection;
 	readonly pinned: boolean;
 	readonly scrollbarDragActive: boolean;
+}
+
+interface FocusedToolGroupTransfer {
+	readonly button: HTMLButtonElement;
+	readonly memberIds: ReadonlySet<string>;
+	readonly surfaceIdentity: string;
+}
+
+type ToolGroupFocusTarget =
+	| { readonly kind: 'group'; readonly key: string; readonly anchorId: string }
+	| { readonly kind: 'member'; readonly key: string; readonly rowId: string };
+
+interface PendingToolGroupFocus extends FocusedToolGroupTransfer {
+	readonly target: ToolGroupFocusTarget;
+	readonly release: () => void;
 }
 
 export class ConversationFeedVirtualController implements ConversationViewportPort {
@@ -94,6 +117,8 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 	#mountedItems = new ConversationMountedVirtualItems();
 	#itemAttachments = new Map<string, Attachment<HTMLElement>>();
 	#lastTransaction: VirtualTransactionRecord | null = null;
+	#pendingToolGroupFocus: PendingToolGroupFocus | null = null;
+	#toolGroupFocusFramePending = false;
 	#destroyed = false;
 
 	constructor(private readonly options: ConversationFeedVirtualControllerOptions) {
@@ -201,6 +226,14 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 		}
 		const identityChanged =
 			nextGeometry.surfaceIdentity !== this.#configuredGeometry.surfaceIdentity;
+		const previousModel = this.#configuredModel;
+		const focusedToolGroup = identityChanged
+			? null
+			: (this.#focusedToolGroupTransfer(previousModel, input.next.model) ??
+				this.#pendingToolGroupFocus);
+		const focusTarget = focusedToolGroup
+			? this.#toolGroupFocusTarget(input.next.model, focusedToolGroup.memberIds)
+			: null;
 		const structure = classifyConversationVirtualStructure({
 			identityChanged,
 			previousKeys: this.#configuredGeometry.keys,
@@ -232,15 +265,19 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 				input.scrollbarDragActive,
 			);
 		}
-		const selectedAnchor = this.#resolveAnchor(readingAnchor, input.next.model);
-		const anchor: VirtualMutationAnchor =
-			this.#activeTargetScrolls > 0 || nextGeometry.endBehavior === 'explicit-navigation'
-				? { kind: 'none' }
-				: restoreEnd
-					? { kind: 'end' }
-					: selectedAnchor
-						? { kind: 'item', key: selectedAnchor.key }
-						: { kind: 'none' };
+		const selected = identityChanged
+			? null
+				: remapConversationAnchor(readingAnchor, previousModel, input.next.model);
+		const selectedAnchor = selected?.anchor ?? null;
+		const nextHiddenAnchor = identityChanged
+			? null
+				: (remapConversationAnchor(this.#hiddenAnchor, previousModel, input.next.model)?.anchor ?? null);
+			const anchor = conversationProjectionMutationAnchor({
+				selected,
+				restoreEnd,
+				explicitNavigation: nextGeometry.endBehavior === 'explicit-navigation',
+				targetScrollActive: this.#activeTargetScrolls > 0,
+			});
 		const result = this.#virt.apply(
 			identityChanged
 				? {
@@ -259,12 +296,18 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 
 		this.#configuredGeometry = nextGeometry;
 		this.#configuredModel = input.next.model;
+		this.#hiddenAnchor = nextHiddenAnchor;
 		this.#configuredTranscriptKeys = transcriptKeys(input.next.model);
 		this.#configuredPinned = input.pinned;
 		this.#appliedDataRevision = Math.max(
 			this.#appliedDataRevision,
 			input.next.projectedDataRevision,
 		);
+		if (identityChanged || !focusedToolGroup || !focusTarget) {
+			this.#clearPendingToolGroupFocus();
+		} else {
+			this.#retainToolGroupFocus(focusedToolGroup, focusTarget);
+		}
 		this.options.retention.prune(nextGeometry.keys);
 		this.#pruneItemAttachments();
 		const isEarlierPublication = nextGeometry.mutationKinds.has('history-earlier');
@@ -310,6 +353,13 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 		if (pinned) return { kind: 'end' };
 		const messageKeys = new Set<string>();
 		for (const item of this.#configuredModel.items) {
+			if (item.kind === 'tool-group') {
+				const first = item.members[0]?.item;
+				if (first?.kind === 'message' && first.ordinal !== undefined) {
+					messageKeys.add(item.key);
+				}
+				continue;
+			}
 			if (
 				item.kind !== 'transcript' ||
 				item.item.kind !== 'message' ||
@@ -333,6 +383,16 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 			const index = this.#configuredModel.indexByKey.get(key);
 			if (index === undefined) continue;
 			const virtualItem = this.#configuredModel.items[index];
+			if (virtualItem?.kind === 'tool-group') {
+				const first = virtualItem.members[0]?.item;
+				if (first?.kind !== 'message' || first.ordinal === undefined) continue;
+				return {
+					kind: 'group-summary',
+					transcriptViewId,
+					ordinal: first.ordinal,
+					viewportOffset: key === anchor.key ? anchor.viewportOffset : 0,
+				};
+			}
 			if (
 				virtualItem?.kind !== 'transcript' ||
 				virtualItem.item.kind !== 'message' ||
@@ -355,6 +415,10 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 
 	isReady(): boolean {
 		return !this.#destroyed && this.options.visible && this.#virt.viewportPosition !== null;
+	}
+
+	hasCollapsedToolGroups(): boolean {
+		return this.#configuredModel.collapsedGroupByMemberRowId.size > 0;
 	}
 
 	isAtEnd(threshold = CHAT_GEOMETRY_END_THRESHOLD_PX): boolean {
@@ -533,14 +597,22 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 			await nextConversationLayoutFrame();
 			if (token !== this.#targetToken) return 'cancelled';
 			if (!this.isReady()) return 'not-ready';
+			const memberRowId = this.#memberRowId(target);
+			if (
+				target.kind !== 'presentation-row' &&
+				memberRowId &&
+				this.#configuredModel.collapsedGroupByMemberRowId.has(memberRowId)
+			) {
+				const surface = this.#configuredGeometry.surfaceIdentity;
+				const revealed = await this.options.revealToolGroup?.(memberRowId);
+				if (token !== this.#targetToken || surface !== this.#configuredGeometry.surfaceIdentity) {
+					return 'cancelled';
+				}
+				if (revealed !== 'applied' || !this.isReady()) return 'not-ready';
+				if (this.#configuredModel.collapsedGroupByMemberRowId.has(memberRowId)) return 'cancelled';
+			}
 			const model = this.#configuredModel;
-			const resolved =
-				target.kind === 'row'
-					? (() => {
-							const index = model.indexByRowId.get(target.id);
-							return index === undefined ? undefined : { index, innerRowId: target.id };
-						})()
-					: model.targetByDomAnchorId.get(target.id);
+			const resolved = this.#resolveTarget(target, model);
 			if (!resolved) return 'target-missing';
 			const key = model.items[resolved.index]?.key;
 			if (!key) return 'target-missing';
@@ -575,6 +647,7 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 	destroy(): void {
 		if (this.#destroyed) return;
 		this.#destroyed = true;
+		this.#clearPendingToolGroupFocus();
 		this.#endRestoreEpoch += 1;
 		this.#cancelTargetScroll();
 		this.#earlierPrependAnchor.clear();
@@ -611,9 +684,122 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 		const key = [anchor.key, ...anchor.fallbackKeys].find((candidate) =>
 			model.indexByKey.has(candidate),
 		);
-		return key
-			? { key, viewportOffset: key === anchor.key ? anchor.viewportOffset : 0, fallbackKeys: [] }
-			: null;
+		if (!key) return null;
+		return {
+			key,
+			viewportOffset: key === anchor.key ? anchor.viewportOffset : 0,
+			fallbackKeys: [],
+		};
+	}
+
+	#focusedToolGroupTransfer(
+		previous: ConversationVirtualFeedModel,
+		next: ConversationVirtualFeedModel,
+	): FocusedToolGroupTransfer | null {
+		if (typeof document === 'undefined') return null;
+		const button = document.activeElement;
+		if (!(button instanceof HTMLButtonElement) || !button.matches('[data-chat-tool-group]')) {
+			return null;
+		}
+		const root = this.options.virtualRoot;
+		if (!root?.contains(button)) return null;
+		const key = button.closest<HTMLElement>('[data-chat-virtual-item]')?.dataset.chatVirtualItem;
+		const index = key === undefined ? undefined : previous.indexByKey.get(key);
+		const oldGroup = index === undefined ? undefined : previous.items[index];
+		if (oldGroup?.kind !== 'tool-group') return null;
+		const memberIds = new Set(oldGroup.members.map((member) => member.item.id));
+		const replacement = this.#toolGroupFocusTarget(next, memberIds);
+		if (!replacement || replacement.key === oldGroup.key) return null;
+		return { button, memberIds, surfaceIdentity: this.#configuredGeometry.surfaceIdentity };
+	}
+
+	#toolGroupFocusTarget(
+		model: ConversationVirtualFeedModel,
+		memberIds: ReadonlySet<string>,
+	): ToolGroupFocusTarget | null {
+		const group = model.items.find(
+			(item): item is ToolGroupVirtualFeedItem =>
+				item.kind === 'tool-group' && item.members.some((member) => memberIds.has(member.item.id)),
+		);
+		if (group) return { kind: 'group', key: group.key, anchorId: group.anchorId };
+		for (const rowId of memberIds) {
+			const index = model.indexByRowId.get(rowId);
+			const item = index === undefined ? undefined : model.items[index];
+			if (item?.kind === 'transcript' && item.item.id === rowId) {
+				return { kind: 'member', key: item.key, rowId };
+			}
+		}
+		return null;
+	}
+
+	#retainToolGroupFocus(
+		transfer: FocusedToolGroupTransfer,
+		target: ToolGroupFocusTarget,
+	): void {
+		if (this.#pendingToolGroupFocus?.target.key !== target.key) {
+			const release = this.options.retention.acquire(target.key, 'focus');
+			this.#clearPendingToolGroupFocus();
+			this.#pendingToolGroupFocus = {
+				...transfer,
+				target,
+				release,
+			};
+		}
+		if (this.#toolGroupFocusFramePending) return;
+		this.#toolGroupFocusFramePending = true;
+		void nextConversationLayoutFrame().then(() => {
+			this.#toolGroupFocusFramePending = false;
+			const pending = this.#pendingToolGroupFocus;
+			if (!pending) return;
+			if (
+				this.#destroyed ||
+				this.#configuredGeometry.surfaceIdentity !== pending.surfaceIdentity ||
+				(document.activeElement !== pending.button && document.activeElement !== document.body)
+			) {
+				this.#clearPendingToolGroupFocus();
+				return;
+			}
+			const selector = pending.target.kind === 'group'
+				? '[data-chat-tool-group]'
+				: '[data-chat-row-id]';
+			const candidates = this.options.virtualRoot?.querySelectorAll<HTMLElement>(selector);
+			const replacement = [...(candidates ?? [])].find((element) =>
+				pending.target.kind === 'group'
+					? element.dataset.chatAnchorId === pending.target.anchorId
+					: element.dataset.chatRowId === pending.target.rowId,
+			);
+			if (replacement && pending.target.kind === 'member') replacement.tabIndex = -1;
+			replacement?.focus({ preventScroll: true });
+			this.#clearPendingToolGroupFocus();
+		});
+	}
+
+	#clearPendingToolGroupFocus(): void {
+		this.#pendingToolGroupFocus?.release();
+		this.#pendingToolGroupFocus = null;
+	}
+
+	#memberRowId(target: ConversationViewportTarget): string | undefined {
+		if (target.kind === 'dom-anchor') {
+			return this.#configuredModel.memberRowIdByDomAnchorId.get(target.id);
+		}
+		return target.id;
+	}
+
+	#resolveTarget(
+		target: ConversationViewportTarget,
+		model: ConversationVirtualFeedModel,
+	): ConversationVirtualTarget | undefined {
+		if (target.kind === 'dom-anchor') return model.targetByDomAnchorId.get(target.id);
+		const index = model.indexByRowId.get(target.id);
+		if (index === undefined) return undefined;
+
+		let innerRowId = target.id;
+		const item = model.items[index];
+		if (target.kind === 'presentation-row' && item?.kind === 'tool-group') {
+			innerRowId = item.anchorId;
+		}
+		return { index, innerRowId };
 	}
 
 	#restoreVirtualAnchor(anchor: ConversationVirtualAnchor): boolean {
@@ -783,5 +969,9 @@ export class ConversationFeedVirtualController implements ConversationViewportPo
 }
 
 function transcriptKeys(model: ConversationVirtualFeedModel): ReadonlySet<string> {
-	return new Set(model.items.flatMap((item) => (item.kind === 'transcript' ? [item.key] : [])));
+	const keys = new Set<string>();
+	for (const item of model.items) {
+		if (item.kind === 'transcript' || item.kind === 'tool-group') keys.add(item.key);
+	}
+	return keys;
 }

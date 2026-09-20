@@ -47,7 +47,9 @@ type MutableTransactionRecord = {
 	-readonly [Key in keyof VirtualTransactionRecord]: VirtualTransactionRecord[Key];
 };
 type CapturedAnchor =
-	{ kind: 'item'; key: string; index: number; start: number } | { kind: 'end' } | { kind: 'none' };
+	| { kind: 'item'; key: string; nextKey: string; index: number; start: number }
+	| { kind: 'end' }
+	| { kind: 'none' };
 
 export interface VirtualListTransactionOptions {
 	readonly environment: VirtualListEnvironment;
@@ -148,13 +150,31 @@ export class VirtualListTransaction {
 		if (mutation.kind === 'reset-measurements') this.geometry.resetMeasurements();
 		this.geometry.setItems(mutation.keys, mutation.estimates);
 		this.#driver?.pruneKeys((key) => this.geometry.indexOf(key) !== undefined);
+		if (mutation.anchor.kind === 'item-remap') {
+			const pendingCommit = this.#pendingCommit;
+			const pendingAnchor = pendingCommit?.measurementAnchor;
+			if (pendingCommit && pendingAnchor?.kind === 'item' && pendingAnchor.key === mutation.anchor.oldKey) {
+				pendingCommit.measurementAnchor = {
+					kind: 'item',
+					key: mutation.anchor.newKey,
+				};
+			}
+		}
 		if (this.#suspended) return { kind: 'applied' };
 
 		const leadingDelta = (dom?.leadingOffset ?? oldLeading) - oldLeading;
 		let correction = leadingDelta;
 		if (anchor.kind === 'item') {
-			const next = this.geometry.item(this.geometry.indexOf(anchor.key) ?? -1);
+			const next = this.geometry.item(this.geometry.indexOf(anchor.nextKey) ?? -1);
 			correction += next ? next.start - anchor.start : -leadingDelta;
+			if (mutation.anchor.kind === 'item-remap' && next && dom) {
+				const pendingTarget = this.#pendingCommit?.target;
+				const logicalOffset = pendingTarget
+					? this.#logicalOffsetForTarget(pendingTarget, dom)
+					: dom.scrollTop - dom.leadingOffset + this.#deviation.value;
+				// A new key has no meaningful position within the replaced row.
+				correction -= Math.max(0, logicalOffset - anchor.start);
+			}
 		} else if (anchor.kind === 'end') {
 			correction += this.geometry.totalSize() - oldTotal;
 		} else {
@@ -466,8 +486,9 @@ export class VirtualListTransaction {
 		});
 		this.#setDeviation(decision.state);
 		record.deviationAfter = decision.state.value;
-		if (input.anchor.kind === 'item') {
-			const index = this.geometry.indexOf(input.anchor.key);
+		if (input.anchor.kind === 'item' || input.anchor.kind === 'item-remap') {
+			const key = input.anchor.kind === 'item' ? input.anchor.key : input.anchor.newKey;
+			const index = this.geometry.indexOf(key);
 			const item = index === undefined ? undefined : this.geometry.item(index);
 			record.anchorPaintedStartAfter = item ? item.start - decision.state.value : null;
 		}
@@ -508,15 +529,20 @@ export class VirtualListTransaction {
 			input.dom ? this.#logicalOffsetForTarget(target, input.dom) : undefined,
 		);
 		record.redeemed = true;
+		let measurementAnchor: VirtualMutationAnchor;
+		if (input.source !== 'items') {
+			measurementAnchor = pendingCorrection?.measurementAnchor ?? input.anchor;
+		} else if (input.anchor.kind === 'item-remap') {
+			measurementAnchor = { kind: 'item', key: input.anchor.newKey };
+		} else {
+			measurementAnchor = input.anchor;
+		}
 		this.#queueCommit({
 			revision: this.#snapshot.revision,
 			source,
 			provenance,
 			target,
-			measurementAnchor:
-				input.source === 'items'
-					? input.anchor
-					: (pendingCorrection?.measurementAnchor ?? input.anchor),
+			measurementAnchor,
 			barriers: 0,
 			restoreDeviation:
 				pendingCorrection?.provenance === 'navigation'
@@ -530,11 +556,14 @@ export class VirtualListTransaction {
 	}
 
 	#captureMutationAnchor(anchor: VirtualMutationAnchor): CapturedAnchor {
-		if (anchor.kind !== 'item') return anchor;
-		const index = this.geometry.indexOf(anchor.key);
+		if (anchor.kind === 'end' || anchor.kind === 'none') return anchor;
+		const oldKey = anchor.kind === 'item' ? anchor.key : anchor.oldKey;
+		const nextKey = anchor.kind === 'item' ? anchor.key : anchor.newKey;
+		const index = this.geometry.indexOf(oldKey);
 		if (index === undefined) return { kind: 'none' };
 		const item = this.geometry.item(index);
-		return item ? { kind: 'item', key: anchor.key, index, start: item.start } : { kind: 'none' };
+		if (!item) return { kind: 'none' };
+		return { kind: 'item', key: oldKey, nextKey, index, start: item.start };
 	}
 
 	#captureMeasurementAnchor(
@@ -551,9 +580,14 @@ export class VirtualListTransaction {
 			: dom.scrollTop - dom.leadingOffset + this.#deviation.value;
 		if (logicalOffset <= 0) {
 			const firstItem = this.geometry.item(0);
-			return firstItem
-				? { kind: 'item', key: firstItem.key, index: firstItem.index, start: firstItem.start }
-				: { kind: 'none' };
+			if (!firstItem) return { kind: 'none' };
+			return {
+				kind: 'item',
+				key: firstItem.key,
+				nextKey: firstItem.key,
+				index: firstItem.index,
+				start: firstItem.start,
+			};
 		}
 		let item =
 			this.geometry.itemAtOffset(logicalOffset) ?? this.geometry.item(this.geometry.count - 1);
@@ -568,7 +602,7 @@ export class VirtualListTransaction {
 			}
 		}
 		if (!item) return { kind: 'none' };
-		return { kind: 'item', key: item.key, index: item.index, start: item.start };
+		return { kind: 'item', key: item.key, nextKey: item.key, index: item.index, start: item.start };
 	}
 
 	#publish(

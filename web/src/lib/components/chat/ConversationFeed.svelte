@@ -31,11 +31,15 @@
 		conversationScrollbarTrackDirection,
 		conversationWheelScrollDirection,
 	} from '$lib/chat/transcript/conversation-scroll-gesture.js';
-	import { ConversationFeedProjectionState } from './ConversationFeedProjectionState.svelte.js';
+	import {
+		ConversationFeedProjectionState,
+		type ConversationFeedProjectionInput,
+	} from './ConversationFeedProjectionState.svelte.js';
 	import { ConversationFeedRetentionState } from './ConversationFeedRetentionState.svelte.js';
 	import { ConversationFeedVirtualController } from './ConversationFeedVirtualController.svelte.js';
 	import type { ConversationViewportPort } from '$lib/chat/transcript/conversation-viewport-port.js';
 	import { ConversationFeedItemState } from './ConversationFeedItemState.svelte.js';
+	import { ConversationToolGroupState } from './ConversationToolGroupState.svelte.js';
 	import { virtualItems as selectVirtualItems } from '$lib/virt/virtual-list-types.js';
 	import {
 		ConversationFeedAnnouncementBatcher,
@@ -43,6 +47,8 @@
 	} from './conversation-feed-announcer.js';
 
 	const EMPTY_PENDING_PERMISSIONS: PendingPermissionRequest[] = [];
+	const EMPTY_TOOL_MEMBER_IDS: ReadonlySet<string> = new Set();
+	const EMPTY_PROTECTED_KEYS: readonly string[] = [];
 
 	interface Props {
 		transcript: ActiveTranscriptState;
@@ -193,6 +199,42 @@
 	const projectionState = new ConversationFeedProjectionState();
 	const retention = new ConversationFeedRetentionState();
 	const itemState = new ConversationFeedItemState();
+	const toolGroups = new ConversationToolGroupState();
+	const revealWaiters = new Map<
+		symbol,
+		{ rowId: string; surfaceIdentity: string; resolve: (result: 'applied' | 'cancelled') => void }
+	>();
+
+	function settleRevealWaiters(applied: boolean): void {
+		for (const [token, waiter] of revealWaiters) {
+			const index = projection.model.indexByRowId.get(waiter.rowId);
+			const item = index === undefined ? undefined : projection.model.items[index];
+			if (
+				applied &&
+				waiter.surfaceIdentity === surfaceIdentity &&
+				item?.kind === 'transcript' &&
+				item.item.id === waiter.rowId
+			) {
+				waiter.resolve('applied');
+			} else {
+				waiter.resolve('cancelled');
+			}
+			revealWaiters.delete(token);
+		}
+	}
+
+	function revealToolGroup(rowId: string): Promise<'applied' | 'cancelled'> {
+		return new Promise((resolve) => {
+			const token = Symbol('tool-group-reveal');
+			revealWaiters.set(token, { rowId, surfaceIdentity, resolve });
+			toolGroups.setExpanded([rowId], true);
+		});
+	}
+
+	function toggleToolGroup(memberIds: readonly string[], expanded: boolean): void {
+		if (!expanded) retention.closeAllTransients();
+		toolGroups.setExpanded(memberIds, expanded);
+	}
 	const announcerState = new ConversationFeedAnnouncerState();
 	let announcement = $state.raw({ sequence: 0, text: '' });
 	const announcementBatcher = new ConversationFeedAnnouncementBatcher((text) => {
@@ -201,19 +243,36 @@
 	const hiddenBashCommands = $derived(
 		hiddenBashCommandMatcherFor(remoteSettings.snapshot?.ui.hiddenBashCommandPatterns ?? []),
 	);
-	const projectionInput = $derived({
+	function earlierBoundaryMode(): ConversationFeedProjectionInput['earlierBoundary'] {
+		if (
+			chatState.pageStates.earlier.status === 'error' ||
+			(chatState.pageStates.earlier.status === 'loading' &&
+				chatState.pageStates.earlier.error !== null)
+		) {
+			return 'visible';
+		}
+		if (localSettings.combineToolUseMessages && chatState.canLoadEarlier) {
+			return 'when-collapsed';
+		}
+		return 'hidden';
+	}
+	const projectionInput: ConversationFeedProjectionInput = $derived({
 		surfaceIdentity,
 		rows: chatState.visibleRows,
 		mutationClock: chatState.feedMutationClock,
 		hiddenToolTypes: localSettings.hiddenToolTypes,
 		hiddenBashCommands,
 		showThinking: localSettings.showThinking,
+		combineToolUseMessages: localSettings.combineToolUseMessages,
+		expandedToolMemberIds: localSettings.combineToolUseMessages
+			? toolGroups.expandedMemberIds
+			: EMPTY_TOOL_MEMBER_IDS,
+		protectedVirtualKeys: localSettings.combineToolUseMessages
+			? retention.retainedKeys
+			: EMPTY_PROTECTED_KEYS,
 		isLiveWindow: !chatState.hasLaterMessages,
 		showRefreshError: chatState.loadStatus === 'error' && chatState.displayMessageCount > 0,
-		showEarlierBoundary:
-			chatState.pageStates.earlier.status === 'error' ||
-			(chatState.pageStates.earlier.status === 'loading' &&
-				chatState.pageStates.earlier.error !== null),
+		earlierBoundary: earlierBoundaryMode(),
 		showLaterBoundary: chatState.hasLaterMessages || chatState.pageStates.later.status !== 'idle',
 		reserveComposerTraySpace,
 		transcriptViewId: chatState.getCursor().transcriptViewId,
@@ -272,12 +331,17 @@
 			return retention;
 		},
 		onInitialEndRestored: () => onInitialEndRestored?.(),
+		revealToolGroup,
 	});
 	const virtualSnapshot = $derived(virtualController.snapshot);
 	const renderedIndexes = $derived(virtualController.renderedIndexes(virtualSnapshot));
 	const virtualItems = $derived(selectVirtualItems(virtualSnapshot, renderedIndexes));
 
 	$effect.pre(() => {
+		toolGroups.reconcile(
+			surfaceIdentity,
+			new Set(chatState.visibleRows.map((row) => row.id)),
+		);
 		const input = projectionInput;
 		const pendingPermissionOccurrences = new Set(
 			activePendingPermissionRequests.map((request) => request.permissionOccurrenceId),
@@ -289,8 +353,12 @@
 				pinned: pinnedToBottom,
 				scrollbarDragActive: scrollbarPointerY !== null,
 			});
-			if (!applied) return;
+			if (!applied) {
+				settleRevealWaiters(false);
+				return;
+			}
 			projection = nextProjection;
+			settleRevealWaiters(true);
 			itemState.reconcile(
 				input.surfaceIdentity,
 				new Set(input.rows.map((row) => row.id)),
@@ -346,6 +414,7 @@
 
 	onDestroy(() => {
 		virtualController.destroy();
+		settleRevealWaiters(false);
 		retention.clear();
 		projectionState.reset();
 		itemState.clear();
@@ -421,6 +490,7 @@
 						{onAppendToDraft}
 						{onGenerateTitleFromMessage}
 						canForkAtMessageNow={canUseForkAtMessage}
+						onToggleToolGroup={toggleToolGroup}
 					/>
 				{/if}
 			{/each}
