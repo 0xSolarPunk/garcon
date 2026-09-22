@@ -25,7 +25,7 @@
 	import type { ChatDraftAppend } from '$lib/chat/composer/chat-draft-append.js';
 	import PortableSurfaceFrame from './PortableSurfaceFrame.svelte';
 	import WorkspaceWindowTitleBar from './WorkspaceWindowTitleBar.svelte';
-	import { WORKSPACE_WINDOW_TITLEBAR_HEIGHT_PX } from './workspace-window-chrome.js';
+	import type { WorkspaceWindowTitlebarMetrics } from './workspace-window-chrome.js';
 	import type { WorkspaceWindowSurfaceMenuItems } from './workspace-window-menu-contract.js';
 	import { cn } from '$lib/utils/cn';
 	import * as m from '$lib/paraglide/messages.js';
@@ -42,6 +42,7 @@
 		panelActions,
 		composerInsetPx,
 		subagentToolbar,
+		titlebarMetrics,
 		surfaceMenuItems,
 		frameBridge,
 		surfaceStyle,
@@ -59,6 +60,7 @@
 		panelActions: ConversationPanelActions | null;
 		composerInsetPx: number;
 		subagentToolbar: SubagentToolbarState;
+		titlebarMetrics: WorkspaceWindowTitlebarMetrics;
 		surfaceMenuItems?: WorkspaceWindowSurfaceMenuItems;
 		frameBridge(surfaceId: string): SurfaceFrameBridge;
 		surfaceStyle: string;
@@ -122,7 +124,7 @@
 		return 'inset-x-0 bottom-0';
 	});
 	const dropLayerTopPx = $derived(
-		dnd.payload?.kind === 'chat' ? undefined : WORKSPACE_WINDOW_TITLEBAR_HEIGHT_PX,
+		dnd.payload?.kind === 'chat' ? undefined : titlebarMetrics.heightPx,
 	);
 
 	function dropZoneLabel(zone: WorkspaceWindowDropZonePresentation): string {
@@ -268,11 +270,23 @@
 	ondragleave={(event) => dnd.handleWindowDragLeave(event)}
 	ondrop={(event) => void handleDrop(event)}
 >
-	<WorkspaceWindowTitleBar {workspaceWindow} {labelFor} {dnd} {isCurrent} {surfaceMenuItems}>
+	<WorkspaceWindowTitleBar
+		{workspaceWindow}
+		{labelFor}
+		{dnd}
+		{isCurrent}
+		{surfaceMenuItems}
+		{titlebarMetrics}
+	>
 		{#snippet auxiliaryActions()}
 			{#if activeChatIsLive && subagentToolbar.model}
 				<SubagentManagementControl
 					model={subagentToolbar.model}
+					sizing={{
+						controlHeightPx: titlebarMetrics.controlSizePx + 4,
+						iconSizePx: titlebarMetrics.iconSizePx,
+						fontSizePx: titlebarMetrics.labelFontSizePx + 2,
+					}}
 					onJumpToTool={(anchorId) => subagentToolbar.jumpToTool(anchorId)}
 				/>
 			{/if}

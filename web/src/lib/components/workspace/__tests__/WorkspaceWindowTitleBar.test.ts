@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import WorkspaceWindowTitleBar from '../WorkspaceWindowTitleBar.svelte';
 import WorkspaceWindowAddMenu from '../WorkspaceWindowAddMenu.svelte';
 import { WorkspaceWindowAddMenuState } from '../workspace-window-add-menu-state.svelte.js';
+import {
+	DEFAULT_WORKSPACE_WINDOW_TITLEBAR_METRICS,
+	workspaceWindowTitlebarMetrics,
+} from '../workspace-window-chrome.js';
 import { WorkspaceWindowDndController } from '$lib/workspace/window-dnd.svelte.js';
 import { resolveUnmeasuredWorkspaceSplit } from '$lib/workspace/__tests__/workspace-geometry-test-fixtures.js';
 import { createWorkspaceLayoutStore } from '$lib/workspace/workspace-layout.svelte.js';
@@ -262,6 +266,7 @@ function renderTitleBar(
 	node: WorkspaceWindowNode,
 	isCurrent = true,
 	resolveLabel: (surfaceId: string) => string = labelFor,
+	titlebarHeightDeltaPx = 0,
 ) {
 	return render(WorkspaceWindowTitleBar, {
 		workspaceWindow: node,
@@ -271,6 +276,7 @@ function renderTitleBar(
 			resolveUnmeasuredWorkspaceSplit,
 		),
 		isCurrent,
+		titlebarMetrics: workspaceWindowTitlebarMetrics(titlebarHeightDeltaPx),
 	});
 }
 
@@ -311,6 +317,37 @@ describe('WorkspaceWindowTitleBar', () => {
 		expect(screen.getByRole('button', { name: m.workspace_fullscreen() })).toBeTruthy();
 		expect(screen.queryByRole('button', { name: m.workspace_close_window() })).toBeNull();
 	});
+
+	it.each([
+		['-2 px', -2, 38, 26, 13, 11],
+		['+6 px', 6, 46, 34, 17, 14],
+	] as const)(
+		'scales titlebar chrome at a %s adjustment',
+		(_label, delta, height, controlSize, iconSize, fontSize) => {
+			const { container } = renderTitleBar(
+				workspaceWindow([chatSurface.id]),
+				true,
+				labelFor,
+				delta,
+			);
+			expect(
+				container.querySelector<HTMLElement>('[data-workspace-window-titlebar]')?.style.height,
+			).toBe(`${height}px`);
+			const tab = screen.getByRole('tab', { name: 'Chat A' });
+			expect(tab.style.height).toBe(`${controlSize}px`);
+			expect(tab.style.fontSize).toBe(`${fontSize}px`);
+			expect(tab.querySelector('svg')?.getAttribute('height')).toBe(`${iconSize}`);
+			const fullscreen = screen.getByRole('button', { name: m.workspace_fullscreen() });
+			expect(fullscreen.style.height).toBe(`${controlSize}px`);
+			expect(fullscreen.querySelector('svg')?.getAttribute('height')).toBe(`${iconSize}`);
+			expect(screen.getByRole('button', { name: m.workspace_add_to_window() }).style.height).toBe(
+				`${controlSize}px`,
+			);
+			expect(screen.getByRole('button', { name: m.workspace_window_actions() }).style.height).toBe(
+				`${controlSize}px`,
+			);
+		},
+	);
 
 	it('keeps an empty Chat tab non-draggable', () => {
 		runtime.surfaces = { [emptyChatSurface.id]: emptyChatSurface };
@@ -657,6 +694,7 @@ describe('WorkspaceWindowTitleBar', () => {
 			labelFor,
 			dnd,
 			isCurrent: true,
+			titlebarMetrics: DEFAULT_WORKSPACE_WINDOW_TITLEBAR_METRICS,
 		});
 		const soleChatTab = screen.getByRole('tab', { name: 'Chat A' });
 		soleChatTab.focus();
@@ -666,6 +704,7 @@ describe('WorkspaceWindowTitleBar', () => {
 			labelFor,
 			dnd,
 			isCurrent: true,
+			titlebarMetrics: DEFAULT_WORKSPACE_WINDOW_TITLEBAR_METRICS,
 		});
 		await waitFor(() =>
 			expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'Chat A' })),
@@ -679,6 +718,7 @@ describe('WorkspaceWindowTitleBar', () => {
 			labelFor,
 			dnd,
 			isCurrent: true,
+			titlebarMetrics: DEFAULT_WORKSPACE_WINDOW_TITLEBAR_METRICS,
 		});
 		await waitFor(() =>
 			expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'Git' })),
@@ -1023,6 +1063,7 @@ describe('WorkspaceWindowTitleBar', () => {
 			labelFor,
 			dnd,
 			isCurrent: true,
+			titlebarMetrics: DEFAULT_WORKSPACE_WINDOW_TITLEBAR_METRICS,
 		});
 		const tabViewport = rendered.container.querySelector<HTMLElement>(
 			'[data-workspace-window-tabs="window-main"]',
