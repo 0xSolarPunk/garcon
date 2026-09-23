@@ -35,6 +35,8 @@ const agentCatalogEntries = [
     models: [
       { value: "gpt-5.5", label: "GPT-5.5", supportsImages: true },
       { value: "gpt-6-astra", label: "GPT-6-Astra", supportsImages: true },
+      { value: "gpt-6-sol", label: "GPT-6-Sol", supportsImages: true },
+      { value: "gpt-6-luna", label: "GPT-6-Luna", supportsImages: true },
       { value: "gpt-5.6-sol", label: "GPT-5.6-Sol", supportsImages: true },
       { value: "gpt-5.6-terra", label: "GPT-5.6-Terra", supportsImages: true },
       { value: "gpt-5.6-luna", label: "GPT-5.6-Luna", supportsImages: true },
@@ -347,6 +349,8 @@ describe("GET /api/v1/models", () => {
     expect(codexModelValues).toEqual([
       "gpt-5.5",
       "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
@@ -359,6 +363,12 @@ describe("GET /api/v1/models", () => {
     ).toMatchObject({ supportsImages: true });
     expect(
       codex.models.find((model) => model.value === "gpt-6-astra"),
+    ).toMatchObject({ supportsImages: true });
+    expect(
+      codex.models.find((model) => model.value === "gpt-6-sol"),
+    ).toMatchObject({ supportsImages: true });
+    expect(
+      codex.models.find((model) => model.value === "gpt-6-luna"),
     ).toMatchObject({ supportsImages: true });
     expect(
       codex.models.find((model) => model.value === "gpt-5.6-sol"),

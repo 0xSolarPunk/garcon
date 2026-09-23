@@ -214,6 +214,8 @@ export function mapThinkingModeToCodexEffort(
     case 'high': return 'high';
     case 'xhigh': return 'xhigh';
     case 'max': return model === GPT_6_ASTRA_MODEL
+      || model === 'gpt-6-sol'
+      || model === 'gpt-6-luna'
       || model === 'gpt-5.6'
       || model?.startsWith('gpt-5.6-')
       ? 'max'
