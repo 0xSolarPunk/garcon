@@ -78,11 +78,26 @@ describe('TerminalSurface', () => {
 		await rerender({ host: 'mobile', onClose, onModifier, onToolbarKey });
 		await fireEvent.click(await screen.findByRole('button', { name: 'Ctrl' }));
 		await fireEvent.click(screen.getByRole('button', { name: 'Esc' }));
-		await fireEvent.click(screen.getByRole('button', { name: 'Close terminal tab' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Exit terminal' }));
 
 		expect(onModifier).toHaveBeenCalledWith('ctrl');
 		expect(onToolbarKey).toHaveBeenCalledWith('escape');
 		expect(onClose).toHaveBeenCalledWith('terminal:terminal-1');
+	});
+
+	it('keeps terminal focus when toggling a mobile modifier', async () => {
+		const onFocus = vi.fn();
+		render(TerminalSurfaceTestHost, { host: 'mobile', onFocus });
+
+		await fireEvent.click(await screen.findByRole('button', { name: 'Ctrl' }));
+
+		expect(onFocus).toHaveBeenCalledOnce();
+	});
+
+	it('shows a discoverable mobile exit control', async () => {
+		render(TerminalSurfaceTestHost, { host: 'mobile' });
+
+		expect(await screen.findByRole('button', { name: 'Exit terminal' })).toBeTruthy();
 	});
 
 	it('shows an exited-terminal cleanup failure from mobile Close', async () => {
@@ -91,7 +106,7 @@ describe('TerminalSurface', () => {
 			closeError: new Error('Terminal cleanup failed'),
 		});
 
-		await fireEvent.click(screen.getByRole('button', { name: 'Close terminal tab' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Exit terminal' }));
 
 		expect(await screen.findByText('Terminal cleanup failed')).toBeTruthy();
 	});
