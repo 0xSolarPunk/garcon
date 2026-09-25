@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, createEvent, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TerminalSurfaceTestHost from './TerminalSurfaceTestHost.svelte';
 import { ApiError } from '$lib/api/client';
@@ -85,13 +85,28 @@ describe('TerminalSurface', () => {
 		expect(onClose).toHaveBeenCalledWith('terminal:terminal-1');
 	});
 
-	it('keeps terminal focus when toggling a mobile modifier', async () => {
+	it('keeps terminal focus and prevents pointer focus transfer for mobile modifiers', async () => {
 		const onFocus = vi.fn();
 		render(TerminalSurfaceTestHost, { host: 'mobile', onFocus });
+		const focusTarget = screen.getByTestId('terminal-focus-target');
+		focusTarget.focus();
 
-		await fireEvent.click(await screen.findByRole('button', { name: 'Ctrl' }));
+		for (const name of ['Ctrl', 'Alt']) {
+			const modifier = await screen.findByRole('button', { name });
+			const pointerDown = createEvent.pointerDown(modifier, {
+				bubbles: true,
+				cancelable: true,
+				pointerType: 'touch',
+			});
 
-		expect(onFocus).toHaveBeenCalledOnce();
+			fireEvent(modifier, pointerDown);
+
+			expect(pointerDown.defaultPrevented).toBe(true);
+			expect(document.activeElement).toBe(focusTarget);
+			await fireEvent.click(modifier);
+		}
+
+		expect(onFocus).toHaveBeenCalledTimes(2);
 	});
 
 	it('shows a discoverable mobile exit control', async () => {
