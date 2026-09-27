@@ -6,6 +6,7 @@ function printHelp() {
 Usage:
   bun server/main.ts [options]
   bun run start -- [options]
+  garcon executor --help
 
 Options:
   --help, -h                     Show this help screen and exit.
@@ -39,16 +40,24 @@ Environment Variables:
   SHELL                            Fallback shell path when GARCON_TERMINAL_SHELL is unset.
 
 Notes:
-  Environment variables take precedence over CLI options where both are available.
-  Server and PTY/agent subprocesses inherit the current process environment.
+  CLI options take precedence over environment variables, then defaults apply.
+  PTY/agent subprocesses inherit the resolved config root and GARCON_RUNTIME=controller.
+  Workspace settings configure controller storage, not garcon-cli discovery.
 `;
   process.stdout.write(helpText);
 }
 
-if (process.argv.includes('--help') || process.argv.includes('-h')) {
+if (process.argv[2] === 'executor') {
+  const { runWorkerCli } = await import('./remote/worker-cli.js');
+  try { await runWorkerCli(process.argv.slice(3)); }
+  catch (error) {
+    console.error(error instanceof Error ? error.message : 'Executor startup failed');
+    process.exitCode = 1;
+  }
+} else if (process.argv.includes('--help') || process.argv.includes('-h')) {
   printHelp();
 } else {
-  const { startServer } = await import('./server.js');
+  const { startServer } = await import('./controller/server.js');
   await startServer();
 }
 

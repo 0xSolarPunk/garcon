@@ -1,10 +1,12 @@
 // API provider HTTP client. API providers are persisted compatible endpoints.
 
-import { apiDelete, apiPost, apiPut } from './client.js';
+import { apiDelete, apiGet, apiPost, apiPut } from './client.js';
 import type { AgentModelOption } from '$shared/agents';
 import type {
 	ApiProtocol,
 	ApiProviderCatalogEntry,
+	ApiProviderCreateResult,
+	ApiProviderManagement,
 	ApiProviderModelDiscoveryRequest,
 	ApiProviderModelDiscoveryResponse,
 	ApiProviderTemplateId,
@@ -26,13 +28,28 @@ export interface ApiProviderEndpointInput {
 }
 
 export interface ApiProviderInput {
+	revision?: number;
+	apiProviderId?: string;
+	endpointId?: string;
 	templateId: ApiProviderTemplateId;
 	label: string;
 	endpoint: ApiProviderEndpointInput;
 }
 
-export async function createApiProvider(input: ApiProviderInput): Promise<ApiProviderCatalogEntry> {
-	return apiPost<ApiProviderCatalogEntry>('/api/v1/api-providers', input);
+export async function createApiProvider(input: ApiProviderInput, executorId = 'local'): Promise<ApiProviderCreateResult> {
+	return apiPost(`/api/v1/api-providers?executorId=${encodeURIComponent(executorId)}`, input);
+}
+
+export function getApiProviderManagement(): Promise<ApiProviderManagement> {
+	return apiGet('/api/v1/api-providers');
+}
+
+export function assignApiProvider(executorId: string, apiProviderId: string): Promise<ApiProviderManagement> {
+	return apiPut(`/api/v1/api-provider-assignments?executorId=${encodeURIComponent(executorId)}&apiProviderId=${encodeURIComponent(apiProviderId)}`, {});
+}
+
+export function unassignApiProvider(executorId: string, apiProviderId: string): Promise<ApiProviderManagement> {
+	return apiDelete(`/api/v1/api-provider-assignments?executorId=${encodeURIComponent(executorId)}&apiProviderId=${encodeURIComponent(apiProviderId)}`);
 }
 
 export async function updateApiProvider(
@@ -46,17 +63,19 @@ export async function updateApiProvider(
 }
 
 export async function deleteApiProvider(id: string): Promise<{ success: boolean }> {
-	return apiDelete<{ success: boolean }>(`/api/v1/api-providers?id=${encodeURIComponent(id)}`);
+	return apiDelete<{ success: boolean }>(`/api/v1/api-providers?id=${encodeURIComponent(id)}&acknowledgeSharedImpact=true`);
 }
 
 export async function testApiProvider(
 	input: ApiProviderInput,
+	executorId = 'local',
 ): Promise<ApiProviderModelDiscoveryResponse> {
-	return apiPost('/api/v1/api-providers/test', input);
+	return apiPost(`/api/v1/api-providers/test?executorId=${encodeURIComponent(executorId)}`, input);
 }
 
 export async function discoverApiProviderModels(
 	input: ApiProviderModelDiscoveryRequest,
+	executorId = 'local',
 ): Promise<ApiProviderModelDiscoveryResponse> {
-	return apiPost('/api/v1/api-providers/models', input);
+	return apiPost(`/api/v1/api-providers/models?executorId=${encodeURIComponent(executorId)}`, input);
 }

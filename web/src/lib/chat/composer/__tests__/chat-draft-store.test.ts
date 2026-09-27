@@ -13,13 +13,30 @@ describe('ChatDraftStore', () => {
 		const drafts = new ChatDraftStore();
 		drafts.setText('chat-a', 'alpha');
 		drafts.queuePersist('chat-a', 'alpha');
+		vi.advanceTimersByTime(200);
+		drafts.queuePersist('chat-a', 'alpha updated');
 		drafts.setText('chat-b', 'beta');
 		drafts.queuePersist('chat-b', 'beta');
 
-		vi.advanceTimersByTime(250);
+		vi.advanceTimersByTime(249);
+		expect(localStorage.getItem(chatDraftStorageKey('chat-a'))).toBeNull();
+		expect(localStorage.getItem(chatDraftStorageKey('chat-b'))).toBeNull();
+		vi.advanceTimersByTime(1);
 
-		expect(localStorage.getItem(chatDraftStorageKey('chat-a'))).toBe('alpha');
+		expect(localStorage.getItem(chatDraftStorageKey('chat-a'))).toBe('alpha updated');
 		expect(localStorage.getItem(chatDraftStorageKey('chat-b'))).toBe('beta');
+	});
+
+	it('restores persisted text in a new store without persisting attachments', () => {
+		const drafts = new ChatDraftStore();
+		drafts.setTextAndFlush('chat-a', 'unfinished thought');
+		drafts.setAttachments('chat-a', [new File(['image'], 'image.png', { type: 'image/png' })]);
+		drafts.destroy();
+
+		const restored = new ChatDraftStore();
+		restored.load('chat-a');
+		expect(restored.view('chat-a')).toMatchObject({ text: 'unfinished thought', attachments: [] });
+		restored.destroy();
 	});
 
 	it('keeps one reactive entry for every consumer of the same chat', () => {

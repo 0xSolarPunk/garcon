@@ -20,6 +20,7 @@
 		getConversationUi,
 		getGitBranchActions,
 		getGitQuickSummary,
+		getExecutors,
 		getLocalSettings,
 		getModelCatalog,
 	} from '$lib/context';
@@ -44,6 +45,7 @@
 		isVisible?: boolean;
 		actions: ConversationPanelActions | null;
 		composerInsetPx?: number;
+		composerNoticeShown?: boolean;
 		reserveMobileToolbar?: boolean;
 	}
 
@@ -56,16 +58,19 @@
 		isVisible = true,
 		actions,
 		composerInsetPx = 0,
+		composerNoticeShown = false,
 		reserveMobileToolbar = false,
 	}: Props = $props();
 
 	const sessions = getChatSessions();
 	const conversationUi = getConversationUi();
 	const localSettings = getLocalSettings();
-	const modelCatalog = getModelCatalog();
+	const rootModelCatalog = getModelCatalog();
+	const modelCatalog = $derived(rootModelCatalog.forExecutor(chat.executorId));
 	const appShell = getAppShell();
 	const quickGit = getGitQuickSummary();
 	const quickGitBranches = getGitBranchActions();
+	const executors = getExecutors();
 
 	const chatId = $derived(chat.id);
 	const queue = $derived(conversationUi.getExecutionControl(chatId)?.queue ?? null);
@@ -75,17 +80,25 @@
 		isProcessing && panel.lifecycle.loadingStatus?.can_interrupt !== false,
 	);
 	const canSteer = $derived(isProcessing && modelCatalog.supportsSteering(chat.agentId));
-	const projectPath = $derived(chat.projectPath || null);
-	const quickGitSummary = $derived(quickGit.summaryFor(projectPath));
+	const executorId = $derived(chat.executorId ?? 'local');
+	const projectPath = $derived(executors.gitAvailable(executorId) ? chat.projectPath || null : null);
+	const gitProject = $derived(projectPath ? { executorId, projectPath } : null);
+	const quickGitSummary = $derived(quickGit.summaryFor(gitProject));
 	const quickGitBranchError = $derived(
-		projectPath && quickGitBranches.currentProjectPath === projectPath
+		projectPath &&
+			quickGitBranches.executorId === executorId &&
+			quickGitBranches.currentProjectPath === projectPath
 			? quickGitBranches.lastError
 			: null,
 	);
-	const quickGitError = $derived(quickGit.lastErrorFor(projectPath) ?? quickGitBranchError);
-	const quickGitRefreshing = $derived(quickGit.isRefreshingFor(projectPath));
+	const quickGitError = $derived(quickGit.lastErrorFor(gitProject) ?? quickGitBranchError);
+	const quickGitRefreshing = $derived(quickGit.isRefreshingFor(gitProject));
+	// The composer's availability notice occupies the tray's place above the composer.
 	const quickGitTrayVisible = $derived(
-		!isProcessing && localSettings.showQuickCommitTray && quickGit.canShowTrayFor(projectPath),
+		!isProcessing &&
+			!(ownsComposer && composerNoticeShown) &&
+			localSettings.showQuickCommitTray &&
+			quickGit.canShowTrayFor(gitProject),
 	);
 	const reserveStatusCap = $derived(
 		shouldReserveComposerCapSlot({
@@ -112,7 +125,9 @@
 	const branchSelector = $derived.by<GitQuickBranchSelectorControls | null>(() => {
 		if (!projectPath || !quickGitSummary) return null;
 		const exposesCurrentBranchState =
-			isCommandOwner && quickGitBranches.currentProjectPath === projectPath;
+			isCommandOwner &&
+			quickGitBranches.executorId === executorId &&
+			quickGitBranches.currentProjectPath === projectPath;
 		return {
 			refs: exposesCurrentBranchState ? quickGitBranches.refs : [],
 			sort: quickGitBranches.branchSort,
@@ -184,10 +199,10 @@
 	});
 
 	$effect(() => {
-		const node = scrollContainer;
+		const element = scrollContainer;
 		const viewport = conversationViewport;
-		if (!node || !isVisible) return;
-		const stop = observeConversationViewportScrollGestures(node, (intent) => {
+		if (!element || !isVisible) return;
+		const stop = observeConversationViewportScrollGestures(element, (intent) => {
 			if (intent.touch !== null) panel.scroll.noteNativeTouchLifecycle(intent.touch);
 			if (intent.contact === 'end') {
 				panel.scroll.finishDirectionlessUserScrollIntent();
@@ -237,6 +252,7 @@
 	<div class="relative min-h-0 flex-1">
 		<svelte:boundary>
 			<ConversationFeed
+				chatContext={{ chatId, executorId: chat.executorId ?? 'local', projectPath: chat.projectPath }}
 				transcript={panel.transcript}
 				agentId={chat.agentId}
 				bind:scrollContainer

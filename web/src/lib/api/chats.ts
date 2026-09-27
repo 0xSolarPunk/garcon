@@ -18,10 +18,7 @@ import {
 	type ThinkingMode,
 } from '$shared/chat-modes';
 import type { AgentSettingsEnvelope } from '$shared/agent-integration';
-import {
-	parseChatSnapshotResponse,
-	type ChatSnapshotResponse,
-} from '$shared/chat-snapshot';
+import { parseChatSnapshotResponse, type ChatSnapshotResponse } from '$shared/chat-snapshot';
 import type { ApiProtocol } from '$shared/api-providers';
 import {
 	parseChatHistoryResponse,
@@ -58,8 +55,6 @@ import type {
 	PermissionDecisionCommandRequest,
 	ProjectPathPatchRequest,
 	ProjectPathPatchResponse,
-	GoalControlCommandRequest,
-	GoalControlCommandResponse,
 	SteerCommandRequest,
 	SteerCommandResponse,
 	QueueEntryCommandResponse,
@@ -74,6 +69,8 @@ import type {
 	QueuePauseRequest,
 	QueueResumeRequest,
 	StartChatCommandResponse,
+	AgentHandoffCommandRequest,
+	AgentHandoffCommandResponse,
 } from '$shared/chat-command-contracts';
 import {
 	normalizeChatTagConflictResponse,
@@ -133,6 +130,7 @@ function withParsedStopOutcome<
 }
 
 export interface StartChatParams {
+	executorId?: string;
 	clientRequestId: string;
 	clientMessageId: string;
 	chatId: string;
@@ -197,6 +195,21 @@ export async function runChat(params: AgentRunCommandRequest): Promise<AgentTurn
 	if (params.handoff && !response.chat) {
 		throw new Error('Invalid handoff response: durable chat projection is missing');
 	}
+	return response;
+}
+
+export async function handoffChat(
+	params: AgentHandoffCommandRequest,
+): Promise<AgentHandoffCommandResponse> {
+	const response = await apiPost<AgentHandoffCommandResponse>(
+		'/api/v1/chats/agent-handoff',
+		params,
+		{
+			timeoutMs: AGENT_HANDOFF_HTTP_TIMEOUT_MS,
+		},
+	);
+	if (!response.chat || response.chat.id !== params.chatId)
+		throw new Error('Invalid handoff chat projection');
 	return response;
 }
 
@@ -281,14 +294,6 @@ export async function moveQueuedInput(
 ): Promise<QueueEntryCommandResponse> {
 	return withParsedControl(
 		await apiPut<QueueEntryCommandResponse>('/api/v1/chats/queue/entries/move', params),
-	);
-}
-
-export async function submitGoalControl(
-	params: GoalControlCommandRequest,
-): Promise<GoalControlCommandResponse> {
-	return withParsedControl(
-		await apiPost<GoalControlCommandResponse>('/api/v1/chats/goal-control', params),
 	);
 }
 
@@ -489,10 +494,10 @@ export interface ValidateStartResponse {
 
 export async function validateStart(
 	path: string,
-	options?: ApiFetchOptions,
+	options?: ApiFetchOptions & { executorId?: string },
 ): Promise<ValidateStartResponse> {
 	return apiGet<ValidateStartResponse>(
-		`/api/v1/chats/validate-start?path=${encodeURIComponent(path)}`,
+		`/api/v1/chats/validate-start?path=${encodeURIComponent(path)}${options?.executorId ? `&executorId=${encodeURIComponent(options.executorId)}` : ''}`,
 		options,
 	);
 }
@@ -520,9 +525,7 @@ export async function reorderChat(request: ReorderChatRequest): Promise<ReorderC
 	return parsed;
 }
 
-export async function sortChatOrder(
-	request: SortChatOrderRequest,
-): Promise<SortChatOrderResponse> {
+export async function sortChatOrder(request: SortChatOrderRequest): Promise<SortChatOrderResponse> {
 	const response = await apiPost<unknown>('/api/v1/chats/sort', request);
 	const parsed = parseSortChatOrderResponse(response);
 	if (!parsed) throw new Error('Invalid chat order sort response');

@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
 	import { onDestroy, untrack } from 'svelte';
 	import ConversationFeed from '../ConversationFeed.svelte';
 	import { createModelCatalogStore } from '$lib/agents/model-catalog-store.svelte.js';
@@ -10,9 +12,12 @@
 	import { createAppShellStore } from '$lib/stores/app-shell.svelte.js';
 	import { createLocalSettingsStore } from '$lib/stores/local-settings.svelte.js';
 	import { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte.js';
+	import type { ConversationMessageChatContext } from '$lib/chat/transcript/conversation-message-context.js';
+	import type { PendingPermissionRequest } from '$lib/types/chat';
 	import {
 		AssistantMessage,
 		BashToolUseMessage,
+		ExitPlanModeToolUseMessage,
 		ToolResultMessage,
 		UserMessage,
 	} from '$shared/chat-types';
@@ -24,16 +29,21 @@
 		setRemoteSettings,
 		setChatSessions,
 		setFileSessions,
+		setNotifications,
 	} from '$lib/context';
+	import { createNotificationsStore } from '$lib/stores/notifications.svelte.js';
 	import { setCanonicalWorkspaceLayout } from './workspace-layout-test-context.js';
 
 	interface Props {
+		chatContext?: ConversationMessageChatContext;
+		sessionsStore?: ReturnType<typeof createChatSessionsStore>;
 		onUserScrollIntent?: (direction: 'earlier' | 'later' | null) => void;
 		isPreparingInitialScroll?: boolean;
 		showAnnouncementTrigger?: boolean;
 		remoteSettingsStore?: RemoteSettingsStore;
 		transcriptScenario?:
 			| 'empty'
+			| 'file-links'
 			| 'local-truncation'
 			| 'loading-earlier'
 			| 'loading-later'
@@ -48,6 +58,8 @@
 	}
 
 	const {
+		chatContext = { chatId: 'chat-1', executorId: 'local', projectPath: '/workspace' },
+		sessionsStore = createChatSessionsStore(),
 		onUserScrollIntent,
 		isPreparingInitialScroll = false,
 		showAnnouncementTrigger = false,
@@ -55,6 +67,8 @@
 		transcriptScenario = 'empty',
 	}: Props = $props();
 	const initialTranscriptScenario = untrack(() => transcriptScenario);
+	const initialChatContext = untrack(() => chatContext);
+	const pendingPermissions: PendingPermissionRequest[] = [];
 
 	const chatState = new ActiveTranscriptState();
 	let viewportPort: ConversationViewportPort | null = null;
@@ -65,7 +79,16 @@
 			id: `generation-1:${ordinal}`,
 		}) ?? 'not-ready';
 	}
-	if (initialTranscriptScenario === 'row-ids') {
+	if (initialTranscriptScenario === 'file-links') {
+		chatState.replaceGeneration(initialChatContext.chatId, 'generation-1', [
+			{ ordinal: 1, message: new AssistantMessage('2026-07-01T00:00:00.000Z', '[Message file](./message.txt)') },
+		], { lastOrdinal: 1, pageOldestOrdinal: 1, nextBeforeOrdinal: null, hasMore: false });
+		pendingPermissions.push({
+			chatId: initialChatContext.chatId,
+			permissionOccurrenceId: 'synthetic-permission',
+			requestedTool: new ExitPlanModeToolUseMessage('2026-07-01T00:00:00.000Z', 'synthetic-tool', '[Permission file](./plan.txt)'),
+		});
+	} else if (initialTranscriptScenario === 'row-ids') {
 		chatState.replaceGeneration(
 			'chat-1',
 			'generation-1',
@@ -205,6 +228,7 @@
 		};
 	}
 	setCanonicalWorkspaceLayout();
+	setNotifications(createNotificationsStore());
 	setAgentState(new AgentState());
 	const localSettings = createLocalSettingsStore();
 	localSettings.chatMaxWidth = 'medium';
@@ -221,7 +245,7 @@
 	});
 	setAppShell(appShell);
 	setModelCatalog(createModelCatalogStore());
-	setChatSessions(createChatSessionsStore());
+	setChatSessions(untrack(() => sessionsStore));
 	setFileSessions(
 		new FileSessionRegistry({
 			getIsMobile: () => false,
@@ -242,6 +266,9 @@
 </script>
 
 	<ConversationFeed
+		{chatContext}
+		pendingPermissionRequests={pendingPermissions}
+		onPermissionDecision={() => {}}
 		transcript={chatState}
 		agentId="codex"
 		{onUserScrollIntent}

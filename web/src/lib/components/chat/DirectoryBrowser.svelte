@@ -15,6 +15,8 @@
 	import { transientLayer } from '$lib/workspace/transient-layer-action.js';
 
 	interface DirectoryBrowserProps {
+		executorContextKey?: string;
+		executorId?: string;
 		currentPath: string;
 		/** Confines browsing to this subtree. */
 		basePath: string;
@@ -23,7 +25,15 @@
 		isMobile: boolean;
 	}
 
-	let { currentPath, basePath, onSelect, onClose, isMobile }: DirectoryBrowserProps = $props();
+	let {
+		executorContextKey = '',
+		executorId = 'local',
+		currentPath,
+		basePath,
+		onSelect,
+		onClose,
+		isMobile,
+	}: DirectoryBrowserProps = $props();
 	const transientLayers = getTransientLayers();
 	const focusReturnTarget =
 		typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
@@ -75,6 +85,7 @@
 
 	// Initialize browsePath from resolvedDir and reset mobile filter.
 	$effect(() => {
+		void executorId;
 		browsePath = resolvedDir;
 		mobileFilter = '';
 	});
@@ -82,14 +93,16 @@
 	// Fetch directory contents whenever browsePath changes.
 	$effect(() => {
 		const path = browsePath;
+		void executorContextKey;
 		if (!path) return;
 
 		loading = true;
 		error = null;
+		allEntries = [];
 
 		const abortController = new AbortController();
 
-		void browseDirectory(path, abortController.signal)
+		void browseDirectory(path, abortController.signal, executorId)
 			.then((list) => {
 				if (abortController.signal.aborted) return;
 				allEntries = list;

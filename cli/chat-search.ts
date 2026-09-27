@@ -23,6 +23,7 @@ import { CliError } from './errors.js';
 import { GarconHttpError } from './garcon-client.js';
 import type { CliOutput } from './output.js';
 import { shellQuote } from './shell-quote.js';
+import { connectionCommandPrefix, connectionOptionEntries } from './connection-options.js';
 
 export interface CliChatSearchHit extends ChatSearchResult {
   readonly chat: CliChatSummary | null;
@@ -234,14 +235,7 @@ export async function runChatSearch(
 
 function formatTranscriptSearchEnableCommand(connection: CliConnectionOptions): string {
   return [
-    'garcon-cli',
-    '--workspace',
-    shellQuote(connection.workspace),
-    '--config-dir',
-    shellQuote(connection.configDir),
-    ...(connection.serverUrl === undefined
-      ? []
-      : ['--server', shellQuote(connection.serverUrl)]),
+    ...connectionCommandPrefix(connection),
     'transcript-search',
     'enable',
   ].join(' ');
@@ -279,13 +273,7 @@ function searchReadCommandTokens(
   const data = (value: string): SearchReadCommandToken => ({ value, syntax: false });
   const includedCategories = readIncludesForSearchRole(anchor.role);
   return [
-    syntax('--workspace'),
-    data(connection.workspace),
-    syntax('--config-dir'),
-    data(connection.configDir),
-    ...(connection.serverUrl === undefined
-      ? []
-      : [syntax('--server'), data(connection.serverUrl)]),
+    ...connectionOptionEntries(connection).flatMap(([flag, value]) => [syntax(flag), data(value)]),
     syntax('read'),
     data(hit.chatId),
     data(String(anchor.ordinal)),

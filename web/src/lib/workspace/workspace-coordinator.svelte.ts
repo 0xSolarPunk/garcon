@@ -168,7 +168,8 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 			commit,
 			commitDestroyedRemoval: (surfaceId, mutations) =>
 				this.#presentation.commitDestroyedRemovals([surfaceId], mutations),
-			resolveCurrentProjectPath: () => resolveProjectPath(deps),
+			resolveCurrentProjectPath: (executorId) => resolveProjectPath(deps, executorId),
+			currentProjectExecutorId: () => deps.workspaceContext.currentTarget?.executorId ?? 'local',
 			isMobile: () => this.isMobile,
 			cancelWorkspaceDrag: () => deps.workspaceInteractionGate.cancelBeforeInertTransition(),
 			windowOf: (surfaceId) => this.#presentation.windowOf(surfaceId),
@@ -838,32 +839,50 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 	async createTerminal(
 		windowId: WorkspaceWindowId = this.defaultWindowId,
 		requestKey?: string,
+		executorId?: string,
 	): Promise<string> {
-		return this.#terminalPlacement.create(windowId, requestKey);
+		return this.#terminalPlacement.create(windowId, requestKey, executorId);
+	}
+
+	get terminalCreationExecutorId(): string {
+		return this.terminalCreationExecutorIdFor(this.currentWindowId);
+	}
+
+	terminalCreationExecutorIdFor(windowId: WorkspaceWindowId): string {
+		const terminalExecutor = this.#terminalPlacement.creationExecutorId(windowId);
+		if (terminalExecutor) return terminalExecutor;
+		return this.#deps.workspaceContext.currentTarget?.executorId ?? 'local';
 	}
 
 	async createTerminalInNewWindow(
 		anchorWindowId?: WorkspaceWindowId,
 		requestKey?: string,
+		executorId?: string,
 	): Promise<string> {
-		if (this.isMobile) return this.#terminalPlacement.create(this.defaultWindowId, requestKey);
+		if (this.isMobile)
+			return this.#terminalPlacement.create(this.defaultWindowId, requestKey, executorId);
 		return this.#terminalPlacement.createInNewWindow(
 			anchorWindowId ?? this.lastFocusedWindowId,
 			requestKey,
+			executorId,
 		);
 	}
 
-	async createTerminalInAvailableSpace(requestKey?: string): Promise<string> {
+	async createTerminalInAvailableSpace(requestKey?: string, executorId?: string): Promise<string> {
 		try {
-			return await this.createTerminalInNewWindow(this.currentWindowId, requestKey);
+			return await this.createTerminalInNewWindow(this.currentWindowId, requestKey, executorId);
 		} catch (error) {
 			if (!(error instanceof WorkspaceSplitBlockedError)) throw error;
-			return this.createTerminal(this.currentWindowId, requestKey);
+			return this.createTerminal(this.currentWindowId, requestKey, executorId);
 		}
 	}
 
-	async createTerminalReplacing(currentTerminalId: string, requestKey?: string): Promise<string> {
-		return this.#terminalPlacement.createReplacing(currentTerminalId, requestKey);
+	async createTerminalReplacing(
+		currentTerminalId: string,
+		requestKey?: string,
+		executorId?: string,
+	): Promise<string> {
+		return this.#terminalPlacement.createReplacing(currentTerminalId, requestKey, executorId);
 	}
 
 	async openTerminalSession(
@@ -909,13 +928,13 @@ export class WorkspaceCoordinator implements FilePlacementPort {
 
 	async reconcileTerminals(
 		liveTerminalIds: readonly string[],
-		options: { deriveLauncher: boolean },
+		options: { deriveLauncher: boolean; executorId?: string },
 	): Promise<void> {
 		await this.#terminalPlacement.reconcile(liveTerminalIds, options);
 	}
 
-	async activateTerminalLauncher(windowId: WorkspaceWindowId): Promise<void> {
-		await this.#terminalPlacement.activateLauncher(windowId);
+	async activateTerminalLauncher(windowId: WorkspaceWindowId, executorId?: string): Promise<void> {
+		await this.#terminalPlacement.activateLauncher(windowId, executorId);
 	}
 
 	#confirmClose(request: NonNullable<WorkspaceCoordinator['closeGuardRequest']>): Promise<boolean> {

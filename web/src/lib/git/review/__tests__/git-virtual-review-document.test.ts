@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import * as gitApi from '$lib/api/git.js';
 import type {
 	GitReviewDocumentSummary,
 	GitReviewFileBody,
@@ -24,6 +25,7 @@ function buildVirtualRows(options: Parameters<typeof buildGitVirtualReviewRowSou
 
 function makeSummary(files: GitReviewFileSummary[], documentId = 'doc'): GitReviewDocumentSummary {
 	return {
+		document: { executorId: 'local', instanceId: 'test-instance', documentId },
 		documentId,
 		project: '/project',
 		mode: 'working',
@@ -64,6 +66,7 @@ function makeFile(path: string, patch: Partial<GitReviewFileSummary> = {}): GitR
 function makeBody(path: string): GitReviewFileBody {
 	const patch = `diff --git a/${path} b/${path}\n@@ -0,0 +1 @@\n+new line\n`;
 	return {
+		patchDigest: 'a'.repeat(64),
 		path,
 		bodyFingerprint: `fingerprint:${path}`,
 		bodyState: 'loaded',
@@ -143,6 +146,7 @@ function documentDeps(visibleFilePaths: () => string[]): GitVirtualReviewDocumen
 		}),
 		surfaceError: vi.fn(),
 		markExternallyStale: vi.fn(),
+		invalidateSelections: vi.fn(),
 	};
 }
 
@@ -281,6 +285,106 @@ describe('buildVirtualRows', () => {
 });
 
 describe('GitVirtualReviewDocumentController syntax', () => {
+	it('loads one file per request and continues after an oversized file', async () => {
+		const paths = ['large.ts', 'a.ts', 'b.ts'];
+		const oversized: GitReviewFileBody = {
+			...makeBody('large.ts'),
+			bodyState: 'too-large',
+			category: 'large',
+			isTooLarge: true,
+			renderedRowCount: 0,
+			patchBytes: 0,
+			patch: null,
+			patchIndex: null,
+			limitReason: 'file-too-many-bytes',
+		};
+		const load = vi
+			.spyOn(gitApi, 'getGitReviewFileBodies')
+			.mockImplementation(async (_target, document, requested) => ({
+				status: 'ready',
+				documentId: document.documentId,
+				files: Object.fromEntries(
+					requested.map((path) => [path, path === 'large.ts' ? oversized : makeBody(path)]),
+				),
+				errors: {},
+			}));
+		const controller = new GitVirtualReviewDocumentController(documentDeps(() => paths));
+		try {
+			controller.applySummary(makeSummary(paths.map((path) => makeFile(path))));
+			controller.requestBodies('/project', paths);
+			await vi.waitFor(() => expect(controller.fileBodies['b.ts']?.bodyState).toBe('loaded'));
+			expect(controller.fileBodies['a.ts']?.bodyState).toBe('loaded');
+			expect(controller.fileBodies['large.ts']?.limitReason).toBe('file-too-many-bytes');
+			expect(load.mock.calls.map(([, , requested]) => requested)).toEqual(
+				paths.map((path) => [path]),
+			);
+			expect(controller.aggregateLimit).toBeNull();
+		} finally {
+			controller.reset();
+			load.mockRestore();
+		}
+	});
+
+	it.each(['document', 'executor', 'instance', 'return'] as const)(
+		'clears and refetches bodies after a %s change',
+		async (change) => {
+			const first = makeSummary([makeFile('a.ts')]);
+			const next = makeSummary(
+				[makeFile('a.ts')],
+				change === 'document' || change === 'return' ? 'next' : first.documentId,
+			);
+			if (change === 'executor') next.document = { ...next.document, executorId: 'remote' };
+			if (change === 'instance') next.document = { ...next.document, instanceId: 'replacement' };
+			const refreshed =
+				Promise.withResolvers<Awaited<ReturnType<typeof gitApi.getGitReviewFileBodies>>>();
+			const load = vi
+				.spyOn(gitApi, 'getGitReviewFileBodies')
+				.mockResolvedValueOnce({
+					status: 'ready',
+					documentId: first.documentId,
+					files: { 'a.ts': makeBody('a.ts') },
+					errors: {},
+				})
+				.mockReturnValueOnce(refreshed.promise);
+			const controller = new GitVirtualReviewDocumentController(documentDeps(() => ['a.ts']));
+			try {
+				controller.applySummary(first);
+				controller.requestBodies('/project', ['a.ts']);
+				await vi.waitFor(() => expect(controller.fileBodies['a.ts']).toBeTruthy());
+				if (change === 'return') controller.clearForDisplayChange();
+				controller.applySummary(next);
+				controller.requestBodies('/project', ['a.ts']);
+				expect(controller.fileBodies).toEqual({});
+				expect(load).toHaveBeenCalledTimes(2);
+				expect(
+					controller.rowSource
+						.rowsInRange(0, controller.rowSource.rowCount)
+						.some((row) => row.kind === 'unified-row'),
+				).toBe(false);
+				refreshed.resolve({
+					status: 'ready',
+					documentId: next.documentId,
+					files: { 'a.ts': { ...makeBody('a.ts'), patchDigest: 'b'.repeat(64) } },
+					errors: {},
+				});
+				await vi.waitFor(() =>
+					expect(controller.fileBodies['a.ts']?.patchDigest).toBe('b'.repeat(64)),
+				);
+				const renewed = controller.rowSource
+					.rowsInRange(0, controller.rowSource.rowCount)
+					.find((row) => row.kind === 'unified-row');
+				expect(renewed?.kind === 'unified-row' && renewed.actionTarget?.proof).toEqual({
+					document: next.document,
+					bodyFingerprint: 'fingerprint:a.ts',
+					patchDigest: 'b'.repeat(64),
+				});
+			} finally {
+				controller.reset();
+				load.mockRestore();
+			}
+		},
+	);
+
 	it('highlights the initial visible body without highlighting prefetched bodies', async () => {
 		const highlighter = vi.fn(async (input: GitDiffSyntaxFileInput) => highlightedAttempt(input));
 		const syntax = new GitDiffSyntaxController({
@@ -292,6 +396,7 @@ describe('GitVirtualReviewDocumentController syntax', () => {
 			syntax,
 		);
 		const summary = makeSummary([makeFile('a.ts'), makeFile('b.ts')]);
+		controller.summary = summary;
 		controller.fileBodies = { 'a.ts': makeBody('a.ts'), 'b.ts': makeBody('b.ts') };
 		controller.applySummary(summary);
 
@@ -314,6 +419,7 @@ describe('GitVirtualReviewDocumentController syntax', () => {
 		const controller = new GitVirtualReviewDocumentController(deps, syntax);
 		const summary = makeSummary([makeFile('a.ts'), makeFile('b.ts')]);
 		const bodies = { 'a.ts': makeBody('a.ts'), 'b.ts': makeBody('b.ts') };
+		controller.summary = summary;
 		controller.fileBodies = bodies;
 		controller.applySummary(summary);
 
@@ -349,6 +455,7 @@ describe('GitVirtualReviewDocumentController syntax', () => {
 			syntax,
 		);
 		const summary = makeSummary([makeFile('a.ts')]);
+		controller.summary = summary;
 		controller.fileBodies = { 'a.ts': makeBody('a.ts') };
 		controller.applySummary(summary);
 
@@ -367,12 +474,14 @@ describe('GitVirtualReviewDocumentController syntax', () => {
 
 		controller.clearForDisplayChange();
 		expect(controller.rowSource.rowCount).toBe(0);
+		controller.summary = summary;
 		controller.fileBodies = { 'a.ts': makeBody('a.ts') };
 		controller.applySummary(summary);
 		await vi.waitFor(() => expect(addedSyntaxSegments(controller)).toBeDefined());
 		expect(highlighter).toHaveBeenCalledOnce();
 
 		controller.refreshAllData();
+		controller.summary = summary;
 		controller.fileBodies = { 'a.ts': makeBody('a.ts') };
 		controller.applySummary(summary);
 		controller.handleBodyDemand({

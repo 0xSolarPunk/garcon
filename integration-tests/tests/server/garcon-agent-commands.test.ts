@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { ChatRegistrySnapshot } from '../../../server/chats/store.js';
+import type { ChatRegistrySnapshot } from '../../../server/controller/chats/store.js';
 import type { ChatMessagesMessage } from '../../../common/ws-events.js';
 import type { PreamblesMutationResponse, PreamblesSnapshot } from '../../../common/preambles.js';
 import type { ApiProviderCatalogEntry } from '../../../common/api-providers.js';
@@ -25,7 +25,7 @@ describe('assistant start and schedule commands', () => {
   test.each(['inherited', 'model-only', 'provider-model', 'native-only'])('resolves delegated %s selection through the server and persistence', async (selection) => {
     await withIntegrationFixture(`agent-command-selection-${selection}`, async (fixture) => {
       const original = fixture.directAgents.openAi;
-      const provider = await fixture.client.post<ApiProviderCatalogEntry>('/api/v1/api-providers', {
+      const provider = await fixture.client.post<ApiProviderCatalogEntry>(`/api/v1/api-providers?executorId=${fixture.client.executorId}`, {
         templateId: 'custom', label: 'Synthetic Selection', endpoint: {
           protocol: 'openai-compatible', baseUrl: `${fixture.fakeProviders.openAi.baseUrl}/v1`,
           apiKey: INTEGRATION_OPENAI_API_KEY, capabilities: { chatCompletions: true, responses: false },

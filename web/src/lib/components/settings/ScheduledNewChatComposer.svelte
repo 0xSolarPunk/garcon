@@ -8,6 +8,7 @@
 	import ProjectPinnedPathToggleButton from '$lib/components/chat/ProjectPinnedPathToggleButton.svelte';
 	import GitWorktreePickerModal from '$lib/components/git/GitWorktreePickerModal.svelte';
 	import ComposerModelSelector from '$lib/components/model-selector/ComposerModelSelector.svelte';
+	import ExecutorSelector from '$lib/components/shared/ExecutorSelector.svelte';
 	import NewChatPreambleControls from '$lib/components/preambles/NewChatPreambleControls.svelte';
 	import ScheduledPromptField from './ScheduledPromptField.svelte';
 	import type { NewChatFormState } from '$lib/chat/new-chat/new-chat-form-state.svelte.js';
@@ -27,13 +28,13 @@
 	import Loader2 from '@lucide/svelte/icons/loader-2';
 	import X from '@lucide/svelte/icons/x';
 	import * as m from '$lib/paraglide/messages.js';
-	import { getAppShell } from '$lib/context';
+	import { getAppShell, getExecutors } from '$lib/context';
 
 	interface Props {
 		startup: NewChatFormState;
 		modelCatalog: ModelCatalogStore;
 		remoteSettings: RemoteSettingsStore;
-		selectableAgentIds: readonly SessionAgentId[];
+		getSelectableAgentIds: (executorId: string) => readonly SessionAgentId[];
 		prompt: string;
 		promptError: string | null;
 		knownTags: string[];
@@ -46,7 +47,7 @@
 		startup,
 		modelCatalog,
 		remoteSettings,
-		selectableAgentIds,
+		getSelectableAgentIds,
 		prompt,
 		promptError,
 		knownTags,
@@ -56,6 +57,7 @@
 	}: Props = $props();
 	let textarea: HTMLTextAreaElement | null = $state(null);
 	const appShell = getAppShell();
+	const executors = getExecutors();
 
 	const permissionOptions = $derived(buildPermissionOptions(startup.permissionModes));
 	const thinkingOptions = $derived(buildThinkingOptions(startup.thinkingModes, startup.modelValue));
@@ -65,17 +67,20 @@
 		surface: 'composer',
 	};
 	const modelSelectorValue = $derived({
+		executorId: startup.executorId,
 		agentId: startup.agentId,
 		model: startup.modelValue,
 		...(startup.modelSelectionTarget ?? {}),
 	});
-	const recentSelectorOptions = $derived.by(() =>
-		buildModelSelectorRecents(modelCatalog, remoteSettings.snapshot?.recentAgentSettings ?? []),
-	);
-	const preferRecentsOnOpen = $derived(recentSelectorOptions.length > 1);
+	function getRecents(executorId: string) {
+		return buildModelSelectorRecents(
+			modelCatalog.forExecutor(executorId),
+			remoteSettings.snapshot?.recentAgentSettings ?? [],
+		);
+	}
 
 	function handlePathKeydown(event: KeyboardEvent): void {
-		if (event.key === 'Tab') {
+		if (event.key === 'Tab' && startup.filesAvailable) {
 			event.preventDefault();
 			void startup.handleTabCompletion();
 			return;
@@ -87,11 +92,12 @@
 	}
 
 	function handlePathFocus(event: FocusEvent & { currentTarget: HTMLInputElement }): void {
-		if (isMobile) event.currentTarget.blur();
+		if (isMobile && startup.filesAvailable) event.currentTarget.blur();
 		startup.handlePathFocus();
 	}
 
 	function handleModelChange(next: ModelSelectorChange): void {
+		if (next.executorId !== startup.executorId) return;
 		startup.selectAgent(next.agentId);
 		startup.selectModel(next.modelValue, next);
 	}
@@ -103,7 +109,10 @@
 			{m.chat_new_chat_project_path()}
 		</label>
 		<div class="relative">
-			<div class="flex gap-2">
+			<div class="flex flex-wrap gap-2 @container/project-target">
+				<ExecutorSelector {executors} executorId={startup.executorId} service="agents" presentation="field"
+					class="h-[42px] w-full sm:pointer-fine:h-[38px] @min-[32rem]/project-target:w-auto @min-[32rem]/project-target:max-w-44"
+					onSelect={(executorId) => startup.selectExecutor(executorId)} />
 				<div class="relative min-w-0 flex-1">
 					<input
 						id="scheduled-project-path"
@@ -142,8 +151,10 @@
 					onToggle={() => startup.toggleTagInput()}
 				/>
 			</div>
-			{#if startup.showBrowser && !startup.isUpdatingPinnedPath}
+			{#if startup.filesAvailable && startup.showBrowser && !startup.isUpdatingPinnedPath}
 				<DirectoryBrowser
+					executorId={startup.executorId}
+					executorContextKey={startup.pathContextKey}
 					currentPath={startup.trimmedPath || startup.browseStartPath || startup.projectBasePath}
 					basePath={startup.projectBasePath}
 					onSelect={(path) => {
@@ -159,7 +170,7 @@
 		<div class="-mt-1 min-h-5">
 			{#if startup.validationStatus === 'invalid' && startup.validationError}
 				<p class="text-xs text-destructive">{startup.validationError}</p>
-			{:else if startup.gitRepoStatus === 'git'}
+			{:else if startup.gitAvailable && startup.gitRepoStatus === 'git'}
 				<button
 					type="button"
 					disabled={startup.isUpdatingPinnedPath}
@@ -192,7 +203,18 @@
 		/>
 
 		{#if startup.modelSelectionError}
-			<p class="text-sm text-destructive">{startup.modelSelectionError}</p>
+			<div role="status" class="flex items-center gap-2 text-sm text-destructive">
+				<span>{startup.modelSelectionError}</span>
+				{#if startup.executorReady && modelCatalog.error}
+					<button
+						type="button"
+						class="text-foreground underline focus-visible:ring-2 focus-visible:ring-ring"
+						onclick={() => void modelCatalog.forceRefresh()}>{m.common_retry()}</button
+					>
+				{/if}
+			</div>
+		{:else if startup.modelSelectionPending}
+			<p role="status" class="text-sm text-muted-foreground">Loading models...</p>
 		{/if}
 	</div>
 
@@ -254,9 +276,9 @@
 							value={modelSelectorValue}
 							mode={modelSelectorMode}
 							onChange={handleModelChange}
-							recents={recentSelectorOptions}
-							{preferRecentsOnOpen}
-							{selectableAgentIds}
+							{getRecents}
+							preferRecentsOnOpen
+							{getSelectableAgentIds}
 							align="end"
 							side="bottom"
 						/>
@@ -267,7 +289,7 @@
 	</ScheduledPromptField>
 </div>
 
-{#if startup.worktreeModalOpen}
+{#if startup.gitAvailable && startup.worktreeModalOpen}
 	<GitWorktreePickerModal
 		worktrees={startup.worktreeItems}
 		isLoading={startup.isLoadingWorktrees}

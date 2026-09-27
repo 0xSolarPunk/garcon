@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
+	import { getExecutors } from '$lib/context';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
@@ -22,7 +23,7 @@
 		pinnedProjectPaths?: string[];
 		isMobile: boolean;
 		onClose: () => void;
-		onConfirm: (chatId: string, projectPath: string) => Promise<void> | void;
+		onConfirm: (target: ChatProjectPathDialog, projectPath: string) => Promise<void> | void;
 		onTogglePinnedProjectPath?: (path: string) => void | Promise<void>;
 	}
 
@@ -36,13 +37,20 @@
 		onTogglePinnedProjectPath,
 	}: SidebarProjectPathDialogProps = $props();
 
-	const projectPathDialogState = new ProjectPathDialogState();
+	const executors = getExecutors();
+	const projectPathDialogState = new ProjectPathDialogState(executors);
+	const filesAvailable = $derived(executors.filesAvailable(projectPathDialogState.executorId));
 	let activeDialogKey = $state('');
 	let pathInputRef = $state<HTMLInputElement | null>(null);
 	let isUpdatingPinnedProjectPath = $state(false);
 
 	let isOpen = $derived(projectPathDialog !== null);
-	let activeProjectBasePath = $derived(projectBasePath || '/');
+	const pathContextKey = $derived(executors.pathContextKey(projectPathDialogState.executorId));
+	let activeProjectBasePath = $derived(
+		projectPathDialogState.executorId === 'local'
+			? projectBasePath || '/'
+			: (executors.get(projectPathDialogState.executorId)?.projectBasePath ?? ''),
+	);
 	let validationMessage = $derived(
 		projectPathDialogState.submitError ?? projectPathDialogState.validationError,
 	);
@@ -67,16 +75,24 @@
 			return;
 		}
 
-		const nextDialogKey = `${projectPathDialog.chatId}:${projectPathDialog.currentProjectPath}`;
+		const nextDialogKey = JSON.stringify([
+			projectPathDialog.chatId,
+			projectPathDialog.executorId,
+			projectPathDialog.agentOwnershipEpoch,
+			projectPathDialog.status,
+			projectPathDialog.currentProjectPath,
+		]);
 		if (activeDialogKey === nextDialogKey) return;
 
 		activeDialogKey = nextDialogKey;
-		projectPathDialogState.open(projectPathDialog.currentProjectPath);
+		projectPathDialogState.open(projectPathDialog.currentProjectPath, projectPathDialog.executorId);
 	});
 
 	$effect(() => {
+		if (!activeDialogKey) return;
 		void projectPathDialogState.trimmedPath;
-		projectPathDialogState.scheduleValidation();
+		const contextKey = pathContextKey;
+		untrack(() => projectPathDialogState.scheduleValidation(contextKey));
 	});
 
 	onDestroy(() => {
@@ -123,7 +139,7 @@
 		projectPathDialogState.isSubmitting = true;
 		projectPathDialogState.submitError = null;
 		try {
-			await onConfirm(projectPathDialog.chatId, projectPathDialogState.trimmedPath);
+			await onConfirm(projectPathDialog, projectPathDialogState.trimmedPath);
 			onClose();
 		} catch (error) {
 			projectPathDialogState.setSubmitFailure(error);
@@ -154,9 +170,7 @@
 			onOpenAutoFocus={handleOpenAutoFocus}
 		>
 			<div class="flex h-full min-w-0 max-w-full flex-col sm:h-auto">
-				<Dialog.Header
-					class="min-w-0 max-w-full overflow-hidden border-b border-border px-5 py-4"
-				>
+				<Dialog.Header class="min-w-0 max-w-full overflow-hidden border-b border-border px-5 py-4">
 					<Dialog.Title>{m.sidebar_project_path_title()}</Dialog.Title>
 					<Dialog.Description class="block w-full min-w-0 max-w-full truncate">
 						{projectPathDialog?.chatTitle || m.sidebar_chats_unnamed()}
@@ -227,7 +241,9 @@
 									type="button"
 									variant="outline"
 									size="icon"
-									disabled={projectPathDialogState.isSubmitting || isUpdatingPinnedProjectPath}
+									disabled={!filesAvailable ||
+										projectPathDialogState.isSubmitting ||
+										isUpdatingPinnedProjectPath}
 									onclick={() => {
 										projectPathDialogState.showBrowser = true;
 									}}
@@ -238,8 +254,10 @@
 								</Button>
 							</div>
 
-							{#if projectPathDialogState.showBrowser && !isUpdatingPinnedProjectPath}
+							{#if filesAvailable && projectPathDialogState.showBrowser && !isUpdatingPinnedProjectPath}
 								<DirectoryBrowser
+									executorContextKey={executors.pathContextKey(projectPathDialogState.executorId)}
+									executorId={projectPathDialogState.executorId}
 									currentPath={projectPathDialogState.trimmedPath || activeProjectBasePath}
 									basePath={activeProjectBasePath}
 									onSelect={(path) => {
@@ -253,7 +271,7 @@
 						</div>
 
 						<div class="min-h-5">
-							{#if projectPathDialogState.gitRepoStatus === 'git' && projectPathDialogState.validationStatus === 'valid'}
+							{#if projectPathDialogState.gitAvailable && projectPathDialogState.gitRepoStatus === 'git' && projectPathDialogState.validationStatus === 'valid'}
 								<button
 									type="button"
 									disabled={!canOpenWorktreePicker}

@@ -2,6 +2,7 @@ import type { PermissionMode, ThinkingMode } from '@garcon/common/chat-modes';
 import type { AgentEndpointSelection } from '@garcon/common/agent-execution';
 import type { AgentSettingsEnvelope } from '@garcon/common/agent-integration';
 import type { AgentChatReference, AgentNativeSessionRef } from './transcript.js';
+import type { AgentProjectPathPreparation, ExecutorCallOptions } from './resources.js';
 
 export interface AgentSessionConfiguration {
   readonly model: string;
@@ -51,5 +52,12 @@ export interface AgentSessionConfigurationUpdates {
 }
 
 export interface AgentProjectPathUpdates {
-  prepare(request: AgentProjectPathUpdateRequest): Promise<AgentProjectPathUpdatePreparation | void>;
+  prepare(request: Omit<AgentProjectPathUpdateRequest, 'signal'>, options?: ExecutorCallOptions): Promise<AgentPreparedProjectPathUpdate | null>;
+  commit(preparation: AgentProjectPathPreparation, options?: ExecutorCallOptions): Promise<void>;
+  rollback(preparation: AgentProjectPathPreparation, options?: ExecutorCallOptions): Promise<void>;
+}
+
+export interface AgentPreparedProjectPathUpdate {
+  readonly preparation: AgentProjectPathPreparation;
+  readonly nativeSession?: AgentNativeSessionRef | null;
 }

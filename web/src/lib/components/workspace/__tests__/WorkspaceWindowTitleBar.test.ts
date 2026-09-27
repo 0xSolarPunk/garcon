@@ -24,6 +24,9 @@ import {
 	ResizeObserverHarness,
 } from '$lib/components/shared/__tests__/resize-observer-harness.js';
 import * as m from '$lib/paraglide/messages.js';
+import { terminalDisplayName } from '$lib/terminal/sessions/terminal-display-name.js';
+import type { GhCapabilityStore } from '$lib/git/pull-requests/gh-capability.svelte.js';
+import type { WorkspaceContextStore } from '$lib/workspace/workspace-context.svelte.js';
 
 const {
 	closeSurface,
@@ -78,6 +81,7 @@ vi.mock('$lib/utils/clipboard', () => ({ copyToClipboard }));
 
 vi.mock('$lib/context', () => ({
 	getWorkspaceCoordinator: () => ({
+		terminalCreationExecutorIdFor: () => 'local',
 		layout: {
 			get snapshot() {
 				return {
@@ -129,11 +133,24 @@ vi.mock('$lib/context', () => ({
 	getFileSessions: () => ({ get: (id: string) => runtime.fileSessions[id] ?? null }),
 	getNotifications: () => ({ error: notificationError }),
 	getTerminalRegistry: () => ({
+		hasRemoteHosts: false,
+		hosts: [{ id: 'local', label: 'Local', available: true, full: false }],
+		canCreate: (executorId: string) => executorId === 'local' && runtime.terminalSessions.length < 8,
+		displayName: (metadata: { title: string | null; displaySequence: number }) =>
+			terminalDisplayName(metadata, 'Local'),
 		get orderedSessions() {
 			return runtime.terminalSessions;
 		},
 	}),
-	getGhCapability: () => ({ hasChecked: true, available: true }),
+	getGhCapability: () => ({
+		forExecutor: (_executorId: string) =>
+			({ hasChecked: true, available: true }) satisfies Pick<
+				ReturnType<GhCapabilityStore['forExecutor']>,
+				'hasChecked' | 'available'
+			>,
+	}),
+	getWorkspaceContext: () =>
+		({ currentTarget: null }) satisfies Pick<WorkspaceContextStore, 'currentTarget'>,
 	getOptionalTransientLayers: () => null,
 }));
 
@@ -263,13 +280,13 @@ function labelFor(surfaceId: string): string {
 }
 
 function renderTitleBar(
-	node: WorkspaceWindowNode,
+	executor: WorkspaceWindowNode,
 	isCurrent = true,
 	resolveLabel: (surfaceId: string) => string = labelFor,
 	titlebarHeightDeltaPx = 0,
 ) {
 	return render(WorkspaceWindowTitleBar, {
-		workspaceWindow: node,
+		workspaceWindow: executor,
 		labelFor: resolveLabel,
 		dnd: new WorkspaceWindowDndController(
 			createWorkspaceLayoutStore(),
@@ -900,10 +917,10 @@ describe('WorkspaceWindowTitleBar', () => {
 	] as const)(
 		'opens $kind through Chat Views in both titlebar layouts',
 		async ({ kind, label }) => {
-			const node = workspaceWindow([chatSurface.id]);
+			const executor = workspaceWindow([chatSurface.id]);
 			const rendered = render(WorkspaceWindowAddMenu, {
-				windowId: node.id,
-				tabs: node.tabs,
+				windowId: executor.id,
+				tabs: executor.tabs,
 				measure: { naturalWidth: 200, viewportWidth: 0 },
 			});
 			await fireEvent.click(screen.getByRole('button', { name: m.workspace_add_to_window() }));
@@ -915,8 +932,8 @@ describe('WorkspaceWindowTitleBar', () => {
 			expect(openSingletonAsTab).toHaveBeenLastCalledWith(kind, 'window-main');
 
 			await rendered.rerender({
-				windowId: node.id,
-				tabs: node.tabs,
+				windowId: executor.id,
+				tabs: executor.tabs,
 				measure: { naturalWidth: 100, viewportWidth: 1_000 },
 			});
 			const inlineTrigger = await screen.findByRole('button', { name: m.workspace_chat_views() });
@@ -934,10 +951,10 @@ describe('WorkspaceWindowTitleBar', () => {
 	);
 
 	it('omits Chat Views already in this window and removes an empty group', async () => {
-		const node = workspaceWindow([chatSurface.id, 'singleton:chat-map']);
+		const executor = workspaceWindow([chatSurface.id, 'singleton:chat-map']);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 		await fireEvent.click(await screen.findByRole('button', { name: m.workspace_chat_views() }));
@@ -947,12 +964,12 @@ describe('WorkspaceWindowTitleBar', () => {
 			m.workspace_open_chat_board(),
 		]);
 		const allViews = workspaceWindow([
-			...node.tabs.order,
+			...executor.tabs.order,
 			'singleton:chat-canvas',
 			'singleton:chat-board',
 		]);
 		await rendered.rerender({
-			windowId: node.id,
+			windowId: executor.id,
 			tabs: allViews.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
@@ -961,10 +978,10 @@ describe('WorkspaceWindowTitleBar', () => {
 	});
 
 	it('restores Chat Views focus when its open submenu moves between layouts', async () => {
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 0 },
 		});
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_add_to_window() }));
@@ -974,8 +991,8 @@ describe('WorkspaceWindowTitleBar', () => {
 		});
 		canvasItem.focus();
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 		await waitFor(() =>
@@ -988,8 +1005,8 @@ describe('WorkspaceWindowTitleBar', () => {
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_chat_views() }));
 		screen.getByRole('menuitem', { name: m.workspace_open_chat_board() }).focus();
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 0 },
 		});
 		await waitFor(() =>
@@ -1053,13 +1070,13 @@ describe('WorkspaceWindowTitleBar', () => {
 			{ metadata: { terminalId: 'terminal-seven', displaySequence: 7, title: 'Build logs' } },
 		];
 		const restoreResizeObserver = installResizeObserverHarness();
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const dnd = new WorkspaceWindowDndController(
 			createWorkspaceLayoutStore(),
 			resolveUnmeasuredWorkspaceSplit,
 		);
 		const rendered = render(WorkspaceWindowTitleBar, {
-			workspaceWindow: node,
+			workspaceWindow: executor,
 			labelFor,
 			dnd,
 			isCurrent: true,
@@ -1086,7 +1103,7 @@ describe('WorkspaceWindowTitleBar', () => {
 			await screen.findByRole('menuitem', { name: m.workspace_new_terminal() });
 
 			await rendered.rerender({
-				workspaceWindow: node,
+				workspaceWindow: executor,
 				labelFor: () => 'Renamed Chat',
 				dnd,
 				isCurrent: true,
@@ -1105,10 +1122,10 @@ describe('WorkspaceWindowTitleBar', () => {
 	});
 
 	it('moves an ordered action prefix inline without duplicating menu actions', async () => {
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 318 },
 		});
 		const expectedLabels = [
@@ -1150,10 +1167,10 @@ describe('WorkspaceWindowTitleBar', () => {
 	});
 
 	it('hides the plus menu when every eligible action fits inline', async () => {
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 
@@ -1165,7 +1182,11 @@ describe('WorkspaceWindowTitleBar', () => {
 		expect(screen.queryByRole('button', { name: m.workspace_add_to_window() })).toBeNull();
 
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_new_terminal() }));
-		expect(createTerminal).toHaveBeenCalledWith('window-main', 'workspace-window:window-main');
+		expect(createTerminal).toHaveBeenCalledWith(
+			'window-main',
+			'workspace-window:window-main',
+			undefined,
+		);
 	});
 
 	it('keeps a busy inline terminal action focused while creation is pending', async () => {
@@ -1176,10 +1197,10 @@ describe('WorkspaceWindowTitleBar', () => {
 					resolveTerminalCreation = resolve;
 				}),
 		);
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 		const terminalAction = await screen.findByRole('button', {
@@ -1197,10 +1218,10 @@ describe('WorkspaceWindowTitleBar', () => {
 	});
 
 	it('restores focus when adaptive add controls move between the toolbar and menu', async () => {
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 0 },
 		});
 		const addLabel = m.workspace_add_to_window();
@@ -1211,8 +1232,8 @@ describe('WorkspaceWindowTitleBar', () => {
 
 		trigger.focus();
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 		await waitFor(() =>
@@ -1222,8 +1243,8 @@ describe('WorkspaceWindowTitleBar', () => {
 		const inlineAction = screen.getByRole('button', { name: firstActionLabel });
 		inlineAction.focus();
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 0 },
 		});
 		await waitFor(() =>
@@ -1235,8 +1256,8 @@ describe('WorkspaceWindowTitleBar', () => {
 		const menuAction = await screen.findByRole('menuitem', { name: secondActionLabel });
 		menuAction.focus();
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 260 },
 		});
 		await waitFor(() =>
@@ -1248,10 +1269,10 @@ describe('WorkspaceWindowTitleBar', () => {
 
 	it('keeps retained action focus across an open menu focus-scope refresh', async () => {
 		const openAutoFocus = vi.spyOn(WorkspaceWindowAddMenuState.prototype, 'handleOpenAutoFocus');
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 200 },
 		});
 		try {
@@ -1274,8 +1295,8 @@ describe('WorkspaceWindowTitleBar', () => {
 				new CustomEvent('focusScope.onOpenAutoFocus', { cancelable: true }),
 			);
 			await rendered.rerender({
-				windowId: node.id,
-				tabs: node.tabs,
+				windowId: executor.id,
+				tabs: executor.tabs,
 				measure: { naturalWidth: 200, viewportWidth: 230 },
 			});
 			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -1303,10 +1324,10 @@ describe('WorkspaceWindowTitleBar', () => {
 		runtime.terminalSessions = [
 			{ metadata: { terminalId: 'terminal-seven', displaySequence: 7, title: 'Build logs' } },
 		];
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 
@@ -1334,7 +1355,11 @@ describe('WorkspaceWindowTitleBar', () => {
 		expect(openTerminals.nextElementSibling).toBe(savedTerminal);
 
 		await fireEvent.click(newTerminal);
-		expect(createTerminal).toHaveBeenCalledWith('window-main', 'workspace-window:window-main');
+		expect(createTerminal).toHaveBeenCalledWith(
+			'window-main',
+			'workspace-window:window-main',
+			undefined,
+		);
 		await fireEvent.click(trigger);
 		await fireEvent.click(screen.getByRole('menuitem', { name: 'Build logs' }));
 		expect(openTerminalSession).toHaveBeenCalledWith('terminal-seven', 'window-main');
@@ -1344,10 +1369,10 @@ describe('WorkspaceWindowTitleBar', () => {
 		runtime.terminalSessions = [
 			{ metadata: { terminalId: 'terminal-seven', displaySequence: 7, title: 'Build logs' } },
 		];
-		const node = workspaceWindow([chatSurface.id]);
+		const executor = workspaceWindow([chatSurface.id]);
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 		const terminalTrigger = await screen.findByRole('button', {
@@ -1356,8 +1381,8 @@ describe('WorkspaceWindowTitleBar', () => {
 		terminalTrigger.focus();
 
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 0 },
 		});
 
@@ -1388,18 +1413,18 @@ describe('WorkspaceWindowTitleBar', () => {
 		runtime.terminalSessions = [
 			{ metadata: { terminalId: 'terminal-seven', displaySequence: 7, title: 'Build logs' } },
 		];
-		const node = workspaceWindow(singletonSurfaces.map((surface) => surface.id));
+		const executor = workspaceWindow(singletonSurfaces.map((surface) => surface.id));
 		const rendered = render(WorkspaceWindowAddMenu, {
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 0 },
 		});
 		const plusTrigger = screen.getByRole('button', { name: m.workspace_add_to_window() });
 		plusTrigger.focus();
 
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 		await waitFor(() =>
@@ -1409,8 +1434,8 @@ describe('WorkspaceWindowTitleBar', () => {
 		);
 
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 200, viewportWidth: 0 },
 		});
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_add_to_window() }));
@@ -1420,8 +1445,8 @@ describe('WorkspaceWindowTitleBar', () => {
 		newTerminalItem.focus();
 
 		await rendered.rerender({
-			windowId: node.id,
-			tabs: node.tabs,
+			windowId: executor.id,
+			tabs: executor.tabs,
 			measure: { naturalWidth: 100, viewportWidth: 1_000 },
 		});
 		await waitFor(() =>
@@ -1489,7 +1514,11 @@ describe('WorkspaceWindowTitleBar', () => {
 		await fireEvent.click(trigger);
 		await fireEvent.click(screen.getByRole('menuitem', { name: m.workspace_new_terminal() }));
 
-		expect(createTerminal).toHaveBeenCalledWith('window-main', 'workspace-window:window-main');
+		expect(createTerminal).toHaveBeenCalledWith(
+			'window-main',
+			'workspace-window:window-main',
+			undefined,
+		);
 		await waitFor(() => expect(trigger.getAttribute('aria-expanded')).toBe('false'));
 	});
 
@@ -1704,15 +1733,15 @@ describe('WorkspaceWindowTitleBar', () => {
 	});
 
 	it('offers every other window as a Chat move destination', async () => {
-		const node = workspaceWindow([chatSurface.id, gitSurface.id]);
+		const executor = workspaceWindow([chatSurface.id, gitSurface.id]);
 		runtime.windowCount = 2;
-		runtime.desktopRoot = twoWindowRoot(node.tabs, otherChatSurface.id);
+		runtime.desktopRoot = twoWindowRoot(executor.tabs, otherChatSurface.id);
 		runtime.surfaces = {
 			[chatSurface.id]: chatSurface,
 			[gitSurface.id]: gitSurface,
 			[otherChatSurface.id]: otherChatSurface,
 		};
-		renderTitleBar(node);
+		renderTitleBar(executor);
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
 		await fireEvent.click(
 			screen.getByRole('menuitem', {
@@ -1732,20 +1761,20 @@ describe('WorkspaceWindowTitleBar', () => {
 	});
 
 	it('keeps long move-destination labels on one truncated line in both tab menus', async () => {
-		const node = workspaceWindow([chatSurface.id, gitSurface.id]);
+		const executor = workspaceWindow([chatSurface.id, gitSurface.id]);
 		const destinationTitle =
 			'Chat B with a deliberately long title that cannot fit inside the destination menu';
 		const moveLabel = m.workspace_move_to_window({ window: destinationTitle });
 		const resolveLabel = (surfaceId: string): string =>
 			surfaceId === otherChatSurface.id ? destinationTitle : labelFor(surfaceId);
 		runtime.windowCount = 2;
-		runtime.desktopRoot = twoWindowRoot(node.tabs, otherChatSurface.id);
+		runtime.desktopRoot = twoWindowRoot(executor.tabs, otherChatSurface.id);
 		runtime.surfaces = {
 			[chatSurface.id]: chatSurface,
 			[gitSurface.id]: gitSurface,
 			[otherChatSurface.id]: otherChatSurface,
 		};
-		renderTitleBar(node, true, resolveLabel);
+		renderTitleBar(executor, true, resolveLabel);
 
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
 		const actionsItem = screen.getByRole('menuitem', { name: moveLabel });
@@ -1808,7 +1837,7 @@ describe('WorkspaceWindowTitleBar', () => {
 	});
 
 	it('disables directional new-window actions in both tab menus at the window cap', async () => {
-		const node = workspaceWindow([chatSurface.id, gitSurface.id]);
+		const executor = workspaceWindow([chatSurface.id, gitSurface.id]);
 		const directionalActionLabels = [
 			m.workspace_move_tab_to_new_window_left(),
 			m.workspace_move_tab_to_new_window_right(),
@@ -1816,8 +1845,8 @@ describe('WorkspaceWindowTitleBar', () => {
 			m.workspace_move_tab_to_new_window_below(),
 		];
 		runtime.windowCount = 4;
-		runtime.desktopRoot = fourWindowRoot(node.tabs);
-		renderTitleBar(node);
+		runtime.desktopRoot = fourWindowRoot(executor.tabs);
+		renderTitleBar(executor);
 
 		await fireEvent.click(screen.getByRole('button', { name: m.workspace_window_actions() }));
 		for (const label of directionalActionLabels) {

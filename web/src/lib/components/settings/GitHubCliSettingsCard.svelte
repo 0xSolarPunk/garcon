@@ -1,19 +1,28 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import GitPullRequest from '@lucide/svelte/icons/git-pull-request';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Button } from '$lib/components/ui/button/index.js';
-	import { getGhCapability } from '$lib/context';
+	import { getGhCapability, getExecutors } from '$lib/context';
 	import { cn } from '$lib/utils/cn';
 	import * as m from '$lib/paraglide/messages.js';
 
-	const ghCapability = getGhCapability();
+	let { executorId }: { executorId: string } = $props();
+	const capabilities = getGhCapability();
+	const executors = getExecutors();
+	const ghCapability = $derived(capabilities.forExecutor(executorId));
+	$effect(() => {
+		if (!executors.ghAvailable(executorId) || ghCapability.hasChecked) return;
+		untrack(() => void ghCapability.ensureChecked());
+	});
 
 	const connectedAccount = $derived(
 		ghCapability.login && ghCapability.host ? `${ghCapability.login}@${ghCapability.host}` : null,
 	);
 
 	const statusLabel = $derived.by(() => {
+		if (!executors.ghAvailable(executorId)) return 'Unavailable';
 		if (!ghCapability.hasChecked || ghCapability.isLoading) return m.settings_gh_status_checking();
 		if (ghCapability.lastError) return m.settings_gh_status_error();
 		if (ghCapability.available) {
@@ -28,7 +37,7 @@
 	});
 
 	const badgeClass = $derived.by(() => {
-		if (!ghCapability.hasChecked || ghCapability.isLoading) {
+		if (!executors.ghAvailable(executorId) || !ghCapability.hasChecked || ghCapability.isLoading) {
 			return 'bg-status-neutral text-status-neutral-foreground border-status-neutral-border';
 		}
 		if (ghCapability.available) {
@@ -46,7 +55,7 @@
 </script>
 
 <section class="rounded-lg border border-border bg-muted/50">
-	<div class="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+	<div class="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
 		<div class="flex min-w-0 items-start gap-3">
 			<div
 				class="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground"
@@ -59,13 +68,16 @@
 			</div>
 		</div>
 
-		<div class="flex shrink-0 items-center gap-2">
-			<Badge variant="outline" class={cn('text-xs', badgeClass)}>{statusLabel}</Badge>
+		<div class="flex min-w-0 flex-wrap items-center gap-2">
+			<Badge
+				variant="outline"
+				class={cn('min-w-0 max-w-full whitespace-normal break-words text-xs', badgeClass)}>{statusLabel}</Badge
+			>
 			<Button
 				variant="outline"
 				size="sm"
 				onclick={refreshGhStatus}
-				disabled={ghCapability.isLoading}
+				disabled={ghCapability.isLoading || !executors.ghAvailable(executorId)}
 				aria-label={m.settings_gh_refresh_aria()}
 			>
 				<RefreshCw class={cn('size-3.5', ghCapability.isLoading && 'animate-spin')} />
@@ -75,7 +87,9 @@
 	</div>
 
 	<div class="space-y-2 border-t border-border px-4 py-3 text-xs text-muted-foreground">
-		{#if !ghCapability.hasChecked || ghCapability.isLoading}
+		{#if !executors.ghAvailable(executorId)}
+			<p>{executors.label(executorId)} is unavailable.</p>
+		{:else if !ghCapability.hasChecked || ghCapability.isLoading}
 			<p>{m.settings_gh_instructions_checking()}</p>
 		{:else if ghCapability.lastError}
 			<p class="text-destructive">

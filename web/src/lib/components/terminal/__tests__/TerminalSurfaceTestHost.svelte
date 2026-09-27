@@ -15,6 +15,7 @@
 	} from '../terminal-surface-ports.js';
 	import type { TerminalClientSession } from '$lib/terminal/sessions/terminal-registry.svelte.js';
 	import TerminalSurface from '../TerminalSurface.svelte';
+	import { terminalDisplayName } from '$lib/terminal/sessions/terminal-display-name.js';
 
 	interface Props {
 		host: WorkspaceWindowId | 'mobile';
@@ -33,8 +34,11 @@
 		runtimeDelay?: Promise<void>;
 		runtimeDelays?: Readonly<Record<string, Promise<void>>>;
 		runtimeError?: string | null;
+		attachmentState?: TerminalClientSession['attachmentState'];
 		createError?: Error | null;
 		closeError?: Error | null;
+		executorError?: string | null;
+		onList?: (executorId?: string) => void;
 	}
 
 	let {
@@ -54,8 +58,11 @@
 		runtimeDelay,
 		runtimeDelays,
 		runtimeError = null,
+		attachmentState = 'attached',
 		createError = null,
 		closeError = null,
+		executorError = null,
+		onList = () => {},
 	}: Props = $props();
 	const localSettings = createLocalSettingsStore();
 	function sessionFor(
@@ -75,7 +82,7 @@
 				exitCode: null,
 				latestOutputSequence: 0,
 			},
-			attachmentState: 'attached',
+			attachmentState,
 			runtimeState: runtimeError ? 'failed' : 'ready',
 			runtimeError,
 			runtimeErrorRequiresPageReload: false,
@@ -123,8 +130,17 @@
 		get orderedSessions() {
 			return Object.values(this.sessions);
 		},
-		listStatus: 'ready',
-		listError: null,
+		get executorInventories() {
+			return {
+				local: { status: executorError ? ('failed' as const) : ('ready' as const), error: executorError },
+			};
+		},
+		executorLabel: () => 'Local',
+		executorIdFor: () => 'local',
+		displayName: terminalDisplayName,
+		hosts: [{ id: 'local', label: 'Local', available: true, full: false }],
+		hasRemoteHosts: false,
+		canCreate: () => true,
 		ensureRuntime: async (selectedTerminalId: string) => {
 			await (runtimeDelays?.[selectedTerminalId] ?? runtimeDelay);
 			return runtime;
@@ -133,7 +149,9 @@
 		rename: async (selectedTerminalId: string, title: string | null) => {
 			onRename(selectedTerminalId, title);
 		},
-		list: () => Promise.resolve(),
+		list: async (executorId?: string) => {
+			onList(executorId);
+		},
 	} satisfies TerminalSurfaceRegistryPort;
 	const workspace = {
 		layout,

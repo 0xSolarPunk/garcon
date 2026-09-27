@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { BoundedLog } from './bounded-log.js';
 import { Deferred, withTimeout } from './deferred.js';
+import { fixtureAuthToken, prepareFixtureAuth } from './fixture-auth.js';
 
 const SERVER_READY_PATTERN = /Started at (http:\/\/[^\s]+)/;
 const LOG_CAPACITY = 2_000;
@@ -16,7 +17,7 @@ export interface GarconProcessOptions {
   startupTimeoutMs?: number;
   environment?: Record<string, string>;
   redactEnvironmentValues?: boolean;
-  disableAuth?: boolean;
+  authentication?: 'existing';
   port?: number;
 }
 
@@ -38,7 +39,7 @@ export function redactSensitiveEnvironmentText(
   );
 }
 
-function isolatedEnvironment(
+export function isolatedEnvironment(
   homeDir: string,
   overrides: Record<string, string> = {},
 ): Record<string, string> {
@@ -56,7 +57,7 @@ function isolatedEnvironment(
   };
 }
 
-async function pumpLines(
+export async function pumpLines(
   stream: ReadableStream<Uint8Array>,
   channel: 'stdout' | 'stderr',
   onText: (text: string) => void,
@@ -93,6 +94,7 @@ export class GarconProcess {
   readonly #stdoutPump: Promise<void>;
   readonly #stderrPump: Promise<void>;
   #baseUrl = '';
+  #authToken: string | null = null;
   #expectedExit = false;
   #unexpectedExit: string | null = null;
   #exitCode: number | null = null;
@@ -107,7 +109,11 @@ export class GarconProcess {
     const inspectText = (text: string) => {
       readinessText = `${readinessText}${text}`.slice(-2_000);
       const match = SERVER_READY_PATTERN.exec(readinessText);
-      if (match) ready.resolve(match[1]);
+      if (match) {
+        const clientUrl = new URL(match[1]);
+        clientUrl.hostname = '127.0.0.1';
+        ready.resolve(clientUrl.origin);
+      }
     };
     const captureLine = (line: string) => {
       this.#logs.push(redactSensitiveEnvironmentText(line, redactedEnvironment));
@@ -127,6 +133,7 @@ export class GarconProcess {
     const ready = new Deferred<string>();
     const environment = isolatedEnvironment(options.homeDir, options.environment);
     await mkdir(environment.TMPDIR, { recursive: true });
+    const credentials = options.authentication === 'existing' ? null : await prepareFixtureAuth(options.configDir);
     const workspaceArguments = options.workspaceName
       ? ['--workspace', options.workspaceName]
       : ['--workspace-dir', options.workspaceDir];
@@ -137,8 +144,7 @@ export class GarconProcess {
         '--port',
         String(options.port ?? 0),
         '--bind-address',
-        '127.0.0.1',
-        ...(options.disableAuth === false ? [] : ['--disable-auth']),
+        '0.0.0.0',
         '--config-dir',
         options.configDir,
         ...workspaceArguments,
@@ -163,6 +169,7 @@ export class GarconProcess {
         options.startupTimeoutMs ?? 20_000,
         () => `Timed out waiting for Garcon startup.\n${instance.describeLogs()}`,
       );
+      if (credentials) instance.#authToken = await fixtureAuthToken(instance.#baseUrl, credentials);
       return instance;
     } catch (error) {
       await instance.#terminateAfterStartupFailure();
@@ -172,6 +179,10 @@ export class GarconProcess {
 
   get baseUrl(): string {
     return this.#baseUrl;
+  }
+
+  get authToken(): string | null {
+    return this.#authToken;
   }
 
   get pid(): number | null {

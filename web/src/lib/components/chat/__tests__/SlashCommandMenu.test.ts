@@ -16,7 +16,6 @@ const baseProps = {
 	projectPath: '',
 	supportsFork: true,
 	supportsSteering: false,
-	supportsGoals: false,
 	canScheduleIn: true,
 };
 const mockedGetSlashCommands = vi.mocked(getSlashCommands);
@@ -32,6 +31,38 @@ function deferred<T>() {
 describe('SlashCommandMenu', () => {
 	beforeEach(() => {
 		mockedGetSlashCommands.mockReset();
+	});
+
+	it('refetches commands for a new executor and discards the old executor response', async () => {
+		const stale = deferred<Awaited<ReturnType<typeof getSlashCommands>>>();
+		mockedGetSlashCommands.mockReturnValueOnce(stale.promise).mockResolvedValueOnce([
+			{ name: 'remote-command', source: 'command' },
+		]);
+		const props = { ...baseProps, projectPath: '/repo', isVisible: true, query: '-command', onSelect: vi.fn(), onClose: vi.fn() };
+		const view = render(SlashCommandMenuTestHost, props);
+		await waitFor(() => expect(mockedGetSlashCommands).toHaveBeenCalledTimes(1));
+		await view.rerender({ ...props, executorId: '11111111-1111-4111-8111-111111111111' });
+		expect(await screen.findByText('/remote-command')).toBeTruthy();
+		stale.resolve([{ name: 'local-command', source: 'command' }]);
+		await tick();
+		expect(screen.queryByText('/local-command')).toBeNull();
+		expect(screen.getByText('/remote-command')).toBeTruthy();
+	});
+
+	it('refetches for a replacement instance with identical executor and project strings', async () => {
+		const stale = deferred<Awaited<ReturnType<typeof getSlashCommands>>>();
+		mockedGetSlashCommands.mockReturnValueOnce(stale.promise).mockResolvedValueOnce([
+			{ name: 'current-command', source: 'command' },
+		]);
+		const view = render(SlashCommandMenuTestHost, {
+			...baseProps, projectPath: '/repo', executorContextKey: 'old', isVisible: true, query: '-command', onSelect: vi.fn(), onClose: vi.fn(),
+		});
+		await waitFor(() => expect(mockedGetSlashCommands).toHaveBeenCalledOnce());
+		await view.rerender({ executorContextKey: 'new' });
+		expect(await screen.findByText('/current-command')).toBeTruthy();
+		stale.resolve([{ name: 'old-command', source: 'command' }]);
+		await tick();
+		expect(screen.queryByText('/old-command')).toBeNull();
 	});
 
 	it('lists the built-in compact command matching the query', () => {
@@ -167,23 +198,10 @@ describe('SlashCommandMenu', () => {
 		expect(onSelect).toHaveBeenCalledWith('s');
 	});
 
-	it('lists the goal command when the agent supports goals', () => {
+	it('does not advertise a built-in goal command for Codex', () => {
 		render(SlashCommandMenuTestHost, {
 			...baseProps,
-			supportsGoals: true,
-			isVisible: true,
-			query: 'goal',
-			onSelect: vi.fn(),
-			onClose: vi.fn(),
-		});
-
-		expect(screen.getByText('/goal')).toBeTruthy();
-		expect(screen.getByText('Set an agent goal and start working toward it')).toBeTruthy();
-	});
-
-	it('hides the goal command without the capability', () => {
-		render(SlashCommandMenuTestHost, {
-			...baseProps,
+			agent: 'codex',
 			isVisible: true,
 			query: 'goal',
 			onSelect: vi.fn(),
@@ -191,6 +209,7 @@ describe('SlashCommandMenu', () => {
 		});
 
 		expect(screen.queryByText('/goal')).toBeNull();
+		expect(screen.queryByRole('option')).toBeNull();
 	});
 
 	it('lists the steer commands from capability data', () => {
@@ -334,7 +353,6 @@ describe('SlashCommandMenu', () => {
 			projectPath: '/repo',
 			supportsFork: true,
 			supportsSteering: true,
-			supportsGoals: true,
 			canScheduleIn: true,
 			isVisible: true,
 			query: 'skill-11',
@@ -344,7 +362,7 @@ describe('SlashCommandMenu', () => {
 
 		expect(await screen.findByText('/skill-11')).toBeTruthy();
 		expect(mockedGetSlashCommands).toHaveBeenCalledWith(
-			{ agent: 'codex', chatId: null, projectPath: '/repo' },
+			{ executorId: 'local', agent: 'codex', chatId: null, projectPath: '/repo' },
 			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 	});
@@ -362,7 +380,6 @@ describe('SlashCommandMenu', () => {
 			projectPath: '/repo',
 			supportsFork: true,
 			supportsSteering: true,
-			supportsGoals: true,
 			canScheduleIn: true,
 			isVisible: true,
 			query: 'skill',

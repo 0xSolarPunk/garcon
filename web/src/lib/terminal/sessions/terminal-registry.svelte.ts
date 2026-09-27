@@ -5,88 +5,47 @@ import {
 	terminateTerminal,
 } from '$lib/api/terminals.js';
 import { ApiError } from '$lib/api/client.js';
-import type {
-	TerminalRuntime,
-	TerminalRuntimeOptions,
-} from '$lib/terminal/runtime/terminal-runtime.svelte.js';
-import {
-	TerminalTransport,
-	type TerminalTransportOptions,
-	type TerminalTransportStatus,
-} from '$lib/ws/terminal-transport.svelte.js';
-import type { PrimaryWsConnectionPort } from '$lib/ws/connection.svelte.js';
-import type {
-	TerminalMetadata,
-	TerminalStreamClientMessage,
-	TerminalStreamServerMessage,
-} from '$shared/terminal';
+import type { TerminalRuntimeOptions } from '$lib/terminal/runtime/terminal-runtime.svelte.js';
+import { TerminalTransport } from '$lib/ws/terminal-transport.svelte.js';
+import type { TerminalMetadata, TerminalStreamServerMessage } from '$shared/terminal';
 import { TerminalThemeStore } from '$lib/terminal/runtime/terminal-theme.svelte.js';
 import type { TerminalThemePresentation } from '$lib/terminal/runtime/terminal-theme.svelte.js';
 import { isAbortError } from '$lib/utils/is-abort-error.js';
 import { ModuleImportError } from '$lib/utils/module-import-error.js';
 import * as m from '$lib/paraglide/messages.js';
+import { parseTerminalReference } from '$shared/terminal-identity';
+import { createRandomId } from '$lib/utils/random-id.js';
+import { TERMINAL_SESSION_LIMIT, terminalIdForMessage } from '$shared/terminal';
+import { terminalDisplayName } from './terminal-display-name.js';
+import { TerminalOutputFragments, decodeTerminalOutput } from './terminal-output-fragments.js';
+import type {
+	TerminalAttachmentState,
+	TerminalClientSession,
+	TerminalExecutorInventory,
+	TerminalRegistryDeps,
+	TerminalRuntimeModule,
+	TerminalSessionRuntime,
+	TerminalTransportPort,
+} from './terminal-registry-types.js';
+export type {
+	TerminalAttachmentState,
+	TerminalClientSession,
+	TerminalRegistryDeps,
+	TerminalRuntimeModule,
+	TerminalSessionRuntime,
+	TerminalTransportPort,
+} from './terminal-registry-types.js';
 
 export const TERMINAL_CREATE_RETRY_WINDOW_MS = 10 * 60 * 1000;
 
-export type TerminalAttachmentState =
-	'connecting' | 'attached' | 'detached' | 'taken-over' | 'unavailable';
-
-export interface TerminalClientSession {
-	metadata: TerminalMetadata;
-	attachmentState: TerminalAttachmentState;
-	runtimeState: 'idle' | 'loading' | 'ready' | 'failed';
-	runtimeError: string | null;
-	runtimeErrorRequiresPageReload: boolean;
-	lastReceivedSequence: number;
-	replayTruncatedAt: number | null;
-}
-
 interface PendingTerminalCreate {
+	executorId: string;
+	terminalRuntimeId?: string;
 	requestId: string;
 	requestedInitialWorkingDirectory: string | null;
 	startedAt: number;
 	requiresList: boolean;
 	timer: ReturnType<typeof setTimeout> | null;
-}
-
-interface PendingOutputFragments {
-	sequence: number;
-	fragmentCount: number;
-	parts: string[];
-}
-
-function decodeBase64Utf8(value: string): string {
-	const binary = atob(value);
-	const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-	return new TextDecoder().decode(bytes);
-}
-
-export interface TerminalRegistryDeps {
-	connection: PrimaryWsConnectionPort;
-	getClientId(): string;
-	now?: () => number;
-	listTerminals?: typeof listTerminals;
-	createTerminal?: typeof createTerminal;
-	terminateTerminal?: typeof terminateTerminal;
-	renameTerminal?: typeof renameTerminal;
-	createTransport?: (options: TerminalTransportOptions) => TerminalTransportPort;
-	createRuntime?: (options: TerminalRuntimeOptions) => TerminalRuntime | Promise<TerminalRuntime>;
-	loadRuntime?: () => Promise<TerminalRuntimeModule>;
-	reloadApplication?: () => void;
-	onSuccessfulList?(terminalIds: readonly string[]): void;
-	onSessionTerminated?(terminalId: string): void;
-}
-
-export interface TerminalRuntimeModule {
-	createTerminalRuntime(options: TerminalRuntimeOptions): Promise<TerminalRuntime>;
-}
-
-export interface TerminalTransportPort {
-	readonly status: TerminalTransportStatus;
-	connect(): void;
-	send(message: TerminalStreamClientMessage): boolean;
-	suspend(): void;
-	destroy(): void;
 }
 
 async function loadRuntime(): Promise<TerminalRuntimeModule> {
@@ -101,7 +60,33 @@ function reloadApplication(): void {
 	if (typeof window !== 'undefined') window.location.reload();
 }
 
+function createClientSession(
+	metadata: TerminalMetadata,
+	attachmentState: TerminalAttachmentState,
+): TerminalClientSession {
+	return {
+		metadata,
+		attachmentState,
+		runtimeState: 'idle',
+		runtimeError: null,
+		runtimeErrorRequiresPageReload: false,
+		lastReceivedSequence: 0,
+		replayTruncatedAt: null,
+	};
+}
+
 export class TerminalRegistry {
+	executorInventories = $state<Record<string, TerminalExecutorInventory>>({});
+	readonly #lists = new Map<string, Promise<void>>();
+	readonly #executorVersions = new Map<string, symbol>();
+	readonly #executorAvailability = new Map<string, string>();
+	readonly #attachmentIds = new Map<string, string>();
+	readonly #gapRecovery = new Set<string>();
+	readonly #drainingOutput = new Set<string>();
+	readonly #stopExecutors: () => void;
+	#initialized = false;
+	#inventoryRetry: ReturnType<typeof setTimeout> | null = null;
+	#onInventoryReady: (() => void) | null = null;
 	sessions = $state<Record<string, TerminalClientSession>>({});
 	listStatus = $state<'idle' | 'loading' | 'ready' | 'failed'>('idle');
 	listError = $state<string | null>(null);
@@ -109,8 +94,8 @@ export class TerminalRegistry {
 
 	readonly #deps: TerminalRegistryDeps;
 	readonly #transport: TerminalTransportPort;
-	readonly #runtimes = new Map<string, TerminalRuntime>();
-	readonly #runtimePromises = new Map<string, Promise<TerminalRuntime>>();
+	readonly #runtimes = new Map<string, TerminalSessionRuntime>();
+	readonly #runtimePromises = new Map<string, Promise<TerminalSessionRuntime>>();
 	readonly #attachmentRequests = new Map<string, symbol>();
 	readonly #theme = new TerminalThemeStore();
 	readonly #runtimeThemeCleanups = new Map<string, () => void>();
@@ -120,9 +105,8 @@ export class TerminalRegistry {
 	readonly #terminateTerminal: typeof terminateTerminal;
 	readonly #renameTerminal: typeof renameTerminal;
 	readonly #sessionMutationVersions = new Map<string, number>();
-	readonly #outputFragments = new Map<string, PendingOutputFragments>();
+	readonly #outputFragments = new TerminalOutputFragments((id) => this.#recoverGap(id));
 	#runtimeModulePromise: Promise<TerminalRuntimeModule> | null = null;
-	#listPromise: Promise<void> | null = null;
 	#sessionMutationVersion = 0;
 	#authSuspended = false;
 	#destroyed = false;
@@ -137,12 +121,56 @@ export class TerminalRegistry {
 		this.#transport = (deps.createTransport ?? ((options) => new TerminalTransport(options)))({
 			connection: deps.connection,
 			onMessage: (message) => this.#handleMessage(message),
-			onConnected: async () => {
-				await this.list();
-			},
+			onConnected: () => this.#reconcileConnection(),
 			onReady: () => this.#restoreAttachments(),
 			onDisconnected: () => this.#markDisconnected(),
 		});
+		this.#stopExecutors = deps.executors?.onChanged(() => this.#nodesChanged()) ?? (() => {});
+		this.#nodesChanged();
+	}
+
+	executorIdFor(terminalId: string): string {
+		return parseTerminalReference(terminalId)?.executorId ?? 'local';
+	}
+	executorLabel(executorId: string): string {
+		return this.#deps.executors?.label(executorId) ?? (executorId === 'local' ? 'Local' : executorId);
+	}
+	displayName(metadata: TerminalMetadata): string {
+		return terminalDisplayName(metadata, this.executorLabel(this.executorIdFor(metadata.terminalId)));
+	}
+	get hosts() {
+		const executors = this.#deps.executors?.executors ?? [
+			{
+				id: 'local',
+				label: 'Local',
+				enabled: true,
+				availability: 'ready',
+				machineServices: { terminals: true },
+			},
+		];
+		return executors
+			.filter((executor) => executor.id === 'local' || executor.machineServices.terminals)
+			.toSorted((left, right) => {
+				if (left.id === 'local') return -1;
+				if (right.id === 'local') return 1;
+				return 0;
+			})
+			.map((executor) => ({
+				id: executor.id,
+				label: executor.label,
+				available: executor.enabled && executor.availability === 'ready' && executor.machineServices.terminals,
+				full:
+					this.orderedSessions.filter(
+						(session) => this.executorIdFor(session.metadata.terminalId) === executor.id,
+					).length >= TERMINAL_SESSION_LIMIT,
+			}));
+	}
+	get hasRemoteHosts(): boolean {
+		return this.hosts.some((host) => host.id !== 'local' && host.available);
+	}
+	canCreate(executorId: string): boolean {
+		const host = this.hosts.find((host) => host.id === executorId);
+		return Boolean(host?.available && !host.full);
 	}
 
 	get orderedSessions(): TerminalClientSession[] {
@@ -156,6 +184,7 @@ export class TerminalRegistry {
 	}
 
 	async initialize(): Promise<void> {
+		this.#initialized = true;
 		this.#authSuspended = false;
 		try {
 			await this.list();
@@ -165,16 +194,54 @@ export class TerminalRegistry {
 		}
 	}
 
-	async list(): Promise<void> {
-		if (this.#listPromise) return this.#listPromise;
+	async list(executorId?: string): Promise<void> {
+		if (executorId !== undefined) return this.#listExecutor(executorId);
+		const hosts = this.hosts.filter((host) => host.available);
+		const results = await Promise.allSettled(hosts.map((host) => this.#listExecutor(host.id)));
+		if (!results.some((result) => result.status === 'fulfilled'))
+			throw new Error(this.listError ?? m.terminal_list_failed());
+	}
+
+	async #reconcileConnection(): Promise<void> {
+		// Accepted inventories, including retries, release readiness; discarded replies do not.
+		let onInventoryReady!: () => void;
+		const readiness = new Promise<void>((resolve, reject) => {
+			onInventoryReady = resolve;
+			this.#onInventoryReady = resolve;
+			void Promise.allSettled(
+				this.hosts.filter((host) => host.available).map((host) => this.#refreshExecutor(host.id)),
+			).then(() => reject(new Error(this.listError ?? m.terminal_list_failed())));
+		});
+		try {
+			await readiness;
+		} finally {
+			if (this.#onInventoryReady === onInventoryReady) this.#onInventoryReady = null;
+		}
+	}
+
+	async #listExecutor(executorId: string): Promise<void> {
+		const pending = this.#lists.get(executorId);
+		if (pending) return pending;
+		const version = this.#executorVersions.get(executorId) ?? Symbol('executor-inventory');
+		this.#executorVersions.set(executorId, version);
 		const startedAtMutationVersion = this.#sessionMutationVersion;
 		this.listStatus = 'loading';
 		this.listError = null;
-		this.#listPromise = (async () => {
+		this.executorInventories[executorId] = {
+			...this.executorInventories[executorId],
+			status: 'loading',
+			error: null,
+		};
+		const listing = Promise.resolve().then(async () => {
 			try {
-				const response = await this.#listTerminals();
-				const next: Record<string, TerminalClientSession> = {};
+				const response = await this.#listTerminals(executorId);
+				if (this.#destroyed || version !== this.#executorVersions.get(executorId)) return;
+				const next: Record<string, TerminalClientSession> = Object.fromEntries(
+					Object.entries(this.sessions).filter(([id]) => this.executorIdFor(id) !== executorId),
+				);
 				for (const metadata of response.terminals) {
+					if (this.executorIdFor(metadata.terminalId) !== executorId)
+						throw new Error('Terminal inventory executor mismatch');
 					const existing = this.sessions[metadata.terminalId];
 					if (
 						(this.#sessionMutationVersions.get(metadata.terminalId) ?? 0) > startedAtMutationVersion
@@ -184,56 +251,79 @@ export class TerminalRegistry {
 					}
 					next[metadata.terminalId] = existing
 						? { ...existing, metadata }
-						: {
-								metadata,
-								attachmentState: 'detached',
-								runtimeState: 'idle',
-								runtimeError: null,
-								runtimeErrorRequiresPageReload: false,
-								lastReceivedSequence: 0,
-								replayTruncatedAt: null,
-							};
+						: createClientSession(metadata, 'detached');
 				}
 				for (const [terminalId, existing] of Object.entries(this.sessions)) {
 					if (next[terminalId]) continue;
-					if ((this.#sessionMutationVersions.get(terminalId) ?? 0) > startedAtMutationVersion) {
+					if (
+						parseTerminalReference(terminalId)?.terminalRuntimeId === response.terminalRuntimeId &&
+						(this.#sessionMutationVersions.get(terminalId) ?? 0) > startedAtMutationVersion
+					) {
 						next[terminalId] = existing;
 						continue;
 					}
 					this.#disposeRuntime(terminalId);
 				}
 				this.sessions = next;
-				this.#sessionMutationVersions.clear();
-				this.#sessionMutationVersion = 0;
+				for (const [id, mutation] of this.#sessionMutationVersions) {
+					if (this.executorIdFor(id) === executorId && mutation <= startedAtMutationVersion)
+						this.#sessionMutationVersions.delete(id);
+				}
+				this.executorInventories[executorId] = {
+					status: 'ready',
+					runtimeId: response.terminalRuntimeId,
+					epoch: response.attachmentEpoch,
+					error: null,
+				};
 				this.listStatus = 'ready';
 				this.#syncTransportDemand();
 				for (const attempt of Object.values(this.pendingCreates)) {
-					if (!attempt.requiresList) continue;
+					if (!attempt.requiresList || attempt.executorId !== executorId) continue;
 					this.#clearCreateAttempt(attempt.requestId);
 				}
 				this.#deps.onSuccessfulList?.(
 					this.orderedSessions.map((session) => session.metadata.terminalId),
+					executorId,
 				);
+				this.#onInventoryReady?.();
 			} catch (error) {
+				if (this.#destroyed || version !== this.#executorVersions.get(executorId)) return;
+				this.executorInventories[executorId] = {
+					...this.executorInventories[executorId],
+					status: 'failed',
+					error: error instanceof Error ? error.message : m.terminal_list_failed(),
+				};
 				this.listStatus = 'failed';
 				this.listError = error instanceof Error ? error.message : m.terminal_list_failed();
+				this.#scheduleInventoryRetry();
 				throw error;
 			} finally {
-				this.#listPromise = null;
+				if (this.#lists.get(executorId) === listing) this.#lists.delete(executorId);
 			}
-		})();
-		return this.#listPromise;
+		});
+		this.#lists.set(executorId, listing);
+		return listing;
 	}
 
 	async create(
 		requestedInitialWorkingDirectory: string | null,
 		requestId: string,
+		executorId = 'local',
 	): Promise<string> {
 		if (!requestId) throw new Error('Terminal creation requires a request ID');
-		if (this.listStatus !== 'ready') await this.list();
+		if (!this.canCreate(executorId) && !this.pendingCreates[requestId])
+			throw new Error(m.terminal_unavailable());
+		if (this.executorInventories[executorId]?.status !== 'ready') await this.list(executorId);
+		if (
+			this.executorInventories[executorId]?.status !== 'ready' ||
+			!this.hosts.some((host) => host.id === executorId && host.available)
+		)
+			throw new Error(m.terminal_unavailable());
 		let attempt = this.pendingCreates[requestId];
 		if (!attempt) {
 			const createdAttempt: PendingTerminalCreate = {
+				executorId,
+				terminalRuntimeId: this.executorInventories[executorId]?.runtimeId,
 				requestId,
 				requestedInitialWorkingDirectory,
 				startedAt: this.#now(),
@@ -249,15 +339,29 @@ export class TerminalRegistry {
 			attempt.timer = null;
 			attempt.requiresList = true;
 		}
+		if (
+			attempt.executorId !== executorId ||
+			attempt.requestedInitialWorkingDirectory !== requestedInitialWorkingDirectory
+		)
+			throw new Error('Terminal retry cannot change its target');
+		if (attempt.terminalRuntimeId !== this.executorInventories[executorId]?.runtimeId)
+			attempt.requiresList = true;
 		if (attempt.requiresList) {
-			await this.list();
+			await this.list(executorId);
 			throw new Error(m.terminal_create_requires_list());
 		}
 		try {
 			const result = await this.#createTerminal({
 				requestId: attempt.requestId,
+				executorId: attempt.executorId,
+				expectedTerminalRuntimeId: attempt.terminalRuntimeId,
 				requestedInitialWorkingDirectory: attempt.requestedInitialWorkingDirectory,
 			});
+			if (this.#destroyed || !this.#executorVersions.has(executorId))
+				throw new ApiError(503, m.terminal_unavailable(), 'terminal-unavailable');
+			const observedRuntime = this.executorInventories[executorId]?.runtimeId;
+			if (observedRuntime && observedRuntime !== attempt.terminalRuntimeId)
+				throw new ApiError(409, m.terminal_create_requires_list(), 'terminal-runtime-changed');
 			this.#upsert(result.terminal, 'detached');
 			this.#clearCreateAttempt(requestId);
 			void this.attach(result.terminal.terminalId, 'restore');
@@ -269,11 +373,12 @@ export class TerminalRegistry {
 	}
 
 	async attach(terminalId: string, intent: 'restore' | 'takeover'): Promise<void> {
-		if (!this.sessions[terminalId]) return;
+		if (!this.sessions[terminalId] || this.#drainingOutput.has(terminalId)) return;
 		const request = this.#beginAttachment(terminalId);
-		if (intent === 'takeover' && this.listStatus === 'failed') {
+		const executorId = this.executorIdFor(terminalId);
+		if (intent === 'takeover') {
 			try {
-				await this.list();
+				await this.list(executorId);
 			} catch {
 				if (this.#isCurrentAttachment(terminalId, request)) {
 					this.sessions[terminalId].attachmentState = 'detached';
@@ -282,7 +387,7 @@ export class TerminalRegistry {
 				return;
 			}
 		}
-		const canStart = this.#listPromise
+		const canStart = this.#listPromiseFor(terminalId)
 			? await this.#waitForAttachmentPreconditions(terminalId, request)
 			: this.#attachmentPreconditionsMet(terminalId, request);
 		if (!canStart) {
@@ -299,7 +404,7 @@ export class TerminalRegistry {
 			this.#finishAttachment(terminalId, request);
 			return;
 		}
-		const canSend = this.#listPromise
+		const canSend = this.#listPromiseFor(terminalId)
 			? await this.#waitForAttachmentPreconditions(terminalId, request)
 			: this.#attachmentPreconditionsMet(terminalId, request);
 		if (!canSend) {
@@ -307,18 +412,25 @@ export class TerminalRegistry {
 			return;
 		}
 		const current = this.sessions[terminalId];
+		this.#outputFragments.delete(terminalId);
+		current.runtimeError = null;
+		const attachmentId = createRandomId();
+		this.#attachmentIds.set(terminalId, attachmentId);
 		const sent = this.#transport.send({
 			type: 'terminal-attach',
 			terminalId,
 			clientId: this.#deps.getClientId(),
 			afterSequence: current.lastReceivedSequence,
 			intent,
+			attachmentId,
+			attachmentEpoch: this.executorInventories[this.executorIdFor(terminalId)]?.epoch,
 		});
 		if (!sent) current.attachmentState = 'detached';
 		this.#finishAttachment(terminalId, request);
 	}
 
 	reattach(terminalId: string): void {
+		this.#gapRecovery.delete(terminalId);
 		if (this.sessions[terminalId]?.runtimeErrorRequiresPageReload) {
 			(this.#deps.reloadApplication ?? reloadApplication)();
 			return;
@@ -346,11 +458,11 @@ export class TerminalRegistry {
 		this.#syncTransportDemand();
 	}
 
-	runtimeIfPresent(terminalId: string): TerminalRuntime | null {
+	runtimeIfPresent(terminalId: string): TerminalSessionRuntime | null {
 		return this.#runtimes.get(terminalId) ?? null;
 	}
 
-	ensureRuntime(terminalId: string): Promise<TerminalRuntime> {
+	ensureRuntime(terminalId: string): Promise<TerminalSessionRuntime> {
 		const existing = this.#runtimes.get(terminalId);
 		if (existing) return Promise.resolve(existing);
 		const pending = this.#runtimePromises.get(terminalId);
@@ -403,15 +515,19 @@ export class TerminalRegistry {
 	authChanged(authenticated: boolean): void {
 		this.#authSuspended = !authenticated;
 		if (!authenticated) {
+			this.#clearInventoryRetry();
 			this.#invalidateAttachments();
 			this.#transport.suspend();
 			return;
 		}
 		this.#syncTransportDemand();
+		this.#scheduleInventoryRetry();
 	}
 
 	destroy(): void {
 		this.#destroyed = true;
+		this.#clearInventoryRetry();
+		this.#stopExecutors();
 		this.#invalidateAttachments();
 		this.#transport.destroy();
 		for (const attempt of Object.values(this.pendingCreates)) {
@@ -423,16 +539,36 @@ export class TerminalRegistry {
 		this.#attachmentRequests.clear();
 		this.#sessionMutationVersions.clear();
 		this.#outputFragments.clear();
+		this.#executorVersions.clear();
+		this.#lists.clear();
+		this.#executorAvailability.clear();
+		this.#gapRecovery.clear();
 	}
 
 	#handleMessage(message: TerminalStreamServerMessage): void {
+		const terminalId = terminalIdForMessage(message);
+		if (
+			terminalId &&
+			(!message.attachmentId || this.#attachmentIds.get(terminalId) !== message.attachmentId)
+		)
+			return;
 		if (message.type === 'terminal-output') {
 			this.#applyOutput(message.terminalId, message.sequence, message.data);
 			return;
 		}
 		if (message.type === 'terminal-replay-batch') {
 			for (const chunk of message.chunks) {
-				this.#applyOutput(message.terminalId, chunk.sequence, decodeBase64Utf8(chunk.dataBase64));
+				if (!this.#attachmentIds.has(message.terminalId)) break;
+				try {
+					this.#applyOutput(
+						message.terminalId,
+						chunk.sequence,
+						decodeTerminalOutput(chunk.dataBase64),
+					);
+				} catch {
+					this.#recoverGap(message.terminalId);
+					break;
+				}
 			}
 			return;
 		}
@@ -443,6 +579,7 @@ export class TerminalRegistry {
 		if (message.type === 'terminal-attached') {
 			this.#upsert(message.terminal, 'attached');
 			for (const chunk of message.replay) {
+				if (!this.#attachmentIds.has(message.terminal.terminalId)) break;
 				this.#applyOutput(message.terminal.terminalId, chunk.sequence, chunk.data);
 			}
 			this.#runtimes.get(message.terminal.terminalId)?.resendSize();
@@ -484,6 +621,7 @@ export class TerminalRegistry {
 			if (session) {
 				session.attachmentState =
 					message.code === 'terminal-takeover-required' ? 'taken-over' : 'unavailable';
+				if (message.code !== 'terminal-takeover-required') session.runtimeError = message.message;
 			}
 		}
 	}
@@ -491,6 +629,10 @@ export class TerminalRegistry {
 	#applyOutput(terminalId: string, sequence: number, data: string): void {
 		const session = this.sessions[terminalId];
 		if (!session || sequence <= session.lastReceivedSequence) return;
+		if (sequence !== session.lastReceivedSequence + 1) {
+			this.#recoverGap(terminalId);
+			return;
+		}
 		const runtime = this.#runtimes.get(terminalId);
 		if (!runtime) {
 			session.attachmentState = 'unavailable';
@@ -499,53 +641,41 @@ export class TerminalRegistry {
 			session.runtimeErrorRequiresPageReload = false;
 			return;
 		}
+		try {
+			if (!runtime.write(data)) {
+				this.#rejectOutput(terminalId);
+				this.#drainingOutput.add(terminalId);
+				session.attachmentState = 'connecting';
+				session.runtimeError = null;
+				return;
+			}
+		} catch {
+			this.#rejectOutput(terminalId);
+			return;
+		}
 		session.lastReceivedSequence = sequence;
+		this.#gapRecovery.delete(terminalId);
 		session.metadata.latestOutputSequence = Math.max(
 			session.metadata.latestOutputSequence,
 			sequence,
 		);
 		this.#recordSessionMutation(terminalId);
-		runtime.write(data);
 	}
 
 	#applyOutputFragment(
 		message: Extract<TerminalStreamServerMessage, { type: 'terminal-output-fragment' }>,
 	): void {
 		const session = this.sessions[message.terminalId];
-		if (!session || message.sequence <= session.lastReceivedSequence) {
+		if (!session) {
 			this.#outputFragments.delete(message.terminalId);
 			return;
 		}
-		let pending = this.#outputFragments.get(message.terminalId);
-		if (
-			!pending ||
-			pending.sequence !== message.sequence ||
-			pending.fragmentCount !== message.fragmentCount ||
-			pending.parts.length !== message.fragmentIndex
-		) {
-			if (message.fragmentIndex !== 0) {
-				this.#outputFragments.delete(message.terminalId);
-				session.attachmentState = 'unavailable';
-				return;
-			}
-			pending = {
-				sequence: message.sequence,
-				fragmentCount: message.fragmentCount,
-				parts: [],
-			};
-			this.#outputFragments.set(message.terminalId, pending);
-		}
-		pending.parts.push(message.dataBase64);
-		if (pending.parts.length !== pending.fragmentCount) return;
-		this.#outputFragments.delete(message.terminalId);
+		if (message.sequence <= session.lastReceivedSequence) return;
 		try {
-			this.#applyOutput(
-				message.terminalId,
-				message.sequence,
-				decodeBase64Utf8(pending.parts.join('')),
-			);
+			const data = this.#outputFragments.append(message);
+			if (data !== null) this.#applyOutput(message.terminalId, message.sequence, data);
 		} catch {
-			session.attachmentState = 'unavailable';
+			this.#recoverGap(message.terminalId);
 		}
 	}
 
@@ -555,15 +685,7 @@ export class TerminalRegistry {
 			...this.sessions,
 			[metadata.terminalId]: existing
 				? { ...existing, metadata, attachmentState }
-				: {
-						metadata,
-						attachmentState,
-						runtimeState: 'idle',
-						runtimeError: null,
-						runtimeErrorRequiresPageReload: false,
-						lastReceivedSequence: 0,
-						replayTruncatedAt: null,
-					},
+				: createClientSession(metadata, attachmentState),
 		};
 		this.#recordSessionMutation(metadata.terminalId);
 		this.#syncTransportDemand();
@@ -574,16 +696,30 @@ export class TerminalRegistry {
 		this.#sessionMutationVersions.set(terminalId, this.#sessionMutationVersion);
 	}
 
-	#restoreAttachments(): void {
-		if (this.#authSuspended) return;
+	#restoreAttachments(executorId?: string): void {
+		if (this.#authSuspended || this.#transport.status !== 'connected') return;
 		for (const session of Object.values(this.sessions)) {
-			if (session.attachmentState === 'taken-over') continue;
-			void this.attach(session.metadata.terminalId, 'restore');
+			const id = session.metadata.terminalId;
+			const host = this.executorIdFor(id);
+			if (executorId !== undefined && executorId !== host) continue;
+			if (
+				this.executorInventories[host]?.status !== 'ready' ||
+				session.attachmentState === 'taken-over' ||
+				this.#attachmentRequests.has(id)
+			)
+				continue;
+			if (
+				this.#attachmentIds.has(id) &&
+				(session.attachmentState === 'attached' || session.attachmentState === 'connecting')
+			)
+				continue;
+			void this.attach(id, 'restore');
 		}
 	}
 
 	#markDisconnected(): void {
 		this.#invalidateAttachments();
+		this.#gapRecovery.clear();
 		this.#outputFragments.clear();
 		for (const session of Object.values(this.sessions)) {
 			if (session.attachmentState !== 'taken-over') session.attachmentState = 'detached';
@@ -622,19 +758,38 @@ export class TerminalRegistry {
 	}
 
 	#isDefinitiveCreateError(error: unknown): boolean {
-		return error instanceof ApiError;
+		return error instanceof ApiError && error.errorCode !== 'terminal-outcome-unknown';
 	}
 
-	async #createRuntime(terminalId: string): Promise<TerminalRuntime> {
+	async #createRuntime(terminalId: string): Promise<TerminalSessionRuntime> {
 		const options: TerminalRuntimeOptions = {
 			initialTheme: this.#theme.theme,
+			onOutputDrained: () => {
+				if (!this.#drainingOutput.delete(terminalId) || this.#destroyed) return;
+				void this.attach(terminalId, 'restore');
+			},
 			onInput: (data) => {
 				if (this.sessions[terminalId]?.attachmentState !== 'attached') return;
-				this.#transport.send({ type: 'terminal-input', terminalId, data });
+				if (new TextEncoder().encode(data).byteLength > 64 * 1024) {
+					this.sessions[terminalId].runtimeError = 'Terminal input exceeds 64 KiB.';
+					return;
+				}
+				this.#transport.send({
+					type: 'terminal-input',
+					terminalId,
+					data,
+					attachmentId: this.#attachmentIds.get(terminalId),
+				});
 			},
 			onResize: ({ cols, rows }) => {
 				if (this.sessions[terminalId]?.attachmentState !== 'attached') return;
-				this.#transport.send({ type: 'terminal-resize', terminalId, cols, rows });
+				this.#transport.send({
+					type: 'terminal-resize',
+					terminalId,
+					cols,
+					rows,
+					attachmentId: this.#attachmentIds.get(terminalId),
+				});
 			},
 		};
 		if (this.#deps.createRuntime) return this.#deps.createRuntime(options);
@@ -650,7 +805,7 @@ export class TerminalRegistry {
 		return this.#runtimeModulePromise;
 	}
 
-	#isCurrentRuntimeRequest(terminalId: string, request: Promise<TerminalRuntime>): boolean {
+	#isCurrentRuntimeRequest(terminalId: string, request: Promise<TerminalSessionRuntime>): boolean {
 		return (
 			!this.#destroyed &&
 			Boolean(this.sessions[terminalId]) &&
@@ -673,9 +828,9 @@ export class TerminalRegistry {
 	}
 
 	async #waitForAttachmentPreconditions(terminalId: string, request: symbol): Promise<boolean> {
-		while (this.#isCurrentAttachment(terminalId, request) && this.#listPromise) {
+		while (this.#isCurrentAttachment(terminalId, request) && this.#listPromiseFor(terminalId)) {
 			try {
-				await this.#listPromise;
+				await this.#listPromiseFor(terminalId);
 			} catch {
 				if (this.#isCurrentAttachment(terminalId, request)) {
 					this.sessions[terminalId].attachmentState = 'detached';
@@ -690,7 +845,8 @@ export class TerminalRegistry {
 		if (!this.#isCurrentAttachment(terminalId, request)) return false;
 		if (
 			!this.#authSuspended &&
-			this.listStatus === 'ready' &&
+			this.hosts.some((host) => host.id === this.executorIdFor(terminalId) && host.available) &&
+			this.executorInventories[this.executorIdFor(terminalId)]?.status === 'ready' &&
 			this.#transport.status === 'connected'
 		) {
 			return true;
@@ -706,10 +862,15 @@ export class TerminalRegistry {
 	}
 
 	#invalidateAttachments(): void {
+		this.#onInventoryReady = null;
 		this.#attachmentRequests.clear();
+		this.#attachmentIds.clear();
 	}
 
 	#disposeRuntime(terminalId: string): void {
+		this.#gapRecovery.delete(terminalId);
+		this.#drainingOutput.delete(terminalId);
+		this.#attachmentIds.delete(terminalId);
 		this.#runtimePromises.delete(terminalId);
 		this.#attachmentRequests.delete(terminalId);
 		this.#outputFragments.delete(terminalId);
@@ -717,5 +878,117 @@ export class TerminalRegistry {
 		this.#runtimeThemeCleanups.delete(terminalId);
 		this.#runtimes.get(terminalId)?.dispose();
 		this.#runtimes.delete(terminalId);
+	}
+
+	#listPromiseFor(terminalId: string): Promise<void> | undefined {
+		return this.#lists.get(this.executorIdFor(terminalId));
+	}
+
+	#recoverGap(terminalId: string): void {
+		this.#rejectOutput(terminalId);
+		if (this.#gapRecovery.has(terminalId)) return;
+		this.#gapRecovery.add(terminalId);
+		queueMicrotask(() => {
+			if (!this.#destroyed && this.#gapRecovery.has(terminalId))
+				void this.attach(terminalId, 'restore');
+		});
+	}
+
+	#rejectOutput(terminalId: string): void {
+		const session = this.sessions[terminalId];
+		if (!session) return;
+		this.#transport.send({
+			type: 'terminal-detach',
+			terminalId,
+			attachmentId: this.#attachmentIds.get(terminalId),
+		});
+		this.#attachmentIds.delete(terminalId);
+		this.#outputFragments.delete(terminalId);
+		session.attachmentState = 'unavailable';
+		session.runtimeError = 'Terminal output interrupted. Reattach to resume.';
+	}
+
+	#nodesChanged(): void {
+		const hosts = this.hosts;
+		const known = new Set((this.#deps.executors?.executors ?? hosts).map((executor) => executor.id));
+		for (const executorId of known) {
+			if (hosts.some((host) => host.id === executorId)) continue;
+			if (this.#executorAvailability.get(executorId) !== 'offline') this.#loseExecutor(executorId);
+			this.#executorAvailability.set(executorId, 'offline');
+		}
+		for (const executorId of this.#executorAvailability.keys()) {
+			if (known.has(executorId)) continue;
+			this.#loseExecutor(executorId);
+			this.#executorAvailability.delete(executorId);
+			this.#executorVersions.delete(executorId);
+			delete this.executorInventories[executorId];
+			for (const id of Object.keys(this.sessions))
+				if (this.executorIdFor(id) === executorId) this.disposeTerminatedSession(id);
+			for (const attempt of Object.values(this.pendingCreates))
+				if (attempt.executorId === executorId) this.#clearCreateAttempt(attempt.requestId);
+			for (const id of this.#sessionMutationVersions.keys())
+				if (this.executorIdFor(id) === executorId) this.#sessionMutationVersions.delete(id);
+			this.#deps.onSuccessfulList?.(Object.keys(this.sessions), executorId);
+		}
+		for (const host of hosts) {
+			const availability = host.available ? 'ready' : 'offline';
+			const previous = this.#executorAvailability.get(host.id);
+			this.#executorAvailability.set(host.id, availability);
+			if (previous === availability) continue;
+			if (!host.available) this.#loseExecutor(host.id);
+			else if (this.#initialized && !this.#authSuspended) {
+				void this.#refreshExecutor(host.id);
+			}
+		}
+	}
+
+	async #refreshExecutor(executorId: string): Promise<void> {
+		try {
+			await this.list(executorId);
+		} catch {
+			return;
+		}
+		this.#restoreAttachments(executorId);
+	}
+
+	#scheduleInventoryRetry(): void {
+		if (this.#inventoryRetry || !this.#initialized || this.#authSuspended || this.#destroyed)
+			return;
+		if (
+			!this.hosts.some(
+				(host) => host.available && this.executorInventories[host.id]?.status === 'failed',
+			)
+		)
+			return;
+		this.#inventoryRetry = setTimeout(() => {
+			this.#inventoryRetry = null;
+			for (const host of this.hosts)
+				if (host.available && this.executorInventories[host.id]?.status === 'failed')
+					void this.#refreshExecutor(host.id);
+		}, 5_000);
+	}
+
+	#clearInventoryRetry(): void {
+		if (this.#inventoryRetry) clearTimeout(this.#inventoryRetry);
+		this.#inventoryRetry = null;
+	}
+
+	#loseExecutor(executorId: string): void {
+		this.#executorVersions.set(executorId, Symbol('executor-inventory'));
+		this.#lists.delete(executorId);
+		this.executorInventories[executorId] = {
+			...this.executorInventories[executorId],
+			status: 'failed',
+			error: m.terminal_unavailable(),
+		};
+		for (const session of this.orderedSessions) {
+			const id = session.metadata.terminalId;
+			if (this.executorIdFor(id) !== executorId) continue;
+			this.#attachmentRequests.delete(id);
+			this.#attachmentIds.delete(id);
+			this.#gapRecovery.delete(id);
+			this.#outputFragments.delete(id);
+			if (session.attachmentState !== 'taken-over') session.attachmentState = 'unavailable';
+		}
 	}
 }

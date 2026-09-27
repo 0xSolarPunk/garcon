@@ -8,6 +8,7 @@
 	import ChatEventCard from './rows/ChatEventCard.svelte';
 	import { agentLabelFor } from '$lib/agents/agent-labels';
 	import * as m from '$lib/paraglide/messages.js';
+	import { getExecutors } from '$lib/context';
 
 	interface Props {
 		message: AgentSwitchMessage;
@@ -15,15 +16,26 @@
 
 	let { message }: Props = $props();
 
-	const fromLabel = $derived(agentLabelFor(message.fromAgentId));
-	const toLabel = $derived(agentLabelFor(message.toAgentId));
+	const executors = getExecutors();
+	const crossExecutor = $derived((message.fromExecutorId ?? 'local') !== (message.toExecutorId ?? 'local'));
+	const fromLabel = $derived(
+		`${crossExecutor ? executors.label(message.fromExecutorId) + ' / ' : ''}${agentLabelFor(message.fromAgentId)}`,
+	);
+	const toLabel = $derived(
+		`${crossExecutor ? executors.label(message.toExecutorId) + ' / ' : ''}${agentLabelFor(message.toAgentId)}`,
+	);
 </script>
 
 <ChatEventCard variant="info" compact>
 	{#snippet body()}
 		<div class="flex flex-wrap items-center gap-2">
 			<ArrowRightLeft class="h-4 w-4 flex-shrink-0" />
-			<span class="text-xs font-medium">
+			<span
+				class="text-xs font-medium"
+				title={crossExecutor
+					? `${message.fromExecutorId ?? 'local'} / ${message.toExecutorId ?? 'local'}`
+					: undefined}
+			>
 				{m.chat_message_agent_switch({ from: fromLabel, to: toLabel })}
 			</span>
 			{#if message.toModel}

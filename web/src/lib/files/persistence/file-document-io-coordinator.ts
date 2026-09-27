@@ -60,7 +60,7 @@ export class FileDocumentIoCoordinator {
 
 	constructor(private readonly options: FileDocumentIoOptions) {
 		this.#polling = new DocumentPollingCoordinator({
-			poll: (documentId) => this.#checkDocumentFreshness(documentId),
+			poll: (documentId) => this.checkDocumentFreshness(documentId),
 			isVisible: (documentId) => options.isDocumentVisible(documentId),
 		});
 	}
@@ -259,6 +259,7 @@ export class FileDocumentIoCoordinator {
 
 	async checkFreshness(sessionId: string): Promise<void> {
 		const session = this.options.getSession(sessionId);
+		if (session && !session.document.executorAvailable) return;
 		const loadedRevision = session?.loadedRevision;
 		if (
 			!session ||
@@ -277,6 +278,7 @@ export class FileDocumentIoCoordinator {
 		try {
 			const result = await (this.options.getFileRevision ?? getFileRevision)(
 				{
+					executorId: session.executorId,
 					projectPath: session.canonicalFileRootPath,
 					filePath: session.relativePath,
 				},
@@ -334,6 +336,7 @@ export class FileDocumentIoCoordinator {
 		try {
 			const result = await (this.options.readText ?? readText)(
 				{
+					executorId: session.executorId,
 					projectPath: session.canonicalFileRootPath,
 					filePath: session.relativePath,
 				},
@@ -388,7 +391,7 @@ export class FileDocumentIoCoordinator {
 		session.isCheckingFreshness = false;
 	}
 
-	async #checkDocumentFreshness(documentId: string): Promise<void> {
+	async checkDocumentFreshness(documentId: string): Promise<void> {
 		const document = this.options.getDocument(documentId);
 		if (!document) return;
 		const view = [...document.viewIds]
@@ -400,6 +403,7 @@ export class FileDocumentIoCoordinator {
 
 	async #readLatest(session: FileViewSession, signal: AbortSignal): Promise<LoadedFileContent> {
 		const params = {
+			executorId: session.executorId,
 			projectPath: session.canonicalFileRootPath,
 			filePath: session.relativePath,
 		};
@@ -436,6 +440,7 @@ export class FileDocumentIoCoordinator {
 	#canRefresh(session: FileViewSession): boolean {
 		return (
 			this.options.getSession(session.id) === session &&
+			session.document.executorAvailable &&
 			!session.loading &&
 			!session.refreshing &&
 			!session.mutationGuarded

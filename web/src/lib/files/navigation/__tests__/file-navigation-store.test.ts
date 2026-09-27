@@ -4,6 +4,7 @@ import {
 	type FileLocation,
 } from '$lib/files/navigation/file-navigation-store.svelte.js';
 import { createMemoryFileDraftRepository } from '$lib/files/persistence/file-draft-repository.js';
+import { fileIdentityKey } from '$lib/files/documents/file-identity.js';
 
 const scope = { deploymentId: 'deployment', userNamespace: 'user' };
 
@@ -101,7 +102,55 @@ describe('FileNavigationStore', () => {
 		const restored = new FileNavigationStore(repository, scope);
 		await restored.restore();
 
-		expect(restored.recents.map((entry) => entry.key)).toEqual(['1', '0']);
-		expect(restored.back()?.key).toBe('0');
+		expect(restored.recents.map((entry) => entry.key)).toEqual([
+			JSON.stringify(['local', '/workspace', 'src/1.ts']),
+			JSON.stringify(['local', '/workspace', 'src/0.ts']),
+		]);
+		expect(restored.back()?.key).toBe(JSON.stringify(['local', '/workspace', 'src/0.ts']));
 	});
+
+	it.each([false, true])(
+		'deduplicates Local recents by identity, newest legacy: %s',
+		async (newestLegacy) => {
+			const repository = createMemoryFileDraftRepository();
+			const local = location(0);
+			const remoteExecutorId = '22222222-2222-4222-8222-222222222222';
+			const legacy = { ...local, key: JSON.stringify(['/workspace', 'src/0.ts']) };
+			const current = { ...local, executorId: 'local', key: fileIdentityKey('/workspace', 'src/0.ts') };
+			for (const [index, entry] of (newestLegacy
+				? [current, legacy]
+				: [legacy, current]
+			).entries()) {
+				await repository.putRecent({
+					...scope,
+					...entry,
+					schemaVersion: 1,
+					timestamp: index + 1,
+					line: index === 1 ? 7 : 1,
+					viewPreference: index === 1 ? 'preview' : 'source',
+				});
+			}
+			await repository.putRecent({
+				...scope,
+				...local,
+				schemaVersion: 1,
+				executorId: remoteExecutorId,
+				key: fileIdentityKey('/workspace', 'src/0.ts', remoteExecutorId),
+				timestamp: 3,
+			});
+
+			const restored = new FileNavigationStore(repository, scope);
+			await restored.restore();
+
+			expect(restored.recents).toHaveLength(2);
+			expect(restored.recents[0]).toMatchObject({ executorId: remoteExecutorId, timestamp: 3 });
+			expect(restored.recents[1]).toMatchObject({
+				key: current.key,
+				executorId: 'local',
+				line: 7,
+				viewPreference: 'preview',
+				timestamp: 2,
+			});
+		},
+	);
 });

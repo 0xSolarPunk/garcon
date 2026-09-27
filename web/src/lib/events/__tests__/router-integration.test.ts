@@ -174,7 +174,6 @@ function createStores(overrides: Partial<EventRouterStores> = {}): EventRouterSt
 		},
 		startup: {
 			startupCoordinator: new StartupCoordinator(),
-			onExternalChatCreated: vi.fn(),
 		},
 		readState: {
 			enqueueReadReceipt: vi.fn(),
@@ -210,14 +209,25 @@ describe('event router integration', () => {
 		vi.mocked(getChatSnapshot).mockReset();
 	});
 
-	it('routes a global event from raw payload through normalize + filter + handler', () => {
+	it.each(['archive-toggled', 'execution-settings-updated'])(
+		'routes %s globally through normalize + filter + handler', (reason) => {
 		const stores = createStores();
 		renderRouterWithRawMessages(
-			[{ type: 'chat-list-refresh-requested', reason: 'archive-toggled', chatId: 'chat-b' }],
+			[{ type: 'chat-list-refresh-requested', reason, chatId: 'chat-b' }],
 			stores,
 		);
 
 		expect(stores.sessions.quietRefreshChats).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(['local', 'external'])('refreshes known chat capabilities after a %s native session is created', (source) => {
+		const stores = createStores();
+		const chatId = source === 'local' ? 'chat-a' : 'chat-b';
+		if (source === 'local') stores.startup.startupCoordinator.beginLocalStartup(chatId);
+		renderRouterWithRawMessages([{ type: 'chat-session-created', chatId }], stores);
+
+		expect(stores.sessions.quietRefreshChats).toHaveBeenCalledTimes(1);
+		expect(stores.startup.startupCoordinator.currentPending).toBeNull();
 	});
 
 	it('clears workspace Chat presentations when a chat is deleted remotely', () => {

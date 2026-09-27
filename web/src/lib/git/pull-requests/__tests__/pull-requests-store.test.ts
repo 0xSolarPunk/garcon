@@ -2,6 +2,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PullRequestsStore } from '../pull-requests-store.svelte';
 import * as prApi from '$lib/api/pull-requests';
 import type { PullRequestDetail, PullRequestSummary } from '$lib/api/pull-requests';
+import { flushSync } from 'svelte';
+import { bindProject } from './pull-requests-effect-harness.svelte.js';
+import { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures.js';
+import { GhCapabilityStore } from '../gh-capability.svelte.js';
+import { ProjectResolutionStore } from '$lib/workspace/project-resolution-store.svelte.js';
+import { getGhStatus } from '$lib/api/gh.js';
+
+vi.mock('$lib/api/gh.js', () => ({ getGhStatus: vi.fn() }));
 
 vi.mock('$lib/api/pull-requests', () => ({
 	getPullRequests: vi.fn(),
@@ -43,6 +52,7 @@ function summary(number: number, over: Partial<PullRequestSummary> = {}): PullRe
 
 function detail(number: number): PullRequestDetail {
 	return {
+		documentId: `pr:${number}`,
 		...summary(number),
 		body: '',
 		createdAt: '2024-01-01T00:00:00Z',
@@ -56,7 +66,7 @@ function detail(number: number): PullRequestDetail {
 
 function createVisibleStore(): PullRequestsStore {
 	const store = new PullRequestsStore();
-	store.setCapability(true, true);
+	store.setCapability('local', true, true);
 	store.setPresentationVisible(true);
 	return store;
 }
@@ -66,23 +76,266 @@ describe('PullRequestsStore', () => {
 		vi.resetAllMocks();
 	});
 
+	it('checks the independently selected executor only while visible and ignores subsequent chat changes', async () => {
+		const executors = new ExecutorsStore();
+		const remote = {
+			...remoteExecutor,
+			machineServices: { files: true, git: true, gh: true, terminals: true },
+		};
+		executors.applySnapshot([
+			{
+				...localExecutor,
+				machineServices: { ...localExecutor.machineServices, gh: false },
+			},
+			remote,
+		]);
+		const capabilities = new GhCapabilityStore(executors);
+		const resolution = new ProjectResolutionStore(
+			async (target) => ({
+				target,
+				resolution: { kind: 'available', effectiveProjectKey: target.projectPath },
+			}),
+			undefined,
+			executors,
+		);
+		vi.mocked(getGhStatus).mockResolvedValue({
+			available: true,
+			authenticated: true,
+			reason: 'authenticated',
+		});
+		getPullRequestsMock.mockResolvedValue({ pulls: [summary(1)], repo: null });
+		const store = new PullRequestsStore({
+			ghCapability: capabilities,
+			projectSelection: {
+				executors,
+				projectResolution: resolution,
+				projectBasePath: (executorId) => executors.get(executorId)?.projectBasePath ?? null,
+			},
+		});
+		try {
+			store.projectSelection.selectResolvedProject({
+				executorId: remote.id,
+				projectPath: '/worker',
+			});
+			flushSync();
+			expect(getGhStatus).not.toHaveBeenCalled();
+			expect(getPullRequestsMock).not.toHaveBeenCalled();
+			store.setPresentationVisible(true);
+			flushSync();
+			await vi.waitFor(() => expect(getPullRequestsMock).toHaveBeenCalledOnce());
+			expect(getGhStatus).toHaveBeenCalledExactlyOnceWith(remote.id, expect.anything());
+			expect(getPullRequestsMock).toHaveBeenCalledWith(
+				{ executorId: remote.id, projectPath: '/worker' },
+				expect.anything(),
+			);
+			store.setProjectState({
+				kind: 'available',
+				project: {
+					target: {
+						kind: 'chat' as const,
+						chatId: 'local-chat',
+						projectPath: '/local',
+						executorId: 'local',
+					},
+					chatId: 'local-chat',
+					executorId: 'local',
+					projectPath: '/local',
+					effectiveProjectKey: '/local',
+				},
+			});
+			flushSync();
+			expect(store.executorId).toBe(remote.id);
+			expect(store.capabilityState).toBe('available');
+			store.projectSelection.goToChatProject();
+			flushSync();
+			expect(store.executorId).toBe('local');
+			expect(store.capabilityState).toBe('unavailable');
+			expect(getPullRequestsMock).toHaveBeenCalledOnce();
+		} finally {
+			store.dispose();
+			capabilities.destroy();
+			resolution.destroy();
+		}
+	});
+
+	it('stabilizes reactive project binding and preserves selection for an unchanged executor and path', async () => {
+		getPullRequestsMock.mockResolvedValue({ pulls: [summary(3)], repo: null });
+		getPullRequestMock.mockResolvedValue(detail(3));
+		const store = createVisibleStore();
+		const project = {
+			target: {
+				kind: 'chat' as const,
+				chatId: 'one',
+				projectPath: '/project',
+				executorId: 'local',
+			},
+			executorId: 'local',
+			chatId: 'one',
+			projectPath: '/project',
+			effectiveProjectKey: '/project',
+		};
+		const binding = bindProject(store, { kind: 'available', project });
+		try {
+			flushSync();
+			await tick();
+			await store.select(3);
+			binding.setProject({ kind: 'available', project: { ...project, chatId: 'two' } });
+			flushSync();
+			const settledRuns = binding.runs;
+			flushSync();
+			expect(binding.runs).toBe(settledRuns);
+			expect(store.selectedNumber).toBe(3);
+			expect(getPullRequestsMock).toHaveBeenCalledOnce();
+		} finally {
+			binding.dispose();
+			store.dispose();
+		}
+	});
+
+	it('refreshes selected detail when replacement project resolution finishes before GitHub capability', async () => {
+		const executors = new ExecutorsStore();
+		const remote = {
+			...remoteExecutor,
+			machineServices: { files: true, git: true, gh: true, terminals: true },
+		};
+		executors.applySnapshot([localExecutor, remote]);
+		const capabilities = new GhCapabilityStore(executors);
+		const resolution = new ProjectResolutionStore(
+			async (target) => ({
+				target,
+				resolution: { kind: 'available', effectiveProjectKey: target.projectPath },
+			}),
+			undefined,
+			executors,
+		);
+		const available = { available: true, authenticated: true, reason: 'authenticated' } as const;
+		const capability = deferred<Awaited<ReturnType<typeof getGhStatus>>>();
+		vi.mocked(getGhStatus).mockResolvedValue(available);
+		getPullRequestsMock.mockResolvedValue({ pulls: [summary(3)], repo: null });
+		getPullRequestMock
+			.mockResolvedValueOnce({ ...detail(3), body: 'Original instance' })
+			.mockResolvedValueOnce({ ...detail(3), body: 'Replacement instance' });
+		const store = new PullRequestsStore({
+			ghCapability: capabilities,
+			projectSelection: {
+				executors,
+				projectResolution: resolution,
+				projectBasePath: (executorId) => executors.get(executorId)?.projectBasePath ?? null,
+			},
+		});
+		try {
+			store.projectSelection.selectResolvedProject({
+				executorId: remote.id,
+				projectPath: '/worker',
+			});
+			flushSync();
+			store.setPresentationVisible(true);
+			flushSync();
+			await vi.waitFor(() => expect(getPullRequestsMock).toHaveBeenCalledOnce());
+			await store.select(3);
+			expect(store.detail?.body).toBe('Original instance');
+
+			vi.mocked(getGhStatus).mockReturnValueOnce(capability.promise);
+			const previousChecks = vi.mocked(getGhStatus).mock.calls.length;
+			executors.applySnapshot([localExecutor, { ...remote, instanceId: 'replacement-instance' }]);
+			flushSync();
+			await vi.waitFor(() => {
+				expect(getGhStatus).toHaveBeenCalledTimes(previousChecks + 1);
+				expect(store.projectIdentityPending).toBe(false);
+			});
+			expect(store.capabilityState).toBe('pending');
+			expect(store.selectedNumber).toBe(3);
+			expect(getPullRequestMock).toHaveBeenCalledOnce();
+
+			capability.resolve(available);
+			await vi.waitFor(() => expect(store.detail?.body).toBe('Replacement instance'));
+			expect(getPullRequestsMock).toHaveBeenCalledTimes(2);
+			expect(getPullRequestMock).toHaveBeenCalledTimes(2);
+			expect(getPullRequestMock).toHaveBeenLastCalledWith(
+				{ executorId: remote.id, projectPath: '/worker' },
+				3,
+				expect.anything(),
+			);
+		} finally {
+			capability.resolve(available);
+			store.dispose();
+			capabilities.destroy();
+			resolution.destroy();
+		}
+	});
+
 	it('loads the list when a project is set', async () => {
 		getPullRequestsMock.mockResolvedValue({
 			pulls: [summary(1), summary(2)],
 			repo: { nameWithOwner: 'o/r' },
 		});
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		await tick();
 		expect(store.pulls).toHaveLength(2);
 		expect(store.repoName).toBe('o/r');
 		expect(store.hasLoaded).toBe(true);
 	});
 
+	it.each([false, true])(
+		'requires explicit retry after detail failure (cached: %s)',
+		async (cached) => {
+			getPullRequestsMock.mockResolvedValue({ pulls: [summary(3)], repo: null });
+			const blocked = deferred<PullRequestDetail>();
+			if (cached) getPullRequestMock.mockResolvedValueOnce(detail(3));
+			getPullRequestMock.mockRejectedValueOnce(new Error('Detail unavailable'));
+			getPullRequestMock.mockReturnValue(blocked.promise);
+			const notifyError = vi.fn();
+			const store = new PullRequestsStore({ notifyError });
+			store.setCapability('remote', true, true);
+			store.setPresentationVisible(true);
+			const project = {
+				target: {
+					kind: 'chat' as const,
+					chatId: 'one',
+					projectPath: '/project',
+					executorId: 'remote',
+				},
+				executorId: 'remote',
+				chatId: 'one',
+				projectPath: '/project',
+				effectiveProjectKey: '/project',
+				executorContextKey: 'first',
+			};
+			const binding = bindProject(store, { kind: 'available', project });
+			try {
+				flushSync();
+				await tick();
+				await store.select(3);
+				if (cached)
+					binding.setProject({
+						kind: 'available',
+						project: { ...project, executorContextKey: 'replacement' },
+					});
+				flushSync();
+				await tick();
+				flushSync();
+				await tick();
+				expect(getPullRequestMock).toHaveBeenCalledTimes(cached ? 2 : 1);
+				expect(store.isDetailLoading).toBe(false);
+				expect(store.detailError).toBe('Detail unavailable');
+				expect(store.detail?.number ?? null).toBe(cached ? 3 : null);
+				expect(notifyError).toHaveBeenCalledExactlyOnceWith('Detail unavailable');
+				getPullRequestMock.mockResolvedValue(detail(3));
+				await store.loadDetail(3);
+				expect(store.detailError).toBeNull();
+				expect(store.detail?.number).toBe(3);
+			} finally {
+				binding.dispose();
+				store.dispose();
+			}
+		},
+	);
+
 	it('records a load error on failure', async () => {
 		getPullRequestsMock.mockRejectedValue(new Error('boom'));
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		await tick();
 		expect(store.loadError).toBe('boom');
 	});
@@ -91,7 +344,7 @@ describe('PullRequestsStore', () => {
 		getPullRequestsMock.mockResolvedValue({ pulls: [summary(7)], repo: null });
 		getPullRequestMock.mockResolvedValue(detail(7));
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		await tick();
 		await store.select(7);
 		expect(store.selectedNumber).toBe(7);
@@ -109,8 +362,8 @@ describe('PullRequestsStore', () => {
 			)
 			.mockResolvedValueOnce({ pulls: [summary(99)], repo: null });
 		const store = createVisibleStore();
-		store.setProject('/proj-a');
-		store.setProject('/proj-b');
+		store.setProject({ executorId: 'local', projectPath: '/proj-a' });
+		store.setProject({ executorId: 'local', projectPath: '/proj-b' });
 		await tick();
 		resolveFirst?.();
 		await tick();
@@ -126,7 +379,7 @@ describe('PullRequestsStore', () => {
 				}),
 		);
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		store.setProject(null);
 		resolveFirst?.();
 		await tick();
@@ -139,11 +392,11 @@ describe('PullRequestsStore', () => {
 		getPullRequestsMock.mockResolvedValue({ pulls: [summary(1)], repo: null });
 		getPullRequestMock.mockResolvedValue(detail(1));
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		await tick();
 		await store.select(1);
 		expect(store.hasSelection).toBe(true);
-		store.setProject('/other');
+		store.setProject({ executorId: 'local', projectPath: '/other' });
 		expect(store.hasSelection).toBe(false);
 		expect(store.detail).toBe(null);
 	});
@@ -155,13 +408,13 @@ describe('PullRequestsStore', () => {
 			.mockResolvedValueOnce({ pulls: [summary(1)], repo: { nameWithOwner: 'o/a' } });
 		getPullRequestMock.mockResolvedValue(detail(1));
 		const store = createVisibleStore();
-		store.setProject('/project-a', '/canonical/a');
+		store.setProject({ executorId: 'local', projectPath: '/project-a' }, '/canonical/a');
 		await tick();
 		await store.select(1);
-		store.setProject('/project-b', '/canonical/b');
+		store.setProject({ executorId: 'local', projectPath: '/project-b' }, '/canonical/b');
 		await tick();
 
-		store.setProject('/project-a-alias', '/canonical/a');
+		store.setProject({ executorId: 'local', projectPath: '/project-a-alias' }, '/canonical/a');
 		expect(store.pulls.map((pull) => pull.number)).toEqual([1]);
 		expect(store.selectedNumber).toBe(1);
 		expect(store.detail?.number).toBe(1);
@@ -173,11 +426,14 @@ describe('PullRequestsStore', () => {
 		getPullRequestsMock.mockResolvedValue({ pulls: [summary(3)], repo: null });
 		getPullRequestMock.mockResolvedValue(detail(3));
 		const store = createVisibleStore();
-		store.setProject('/project-link', '/canonical/project');
+		store.setProject({ executorId: 'local', projectPath: '/project-link' }, '/canonical/project');
 		await tick();
 		await store.select(3);
 
-		store.setProject('/canonical/project', '/canonical/project');
+		store.setProject(
+			{ executorId: 'local', projectPath: '/canonical/project' },
+			'/canonical/project',
+		);
 		expect(store.selectedNumber).toBe(3);
 		expect(store.detail?.number).toBe(3);
 		expect(getPullRequestsMock).toHaveBeenCalledOnce();
@@ -187,13 +443,17 @@ describe('PullRequestsStore', () => {
 		getPullRequestsMock.mockResolvedValue({ pulls: [summary(3)], repo: null });
 		getPullRequestMock.mockResolvedValue(detail(3));
 		const store = createVisibleStore();
-		store.setProject('/project', '/canonical/project');
+		store.setProject({ executorId: 'local', projectPath: '/project' }, '/canonical/project');
 		await tick();
 		await store.select(3);
 
 		store.setProjectState({
 			kind: 'resolving',
-			context: { chatId: 'draft', projectPath: '/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'draft', projectPath: '/project' },
+				chatId: 'draft',
+				projectPath: '/project',
+			},
 		});
 		await store.refresh();
 		await store.select(4);
@@ -207,6 +467,7 @@ describe('PullRequestsStore', () => {
 		store.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat2', projectPath: '/project' },
 				chatId: 'chat2',
 				projectPath: '/project',
 				effectiveProjectKey: '/canonical/project',
@@ -226,17 +487,22 @@ describe('PullRequestsStore', () => {
 			return list.promise;
 		});
 		const store = createVisibleStore();
-		store.setProject('/project', '/canonical/project');
+		store.setProject({ executorId: 'local', projectPath: '/project' }, '/canonical/project');
 		await vi.waitFor(() => expect(getPullRequestsMock).toHaveBeenCalledOnce());
 
 		store.setProjectState({
 			kind: 'resolving',
-			context: { chatId: 'chat-2', projectPath: '/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'chat-2', projectPath: '/project' },
+				chatId: 'chat-2',
+				projectPath: '/project',
+			},
 		});
 		expect(signal?.aborted).toBe(false);
 		store.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat-2', projectPath: '/project' },
 				chatId: 'chat-2',
 				projectPath: '/project',
 				effectiveProjectKey: '/canonical/project',
@@ -260,14 +526,18 @@ describe('PullRequestsStore', () => {
 			})
 			.mockResolvedValueOnce({ pulls: [summary(2)], repo: null });
 		const store = createVisibleStore();
-		store.setProject('/project', '/canonical/project');
+		store.setProject({ executorId: 'local', projectPath: '/project' }, '/canonical/project');
 		await tick();
 		const staleRefresh = store.refresh();
 		await vi.waitFor(() => expect(getPullRequestsMock).toHaveBeenCalledTimes(2));
 
 		store.setProjectState({
 			kind: 'unavailable',
-			context: { chatId: 'chat-1', projectPath: '/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'chat-1', projectPath: '/project' },
+				chatId: 'chat-1',
+				projectPath: '/project',
+			},
 			reason: 'not-found',
 		});
 		expect(refreshSignal?.aborted).toBe(true);
@@ -275,6 +545,7 @@ describe('PullRequestsStore', () => {
 		store.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat-1', projectPath: '/project' },
 				chatId: 'chat-1',
 				projectPath: '/project',
 				effectiveProjectKey: '/canonical/project',
@@ -295,7 +566,7 @@ describe('PullRequestsStore', () => {
 			.mockImplementationOnce(() => new Promise(() => undefined))
 			.mockResolvedValueOnce(detail(4));
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		await tick();
 
 		void store.select(4);
@@ -320,7 +591,7 @@ describe('PullRequestsStore', () => {
 			})
 			.mockResolvedValueOnce({ pulls: [summary(6)], repo: null });
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		await vi.waitFor(() => expect(getPullRequestsMock).toHaveBeenCalledOnce());
 
 		store.setPresentationVisible(false);
@@ -339,15 +610,15 @@ describe('PullRequestsStore', () => {
 			})
 			.mockResolvedValueOnce({ pulls: [summary(8)], repo: null });
 		const store = createVisibleStore();
-		store.setProject('/proj');
+		store.setProject({ executorId: 'local', projectPath: '/proj' });
 		await tick();
 
-		store.setCapability(true, false);
+		store.setCapability('local', true, false);
 		expect(firstSignal?.aborted).toBe(true);
 		expect(store.capabilityState).toBe('unavailable');
 		expect(store.isLoading).toBe(false);
 
-		store.setCapability(true, true);
+		store.setCapability('local', true, true);
 		await tick();
 		expect(store.capabilityState).toBe('available');
 		expect(store.pulls.map((pull) => pull.number)).toEqual([8]);

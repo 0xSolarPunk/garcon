@@ -1,3 +1,6 @@
+import type { GitProjectTarget } from '$lib/api/git-client.js';
+import { gitProjectKey } from '$lib/git/targets/git-target.js';
+import { effectiveExecutorId } from '$shared/executors';
 // Owns the GitHub pull request viewer's PR list for the
 // active project plus the currently selected PR's detail (diff + threads).
 // Selecting a PR loads its detail lazily; generation guards drop stale
@@ -13,13 +16,22 @@ import * as m from '$lib/paraglide/messages.js';
 import type { WorkspaceProjectState } from '$lib/workspace/workspace-context.svelte.js';
 import type { PortableSingletonController } from '$lib/workspace/portable-singleton-controller.js';
 import { errorMessage } from '$lib/utils/error-message.js';
+import { untrack } from 'svelte';
+import {
+	GitProjectSelectionController,
+	type GitProjectSelectionDeps,
+	type GitProjectState,
+} from '$lib/git/targets/git-project-selection.svelte.js';
+import type { GhCapabilityContext } from './gh-capability.svelte.js';
 
 export interface PullRequestsStoreDeps {
 	notifyError?: (message: string) => void;
+	projectSelection?: GitProjectSelectionDeps;
+	ghCapability?: GhCapabilityContext;
 }
 
 interface PullRequestProjectSnapshot {
-	projectPath: string;
+	project: GitProjectTarget;
 	pulls: PullRequestSummary[];
 	repoName: string | null;
 	hasLoaded: boolean;
@@ -29,7 +41,11 @@ interface PullRequestProjectSnapshot {
 }
 
 export class PullRequestsStore implements PortableSingletonController {
-	#projectPath = $state<string | null>(null);
+	readonly projectSelection: GitProjectSelectionController;
+	readonly #destroyCapabilityBinding?: () => void;
+	#project = $state<GitProjectTarget | null>(null);
+	#executorContextKey: string | null = null;
+	#capability: { executorId: string; hasChecked: boolean; available: boolean } | null = null;
 	#effectiveProjectKey = $state<string | null>(null);
 	#visible = $state(false);
 	#projectIdentityPending = $state(false);
@@ -39,6 +55,7 @@ export class PullRequestsStore implements PortableSingletonController {
 	#detailController: AbortController | null = null;
 	#snapshots = new Map<string, PullRequestProjectSnapshot>();
 	#needsRefresh = false;
+	#detailNeedsRefresh = false;
 	#deps: PullRequestsStoreDeps;
 	capabilityState = $state<'pending' | 'available' | 'unavailable'>('pending');
 
@@ -56,10 +73,38 @@ export class PullRequestsStore implements PortableSingletonController {
 
 	constructor(deps: PullRequestsStoreDeps = {}) {
 		this.#deps = deps;
+		this.projectSelection = new GitProjectSelectionController(
+			(project) => this.#setProjectState(project),
+			deps.projectSelection,
+		);
+		if (deps.ghCapability) {
+			const capabilities = deps.ghCapability;
+			this.#destroyCapabilityBinding = $effect.root(() => {
+				$effect(() => {
+					const executorId = this.projectSelection.executorId;
+					const capability = capabilities.forExecutor(executorId);
+					const visible = this.#visible;
+					const checked = capability.hasChecked;
+					const available = capability.available;
+					untrack(() => {
+						this.setCapability(executorId, checked, available);
+						if (visible && !checked) void capability.ensureChecked();
+					});
+				});
+			});
+		}
+	}
+
+	retryCapability(): void {
+		void this.#deps.ghCapability?.forExecutor(this.projectSelection.executorId).refresh();
 	}
 
 	get projectPath(): string | null {
-		return this.#projectPath;
+		return this.#project?.projectPath ?? null;
+	}
+
+	get executorId(): string {
+		return this.#project?.executorId ?? 'local';
 	}
 
 	get effectiveProjectKey(): string | null {
@@ -78,31 +123,38 @@ export class PullRequestsStore implements PortableSingletonController {
 		return this.pulls.find((pr) => pr.number === this.selectedNumber) ?? null;
 	}
 
-	setCapability(hasChecked: boolean, available: boolean): void {
-		const next = !hasChecked ? 'pending' : available ? 'available' : 'unavailable';
+	setCapability(executorId: string, hasChecked: boolean, available: boolean): void {
+		this.#capability = { executorId, hasChecked, available };
+		const next =
+			executorId !== this.executorId || !hasChecked ? 'pending' : available ? 'available' : 'unavailable';
 		if (next === this.capabilityState) return;
 		this.capabilityState = next;
 		if (next !== 'available') {
 			this.#suspendRequests();
 			return;
 		}
-		if (
-			!this.#projectIdentityPending &&
-			this.#visible &&
-			this.#projectPath &&
-			(!this.hasLoaded || this.#needsRefresh)
-		) {
-			void this.refresh();
-		}
+		this.#activateIfNeeded();
 	}
 
 	setProjectState(projectState: WorkspaceProjectState): void {
+		this.projectSelection.setProjectState(projectState);
+	}
+
+	#setProjectState(projectState: GitProjectState): void {
 		if (projectState.kind === 'unchecked' || projectState.kind === 'resolving') {
 			this.#projectIdentityPending = true;
+			if (
+				!this.projectSelection.followingChat ||
+				projectState.context.executorId !== this.executorId ||
+				projectState.context.projectPath !== this.projectPath
+			)
+				this.#suspendRequests();
 			return;
 		}
 		if (projectState.kind === 'unavailable' || projectState.kind === 'request-failed') {
 			this.#projectIdentityPending = true;
+			this.#executorContextKey = null;
+			this.#detailNeedsRefresh = true;
 			this.#suspendRequests();
 			return;
 		}
@@ -112,20 +164,37 @@ export class PullRequestsStore implements PortableSingletonController {
 			return;
 		}
 		const { project } = projectState;
-		this.setProject(project.projectPath, project.effectiveProjectKey);
+		const executorContextKey = project.executorContextKey ?? null;
+		if (executorContextKey !== this.#executorContextKey) {
+			this.#suspendRequests();
+			this.#detailNeedsRefresh = true;
+			this.#executorContextKey = executorContextKey;
+		}
+		this.setProject(
+			{ executorId: effectiveExecutorId(project.executorId), projectPath: project.projectPath },
+			project.effectiveProjectKey,
+		);
 		this.#activateIfNeeded();
 	}
 
 	// Points the store at a project. Clears state and reloads when it changes.
-	setProject(projectPath: string | null, effectiveProjectKey: string | null = projectPath): void {
-		if (effectiveProjectKey === this.#effectiveProjectKey) {
-			this.#projectPath = projectPath;
+	setProject(
+		project: GitProjectTarget | null,
+		effectiveProjectKey: string | null = project ? gitProjectKey(project) : null,
+	): void {
+		if (
+			effectiveProjectKey === this.#effectiveProjectKey &&
+			project?.executorId === this.#project?.executorId
+		) {
+			if (project?.projectPath !== this.#project?.projectPath) this.#project = project;
 			return;
 		}
 		this.#listController?.abort();
 		this.#detailController?.abort();
 		this.#saveSnapshot();
-		this.#projectPath = projectPath;
+		this.#listController = null;
+		this.#detailController = null;
+		this.#project = project;
 		this.#effectiveProjectKey = effectiveProjectKey;
 		this.#listGeneration++;
 		this.pulls = [];
@@ -133,14 +202,22 @@ export class PullRequestsStore implements PortableSingletonController {
 		this.hasLoaded = false;
 		this.loadError = null;
 		this.clearSelection();
-		if (projectPath && effectiveProjectKey) this.#restoreSnapshot(effectiveProjectKey);
-		this.#needsRefresh = Boolean(projectPath);
-		if (projectPath && this.#visible && this.capabilityState === 'available') void this.refresh();
+		if (this.#capability) {
+			const { executorId, hasChecked, available } = this.#capability;
+			this.capabilityState =
+				executorId !== this.executorId || !hasChecked ? 'pending' : available ? 'available' : 'unavailable';
+		}
+		if (project && effectiveProjectKey)
+			this.#restoreSnapshot(JSON.stringify([project.executorId, effectiveProjectKey]));
+		this.#needsRefresh = Boolean(project);
+		this.#detailNeedsRefresh = Boolean(project);
+		this.#activateIfNeeded();
 	}
 
 	setPresentationVisible(visible: boolean): void {
 		if (visible === this.#visible) return;
 		this.#visible = visible;
+		this.projectSelection.setPresentationVisible(visible);
 		if (!visible) {
 			this.#suspendRequests();
 			return;
@@ -153,10 +230,10 @@ export class PullRequestsStore implements PortableSingletonController {
 	}
 
 	async refresh(): Promise<void> {
-		const projectPath = this.#projectPath;
+		const project = this.#project;
 		if (
 			this.#projectIdentityPending ||
-			!projectPath ||
+			!project ||
 			!this.#visible ||
 			this.capabilityState !== 'available'
 		)
@@ -168,7 +245,7 @@ export class PullRequestsStore implements PortableSingletonController {
 		this.isLoading = true;
 		this.loadError = null;
 		try {
-			const result = await getPullRequests(projectPath, { signal: controller.signal });
+			const result = await getPullRequests(project, { signal: controller.signal });
 			if (controller.signal.aborted || generation !== this.#listGeneration) return;
 			this.pulls = result.pulls;
 			this.repoName = result.repo?.nameWithOwner ?? null;
@@ -188,17 +265,17 @@ export class PullRequestsStore implements PortableSingletonController {
 	}
 
 	async select(number: number): Promise<void> {
-		if (this.#projectIdentityPending || !this.#projectPath || this.capabilityState !== 'available')
+		if (this.#projectIdentityPending || !this.#project || this.capabilityState !== 'available')
 			return;
 		this.selectedNumber = number;
 		await this.loadDetail(number);
 	}
 
 	async loadDetail(number: number): Promise<void> {
-		const projectPath = this.#projectPath;
+		const project = this.#project;
 		if (
 			this.#projectIdentityPending ||
-			!projectPath ||
+			!project ||
 			!this.#visible ||
 			this.capabilityState !== 'available'
 		)
@@ -211,7 +288,7 @@ export class PullRequestsStore implements PortableSingletonController {
 		this.detailError = null;
 		if (this.detail?.number !== number) this.detail = null;
 		try {
-			const detail = await getPullRequest(projectPath, number, { signal: controller.signal });
+			const detail = await getPullRequest(project, number, { signal: controller.signal });
 			if (controller.signal.aborted || generation !== this.#detailGeneration) return;
 			this.detail = detail;
 		} catch (error) {
@@ -222,6 +299,7 @@ export class PullRequestsStore implements PortableSingletonController {
 			this.#deps.notifyError?.(message);
 		} finally {
 			if (generation === this.#detailGeneration) {
+				if (!controller.signal.aborted) this.#detailNeedsRefresh = false;
 				this.isDetailLoading = false;
 				if (this.#detailController === controller) this.#detailController = null;
 			}
@@ -239,13 +317,15 @@ export class PullRequestsStore implements PortableSingletonController {
 	}
 
 	dispose(): void {
+		this.projectSelection.dispose();
+		this.#destroyCapabilityBinding?.();
 		this.#listController?.abort();
 		this.#detailController?.abort();
 		this.#listController = null;
 		this.#detailController = null;
 		this.#listGeneration += 1;
 		this.#detailGeneration += 1;
-		this.#projectPath = null;
+		this.#project = null;
 		this.#effectiveProjectKey = null;
 		this.#projectIdentityPending = false;
 		this.#snapshots.clear();
@@ -263,18 +343,31 @@ export class PullRequestsStore implements PortableSingletonController {
 		this.detailError = null;
 	}
 
+	pruneExecutors(executorIds: ReadonlySet<string>): void {
+		for (const [key, snapshot] of this.#snapshots) {
+			if (!executorIds.has(snapshot.project.executorId)) this.#snapshots.delete(key);
+		}
+		if (this.#project && !executorIds.has(this.executorId)) {
+			this.#suspendRequests();
+			this.#projectIdentityPending = true;
+			this.detail = null;
+			this.pulls = [];
+		}
+	}
+
 	#activateIfNeeded(): void {
 		if (
 			this.#projectIdentityPending ||
 			!this.#visible ||
-			!this.#projectPath ||
+			!this.#project ||
 			this.capabilityState !== 'available'
 		)
 			return;
 		if (!this.#listController && (!this.hasLoaded || this.#needsRefresh)) void this.refresh();
 		if (
 			this.selectedNumber !== null &&
-			this.detail?.number !== this.selectedNumber &&
+			(this.#detailNeedsRefresh ||
+				(this.detail?.number !== this.selectedNumber && !this.detailError)) &&
 			!this.isDetailLoading
 		) {
 			void this.loadDetail(this.selectedNumber);
@@ -290,16 +383,17 @@ export class PullRequestsStore implements PortableSingletonController {
 		this.#detailGeneration += 1;
 		this.isLoading = false;
 		this.isDetailLoading = false;
-		this.#needsRefresh = Boolean(this.#projectPath);
+		this.#needsRefresh = Boolean(this.#project);
 	}
 
 	#saveSnapshot(): void {
 		const effectiveProjectKey = this.#effectiveProjectKey;
-		const projectPath = this.#projectPath;
-		if (!effectiveProjectKey || !projectPath) return;
-		this.#snapshots.delete(effectiveProjectKey);
-		this.#snapshots.set(effectiveProjectKey, {
-			projectPath,
+		const project = this.#project;
+		if (!effectiveProjectKey || !project) return;
+		const key = JSON.stringify([project.executorId, effectiveProjectKey]);
+		this.#snapshots.delete(key);
+		this.#snapshots.set(key, {
+			project,
 			pulls: this.pulls,
 			repoName: this.repoName,
 			hasLoaded: this.hasLoaded,

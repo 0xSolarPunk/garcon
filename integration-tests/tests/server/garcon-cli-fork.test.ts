@@ -1,12 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { fileURLToPath } from 'node:url';
 import { assistantContents, userContents } from '../../support/chat-assertions.js';
+import { cliEnvironment } from '../../support/cli-environment.js';
 import {
-  withIntegrationFixture,
+  withCliFixture,
+  cliConnectionArguments,
   type IntegrationFixture,
-} from '../../support/integration-fixture.js';
+} from '../../support/cli-fixture.js';
 
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const WORKSPACE = 'cli-fork';
 
 async function runCli(fixture: IntegrationFixture, arguments_: readonly string[]) {
@@ -14,17 +16,11 @@ async function runCli(fixture: IntegrationFixture, arguments_: readonly string[]
     cmd: [
       process.execPath,
       'cli/main.ts',
-      '--config-dir', fixture.dirs.config,
-      '--workspace', WORKSPACE,
-      '--server', fixture.garcon.baseUrl,
+      ...cliConnectionArguments(fixture),
       ...arguments_,
     ],
     cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      GARCON_CONFIG_DIR: '',
-      GARCON_WORKSPACE: '',
-    },
+    env: cliEnvironment(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -38,12 +34,12 @@ async function runCli(fixture: IntegrationFixture, arguments_: readonly string[]
 
 describe('garcon-cli fork', () => {
   test('creates bare and prompted forks through the atomic server contracts', async () => {
-    await withIntegrationFixture('garcon-cli-fork', async (fixture) => {
+    await withCliFixture('garcon-cli-fork', async (fixture) => {
       const sourceChatId = fixture.newChatId();
       const source = await fixture.client.startDirectChat({
         chatId: sourceChatId,
         content: 'cli-fork-source',
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         agent: fixture.directAgents.openAi,
       });
       await fixture.client.waitForTurnTerminal(sourceChatId, source.turnId);

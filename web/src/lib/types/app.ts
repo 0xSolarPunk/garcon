@@ -9,6 +9,7 @@ export type SessionAgentId = string;
 export { type ChatSession } from './session';
 
 export interface NewChatConfig {
+	executorId?: string;
 	agentId: SessionAgentId;
 	projectPath: string;
 	model: string;

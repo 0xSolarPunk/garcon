@@ -1,8 +1,5 @@
 import type { ChatImage } from '$shared/chat-types';
 import type { ChatSessionRecord, ChatStartupConfig } from '$lib/types/chat-session';
-import type { ApiProtocol } from '$shared/api-providers';
-import type { AgentHandoffRequest } from '$shared/chat-command-contracts';
-import type { ChatListEntry } from '$shared/chat-list';
 import type { SessionControllerDeps } from './conversation-session-controller.svelte.js';
 import type { AcceptedInputSubmissionService } from './accepted-input-submission-service.js';
 import type { ConversationQueueController } from './conversation-queue-controller.svelte.js';
@@ -18,13 +15,13 @@ import {
 import * as m from '$lib/paraglide/messages.js';
 import { ApiError } from '$lib/api/client.js';
 import type { ProjectTarget } from '$shared/project-resolution';
+import { effectiveExecutorId } from '$shared/executors';
 
 type RouteDeps = Pick<
 	SessionControllerDeps,
 	| 'sessions'
 	| 'chatState'
 	| 'composerState'
-	| 'agentState'
 	| 'lifecycle'
 	| 'conversationUi'
 	| 'startupCoordinator'
@@ -49,13 +46,6 @@ type DraftSubmissionContext = Omit<SubmissionContext, 'startup'> & {
 	startup: ChatStartupConfig;
 };
 
-interface ExecutionModelSelection {
-	model: string;
-	apiProviderId: string | null;
-	modelEndpointId: string | null;
-	modelProtocol: ApiProtocol | null;
-}
-
 export function rejectMissingDraftStartup(
 	deps: Pick<RouteDeps, 'chatState'>,
 	chatId: string,
@@ -64,6 +54,38 @@ export function rejectMissingDraftStartup(
 		chatId,
 		'error',
 		m.chat_notice_failed_start_chat({ detail: m.chat_notice_missing_draft_startup() }),
+	);
+	return 'rejected';
+}
+
+export function restoreAutomaticStartDraft(
+	deps: Pick<RouteDeps, 'composerState' | 'sessions'>,
+	chatId: string,
+	text: string,
+	attachments: readonly File[],
+): void {
+	const draft = deps.composerState.draftSnapshot(chatId);
+	const retainedText = draft.text.includes(text)
+		? draft.text
+		: [text, draft.text].filter(Boolean).join('\n\n');
+	deps.composerState.restoreDraftIfRevision(chatId, draft.revision, retainedText, [
+		...new Set([...attachments, ...draft.attachments]),
+	]);
+	// A blocked automatic start becomes an editable draft, never a reconnect retry.
+	deps.sessions.patchDraftStartup(chatId, { firstMessage: '', initialImages: [] });
+}
+
+export function rejectUnavailableDraftStart(
+	deps: Pick<RouteDeps, 'chatState'>,
+	chatId: string,
+): ConversationSubmissionOutcome {
+	deps.chatState.appendLocalNoticeForChat(
+		chatId,
+		'error',
+		m.chat_notice_failed_start_chat({
+			detail:
+				'Executor or model catalog is unavailable. The initial prompt is kept in the composer.',
+		}),
 	);
 	return 'rejected';
 }
@@ -88,46 +110,6 @@ export async function submitQueueRoute(
 		const result = await submission.submit();
 		deps.conversationUi.setExecutionControlFromLiveUpdate(context.chatId, result.control);
 		deps.chatState.clearResendExclusions();
-		return 'accepted';
-	} catch (error) {
-		return settleSubmissionFailure(deps, context, error, {
-			unknownNotice: m.chat_notice_queue_outcome_unconfirmed(),
-			rejectedNotice: (failure) =>
-				m.chat_notice_failed_queue_message({
-					detail: errorDetail(failure),
-					content: context.ownsComposer ? context.previousText : context.text,
-				}),
-			restoreRejected: () =>
-				queue.recordSubmissionFailure(context.chatId, {
-					sequence,
-					text: context.previousText,
-					images: context.previousImages,
-				}),
-			refreshControl: () => queue.startControlRefresh(context.chatId),
-			onRejected: (failure) => refreshUnavailableProject(deps, context, failure),
-		});
-	} finally {
-		queue.finishSubmission(context.chatId);
-	}
-}
-
-export async function submitGoalControlRoute(
-	deps: RouteDeps,
-	acceptedInputs: AcceptedInputSubmissionService,
-	queue: ConversationQueueController,
-	context: SubmissionContext,
-): Promise<ConversationSubmissionOutcome> {
-	const sequence = queue.beginSubmission(context.chatId);
-	const clearedRevision = clearOwnedComposer(deps, context);
-	if (clearedRevision !== null) queue.recordComposerClear(context.chatId, clearedRevision);
-	const submission = acceptedInputs.goalControl({
-		chatId: context.chatId,
-		transcriptViewId: requireTranscriptView(deps, context.chatId),
-		content: context.content,
-	});
-	try {
-		const result = await submission.submit();
-		deps.conversationUi.setExecutionControlFromLiveUpdate(context.chatId, result.control);
 		return 'accepted';
 	} catch (error) {
 		return settleSubmissionFailure(deps, context, error, {
@@ -193,14 +175,12 @@ export function submitSteerPreferenceRoute(
 		chat: ChatSessionRecord;
 		text: string;
 		supportsSteering: boolean;
-		handoffPending: boolean;
 	},
 ): Promise<ConversationSubmissionOutcome> {
 	const rejection = steerSubmissionRejection({
 		prompt: input.text,
 		supportsSteering: input.supportsSteering,
 		attachmentCount: deps.composerState.images.length,
-		handoffPending: input.handoffPending,
 	});
 	if (rejection) {
 		deps.chatState.appendLocalNoticeForChat(
@@ -233,6 +213,7 @@ export async function submitDraftRoute(
 	const { chatId, chat, startup } = context;
 	const submission = acceptedInputs.start({
 		chatId,
+		executorId: startup.executorId,
 		agentId: startup.agentId,
 		projectPath: chat.projectPath,
 		model: startup.model,
@@ -275,8 +256,6 @@ export async function submitDraftRoute(
 				refreshUnavailableProject(deps, context, failure);
 			},
 		});
-	} finally {
-		deps.composerState.isSubmitting = false;
 	}
 }
 
@@ -285,9 +264,6 @@ export async function submitRunRoute(
 	acceptedInputs: AcceptedInputSubmissionService,
 	queue: ConversationQueueController,
 	context: SubmissionContext,
-	selection: ExecutionModelSelection,
-	handoff: AgentHandoffRequest | null,
-	onHandoffAccepted: (chat: ChatListEntry) => void,
 ): Promise<ConversationSubmissionOutcome> {
 	const submission = acceptedInputs.run({
 		chatId: context.chatId,
@@ -295,14 +271,6 @@ export async function submitRunRoute(
 		command: context.text,
 		images: context.images.length > 0 ? context.images : undefined,
 		excludedResendOrdinals: [...deps.chatState.excludedResendOrdinals],
-		...(handoff
-			? { handoff }
-			: {
-					permissionMode: deps.agentState.permissionMode,
-					thinkingMode: deps.agentState.thinkingMode,
-					agentSettings: deps.agentState.agentSettings,
-					...selection,
-				}),
 	});
 	const composerRevisionAfterClear = beginOptimisticInput(
 		deps,
@@ -311,11 +279,6 @@ export async function submitRunRoute(
 	);
 	try {
 		const response = await submission.submit();
-		if (handoff) {
-			if (!response.chat) throw new Error('Accepted handoff response omitted its chat projection');
-			deps.sessions.reconcileAcceptedHandoffProjection(response.chat);
-			onHandoffAccepted(response.chat);
-		}
 		deps.chatState.markOptimisticUserInputDelivered(submission.clientMessageId);
 		deps.chatState.clearResendExclusions();
 		deps.lifecycle.beginTurn(context.chatId);
@@ -334,8 +297,6 @@ export async function submitRunRoute(
 			refreshControl: () => queue.settleControlRefresh(queue.startControlRefresh(context.chatId)),
 			onRejected: (failure) => refreshUnavailableProject(deps, context, failure),
 		});
-	} finally {
-		deps.composerState.isSubmitting = false;
 	}
 }
 
@@ -345,9 +306,11 @@ function refreshUnavailableProject(
 	error: unknown,
 ): void {
 	if (!(error instanceof ApiError) || error.errorCode !== 'PROJECT_UNAVAILABLE') return;
-	const target: ProjectTarget = context.chat.status === 'draft'
-		? { kind: 'path', projectPath: context.chat.projectPath }
-		: { kind: 'chat', chatId: context.chatId, projectPath: context.chat.projectPath };
+	const executorId = effectiveExecutorId(context.chat.executorId);
+	const target: ProjectTarget =
+		context.chat.status === 'draft'
+			? { kind: 'path', executorId, projectPath: context.chat.projectPath }
+			: { kind: 'chat', executorId, chatId: context.chatId, projectPath: context.chat.projectPath };
 	try {
 		void Promise.resolve(deps.onProjectUnavailable?.(target)).catch(() => undefined);
 	} catch {
@@ -371,7 +334,6 @@ function beginOptimisticInput(
 	);
 	if (deps.sessions.selectedChatId === context.chatId) deps.scrollToBottom();
 	const composerRevisionAfterClear = clearOwnedComposer(deps, context);
-	deps.composerState.isSubmitting = true;
 	return composerRevisionAfterClear;
 }
 

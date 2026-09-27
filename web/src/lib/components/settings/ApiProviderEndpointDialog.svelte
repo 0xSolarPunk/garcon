@@ -6,7 +6,7 @@
 	import { Switch } from '$lib/components/ui/switch';
 	import * as Select from '$lib/components/ui/select';
 	import { untrack } from 'svelte';
-	import { getModelCatalog } from '$lib/context';
+	import { getModelCatalog, getApiProviders, getExecutors } from '$lib/context';
 	import * as m from '$lib/paraglide/messages.js';
 	import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw';
 	import type { ApiProtocol } from '$shared/api-providers';
@@ -18,21 +18,32 @@
 		protocol,
 		endpointId = null,
 		templateId = 'custom',
+		duplicate = false,
 		onOpenChange = () => undefined,
 	} = $props<{
 		open?: boolean;
 		protocol: ApiProtocol;
 		endpointId?: string | null;
 		templateId?: ApiProviderTemplateId;
+		duplicate?: boolean;
 		onOpenChange?: (open: boolean) => void;
 	}>();
 
-	const modelCatalog = getModelCatalog();
+	const rootModelCatalog = getModelCatalog();
+	const providers = getApiProviders();
+	const executors = getExecutors();
+	let executorId = $state('local');
+	const modelCatalog = $derived(rootModelCatalog.forExecutor(executorId));
 	const dialog = new ApiProviderEndpointDialogState({
-		modelCatalog,
+		get modelCatalog() {
+			return modelCatalog;
+		},
+		providers,
+		isExecutorReady: () => executors.isReady(executorId),
 		getProtocol: () => protocol,
 		getEndpointId: () => endpointId,
 		getTemplateId: () => templateId,
+		getDuplicate: () => duplicate,
 		onSaved: () => onOpenChange(false),
 	});
 
@@ -40,13 +51,26 @@
 		dialog.open = open;
 		if (open) {
 			untrack(() => {
+				executorId = initialExecutorId();
 				void dialog.load();
 			});
 		}
+		return () => dialog.dispose();
 	});
 
-	function handleOpenChange(next: boolean) {
-		onOpenChange(next);
+	function initialExecutorId(): string {
+		const found = endpointId ? providers.findEndpoint(endpointId) : null;
+		if (!found) return 'local';
+
+		const assignedExecutors = executors.executors.filter((executor) => providers.isAssigned(executor.id, found.apiProvider.id));
+		const readyExecutor = assignedExecutors.find((executor) => executors.isReady(executor.id));
+		return readyExecutor?.id ?? assignedExecutors[0]?.id ?? 'local';
+	}
+
+	function selectExecutor(value: string): void {
+		if (dialog.isSaving || value === executorId) return;
+		dialog.clearProbeResults();
+		executorId = value;
 	}
 
 	function handleModelsInput(event: Event) {
@@ -56,7 +80,7 @@
 	}
 </script>
 
-<Dialog.Root {open} onOpenChange={handleOpenChange}>
+<Dialog.Root {open} {onOpenChange}>
 	<Dialog.Content
 		class="flex h-dvh w-full max-w-full flex-col rounded-none border-0 p-0 sm:h-auto sm:max-h-[calc(100dvh-2rem)] sm:max-w-3xl sm:rounded-lg sm:border"
 	>
@@ -72,6 +96,36 @@
 				void dialog.save();
 			}}
 		>
+			{#if executors.hasRemoteExecutors}
+				<div class="grid gap-2">
+					<label class="text-sm font-medium" for="api-provider-executor">
+						{dialog.apiProviderId
+							? m.settings_provider_test_from()
+							: m.settings_provider_create_on()}
+					</label>
+					<select
+						id="api-provider-executor"
+						class="h-9 min-w-0 w-full rounded-md border border-input bg-background px-3 text-base pointer-fine:text-sm"
+						value={executorId}
+						onchange={(event) => selectExecutor(event.currentTarget.value)}
+						disabled={dialog.isSaving}
+					>
+						{#each executors.executors as executor (executor.id)}
+							<option value={executor.id}>{executor.label}</option>
+						{/each}
+					</select>
+				</div>
+			{/if}
+			{#if dialog.apiProviderId}
+				<p class="text-sm text-muted-foreground">
+					Changes affect every executor and workspace using this shared profile.
+				</p>
+			{/if}
+			{#if !dialog.canProbe}
+				<p class="text-sm text-muted-foreground">
+					Testing requires a ready executor and an assigned profile or a newly entered key.
+				</p>
+			{/if}
 			<div class="grid gap-2">
 				<label class="text-sm font-medium" for="api-provider-label"
 					>{m.settings_api_provider_dialog_display_name()}</label
@@ -99,6 +153,7 @@
 					type="password"
 					bind:value={dialog.apiKey}
 					autocomplete="off"
+					required={dialog.apiKeyRequired && !dialog.apiProviderId}
 					placeholder={dialog.apiKeyPlaceholder}
 				/>
 			</div>
@@ -236,7 +291,7 @@
 				>
 					{dialog.isTesting
 						? m.settings_api_provider_dialog_testing()
-						: m.settings_api_provider_dialog_test()}
+						: `Test from ${executors.label(executorId)}`}
 				</Button>
 				<Button type="submit" disabled={!dialog.canSave}>
 					{dialog.isSaving

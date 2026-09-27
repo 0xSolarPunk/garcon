@@ -16,14 +16,56 @@ describe('TerminalSurface', () => {
 	it('labels the terminal path as its initial directory rather than its current directory', () => {
 		render(TerminalSurfaceTestHost, { host: 'mobile' });
 
-		expect(screen.getByText('Started in /workspace/project')).toBeTruthy();
+		expect(screen.getByText('Started in Local: /workspace/project')).toBeTruthy();
 	});
 
 	it('labels placed sessions with their workspace window number', () => {
 		render(TerminalSurfaceTestHost, { host: 'mobile' });
 
-		expect(screen.getByRole('option', { name: 'Terminal 1 - running - Window 1' })).toBeTruthy();
-		expect(screen.getByRole('option', { name: 'Build logs - running' })).toBeTruthy();
+		expect(screen.getByRole('option', { name: 'Local 1 - running - Window 1' })).toBeTruthy();
+		expect(screen.getByRole('option', { name: 'Local: Build logs - running' })).toBeTruthy();
+	});
+
+	it.each(['detached', 'taken-over'] as const)(
+		'exposes %s status outside hover-only context',
+		(attachmentState) => {
+			render(TerminalSurfaceTestHost, { host: 'mobile', attachmentState });
+			const status = screen.getByRole('status', {
+				name: attachmentState === 'detached' ? 'Detached' : 'Taken over',
+			});
+			expect(status.classList.contains('terminal-context')).toBe(false);
+		},
+	);
+
+	it('shows and retries only the missing terminal host inventory', async () => {
+		const onList = vi.fn();
+		render(TerminalSurfaceTestHost, {
+			host: 'mobile',
+			terminalId: 'missing',
+			executorError: 'Local inventory failed',
+			onList,
+		});
+		expect(screen.getByText('Local inventory failed')).toBeTruthy();
+		expect(screen.queryByText('Another host failed')).toBeNull();
+		await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+		expect(onList).toHaveBeenCalledWith('local');
+	});
+
+	it('keeps attachment status in the mobile session picker title', async () => {
+		const view = render(TerminalSurfaceTestHost, { host: 'mobile' });
+		const picker = screen.getByRole('combobox', { name: 'Terminal session' });
+		expect(picker.getAttribute('title')).toBe('Local 1 - Local: /workspace/project - Attached');
+		await view.rerender({ attachmentState: 'taken-over' });
+		expect(picker.getAttribute('title')).toBe('Local 1 - Local: /workspace/project - Taken over');
+	});
+
+	it('updates the mobile picker title for custom titles and missing sessions', async () => {
+		const view = render(TerminalSurfaceTestHost, { host: 'mobile' });
+		const picker = screen.getByRole('combobox', { name: 'Terminal session' });
+		await view.rerender({ terminalId: 'terminal-2' });
+		expect(picker.getAttribute('title')).toBe('Build logs - Local: /workspace/project - Attached');
+		await view.rerender({ terminalId: 'missing' });
+		expect(picker.hasAttribute('title')).toBe(false);
 	});
 
 	it('shows input helpers on a coarse-pointer desktop', async () => {
@@ -138,7 +180,7 @@ describe('TerminalSurface', () => {
 			createError: new ApiError(409, 'Limit reached', 'terminal-limit'),
 		});
 
-		await fireEvent.click(screen.getByRole('button', { name: 'New terminal' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'New Terminal' }));
 		await Promise.resolve();
 		expect(document.activeElement).toBe(screen.getByRole('combobox', { name: 'Terminal session' }));
 	});
@@ -158,7 +200,7 @@ describe('TerminalSurface', () => {
 		const onCreateReplacing = vi.fn();
 		render(TerminalSurfaceTestHost, { host: 'mobile', onCreateReplacing });
 
-		await fireEvent.click(screen.getByRole('button', { name: 'New terminal' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'New Terminal' }));
 
 		expect(onCreateReplacing).toHaveBeenCalledWith('terminal-1');
 	});

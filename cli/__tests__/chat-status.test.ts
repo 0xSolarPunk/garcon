@@ -20,7 +20,7 @@ const CHAT_ID = '1785337200123456';
 const TIMESTAMP = '2026-08-04T12:00:00.000Z';
 const command: StatusCliCommand = {
   kind: 'status',
-  workspace: 'work',
+  runtime: 'controller',
   configDir: '/config',
   chatId: CHAT_ID,
   messageLimit: 10,
@@ -164,7 +164,7 @@ describe('chat status', () => {
     expect(value).not.toContain('transcript:');
   });
 
-  test('renders exact pending permission controls even when transcript messages are omitted', () => {
+  test.each(['controller', 'executor'] as const)('renders usable permission controls for runtime %s', (runtime) => {
     const permissionOccurrenceId = 'permission-occurrence-1';
     const value = formatChatStatus(snapshot({
       messageLimit: 0,
@@ -186,7 +186,7 @@ describe('chat status', () => {
           ),
         }],
       },
-    }), command);
+    }), { ...command, runtime });
 
     expect(value).toContain('pending permissions: 1');
     expect(value).toContain(`permission occurrence: ${permissionOccurrenceId}`);
@@ -197,6 +197,8 @@ describe('chat status', () => {
       `permission-decision '${CHAT_ID}' '${permissionOccurrenceId}' allow --run 'run-1' --server-instance 'instance-1'`,
     );
     expect(value).not.toContain('transcript:');
+    expect(value).toContain(`garcon-cli --config-dir '/config' --runtime '${runtime}' permission-decision`);
+    expect(value).not.toContain('--workspace');
   });
 
   test('renders a typed answer template for structured permission requests', () => {
@@ -454,7 +456,7 @@ describe('chat status', () => {
     expect(JSON.stringify(value)).toBe(before);
   });
 
-  test('names the effective workspace when the chat is missing', async () => {
+  test.each(['controller', 'executor'] as const)('does not invent a workspace for a missing chat: runtime=%s', async (runtime) => {
     const client: ChatStatusClient = {
       async getChatSnapshot() {
         throw new GarconHttpError(
@@ -467,7 +469,7 @@ describe('chat status', () => {
       },
     };
 
-    await expect(runChatStatus(command, client, output()))
-      .rejects.toThrow('Garcon workspace "work"');
+    await expect(runChatStatus({ ...command, runtime }, client, output()))
+      .rejects.toThrow('Session not found (HTTP 404, SESSION_NOT_FOUND)');
   });
 });

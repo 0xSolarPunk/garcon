@@ -2,8 +2,9 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { userContents } from '../../support/chat-assertions.js';
+import { cliEnvironment } from '../../support/cli-environment.js';
 import { codexAssistantMessage } from '../../support/fake-codex-model.js';
-import { withIntegrationFixture } from '../../support/integration-fixture.js';
+import { cliConnectionArguments, withCliFixture } from '../../support/cli-fixture.js';
 import { expectFinished, LIVE_TURN_TIMEOUT_MS } from '../../support/live-agent.js';
 import { liveCodexStartRequest } from '../../support/live-codex.js';
 import {
@@ -11,7 +12,7 @@ import {
   type ScriptedCodexTestEnvironment,
 } from '../../support/scripted-codex.js';
 
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const WORKSPACE = 'cli-scripted-steer';
 
 function runCli(arguments_: string[]): Promise<{
@@ -22,11 +23,7 @@ function runCli(arguments_: string[]): Promise<{
   const child = Bun.spawn({
     cmd: [process.execPath, 'cli/main.ts', ...arguments_],
     cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      GARCON_CONFIG_DIR: '',
-      GARCON_WORKSPACE: '',
-    },
+    env: cliEnvironment(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -58,12 +55,12 @@ describe('scripted Codex CLI steering', () => {
     const held = testEnvironment.model.scriptHeldTurn([codexAssistantMessage(firstReply)]);
     testEnvironment.model.scriptTurn([codexAssistantMessage(steeredReply)]);
 
-    await withIntegrationFixture('garcon-cli-scripted-steer', async (fixture) => {
+    await withCliFixture('garcon-cli-scripted-steer', async (fixture) => {
       const chatId = fixture.newChatId();
       const firstCursor = fixture.client.markEvents();
       const first = await fixture.client.startChat(liveCodexStartRequest({
         chatId,
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         command: firstPrompt,
         permissionMode: 'bypassPermissions',
       }));
@@ -72,8 +69,7 @@ describe('scripted Codex CLI steering', () => {
       await held.requested;
 
       const steered = await runCli([
-        '--config-dir', fixture.dirs.config,
-        '--workspace', WORKSPACE,
+        ...cliConnectionArguments(fixture),
         'resume-async', chatId, '--allow-steer',
         '--message-title', 'Steer context',
         '--color', '0EA5E9,7dd3fc',

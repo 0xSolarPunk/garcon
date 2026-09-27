@@ -1,0 +1,218 @@
+import { describe, expect, it, mock } from 'bun:test';
+
+import { AgentSessionSettingsService } from '../session-settings-service.ts';
+
+function makeService(thinkingMode = 'high') {
+  const entry = {
+    agentId: 'amp',
+    agentSessionId: null,
+    model: 'medium',
+    apiProviderId: null,
+    modelEndpointId: null,
+    modelProtocol: null,
+    permissionMode: 'bypassPermissions',
+    thinkingMode,
+    agentSettingsById: {
+      amp: { ownerId: 'amp', schemaVersion: 2, values: {} },
+    },
+  };
+  const updateChat = mock(async (_chatId, patch) => ({ ...entry, ...patch }));
+  const integration = {
+    descriptor: {
+      supportedThinkingModes: [],
+    },
+    endpoints: null,
+    configurationValidation: null,
+    sessionConfiguration: null,
+    settings: {
+      defaults: () => ({ ownerId: 'amp', schemaVersion: 2, values: {} }),
+      parse: (value) => value,
+      applyPatch: (value) => value,
+    },
+  };
+  const endpointResolver = {
+    describePrevious(input) { return this.resolveSelection(input); },
+    resolveSelection: ({ model, apiProviderId, modelEndpointId }) => ({
+      model,
+      apiProviderId: apiProviderId ?? null,
+      endpointId: modelEndpointId ?? null,
+      protocol: null,
+      isLocal: false,
+    }),
+    resolveEndpointReference: () => null,
+  };
+  const onCommitted = mock(() => undefined);
+  const service = new AgentSessionSettingsService({
+    onCommitted,
+    registry: {
+      getChat: () => entry,
+      updateChat,
+    },
+    directory: { require: () => integration },
+    endpointResolver,
+  });
+  return { service, updateChat, entry, integration, endpointResolver, onCommitted };
+}
+
+describe('AgentSessionSettingsService', () => {
+  it('publishes settings only after their durable write succeeds', async () => {
+    const { service, updateChat, entry, onCommitted } = makeService('none');
+    const saved = Promise.withResolvers();
+    updateChat.mockImplementationOnce(() => saved.promise);
+    const updating = service.updateSessionSettings('chat-1', { model: 'new-model' });
+    await Promise.resolve();
+    expect(onCommitted).not.toHaveBeenCalled();
+    saved.resolve({ ...entry, model: 'new-model' });
+    await updating;
+    expect(updateChat).toHaveBeenCalledWith('chat-1', expect.any(Object), { flush: true });
+    expect(onCommitted.mock.calls).toEqual([['chat-1']]);
+    onCommitted.mockClear();
+    updateChat.mockRejectedValueOnce(new Error('disk full'));
+    await expect(service.updateSessionSettings('chat-1', { model: 'another' })).rejects.toThrow('disk full');
+    expect(onCommitted).not.toHaveBeenCalled();
+  });
+  it('rejects settings from a superseded owner before touching the integration or registry', async () => {
+    const { service, entry, integration, updateChat } = makeService();
+    entry.agentOwnershipEpoch = 'current-owner';
+    const validate = mock(async () => undefined);
+    integration.configurationValidation = { validate };
+    await expect(service.updateSessionSettings('chat-1', { model: 'new-model' }, 'previous-owner'))
+      .rejects.toMatchObject({ code: 'STALE_CHAT_OWNERSHIP', status: 409 });
+    expect(validate).not.toHaveBeenCalled();
+    expect(updateChat).not.toHaveBeenCalled();
+    await service.updateSessionSettings('chat-1', { model: 'new-model' }, 'current-owner');
+    expect(updateChat).toHaveBeenCalledTimes(1);
+  });
+  it('enforces assignment policy even without an integration configuration-validation facet', async () => {
+    const { service, endpointResolver, integration } = makeService();
+    expect(integration.configurationValidation).toBeNull();
+    endpointResolver.resolveSelection = mock(() => { throw new Error('Synthetic unavailable provider'); });
+    await expect(service.validateConfiguration({ agentId: 'amp', model: 'synthetic', apiProviderId: 'profile_one',
+      modelEndpointId: 'profile_one_openai', permissionMode: 'default', thinkingMode: 'none',
+      agentSettings: { ownerId: 'amp', schemaVersion: 2, values: {} } })).rejects.toThrow('Synthetic unavailable provider');
+  });
+  it('preflights a new configuration without applying settings or saving a chat', async () => {
+    const { service, updateChat, integration } = makeService();
+    const validate = mock(async () => undefined);
+    const apply = mock(async () => undefined);
+    integration.configurationValidation = { validate };
+    integration.sessionConfiguration = { apply };
+    const agentSettings = { ownerId: 'amp', schemaVersion: 2, values: {} };
+
+    await service.validateConfiguration({
+      agentId: 'amp', model: 'next-model', permissionMode: 'default',
+      thinkingMode: 'none', agentSettings,
+    });
+
+    expect(validate).toHaveBeenCalledWith({
+      model: 'next-model', permissionMode: 'default', thinkingMode: 'none',
+      settings: agentSettings, endpoint: null,
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(updateChat).not.toHaveBeenCalled();
+  });
+
+  it.each([null, 'session-1'])('validates before live changes or persistence with native session %s', async (agentSessionId) => {
+    const { service, updateChat, entry, integration } = makeService('none');
+    entry.agentSessionId = agentSessionId;
+    const validate = mock(async () => { throw new Error('invalid model'); });
+    const apply = mock(async () => undefined);
+    integration.configurationValidation = { validate };
+    integration.sessionConfiguration = { apply };
+
+    await expect(service.updateSessionSettings('chat-1', { model: 'invalid' }))
+      .rejects.toThrow('invalid model');
+    expect(validate).toHaveBeenCalledWith({
+      model: 'invalid',
+      permissionMode: 'bypassPermissions',
+      thinkingMode: 'none',
+      settings: { ownerId: 'amp', schemaVersion: 2, values: {} },
+      endpoint: null,
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(updateChat).not.toHaveBeenCalled();
+  });
+
+  it('rejects an explicit thinking mode outside the agent capability', async () => {
+    const { service, updateChat } = makeService('none');
+
+    await expect(service.updateSessionSettings('chat-1', {
+      thinkingMode: 'high',
+    })).rejects.toMatchObject({ code: 'VALIDATION_FAILED', status: 422 });
+
+    expect(updateChat).not.toHaveBeenCalled();
+  });
+
+  it('accepts neutral and canonicalizes stale inherited thinking mode', async () => {
+    const explicit = makeService('high');
+    await explicit.service.updateSessionSettings('chat-1', { thinkingMode: 'none' });
+    expect(explicit.updateChat).toHaveBeenCalledWith(
+      'chat-1',
+      expect.objectContaining({ thinkingMode: 'none' }),
+      { flush: true },
+    );
+
+    const inherited = makeService('high');
+    await inherited.service.updateSessionSettings('chat-1', { model: 'medium' });
+    expect(inherited.updateChat).toHaveBeenCalledWith(
+      'chat-1',
+      expect.objectContaining({
+        model: 'medium',
+        apiProviderId: null,
+        modelEndpointId: null,
+        modelProtocol: null,
+        thinkingMode: 'none',
+      }),
+      { flush: true },
+    );
+  });
+
+  it('passes complete next and previous configurations before persistence', async () => {
+    const { service, updateChat, entry, integration } = makeService('high');
+    entry.agentSessionId = 'session-1';
+    integration.descriptor.supportedThinkingModes = ['none', 'low', 'medium', 'high'];
+    const apply = mock(async () => undefined);
+    integration.sessionConfiguration = { apply };
+
+    await service.updateSessionSettings('chat-1', {
+      model: 'large',
+      permissionMode: 'manualBypass',
+      thinkingMode: 'medium',
+    });
+
+    expect(apply).toHaveBeenCalledWith(
+      'session-1',
+      {
+        model: 'large',
+        permissionMode: 'manualBypass',
+        thinkingMode: 'medium',
+        settings: { ownerId: 'amp', schemaVersion: 2, values: {} },
+        endpoint: null,
+      },
+      {
+        model: 'medium',
+        permissionMode: 'bypassPermissions',
+        thinkingMode: 'high',
+        settings: { ownerId: 'amp', schemaVersion: 2, values: {} },
+        endpoint: null,
+      },
+    );
+    expect(apply.mock.invocationCallOrder[0]).toBeLessThan(
+      updateChat.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('does not persist when the live configuration update rejects', async () => {
+    const { service, updateChat, entry, integration } = makeService('high');
+    entry.agentSessionId = 'session-1';
+    integration.descriptor.supportedThinkingModes = ['none', 'low', 'medium', 'high'];
+    integration.sessionConfiguration = {
+      apply: mock(async () => { throw new Error('provider rejected settings'); }),
+    };
+
+    await expect(service.updateSessionSettings('chat-1', {
+      thinkingMode: 'medium',
+    })).rejects.toThrow('provider rejected settings');
+    expect(updateChat).not.toHaveBeenCalled();
+  });
+});

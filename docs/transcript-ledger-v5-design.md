@@ -1,10 +1,53 @@
 # Garcon Transcript Ledger V5: Core-Owned Append-Only Authority
 
-Status: revision 39 integrated design. Supersedes
+Status: revision 40 integrated design. Supersedes
 `AGENT_OWNED_TRANSCRIPT_PROJECTION_DESIGN.md`
 (V4, SHA-256 `12e6efbcbd30419c0b4580d8159f60e2b1948d8dd790857a070dee5b3f6873cf`),
 which remains untouched as the historical record of the reconciliation-based
 architecture and its implementation through commit `f029424c`.
+
+Revision 40 makes the complete provider integration an executor boundary.
+Core retains synchronous ledger acceptance and durable-before-visible ordering.
+Provider emission captures an instance-scoped producer binding, not a callback
+to a remote ledger. Core installs that binding's route to the exact producer
+lease before registering it with the integration; no event resolves the current
+sink by chat ID. Closing the original lease rejects late/replayed events even
+before worker cleanup. Run completion does not close its binding.
+Closing a binding cancels admission and best-effort aborts its active native
+operation, including a session established after closure. A pending start
+rejects with `STALE_RESOURCE`; completed operations are never aborted.
+
+Local dispatch may reach the sink synchronously. Remote emission snapshots and
+hands normalized events to bounded, ordered socket delivery; its return does
+not promise ledger acceptance. Connection loss terminates the session without
+replay or automatic mutation retry. A surviving worker keeps its integrations
+and native turns alive, detaches old producer bindings, drops their later output,
+and denies their pending permissions. New work for the same chat on that
+integration is rejected until the detached turn ends. Either side may establish
+a fresh session without a coordinated restart. A surviving controller reports
+lost worker execution with a manual Reload warning and releases the
+affected ownership; controller startup still synthesizes no run endings and
+starts execution state empty. Residual native work and missing final rows are
+accepted losses. The existing transcript-may-have-changed warning remains
+advisory, and native-history Reload remains exclusively manual. Neither a
+disconnect nor restart initiates native import or transcript replacement.
+Earlier statements about
+unbuffered synchronous publication and object-only capabilities describe the
+controller ledger boundary, not cross-machine delivery.
+
+Permission occurrences carry scoped response references. Native closures stay
+on the executor and each response is single-flight. Confirmed success
+permits a resolved row; definite non-dispatch may release a claim; uncertainty
+or an expired resource retires actionability without recording success. Targets
+are captured asynchronously against an expected Garcon run. Controller ownership
+is rechecked before delivery; worker native-target checks remain immediately
+before native writes. Authorization already sent cannot be synchronously revoked.
+Goal behavior is removed from the product, including goal commands, automatic
+continuation, and goal-run handoff. Execution handles remain scoped to one
+operation. Ordinary steering, interruption, compaction, cross-provider handoff,
+and existing transcript rows are unchanged.
+Project-path preparations are compensation, not distributed transactions:
+expiry never rolls back potentially authoritative artifacts after a lost reply.
 
 Revision 39 keeps a bounded in-memory transcript window for recently inactive
 chat surfaces when combined tool use is enabled. A warm return restores the
@@ -1102,8 +1145,8 @@ CREATE UNIQUE INDEX transcript_submission
 
 ### 5.1 The sink
 
-Core issues each active integration one producer sink per chat — a
-capability object bound internally to the chat and its current view:
+Core owns one producer sink per active chat, bound to its current view.
+An integration captures an instance-scoped binding routed to this exact object:
 
 ```ts
 interface AgentProducerSink {
@@ -1116,7 +1159,8 @@ interface AgentProducerSink {
 }
 ```
 
-Possession of the open sink is the fence; there is no token. Core
+The open sink is the controller fence. The transport binding is an ephemeral
+capability scoped to executor, runtime and integration, not another ledger identity. Core
 closes the sink at in-place handoff, manual reload, chat deletion, and
 shutdown; a closed sink rejects synchronously, and core may additionally
 verify object identity against the chat's single active sink. Old-owner
@@ -1125,10 +1169,9 @@ restart. `runId` is ephemeral correlation metadata on `run-ended`, permission,
 and producer notice events only — never ledger identity and never present on
 stored content, notice, or session rows.
 
-A runtime never looks a sink up. Core hands it a publisher closing over
-one binding, and that closure is the only route the runtime has to a
-transcript. Events therefore carry no chat id: routing is not data a
-provider can get wrong, because it is not data at all. An operation that
+A runtime never looks a sink up. Its integration hands it a publisher closing
+over one registered binding. Transport notifications carry that binding, not
+a chat ID used to discover the latest sink. An operation that
 outlives the transcript it was started against keeps publishing at its
 own closed sink and has no mechanism to discover the replacement, which
 is what makes possession the fence rather than a claim about it.
@@ -1193,7 +1236,7 @@ interface AgentIntegrationV5 {
   nativeSessions: codec;          // encode/decode session refs
   nativeActivity: AgentNativeActivityProbe | null;  // drift check (10.2)
   forking: AgentNativeForkV5 | null;  // native-fidelity fork (12.3)
-  steering; goals;                // unchanged nullable facets
+  steering;                      // unchanged nullable facet
 }
 
 interface AgentPermissionResponseCapability {
@@ -1254,8 +1297,8 @@ occurrence.
 
 ### 5.2 Acceptance semantics
 
-`publish()` is the event's acceptance point, and acceptance is
-durability:
+Controller sink `publish()` is the event's acceptance point, and acceptance
+is durability. Worker emission is only transport handoff:
 
 - Validation is synchronous: closure state and event shape. An event
   offered to a closed sink rejects synchronously, and so does an event
@@ -1277,8 +1320,9 @@ durability:
   order and the established chat-messages-before-terminal-derived-state
   contract. A crash before broadcast is harmless; reconnect reads the
   committed rows.
-- Nothing buffers, so there is no flush concept, no accepted-but-
-  unpersisted state, and no publish/close race protocol. The loss window
+- The controller ledger does not buffer. A bounded socket queue holds unsent
+  events; these are not ledger-accepted and are discarded on disconnect. There is no
+  ledger flush or distributed publish/close protocol. The loss window
   is events the provider emitted that core had not yet handled at crash,
   plus the NORMAL power-loss window (4.3); a later active history load may
   surface newer native evidence where the provider persisted it, and manual
@@ -1368,7 +1412,7 @@ flush, and broadcasts `ChatSessionCreatedMessage`. Opening a chat
 repairs the registry cache from the authoritative row, closing the
 commit-versus-flush crash window. There is no second value to validate
 for agreement; the V4 session-metadata registry write from `RuntimeRouter`'s
-start return path (`server/agents/runtime-router.ts`) is removed. Startup fences
+start return path (`server/controller/agents/runtime-router.ts`) is removed. Startup fences
 orphan provider processes (unchanged policy).
 
 ## 7. Inputs and Resend
@@ -1648,10 +1692,11 @@ type PermissionLifecycle =
   `serverInstanceId`, current run correlation, and unresolved lifecycle
   state. Those checks reject stale or historical controls; they are not a
   second source of authority. Core invokes only the claimed occurrence's
-  capability, abandons the claim if provider response fails, and appends
-  `permission-resolved` only after response succeeds.
+  capability, releases the claim only after definite non-dispatch while still
+  valid, and appends `permission-resolved` only after response succeeds.
+  Ambiguous delivery retires actionability without a resolved row or retry.
 - Ledger schema version 1 intentionally keeps the stored lifecycle JSON key
-  `incarnation`. `server/ledger/codec.ts` encodes
+  `incarnation`. `server/controller/ledger/codec.ts` encodes
   `permissionOccurrenceId` as `incarnation` and decodes stored `incarnation`
   as `permissionOccurrenceId`; an old extra `requestId` is ignored. No other
   layer knows the durable spelling, no dual public field exists, and no
@@ -1714,6 +1759,12 @@ model context, carryover, or export.
   unbounded complete match set.
 - **Preview** selects the latest conversational row; notices, provider errors,
   and lifecycle state are separate UI signals, never preview text.
+  Cold list-cache repair is best effort: after readiness it samples bounded head
+  and tail ordinal ranges rather than scanning the full ledger. Oversized tail
+  payloads are skipped; an omitted head candidate defers repair unless a readable
+  first user input precedes it. Missing candidates also leave cached metadata unchanged;
+  live commits continue updating previews normally. Startup loads only persisted
+  list metadata.
 - **Context seeding and carryover** use the conversational fold. A new-session
   seed excludes rows composed into the outgoing prompt so they appear exactly
   once across that seed and prompt. A message the user declined to resend
@@ -1729,7 +1780,7 @@ model context, carryover, or export.
   enters model context.
 - **Shares are snapshot artifacts**: publishing a share copies its
   rendering fold into the share store (the existing product behavior —
-  `server/routes/shares.ts`, `server/chats/share-store.ts`,
+  `server/controller/routes/shares.ts`, `server/controller/chats/share-store.ts`,
   `common/share-types.ts`); the share never reads the ledger again and
   is unaffected by reload or deletion of views. Share revocation policy
   is unchanged.
@@ -2128,6 +2179,39 @@ product flow reuses it is outside this design. `transcriptViewId` does
 not change; cursors remain valid; reads stay available throughout
 (12.4).
 
+Execution ownership also includes the controller-owned `executorId`; absent/null
+means Local. An in-place cross-executor handoff follows 12.1 even when the agent
+ID is unchanged. The destination project is inspected on its executor before the
+decision. The decision records source/destination executor, destination path and
+execution settings; registry roll-forward installs them together, clears native
+references, and rotates the ownership epoch. Optional `fromExecutorId`/`toExecutorId`
+detail on the `agent-switch` row preserves that boundary through projections
+and Reload. Existing rows imply Local; no transcript rewrite is required.
+
+The controller ledger supplies carryover to a fresh destination native session.
+Native references, running tools, and project files never move between executors.
+A committed decision rolls forward without either executor being reachable;
+execution remains unavailable until the destination is ready and an explicit
+new dispatch is admitted. Source unavailability does not prevent a ledger-based
+handoff. Prepared carryover reuse is fenced by destination executor and ownership
+epoch as well as the existing request and view identities.
+
+Composer executor and agent selections commit through the promptless
+`POST /api/v1/chats/agent-handoff` command, under a transcript-snapshot
+reservation. Confirmation completes the ownership change without admitting a
+turn or consuming the editable composer draft. Files, Git, and project controls
+follow the committed chat projection immediately. A same-executor agent switch
+carries a destination folder when the chat's current folder is known to be
+unavailable; that folder is inspected before the decision and installed with
+the target, as for a cross-executor handoff. Selection-only changes do not
+plan carryover or invoke compaction; the next explicit dispatch plans against its
+actual input and final target. Switching selections, including switching back,
+must not issue a compaction query. Compaction configuration or generation failures
+are reported on dispatch without reverting the committed target. Model-only changes
+retain the existing owner and use the model PATCH command. An uncertain handoff
+response refreshes the authoritative chat projection; it never automatically
+retries the handoff or rolls back ownership.
+
 ### 12.2 Continuation to a new chat (`/handoff`)
 
 Creates a new target chat from a source chat. The handoff record names
@@ -2263,6 +2347,12 @@ Carried forward from V4, with the 12.1 ordering and a narrowed fence:
   records, closing the ledger connection before removing the chat
   directory. Deletion's read-blocking is its own tombstone mechanism,
   not the pending fence.
+  Permanently removing an executor configuration may abandon that executor's
+  native cleanup references after registry removal; it never substitutes Local
+  cleanup or skips controller ledger removal. Offline or disabled configured
+  executors retain their cleanup records. Executor removal itself preserves existing
+  chats and ledgers as readable, unavailable targets; pending handoff decisions
+  and prepared registry deletions remain temporary executor-removal blockers.
 - Restart: reopen ledgers (SQLite WAL recovery is normal startup
   behavior); drop all overlay state; fence orphan provider processes; no
   epoch rotation, no replay; ordinals and the view continue.
@@ -2340,8 +2430,8 @@ Implementation and regression references:
 - `server-agents/common/src/direct/{session-store,direct-chat-runtime-base,execution,native-session,openai-compatible-responses-runtime}.ts`
 - `server-agents/{direct-openai-compatible,direct-openai-responses-compatible,direct-anthropic-compatible}/src/index.ts`
 - `server-agents/common/src/direct/__tests__/{session-store.test.ts,native-session.test.ts,execution.test.ts,openai-compatible-responses-runtime.test.js}`
-- `server/agents/__tests__/architecture-boundaries.test.js` and
-  `server/ledger/__tests__/adoption-architecture.test.js`
+- `server/controller/agents/__tests__/architecture-boundaries.test.js` and
+  `server/controller/ledger/__tests__/adoption-architecture.test.js`
 - `integration-tests/tests/server/direct-native-history.test.ts` and
   `integration-tests/tests/sacs/legacy-history-adoption.test.ts`
 
@@ -2373,6 +2463,12 @@ relevant-entry definition under the 10.2 obligation.
   conversation-relevant rollout entry, excluding turn markers. Note the
   stateful Responses API can itself desync from the rollout across a
   crash — the same accepted risk class this design carries.
+  Garcon starts app-server with `features.goals=false` before loading threads,
+  preventing persisted goals from launching native turns outside Garcon's run
+  ownership. Existing goal records are not cleared or migrated; standalone native
+  use may still activate them. The pinned upstream
+  [resume and idle gates](https://github.com/openai/codex/blob/fe74a774532af67b5a4a3dec03ce9469e17f89af/codex-rs/ext/goal/src/runtime.rs#L401-L440)
+  honor this feature flag before restoring or continuing a goal.
 - **OpenCode**: part-id dedup at translation; provider errors emit as normal
   `provider-row`s; real-binary scripted tier retained. A typed
   `session.status` retry arm is attached only to the session's active turn and
@@ -2772,7 +2868,7 @@ The catalog cites this revision, but its inventory is not repeated here.
   their strongest deterministic tier. OpenCode adoption remains
   directory-scoped; directoryless discovery is a documented follow-up, not a
   runtime fallback. Static architecture tests allow Direct package imports
-  only in `server/agents/default-agent-integrations.ts` for registration and
+  only in `server/runtime/agents/default-agent-integrations.ts` for registration and
   reject Direct IDs, Direct leaf-package or
   `@garcon/server-agent-common/direct/*` imports, `DirectSessionStore` serving
   paths, or Direct-specific adoption branches throughout core. The scan still
@@ -2972,7 +3068,7 @@ Direct plan without requiring another implementation or migration.
    the exact response capability, and keeps native request IDs private. Remove
    the composite public fields and nested maps across interface, core, API,
    WebSocket, presentation, and browser. Keep schema-v1 payload JSON stable by
-   translating only in `server/ledger/codec.ts`; add an old-payload reopen
+   translating only in `server/controller/ledger/codec.ts`; add an old-payload reopen
    fixture before changing production readers.
 4. **Separate legacy migration from Reload.** Add required nullable
    `legacyHistoryImport` beside `nativeHistoryImport` on every integration.

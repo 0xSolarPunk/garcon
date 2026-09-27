@@ -56,6 +56,35 @@ describe('file draft repository', () => {
 		expect(await repository.getDrafts('user-a', 'other-deployment')).toHaveLength(1);
 	});
 
+	it('retains separate same-path backups for Local and two workers', async () => {
+		const repository = createMemoryFileDraftRepository();
+		const executors = [
+			undefined,
+			'22222222-2222-4222-8222-222222222222',
+			'33333333-3333-4333-8333-333333333333',
+		];
+		for (const executorId of executors) {
+			await repository.putDraft({
+				...draft(),
+				executorId,
+				documentId: fileDraftKey('user', 'deployment', '/workspace', 'file.ts', executorId),
+				content: executorId ?? 'original local',
+			});
+		}
+		await repository.putDraft({ ...draft(), executorId: 'local', content: 'latest local', savedAt: 2 });
+		const recovered = await repository.getDrafts('user', 'deployment');
+		expect(recovered).toHaveLength(3);
+		expect(recovered.map((item) => item.content).sort()).toEqual(
+			[executors[1], executors[2], 'latest local'].sort(),
+		);
+		await repository.deleteDraft(
+			fileDraftKey('user', 'deployment', '/workspace', 'file.ts', executors[1]),
+		);
+		expect(
+			(await repository.getDrafts('user', 'deployment')).map((item) => item.executorId).sort(),
+		).toEqual([executors[2], 'local'].sort());
+	});
+
 	it('evicts the oldest backup when the retained file limit is reached', async () => {
 		const repository = createMemoryFileDraftRepository();
 		for (let i = 0; i <= FILE_DRAFT_LIMIT; i++) {

@@ -65,6 +65,7 @@
 	}
 </script>
 
+<menu.Label>{terminals.executorLabel(terminals.executorIdFor(terminalId))}</menu.Label>
 {#if canReattach}
 	<menu.Item onSelect={() => terminals.reattach(terminalId)}>
 		<RefreshCw />

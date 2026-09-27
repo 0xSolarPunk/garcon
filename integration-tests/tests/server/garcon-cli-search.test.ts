@@ -2,12 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cliEnvironment } from '../../support/cli-environment.js';
 import {
   type IntegrationFixture,
-  withIntegrationFixture,
-} from '../../support/integration-fixture.js';
+  cliConnectionArguments,
+  withCliFixture,
+} from '../../support/cli-fixture.js';
 
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const WORKSPACE = 'cli-search-integration';
 
 function marker(prefix: string): string {
@@ -22,18 +24,11 @@ async function runCli(
     cmd: [
       process.execPath,
       'cli/main.ts',
-      '--config-dir', fixture.dirs.config,
-      '--workspace', WORKSPACE,
-      '--server', fixture.garcon.baseUrl,
+      ...cliConnectionArguments(fixture),
       ...arguments_,
     ],
     cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      GARCON_CONFIG_DIR: '',
-      GARCON_WORKSPACE: '',
-      HOME: fixture.dirs.home,
-    },
+    env: cliEnvironment({ HOME: fixture.dirs.home }),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -48,8 +43,8 @@ async function runCli(
 
 describe('garcon-cli chat research', () => {
   test('lists, searches, and reads a chat after its project directory disappears', async () => {
-    await withIntegrationFixture('garcon-cli-search-read', async (fixture) => {
-      const projectPath = path.join(fixture.dirs.project, 'removed-project');
+    await withCliFixture('garcon-cli-search-read', async (fixture) => {
+      const projectPath = path.join(fixture.executionDirs.project, 'removed-project');
       await fs.mkdir(projectPath);
       const parentChatId = fixture.newChatId();
       const chatId = fixture.newChatId();
@@ -59,7 +54,7 @@ describe('garcon-cli chat research', () => {
       const parent = await fixture.client.startDirectChat({
         chatId: parentChatId,
         content: marker('parentclause'),
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         agent,
       });
       expect((await fixture.client.waitForTurnTerminal(parentChatId, parent.turnId)).type)
@@ -213,15 +208,13 @@ describe('garcon-cli chat research', () => {
   }, 120_000);
 
   test('names the feature setting when transcript search is disabled', async () => {
-    await withIntegrationFixture('garcon-cli-search-disabled', async (fixture) => {
+    await withCliFixture('garcon-cli-search-disabled', async (fixture) => {
       const result = await runCli(fixture, ['search', 'needle', '--json']);
       expect(result.exitCode).toBe(2);
       expect(result.stdout).toBe('');
       expect(result.stderr).toContain([
         'garcon-cli',
-        '--workspace', `'${WORKSPACE}'`,
-        '--config-dir', `'${fixture.dirs.config}'`,
-        '--server', `'${fixture.garcon.baseUrl}'`,
+        ...cliConnectionArguments(fixture).map((argument, index) => index % 2 ? `'${argument}'` : argument),
         'transcript-search',
         'enable',
       ].join(' '));

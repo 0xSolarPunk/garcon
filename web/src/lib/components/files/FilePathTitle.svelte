@@ -1,13 +1,23 @@
 <script lang="ts">
 	import CopyFilePathButton from './CopyFilePathButton.svelte';
+	import FilePathPopover from './FilePathPopover.svelte';
 	import * as m from '$lib/paraglide/messages.js';
 
-	let { path, fileName, dirty }: { path: string; fileName: string; dirty: boolean } = $props();
+	let {
+		path,
+		fileName,
+		dirty,
+		executorLabel,
+	}: { path: string; fileName: string; dirty: boolean; executorLabel?: string } = $props();
+	const displayPath = $derived(executorLabel ? `${executorLabel}: ${path}` : path);
+	const displayName = $derived(executorLabel ? `${executorLabel}: ${fileName}` : fileName);
 	let availableSize = $state<DOMRectReadOnly>();
 	let requiredSize = $state<DOMRectReadOnly>();
 	let controlsSize = $state<DOMRectReadOnly>();
 	const title = $derived(
-		requiredSize && availableSize && requiredSize.width <= availableSize.width ? path : fileName,
+		requiredSize && availableSize && requiredSize.width <= availableSize.width
+			? displayPath
+			: displayName,
 	);
 </script>
 
@@ -22,11 +32,13 @@
 			bind:contentRect={requiredSize}
 			data-file-path-title-measure
 		>
-			<span>{path}</span>
+			<span>{displayPath}</span>
 			<span style:width={`${controlsSize?.width ?? 0}px`}></span>
 		</div>
 	</div>
-	<h2 class="min-w-0 truncate" title={path}>{title}</h2>
+	<h2 class="min-w-0 truncate" title={displayPath} aria-label={displayPath}>
+		<FilePathPopover {path} label={title} class="block max-w-full" />
+	</h2>
 	<div class="flex shrink-0 items-center gap-1.5" bind:contentRect={controlsSize}>
 		<CopyFilePathButton {path} />
 		{#if dirty}

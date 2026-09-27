@@ -1,4 +1,6 @@
 import * as m from '$lib/paraglide/messages.js';
+import { effectiveExecutorId } from '$shared/executors';
+import { fileIdentityKey } from '$lib/files/documents/file-identity.js';
 import {
 	getFileRevision,
 	readContent,
@@ -62,6 +64,7 @@ export type { FileOpenMode };
 export type FilePlacementResult = 'placed' | 'cancelled';
 
 export interface FileOpenRequest {
+	executorId?: string | null;
 	fileRootPath: string;
 	relativePath: string;
 	mode: FileOpenMode;
@@ -115,6 +118,7 @@ export interface FileThresholdRequest {
 }
 
 export interface FileSessionsDeps {
+	isExecutorAvailable?(executorId: string): boolean;
 	getIsMobile(): boolean;
 	getEditorSettings(): Omit<EditorPresentationSettings, 'editorThemeId'>;
 	getDefaultPlacement(mode: FileRendererMode, origin: PresentationHostId): DesktopPlacement;
@@ -140,9 +144,7 @@ export type { FileEditorRuntimeModule };
 export const FILE_SESSION_SOFT_LIMIT = 32;
 export { FILE_SAVE_TIMEOUT_MS };
 
-export function fileIdentityKey(root: string, relativePath: string): string {
-	return JSON.stringify([root, relativePath]);
-}
+export { fileIdentityKey };
 
 export class FileSessionRegistry {
 	sessions = $state.raw<Readonly<Record<string, FileViewSession>>>({});
@@ -264,15 +266,22 @@ export class FileSessionRegistry {
 		let response: FileIdentityResponse;
 		try {
 			response = await (this.deps.resolveFileIdentity ?? resolveFileIdentity)({
+				executorId: effectiveExecutorId(request.executorId),
 				projectPath: request.fileRootPath,
 				relativePath: request.relativePath,
 			});
+			if (response.identity.executorId !== effectiveExecutorId(request.executorId))
+				throw new Error('File identity belongs to a different executor');
 		} catch (error) {
 			this.deps.onOpenError?.(request, error);
 			return null;
 		}
 		const identity = response.identity;
-		const key = fileIdentityKey(identity.canonicalFileRootPath, identity.normalizedRelativePath);
+		const key = fileIdentityKey(
+			identity.canonicalFileRootPath,
+			identity.normalizedRelativePath,
+			identity.executorId,
+		);
 		await this.#teardowns.drain(key);
 		if (this.#destroyed) return null;
 		const documentId = this.#documentIdByIdentity.get(key);
@@ -354,7 +363,12 @@ export class FileSessionRegistry {
 
 	async refresh(sessionId: string): Promise<void> {
 		const current = this.get(sessionId);
-		if (!current || current.loading || !(await this.#prepareDraftRecovery(current.document)))
+		if (
+			!current ||
+			!current.document.executorAvailable ||
+			current.loading ||
+			!(await this.#prepareDraftRecovery(current.document))
+		)
 			return;
 		await this.#io.refresh(sessionId, (id) => this.confirmDestructive(id, 'refresh'));
 		const session = this.get(sessionId);
@@ -372,6 +386,16 @@ export class FileSessionRegistry {
 
 	checkFreshness(sessionId: string): Promise<void> {
 		return this.#io.checkFreshness(sessionId);
+	}
+
+	/** Checks open documents on one executor now instead of waiting for the next poll. */
+	checkExecutorFreshness(executorId: string): void {
+		for (const document of Object.values(this.documents)) {
+			if (document.executorId !== executorId) continue;
+			void this.#io.checkDocumentFreshness(document.id).catch((error: unknown) => {
+				console.error('File revision check failed', error);
+			});
+		}
 	}
 
 	confirmDestructive(sessionId: string, reason: FileDestructiveReason): Promise<boolean> {
@@ -505,6 +529,7 @@ export class FileSessionRegistry {
 		const session = this.get(sessionId);
 		if (!session) return null;
 		return this.open({
+			executorId: session.executorId,
 			fileRootPath: session.canonicalFileRootPath,
 			relativePath: session.relativePath,
 			mode: session.rendererMode,
@@ -540,11 +565,14 @@ export class FileSessionRegistry {
 		if (this.#destroyed) return null;
 		const existingDocumentId = this.#documentIdByIdentity.get(key);
 		let existingDocument = existingDocumentId ? this.documents[existingDocumentId] : null;
-		let document = existingDocument ?? new FileDocumentState(identity, key);
+		const options = {
+			isExecutorAvailable: () => this.deps.isExecutorAvailable?.(identity.executorId) ?? true,
+		};
+		let document = existingDocument ?? new FileDocumentState(identity, key, options);
 		if (!(await this.#prepareDraftRecovery(document)) || this.#destroyed) return null;
 		if (existingDocument && this.documents[document.id] !== document) {
 			const pendingRecoveryContent = document.pendingRecoveryContent;
-			document = new FileDocumentState(identity, key);
+			document = new FileDocumentState(identity, key, options);
 			document.pendingRecoveryContent = pendingRecoveryContent;
 			existingDocument = null;
 		}
@@ -601,12 +629,12 @@ export class FileSessionRegistry {
 
 	async showConflict(sessionId: string): Promise<void> {
 		const session = this.get(sessionId);
-		if (!session || session.document.mutationGuarded) return;
+		if (!session || !session.document.executorAvailable || session.document.mutationGuarded) return;
 		const disk = await this.#io.loadConflictSnapshot(session);
 		if (!disk) return;
 		const decision = await this.#confirmConflict(session, disk);
 		if (decision.choice !== 'save-checked' || !canSubmitFileWrite(session)) return;
-		this.#applyConflictResolution(session, decision);
+		if (!this.#applyConflictResolution(session, decision)) return;
 		const controller = this.#beginSave(session.document);
 		try {
 			await this.#saves.submit(
@@ -635,14 +663,22 @@ export class FileSessionRegistry {
 			document.loadedRevision ||
 			document.dirty ||
 			document.pendingRecoveryContent !== null ||
-			!this.#drafts?.find(document.canonicalFileRootPath, document.relativePath)
+			!this.#drafts?.find(
+				document.canonicalFileRootPath,
+				document.relativePath,
+				document.executorId,
+			)
 		)
 			return Promise.resolve(true);
 		return this.#decisionQueue.enqueue(async () => {
 			if (this.#destroyed) return false;
 			if (document.loadedRevision || document.dirty || document.pendingRecoveryContent !== null)
 				return true;
-			const draft = this.#drafts?.find(document.canonicalFileRootPath, document.relativePath);
+			const draft = this.#drafts?.find(
+				document.canonicalFileRootPath,
+				document.relativePath,
+				document.executorId,
+			);
 			if (!draft) return true;
 			const choice = await new Promise<'resume' | 'discard' | 'cancel'>((resolve) => {
 				this.#openMainInert(() => {
@@ -667,7 +703,11 @@ export class FileSessionRegistry {
 		for (const document of Object.values(this.documents)) {
 			if (document.pendingRecoveryContent !== null || (!document.loadedRevision && !document.dirty))
 				continue;
-			this.#drafts?.opened(document.canonicalFileRootPath, document.relativePath);
+			this.#drafts?.opened(
+				document.canonicalFileRootPath,
+				document.relativePath,
+				document.executorId,
+			);
 			void this.#drafts?.settle(document);
 		}
 	}
@@ -679,8 +719,11 @@ export class FileSessionRegistry {
 			session.document.pendingRecoveryContent !== null
 		)
 			return;
-		if (!this.#drafts?.find(session.canonicalFileRootPath, session.relativePath)) return;
-		this.#drafts.opened(session.canonicalFileRootPath, session.relativePath);
+		if (
+			!this.#drafts?.find(session.canonicalFileRootPath, session.relativePath, session.executorId)
+		)
+			return;
+		this.#drafts.opened(session.canonicalFileRootPath, session.relativePath, session.executorId);
 		void this.#drafts.settle(session.document);
 	}
 
@@ -723,8 +766,8 @@ export class FileSessionRegistry {
 		const disk = await this.#io.loadConflictSnapshot(session);
 		if (!disk) return false;
 		const decision = await this.#confirmConflict(session, disk, true);
-		if (decision.choice !== 'save-checked') return false;
-		this.#applyConflictResolution(session, decision);
+		if (decision.choice !== 'save-checked' || !session.document.executorAvailable) return false;
+		if (!this.#applyConflictResolution(session, decision)) return false;
 		await this.#saves.submit(
 			session.document,
 			decision.resolvedContent,
@@ -765,15 +808,14 @@ export class FileSessionRegistry {
 					this.overwriteRequest = snapshot;
 				});
 			});
-			if (decision.choice !== 'cancel' && !canResolve()) {
+			if (
+				decision.choice !== 'cancel' &&
+				(!canResolve() || session.document.bufferVersion !== decision.snapshot.localBufferVersion)
+			) {
 				session.saveError = m.file_conflict_buffer_changed();
 				return cancelled();
 			}
 			if (decision.choice === 'accept-disk') {
-				if (session.document.bufferVersion !== decision.snapshot.localBufferVersion) {
-					session.saveError = m.file_conflict_buffer_changed();
-					return cancelled();
-				}
 				this.#io.commitLoadedContent(session, {
 					kind: 'text',
 					content: decision.snapshot.diskContent,
@@ -785,13 +827,15 @@ export class FileSessionRegistry {
 		});
 	}
 
-	#applyConflictResolution(session: FileViewSession, decision: FileConflictDecision): void {
+	#applyConflictResolution(session: FileViewSession, decision: FileConflictDecision): boolean {
 		if (session.document.bufferVersion !== decision.snapshot.localBufferVersion) {
-			return;
+			session.saveError = m.file_conflict_buffer_changed();
+			return false;
 		}
 		if (decision.resolvedContent !== session.document.currentContent()) {
 			session.document.applyUserEdit(decision.resolvedContent);
 		}
+		return true;
 	}
 
 	#mostRecentViewId(documentId: string): string | undefined {
@@ -803,6 +847,7 @@ export class FileSessionRegistry {
 	#recordNavigation(session: FileViewSession): void {
 		const selection = session.editor?.selectionLocation();
 		this.navigation?.record({
+			executorId: session.executorId,
 			key: session.identityKey,
 			canonicalFileRootPath: session.canonicalFileRootPath,
 			normalizedRelativePath: session.relativePath,

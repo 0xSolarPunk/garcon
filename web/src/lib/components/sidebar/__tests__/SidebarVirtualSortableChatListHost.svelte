@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
 	import { onMount } from 'svelte';
 	import SidebarVirtualSortableChatList from '../SidebarVirtualSortableChatList.svelte';
 	import {
@@ -94,6 +96,7 @@
 	} as never);
 
 	setModelCatalog({
+		forExecutor() { return this; },
 		supportsFork() {
 			return true;
 		},

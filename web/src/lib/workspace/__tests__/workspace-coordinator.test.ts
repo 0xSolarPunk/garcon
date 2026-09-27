@@ -19,7 +19,10 @@ import {
 import { CANONICAL_CHAT_SURFACE_ID, CANONICAL_FILES_SURFACE_ID } from '../canonical-layout';
 import { windowIdOfSurface, windowNodeById, collectWindowNodes } from '../window-tree';
 import type { TerminalMetadata } from '$shared/terminal';
-import type { TerminalAttachmentState } from '$lib/terminal/sessions/terminal-registry.svelte.js';
+import type {
+	TerminalAttachmentState,
+	TerminalRegistry,
+} from '$lib/terminal/sessions/terminal-registry.svelte.js';
 import { SurfaceFrameRegistry } from '../surface-frame-registry.svelte';
 import { SurfaceFrameBridge } from '../surface-frame-context';
 import { WorkspaceShortcutDispatcher, type WorkspaceShortcutDeps } from '../workspace-shortcuts';
@@ -34,9 +37,10 @@ import type { ProjectTarget } from '$shared/project-resolution';
 import type {
 	ProjectResolutionLease,
 	ProjectResolutionSnapshot,
-} from '../project-resolution-store.svelte';
+} from '../project-resolution-store.svelte.ts';
 import type { ProjectResolver } from '../workspace-project-path-resolution';
 import { AppShellChatNavigationController } from '$lib/components/layout/app-shell-chat-navigation-controller.svelte.js';
+import { TerminalLayoutBinding } from '../terminal-layout-binding.js';
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;
@@ -157,7 +161,14 @@ function createHarness(
 				: null,
 		),
 	};
+	let createdTerminals = 0;
+	const createTerminal = vi.fn<TerminalRegistry['create']>(
+		async () => `terminal-${++createdTerminals}`,
+	);
 	const terminals = {
+		displayName: (metadata: TerminalMetadata) =>
+			metadata.title ?? `Local ${metadata.displaySequence}`,
+		executorIdFor: vi.fn((_terminalId: string) => 'local'),
 		sessions: {} as Record<
 			string,
 			{
@@ -167,7 +178,14 @@ function createHarness(
 		>,
 		requestTermination: options.terminate ?? vi.fn(async () => undefined),
 		disposeTerminatedSession: vi.fn(),
-		create: vi.fn(),
+		async create(...args: Parameters<TerminalRegistry['create']>): Promise<string> {
+			const terminalId = await createTerminal(...args);
+			terminals.sessions[terminalId] ??= {
+				metadata: terminalMetadata(terminalId),
+				attachmentState: 'detached',
+			};
+			return terminalId;
+		},
 		pendingCreates: {} as Record<string, unknown>,
 		prepareRendererTransfer:
 			options.terminalPrepareRendererTransfer ?? vi.fn((_terminalId: string) => undefined),
@@ -236,7 +254,7 @@ function createHarness(
 		files,
 		fileCloseReleases,
 		layout,
-		terminals,
+		terminals: { ...terminals, create: createTerminal },
 		appShell,
 		singletons,
 		workspaceInteractionGate,
@@ -2711,6 +2729,128 @@ describe('WorkspaceCoordinator', () => {
 		expect(terminals.requestTermination).not.toHaveBeenCalled();
 	});
 
+	it.each(['window', 'replace'] as const)(
+		'captures the source terminal host/directory for %s creation',
+		async (mode) => {
+			const { coordinator, layout, terminals } = createHarness();
+			terminals.executorIdFor.mockReturnValue('remote');
+			terminals.sessions.one = {
+				metadata: { ...terminalMetadata('one'), initialWorkingDirectory: '/remote/project' },
+				attachmentState: 'attached',
+			};
+			terminals.create.mockResolvedValue('two');
+			layout.publish(
+				layout.revision,
+				reduceWorkspaceLayout(layout.snapshot, [
+					{
+						type: 'register-surface',
+						surface: { id: terminalSurfaceId('one'), type: 'terminal', terminalId: 'one' },
+						windowId: 'window-main',
+					},
+					{
+						type: 'activate-window-tab',
+						windowId: 'window-main',
+						surfaceId: terminalSurfaceId('one'),
+					},
+				]),
+			);
+			expect(coordinator.terminalCreationExecutorIdFor('window-main')).toBe('remote');
+			if (mode === 'window') await coordinator.createTerminal('window-main');
+			else await coordinator.createTerminalReplacing('one');
+			expect(terminals.create).toHaveBeenCalledWith(
+				'/remote/project',
+				expect.any(String),
+				'remote',
+			);
+		},
+	);
+
+	it('uses the destination base when an existing terminal chooses a different host', async () => {
+		const { coordinator, layout, terminals } = createHarness();
+		terminals.executorIdFor.mockReturnValue('remote');
+		terminals.sessions.one = { metadata: terminalMetadata('one'), attachmentState: 'attached' };
+		terminals.create.mockResolvedValue('two');
+		layout.publish(
+			layout.revision,
+			reduceWorkspaceLayout(layout.snapshot, [
+				{
+					type: 'register-surface',
+					surface: { id: terminalSurfaceId('one'), type: 'terminal', terminalId: 'one' },
+					windowId: 'window-main',
+				},
+				{
+					type: 'activate-window-tab',
+					windowId: 'window-main',
+					surfaceId: terminalSurfaceId('one'),
+				},
+			]),
+		);
+		await coordinator.createTerminal('window-main', 'synthetic-create', 'local');
+		expect(terminals.create).toHaveBeenCalledWith(null, expect.any(String), 'local');
+	});
+
+	it.each([undefined, 'remote'])(
+		'uses the visible mobile terminal directory for command creation on %s',
+		async (executorId) => {
+			const { coordinator, layout, terminals } = createHarness();
+			terminals.executorIdFor.mockImplementation((id) =>
+				id === 'remote-terminal' ? 'remote' : 'local',
+			);
+			for (const id of ['remote-terminal', 'local-terminal']) {
+				terminals.sessions[id] = {
+					metadata: { ...terminalMetadata(id), initialWorkingDirectory: `/${id}/project` },
+					attachmentState: 'attached',
+				};
+				await coordinator.openTerminalSession(id, 'window-main');
+			}
+			await coordinator.enterMobilePresentation();
+			await coordinator.switchTerminalSurface('local-terminal', 'remote-terminal');
+			expect(windowTabs(layout.snapshot, 'window-main').activeId).toBe(
+				terminalSurfaceId('local-terminal'),
+			);
+			expect(layout.snapshot.mobileActiveSurfaceId).toBe(terminalSurfaceId('remote-terminal'));
+			expect(coordinator.terminalCreationExecutorId).toBe('remote');
+			terminals.create.mockResolvedValue('new-terminal');
+			await coordinator.createTerminalInAvailableSpace('command-menu:new-terminal', executorId);
+			expect(terminals.create).toHaveBeenCalledWith(
+				'/remote-terminal/project',
+				expect.any(String),
+				'remote',
+			);
+		},
+	);
+
+	it.each([
+		{ firstExecutor: undefined, retryExecutor: 'local' },
+		{ firstExecutor: 'local', retryExecutor: undefined },
+	])(
+		'retains create identity when direct/menu selection changes $firstExecutor to $retryExecutor',
+		async ({ firstExecutor, retryExecutor }) => {
+			const { coordinator, terminals } = createHarness();
+			terminals.create
+				.mockImplementationOnce(
+					async (directory: string | null, requestId: string, executorId = 'local') => {
+						terminals.pendingCreates[requestId] = {
+							requestedInitialWorkingDirectory: directory,
+							executorId,
+						};
+						throw new Error('Lost response');
+					},
+				)
+				.mockImplementationOnce(async (_directory: string | null, requestId: string) => {
+					delete terminals.pendingCreates[requestId];
+					return 'recovered-terminal';
+				});
+			await expect(
+				coordinator.createTerminalInAvailableSpace('entry-point', firstExecutor),
+			).rejects.toThrow('Lost response');
+			await expect(
+				coordinator.createTerminalInAvailableSpace('entry-point', retryExecutor),
+			).resolves.toBe('recovered-terminal');
+			expect(terminals.create.mock.calls[1]).toEqual(terminals.create.mock.calls[0]);
+		},
+	);
+
 	it('opens a singleton in a new window and focuses it', async () => {
 		const { coordinator, layout } = createHarness();
 
@@ -2960,6 +3100,54 @@ describe('WorkspaceCoordinator', () => {
 		expect(windowTabs(layout.snapshot, 'window-main').order).toContain(terminalSurfaceId('one'));
 		expect(windowTabs(layout.snapshot, 'window-main').order).toContain(terminalSurfaceId('two'));
 		expect(windowTabs(layout.snapshot, 'window-main').activeId).toBe(CANONICAL_CHAT_SURFACE_ID);
+	});
+
+	it('reconciles concurrent executor inventories against the latest placement without resurrecting tabs', async () => {
+		const { coordinator, layout, terminals } = createHarness();
+		const local = ['local-placed', 'local-hidden'];
+		const remote = ['remote-placed', 'remote-hidden'];
+		const offline = ['offline-placed', 'offline-hidden'];
+		terminals.executorIdFor.mockImplementation((id: string) => id.split('-')[0]);
+		for (const id of [...local, ...remote, ...offline]) {
+			terminals.sessions[id] = { metadata: terminalMetadata(id), attachmentState: 'detached' };
+			await coordinator.openTerminalSession(id, 'window-main');
+			if (id.endsWith('-hidden')) await coordinator.closeSurface(terminalSurfaceId(id));
+		}
+		const binding = new TerminalLayoutBinding({
+			restoreSource: 'valid',
+			workspace: coordinator,
+			isLauncherDismissed: () => false,
+			onError(error) {
+				throw error;
+			},
+		});
+		for (const id of [...local, ...remote]) delete terminals.sessions[id];
+		binding.handleSuccessfulList([], 'local');
+		binding.handleSuccessfulList([], 'remote');
+		await vi.waitFor(() => {
+			for (const id of [...local, ...remote]) {
+				expect(layout.surface(terminalSurfaceId(id))).toBeNull();
+				expect(layout.snapshot.unplacedTerminalIds).not.toContain(id);
+			}
+		});
+		expect(layout.surface(terminalSurfaceId(offline[0]))).not.toBeNull();
+		expect(layout.snapshot.unplacedTerminalIds).toContain(offline[1]);
+		binding.destroy();
+	});
+
+	it('does not restore a terminal removed after its executor inventory queued layout reconciliation', async () => {
+		const { coordinator, layout, terminals } = createHarness();
+		const id = 'local-race';
+		terminals.sessions[id] = { metadata: terminalMetadata(id), attachmentState: 'detached' };
+		await coordinator.openTerminalSession(id, 'window-main');
+		const reconciling = coordinator.reconcileTerminals([id], {
+			executorId: 'local',
+			deriveLauncher: false,
+		});
+		delete terminals.sessions[id];
+		await reconciling;
+		expect(layout.surface(terminalSurfaceId(id))).toBeNull();
+		expect(layout.snapshot.unplacedTerminalIds).not.toContain(id);
 	});
 
 	it('returns to an inactive Chat when mobile terminal reconciliation removes the active tab', async () => {

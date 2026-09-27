@@ -416,7 +416,8 @@ class IndexedGitVirtualReviewRowSource implements GitVirtualReviewRowSource {
 			file,
 			view,
 			actionTarget: interaction.actionTarget,
-			selectableLineKeys: () => this.selectableLineKeys(file, body, interaction.activeTab),
+			selectableLineKeys: () =>
+				interaction.actionTarget ? this.selectableLineKeys(file, body, interaction.activeTab) : [],
 		};
 	}
 
@@ -434,7 +435,8 @@ class IndexedGitVirtualReviewRowSource implements GitVirtualReviewRowSource {
 			file,
 			view,
 			actionTarget: interaction.actionTarget,
-			selectableLineKeys: () => this.selectableLineKeys(file, body, interaction.activeTab),
+			selectableLineKeys: () =>
+				interaction.actionTarget ? this.selectableLineKeys(file, body, interaction.activeTab) : [],
 		};
 	}
 
@@ -642,6 +644,12 @@ function splitCell(
 
 function interactionForFile(options: BuildVirtualRowsOptions, file: GitReviewFileSummary) {
 	const workbench = options.interaction.kind === 'workbench' ? options.interaction : null;
+	const document = options.summary.document;
+	const body = options.fileBodies[file.path];
+	const proof =
+		document && body?.patchDigest && body.bodyFingerprint === file.bodyFingerprint
+			? { document, bodyFingerprint: body.bodyFingerprint, patchDigest: body.patchDigest }
+			: null;
 	const activeTab = workbench?.activeTab ?? 'staged';
 	const composer =
 		options.interaction.kind === 'read-only' ? null : options.interaction.composerState;
@@ -657,21 +665,23 @@ function interactionForFile(options: BuildVirtualRowsOptions, file: GitReviewFil
 	const common = {
 		filePath: file.path,
 		activeTab,
-		readOnly: !workbench,
+		readOnly: !workbench || !proof,
 		selectedLineKeys: workbench?.selectedLineKeys ?? new Set<string>(),
 		composerTarget,
 		...(options.syntaxResults?.[file.path]
 			? { syntaxResult: options.syntaxResults[file.path] }
 			: {}),
 	};
-	const actionTarget: GitDiffActionTarget | null = workbench
-		? {
-				filePath: file.path,
-				tab: activeTab,
-				mode: activeTab === 'unstaged' ? 'stage' : 'unstage',
-				contextLines: options.contextLines,
-			}
-		: null;
+	const actionTarget: GitDiffActionTarget | null =
+		workbench && proof
+			? {
+					filePath: file.path,
+					tab: activeTab,
+					mode: activeTab === 'unstaged' ? 'stage' : 'unstage',
+					contextLines: options.contextLines,
+					proof,
+				}
+			: null;
 	return {
 		activeTab,
 		actionTarget,

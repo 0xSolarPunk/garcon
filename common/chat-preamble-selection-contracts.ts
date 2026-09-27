@@ -18,10 +18,12 @@ import {
   type PreambleSelectionProjection,
 } from './preambles.js';
 import { isRecord } from './json.js';
+import { parseExecutorId, LOCAL_EXECUTOR_ID } from './executors.js';
 
 export const CHAT_PREAMBLE_SELECTION_BODY_MAX_BYTES = 32 * 1024;
 
 export interface ChatPreambleSelectionTargetResponse {
+  readonly executorId?: string | null;
   readonly success: true;
   readonly chatId: string;
   readonly transcriptViewId: string;
@@ -56,6 +58,7 @@ export interface UpdateChatPreambleSelectionResponse {
 }
 
 export interface PreambleSelectionPreviewRequest {
+  readonly executorId?: string | null;
   readonly projectPath: string;
   readonly agentId: AgentId;
   readonly tags: readonly string[];
@@ -63,6 +66,7 @@ export interface PreambleSelectionPreviewRequest {
 }
 
 export interface PreambleSelectionPreviewResponse {
+  readonly executorId?: string | null;
   readonly success: true;
   readonly canonicalProjectPath: string;
   readonly orderedPreambleIds: readonly PreambleId[];
@@ -135,7 +139,10 @@ export function parseUpdateChatPreambleSelectionRequest(
 export function parsePreambleSelectionPreviewRequest(
   value: unknown,
 ): PreambleSelectionPreviewRequest {
-  const body = strictRecord(value, ['projectPath', 'agentId', 'tags', 'orderedPreambleIds']);
+  const body = strictRecord(value, ['executorId', 'projectPath', 'agentId', 'tags', 'orderedPreambleIds']);
+  const executorId = parseExecutorId(body.executorId);
+  if (!executorId) throw new CommandRequestValidationError('executorId is invalid');
+  const executor = executorId === LOCAL_EXECUTOR_ID ? {} : { executorId };
   const projectPath = body.projectPath;
   if (typeof projectPath !== 'string' || projectPath.trim().length === 0) {
     throw new CommandRequestValidationError('projectPath is required');
@@ -155,7 +162,7 @@ export function parsePreambleSelectionPreviewRequest(
     throw new CommandRequestValidationError('tags must be normalized, unique, and sorted');
   }
   if (body.orderedPreambleIds === undefined) {
-    return { projectPath, agentId: body.agentId, tags };
+    return { ...executor, projectPath, agentId: body.agentId, tags };
   }
   if (!Array.isArray(body.orderedPreambleIds)) {
     throw new CommandRequestValidationError('orderedPreambleIds must be an array');
@@ -163,6 +170,7 @@ export function parsePreambleSelectionPreviewRequest(
   return {
     projectPath,
     agentId: body.agentId,
+    ...executor,
     tags,
     orderedPreambleIds: requiredOrderedPreambleIds(body.orderedPreambleIds),
   };
@@ -206,6 +214,7 @@ export function parseChatPreambleSelectionTargetResponse(
   value: unknown,
 ): ChatPreambleSelectionTargetResponse | null {
   const response = responseRecord(value, [
+    'executorId',
     'success',
     'chatId',
     'transcriptViewId',
@@ -214,6 +223,8 @@ export function parseChatPreambleSelectionTargetResponse(
     'projection',
   ]);
   if (!response || response.success !== true) return null;
+  const executorId = parseExecutorId(response.executorId);
+  if (!executorId) return null;
   const selection = normalizeChatPreambleSelection(response.selection);
   const projection = normalizePreambleSelectionProjection(response.projection);
   if (!isResponseChatId(response.chatId)
@@ -227,6 +238,7 @@ export function parseChatPreambleSelectionTargetResponse(
     chatId: response.chatId,
     transcriptViewId: response.transcriptViewId,
     canonicalProjectPath: response.canonicalProjectPath,
+    ...(executorId === LOCAL_EXECUTOR_ID ? {} : { executorId }),
     selection,
     projection,
   };
@@ -299,12 +311,15 @@ export function parsePreambleSelectionPreviewResponse(
   value: unknown,
 ): PreambleSelectionPreviewResponse | null {
   const response = responseRecord(value, [
+    'executorId',
     'success',
     'canonicalProjectPath',
     'orderedPreambleIds',
     'projection',
   ]);
   if (!response || response.success !== true) return null;
+  const executorId = parseExecutorId(response.executorId);
+  if (!executorId) return null;
   const projection = normalizePreambleSelectionProjection(response.projection);
   if (
     !isNonEmptyString(response.canonicalProjectPath)
@@ -321,6 +336,7 @@ export function parsePreambleSelectionPreviewResponse(
   return {
     success: true,
     canonicalProjectPath: response.canonicalProjectPath,
+    ...(executorId === LOCAL_EXECUTOR_ID ? {} : { executorId }),
     orderedPreambleIds: [...response.orderedPreambleIds],
     projection,
   };

@@ -3,9 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CURRENT_WORKSPACE_VERSION } from '../../../server/migrations/index.js';
 import { createCodexRolloutFileName } from '../../support/codex-rollout-filename.js';
-import { withIntegrationFixture } from '../../support/integration-fixture.js';
+import { withIntegrationFixture, type IntegrationFixture } from '../../support/integration-fixture.js';
+import { restartWithSeededChat } from '../../support/persisted-chat.js';
 
 describe('Codex history modes', () => {
   test('falls back to a frozen point fork when paginated native history cannot fork', async () => {
@@ -26,6 +26,7 @@ describe('Codex history modes', () => {
     };
 
     await withIntegrationFixture('codex-paginated-full-fork', async (fixture) => {
+      await seedChat(fixture, sourceChatId, sourceAgentSessionId, sourceNativePath);
       const messages = await fixture.client.getMessages(sourceChatId);
       expect(messages.messages.map((entry) => (
         entry.message.type === 'user-message' || entry.message.type === 'assistant-message'
@@ -105,38 +106,6 @@ describe('Codex history modes', () => {
             history_base: null,
           },
         })}\n`);
-        await writeFile(
-          join(directories.workspace, 'workspace-version.json'),
-          JSON.stringify({ version: CURRENT_WORKSPACE_VERSION }),
-        );
-        await writeFile(join(directories.workspace, 'chats.json'), JSON.stringify({
-          version: 5,
-          sessions: {
-            [sourceChatId]: {
-              agentId: 'codex',
-              nativeSession: {
-                ownerId: 'codex',
-                schemaVersion: 1,
-                value: { path: sourceNativePath, agentSessionId: sourceAgentSessionId },
-              },
-              agentOwnershipEpoch: randomUUID(),
-              agentSettingsById: {},
-              projectPath: directories.project,
-              tags: [],
-              agentSessionId: sourceAgentSessionId,
-              model: 'gpt-5.6-sol',
-              apiProviderId: null,
-              modelEndpointId: null,
-              modelProtocol: null,
-              lastReadAt: null,
-              permissionMode: 'default',
-              thinkingMode: 'none',
-              carryOverSegments: [],
-              nativeSeedReceipt: null,
-              carryOverMigrationQuarantine: null,
-            },
-          },
-        }));
       },
     });
   });
@@ -159,6 +128,7 @@ describe('Codex history modes', () => {
     };
 
     await withIntegrationFixture('codex-paginated-point-fork', async (fixture) => {
+      await seedChat(fixture, sourceChatId, sourceAgentSessionId, sourceNativePath);
       const messages = await fixture.client.getMessages(sourceChatId);
       expect(messages.messages.map((entry) => (
         entry.message.type === 'user-message' || entry.message.type === 'assistant-message'
@@ -204,7 +174,7 @@ describe('Codex history modes', () => {
         .map((line) => JSON.parse(line) as Record<string, unknown>);
       expect(forkParams).toEqual([{
         threadId: sourceAgentSessionId,
-        cwd: fixture.dirs.project,
+        cwd: fixture.executionDirs.project,
         model: 'gpt-5.6-sol',
         ephemeral: false,
         excludeTurns: true,
@@ -275,39 +245,14 @@ describe('Codex history modes', () => {
           assistantItem('item-4', 'second answer'),
           '',
         ].join('\n'));
-        await writeFile(
-          join(directories.workspace, 'workspace-version.json'),
-          JSON.stringify({ version: CURRENT_WORKSPACE_VERSION }),
-        );
-        await writeFile(join(directories.workspace, 'chats.json'), JSON.stringify({
-          version: 5,
-          sessions: {
-            [sourceChatId]: {
-              agentId: 'codex',
-              nativeSession: {
-                ownerId: 'codex',
-                schemaVersion: 1,
-                value: { path: sourceNativePath, agentSessionId: sourceAgentSessionId },
-              },
-              agentOwnershipEpoch: randomUUID(),
-              agentSettingsById: {},
-              projectPath: directories.project,
-              tags: [],
-              agentSessionId: sourceAgentSessionId,
-              model: 'gpt-5.6-sol',
-              apiProviderId: null,
-              modelEndpointId: null,
-              modelProtocol: null,
-              lastReadAt: null,
-              permissionMode: 'default',
-              thinkingMode: 'none',
-              carryOverSegments: [],
-              nativeSeedReceipt: null,
-              carryOverMigrationQuarantine: null,
-            },
-          },
-        }));
       },
     });
   });
 });
+
+async function seedChat(fixture: IntegrationFixture, chatId: string, agentSessionId: string, nativePath: string): Promise<void> {
+  await restartWithSeededChat(fixture, chatId, {
+    agentId: 'codex', model: 'gpt-5.6-sol', agentSessionId,
+    nativeSession: { ownerId: 'codex', schemaVersion: 1, value: { path: nativePath, agentSessionId } },
+  });
+}

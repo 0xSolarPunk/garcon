@@ -6,9 +6,11 @@ import { CHAT_PROCESSING_PHASES, type ChatProcessingPhase } from './chat-types.j
 import { parseParentChatRef, type ParentChatRef } from './chat-parentage.js';
 import { parseChatId } from './chat-id.js';
 import { isRecord } from './json.js';
+import { isExecutorId } from './executors.js';
 
 export interface ChatListEntry {
   id: string;
+  executorId?: string | null;
   parentChat: ParentChatRef | null;
   agentId: string;
   agentOwnershipEpoch: string;
@@ -89,6 +91,8 @@ function parseChatListEntry(value: unknown, index: number): ChatListEntry {
     if (!parentChat) fail(field('parentChat'));
   }
   const agentId = nonEmptyString(value.agentId, field('agentId'));
+  const executorId = value.executorId;
+  if (executorId != null && !isExecutorId(executorId)) fail(field('executorId'));
   const agentOwnershipEpoch = nonEmptyString(
     value.agentOwnershipEpoch,
     field('agentOwnershipEpoch'),
@@ -142,6 +146,7 @@ function parseChatListEntry(value: unknown, index: number): ChatListEntry {
 
   return {
     id: value.id,
+    ...(executorId === undefined ? {} : { executorId }),
     parentChat,
     agentId,
     agentOwnershipEpoch,

@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
 	import SidebarChatList from '../SidebarChatList.svelte';
 	import { setAppShell, setModelCatalog } from '$lib/context';
 	import { setWorkspaceWindowDndTestContext } from './workspace-window-dnd-test-context.js';
@@ -77,6 +79,7 @@
 	} as never);
 
 	setModelCatalog({
+		forExecutor() { return this; },
 		supportsFork() {
 			return true;
 		},

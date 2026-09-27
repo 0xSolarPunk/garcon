@@ -2,10 +2,59 @@ import { fireEvent, render, screen } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 import { AssistantMessage, TranscriptNoticeMessage } from '$shared/chat-types';
 import ConversationMessageHost from './ConversationMessageHost.svelte';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
 
 const TS = '2026-05-14T00:00:00.000Z';
 
 describe('ConversationMessage file links', () => {
+	it('opens a remote panel link on its owning executor while Local is selected', async () => {
+		const openAuto = vi.fn();
+		render(ConversationMessageHost, {
+			message: new AssistantMessage(TS, 'Open [remote file](file.txt)'),
+			openAuto,
+			chatContext: {
+				chatId: 'remote-chat',
+				executorId: remoteExecutor.id,
+				projectPath: '/worker/project',
+			},
+			executors: [
+				localExecutor,
+				{ ...remoteExecutor, machineServices: { files: true, git: false, gh: false, terminals: false } },
+			],
+		});
+		await fireEvent.click(screen.getByRole('link', { name: 'remote file' }));
+		expect(openAuto).toHaveBeenCalledWith(
+			expect.objectContaining({
+				executorId: remoteExecutor.id,
+				fileRootPath: '/worker',
+				relativePath: 'project/file.txt',
+			}),
+		);
+	});
+
+	it('does not redirect an unavailable remote panel link to Local', async () => {
+		const openAuto = vi.fn();
+		render(ConversationMessageHost, {
+			message: new AssistantMessage(TS, 'Open [remote file](file.txt)'),
+			openAuto,
+			chatContext: {
+				chatId: 'remote-chat',
+				executorId: remoteExecutor.id,
+				projectPath: '/workspace/project',
+			},
+			executors: [
+				localExecutor,
+				{
+					...remoteExecutor,
+					availability: 'offline',
+					machineServices: { files: true, git: false, gh: false, terminals: false },
+				},
+			],
+		});
+		await fireEvent.click(screen.getByRole('link', { name: 'remote file' }));
+		expect(openAuto).not.toHaveBeenCalled();
+		expect(screen.getByText('Files are unavailable on this executor.')).toBeTruthy();
+	});
 	it('opens absolute markdown links under base but outside the chat project', async () => {
 		const openAuto = vi.fn();
 		render(ConversationMessageHost, {

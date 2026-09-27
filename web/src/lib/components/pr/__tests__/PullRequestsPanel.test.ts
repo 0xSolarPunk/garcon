@@ -7,6 +7,7 @@ import {
 	ResizeObserverHarness,
 } from '$lib/components/shared/__tests__/resize-observer-harness';
 import PullRequestsPanelTestHost from './PullRequestsPanelTestHost.svelte';
+import * as m from '$lib/paraglide/messages.js';
 
 function summary(number: number): PullRequestSummary {
 	return {
@@ -29,8 +30,22 @@ function summary(number: number): PullRequestSummary {
 
 function makeController(): PullRequestsStore {
 	const controller = new PullRequestsStore();
-	controller.setCapability(true, true);
-	controller.setProject('/project', 'project-key');
+	controller.setCapability('local', true, true);
+	controller.setProjectState({
+		kind: 'available',
+		project: {
+			target: {
+				kind: 'chat' as const,
+				chatId: 'chat',
+				projectPath: '/project',
+				executorId: 'local',
+			},
+			chatId: 'chat',
+			executorId: 'local',
+			projectPath: '/project',
+			effectiveProjectKey: 'project-key',
+		},
+	});
 	controller.pulls = [summary(1), summary(2)];
 	controller.hasLoaded = true;
 	return controller;
@@ -47,6 +62,28 @@ describe('PullRequestsPanel container presentation', () => {
 		restoreResizeObserver();
 	});
 
+	it('retries GitHub capability through its own controller', async () => {
+		const controller = makeController();
+		controller.setCapability('local', true, false);
+		const retry = vi.spyOn(controller, 'retryCapability').mockImplementation(() => undefined);
+		const { unmount } = render(PullRequestsPanelTestHost, {
+			props: {
+				props: {
+					controller,
+					onSendToChat: vi.fn().mockResolvedValue(true),
+					onNavigateToChat: vi.fn(),
+				},
+			},
+		});
+		try {
+			await fireEvent.click(screen.getByRole('button', { name: m.common_retry() }));
+			expect(retry).toHaveBeenCalledOnce();
+		} finally {
+			unmount();
+			controller.dispose();
+		}
+	});
+
 	it('uses host width for wide, compact, and list-to-detail layouts', async () => {
 		const controller = makeController();
 		const { container } = render(PullRequestsPanelTestHost, {
@@ -56,7 +93,6 @@ describe('PullRequestsPanel container presentation', () => {
 					isMobile: false,
 					onSendToChat: vi.fn().mockResolvedValue(true),
 					onNavigateToChat: vi.fn(),
-					onRetryCapability: vi.fn(),
 				},
 			},
 		});

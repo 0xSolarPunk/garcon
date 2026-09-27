@@ -14,6 +14,9 @@ export interface ChatRenameConfirmation {
 }
 
 export interface ChatProjectPathDialog {
+	executorId?: string | null;
+	agentOwnershipEpoch: string | null;
+	status: ChatSessionRecord['status'];
 	chatId: string;
 	chatTitle: string;
 	currentProjectPath: string;
@@ -73,6 +76,9 @@ export class ChatActionDialogsState {
 
 	requestProjectPath(chat: ChatSessionRecord, fallbackTitle: string): void {
 		this.chatProjectPathDialog = {
+			executorId: chat.executorId,
+			agentOwnershipEpoch: chat.agentOwnershipEpoch,
+			status: chat.status,
 			chatId: chat.id,
 			chatTitle: chat.title || fallbackTitle,
 			currentProjectPath: chat.projectPath,

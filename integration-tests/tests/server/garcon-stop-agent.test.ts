@@ -1,8 +1,10 @@
+import { cliConnectionArguments } from '../../support/cli-fixture.js';
 import { expect, test } from 'bun:test';
 import { fileURLToPath } from 'node:url';
 import type { ChatMessagesMessage, ServerWsMessage } from '../../../common/ws-events.js';
 import { messagesOfType, userContents } from '../../support/chat-assertions.js';
-import { withIntegrationFixture, type IntegrationFixture } from '../../support/integration-fixture.js';
+import { cliEnvironment } from '../../support/cli-environment.js';
+import { withCliFixture, type IntegrationFixture } from '../../support/cli-fixture.js';
 
 const WORKSPACE = 'stop-agent';
 
@@ -22,13 +24,13 @@ async function childOutcome(fixture: IntegrationFixture, parent: string, ref: st
 
 for (const creation of ['markup', 'cli'] as const) for (const remove of [false, true]) {
   test(`${creation} delegated child can be ${remove ? 'removed while active' : 'stopped and resumed'} without a stop reply`, async () => {
-    await withIntegrationFixture(`stop-agent-${creation}-${remove}`, async (fixture) => {
+    await withCliFixture(`stop-agent-${creation}-${remove}`, async (fixture) => {
       const agent = fixture.directAgents.openAiResponses;
       const model = fixture.fakeProviders.openAiResponses;
       const parent = fixture.newChatId();
       const initial = model.holdNext({ lastUserText: 'Synthetic parent task.' });
       const cursor = fixture.client.markEvents();
-      const started = await fixture.client.startDirectChat({ chatId: parent, projectPath: fixture.dirs.project,
+      const started = await fixture.client.startDirectChat({ chatId: parent, projectPath: fixture.executionDirs.project,
         content: 'Synthetic parent task.', agent });
       await initial.received;
       initial.releaseText('Synthetic parent ready.');
@@ -37,12 +39,11 @@ for (const creation of ['markup', 'cli'] as const) for (const remove of [false, 
       const heldChild = model.holdNext({ lastUserText: 'Synthetic child task.' });
       let child: string;
       if (creation === 'cli') {
-        const processRun = Bun.spawn([process.execPath, 'cli/main.ts', '--config-dir', fixture.dirs.config,
-          '--workspace', WORKSPACE, 'start-async', '--cwd', fixture.dirs.project, '--agent', agent.agentId,
+        const processRun = Bun.spawn([process.execPath, 'cli/main.ts', ...cliConnectionArguments(fixture), 'start-async', '--cwd', fixture.executionDirs.project, '--agent', agent.agentId,
           '--provider', agent.provider.providerId, '--endpoint', agent.provider.endpointId,
           '--model', agent.provider.model, '--parent', parent, 'Synthetic child task.'], {
-          cwd: fileURLToPath(new URL('../../../', import.meta.url)),
-          env: { ...process.env, GARCON_CONFIG_DIR: '', GARCON_WORKSPACE: '' }, stdout: 'pipe', stderr: 'pipe',
+          cwd: fileURLToPath(new URL('../../..', import.meta.url)),
+          env: cliEnvironment(), stdout: 'pipe', stderr: 'pipe',
         });
         const [code, stdout, stderr] = await Promise.all([processRun.exited,
           new Response(processRun.stdout).text(), new Response(processRun.stderr).text()]);
@@ -112,7 +113,7 @@ for (const creation of ['markup', 'cli'] as const) for (const remove of [false, 
 }
 
 for (const remove of [false, true]) test(`stop with remove=${remove} releases parent locks before a synchronous child result`, async () => {
-  await withIntegrationFixture(`stop-child-waiter-${remove}`, async (fixture) => {
+  await withCliFixture(`stop-child-waiter-${remove}`, async (fixture) => {
     const agent = fixture.directAgents.openAiResponses;
     const model = fixture.fakeProviders.openAiResponses;
     const parent = fixture.newChatId();
@@ -121,7 +122,7 @@ for (const remove of [false, true]) test(`stop with remove=${remove} releases pa
     const ack = model.holdNext({ lastUserTextIncludes: 'status="accepted"' });
     const terminal = model.holdNext({ lastUserTextIncludes: 'status="interrupted"' });
     const cursor = fixture.client.markEvents();
-    await fixture.client.startDirectChat({ chatId: parent, projectPath: fixture.dirs.project, content: 'Delegate pending work.', agent });
+    await fixture.client.startDirectChat({ chatId: parent, projectPath: fixture.executionDirs.project, content: 'Delegate pending work.', agent });
     await emission.received;
     emission.releaseText(`<garcon-start-agent ref="pending" agent="${agent.agentId}" provider="${agent.provider.providerId}" model="${agent.provider.model}">Pending child work.</garcon-start-agent>`);
     const admitted = await childOutcome(fixture, parent, 'pending', 'accepted', cursor);

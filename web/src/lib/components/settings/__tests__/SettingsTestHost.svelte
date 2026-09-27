@@ -1,7 +1,15 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
 	import Settings from '../Settings.svelte';
+	import AppSettings from '../AppSettings.svelte';
+	import type { ExecutorSnapshot } from '$shared/executors';
+	import type { ExecutorsStore } from '$lib/executors/executors-store.svelte';
+	import type { GhCapabilityContext } from '$lib/git/pull-requests/gh-capability.svelte';
+	import { makeTestGhCapability } from './gh-capability-test-context';
 	import {
 		setAppShell,
+		setApiProviders,
+		setExecutors,
 		setFileSessions,
 		setGhCapability,
 		setLocalSettings,
@@ -17,6 +25,7 @@
 		type LocalSettingsSnapshot,
 	} from '$lib/stores/local-settings.svelte.js';
 	import { onDestroy, untrack } from 'svelte';
+	import { ApiProvidersStore } from '$lib/api-providers/api-providers-store.svelte';
 	import { getThemeProfile, resolveThemeId } from '$lib/theme/themes.js';
 
 	interface SettingsTestHostProps {
@@ -25,6 +34,9 @@
 		onLocalSet?: (key: string, value: unknown) => void;
 		onLocalToggle?: (key: string) => void;
 		onClearRecovery?: FileSessionRegistry['clearRecovery'];
+		executors?: readonly ExecutorSnapshot[];
+		executorStore?: ExecutorsStore;
+		ghCapability?: GhCapabilityContext;
 	}
 
 	let {
@@ -33,7 +45,14 @@
 		onLocalSet = () => undefined,
 		onLocalToggle = () => undefined,
 		onClearRecovery = async () => true,
+		executors,
+		executorStore,
+		ghCapability = { forExecutor: () => makeTestGhCapability() },
 	}: SettingsTestHostProps = $props();
+	untrack(() => {
+		if (executorStore) setExecutors(executorStore);
+		else setExecutorsTestContext(executors);
+	});
 	class SettingsLocalStore extends LocalSettingsStore {
 		#notifySet: (key: string, value: unknown) => void;
 		#notifyToggle: (key: string) => void;
@@ -177,20 +196,14 @@
 		},
 	};
 
-	setGhCapability({
-		available: true,
-		authenticated: true,
-		reason: 'authenticated',
-		login: 'octocat',
-		host: 'github.com',
-		isLoading: false,
-		hasChecked: true,
-		lastError: null,
-		ensureChecked: async () => {},
-		refresh: async () => {},
-	});
+	setGhCapability(untrack(() => ghCapability));
 
 	setAppShell(untrack(() => appShell));
+	setApiProviders(new ApiProvidersStore(() => {}, {
+		read: async () => ({ providers: [], assignments: { version: 1, revision: 0, assignments: {} } }),
+		assign: async () => ({ providers: [], assignments: { revision: 0, assignments: {} } }),
+		unassign: async () => ({ providers: [], assignments: { revision: 0, assignments: {} } }), delete: async () => ({ success: true }),
+	}));
 	const files: Pick<FileSessionRegistry, 'clearRecovery'> = {
 		clearRecovery: () => onClearRecovery(),
 	};
@@ -203,6 +216,9 @@
 		},
 	});
 	setModelCatalog({
+		forExecutor() {
+			return this;
+		},
 		version: 0,
 		apiProviderCatalog: [],
 		getModels() {
@@ -256,4 +272,5 @@
 	onDestroy(() => localSettings.destroy());
 </script>
 
-<Settings />
+{#if appShell.showSettings}<Settings />{/if}
+{#if appShell.showAppSettings}<AppSettings />{/if}

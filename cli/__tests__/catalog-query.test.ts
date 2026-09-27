@@ -18,7 +18,6 @@ const catalog: ModelCatalogResponse = {
       supportsForkWhileRunning: false,
       supportsUpdateProjectPath: true,
       supportsSteering: true,
-      supportsGoals: true,
       supportsImages: true,
       acceptsApiProviderEndpoints: true,
       supportedProtocols: ['openai-compatible'],
@@ -125,7 +124,7 @@ function command(
   return {
     kind: 'list',
     resource,
-    workspace: 'default',
+    runtime: 'controller',
     configDir: '/config',
     json: false,
     ...options,

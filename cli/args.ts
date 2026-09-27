@@ -1,6 +1,7 @@
-import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { resolveConfigDirectory } from '@garcon/common/config-dir';
+import type { RuntimeSelection } from '@garcon/common/cli-runtime-paths';
 import {
   isPermissionMode,
   isThinkingMode,
@@ -148,7 +149,7 @@ Ticket management:
   Every verb accepts --json. Mutations accept --from-chat <chat-id> as declared attribution.
   Owners: chat:<id>, user:<username>, or unassigned. Read before editing to obtain revisions.
   New create defaults to the shared repository or folder path; --project is an arbitrary string.
-  Mutations print retry identity before POST. Retry with identical arguments/body and paired
+  Mutations print a retry connection prefix and identity before POST. Keep the same operation/body and paired
   --request-id <uuid> --expected-store-id <uuid>; create retries also require the printed --project.
   No automatic retries. Comment removal preserves prior versions in activity history.
 
@@ -175,9 +176,9 @@ Chat research:
   activity, not title, tag, pin, or archive modification time.
 
 Options:
-  --workspace <name>           Named Garcon data workspace (default: default)
   --config-dir <path>          Garcon config root (default: ~/.garcon)
-  --server <url>               Assert the workspace descriptor's exact URL
+  --runtime <role>             auto, controller, or executor (default: auto)
+  --server <url>               Assert the selected runtime's exact URL
   --cwd <path>                 Project directory for a new chat (default: current directory)
   --parent <chat-id>           Record an existing parent for a new delegated chat
   --no-preamble               Disable all preambles for this new chat
@@ -229,12 +230,15 @@ Options:
   --version                    Show the Garcon version
 
 Use a single - as the prompt to read UTF-8 text from stdin.
+Flags override GARCON_CONFIG_DIR and GARCON_RUNTIME, then defaults apply.
+auto selects the newer startedAt when both runtime files exist, with a stderr warning.
+Workspace options belong only to the controller. Runtime failures never switch roles.
 Use -- before prompt text that begins with an option-like token.
 The cli tag records creation through garcon-cli; resume, resume-async, and stop never add it.`;
 
 export interface CliEnvironment {
   GARCON_CONFIG_DIR?: string;
-  GARCON_WORKSPACE?: string;
+  GARCON_RUNTIME?: string;
   HOME?: string;
 }
 
@@ -248,8 +252,8 @@ interface CliSelectionOptions {
 }
 
 export interface CliConnectionOptions {
-  workspace: string;
   configDir: string;
+  runtime: RuntimeSelection;
   serverUrl?: string;
 }
 
@@ -497,8 +501,8 @@ export type ParsedCliCommand =
 
 const SINGLE_STRING_OPTIONS = [
   ...TICKET_STRING_OPTIONS,
-  'workspace',
   'config-dir',
+  'runtime',
   'server',
   'cwd',
   'parent',
@@ -549,14 +553,6 @@ function parseChatIdOption(value: string, flag: string): ChatId {
 
 function resolvedEnvironmentValue(value: string | undefined): string | undefined {
   return value === undefined || value === '' ? undefined : value;
-}
-
-function validateWorkspace(value: string): string {
-  if (value.trim().length === 0) throw argumentError('--workspace must not be empty');
-  if (value === '.' || value === '..' || /[\\/\0]/.test(value)) {
-    throw argumentError('--workspace must be a name without path separators');
-  }
-  return value;
 }
 
 function parseModeOptions(values: Record<string, ParsedOptionValue>): {
@@ -662,7 +658,7 @@ type ControlCommandKind =
   | 'rename'
   | 'set-tags';
 
-const CONNECTION_OPTION_KEYS = ['workspace', 'config-dir', 'server'] as const;
+const CONNECTION_OPTION_KEYS = ['config-dir', 'runtime', 'server'] as const;
 
 function optionSet(...keys: string[]): ReadonlySet<string> {
   return new Set([...CONNECTION_OPTION_KEYS, ...keys]);
@@ -1482,8 +1478,8 @@ export function parseCliArgs(
       strict: true,
       options: {
         ...TICKET_PARSE_OPTIONS,
-        workspace: { type: 'string' },
         'config-dir': { type: 'string' },
+        runtime: { type: 'string' },
         server: { type: 'string' },
         cwd: { type: 'string' },
         parent: { type: 'string' },
@@ -1557,16 +1553,14 @@ export function parseCliArgs(
   if (values.version === true) return { kind: 'version' };
 
   const explicitConfigDir = nonEmptyOption(values['config-dir'] as string | undefined, '--config-dir');
-  const environmentConfigDir = resolvedEnvironmentValue(environment.GARCON_CONFIG_DIR);
-  const configDir = path.resolve(
-    environmentConfigDir
-      ?? explicitConfigDir
-      ?? path.join(environment.HOME ?? os.homedir(), '.garcon'),
-  );
-  const explicitWorkspace = nonEmptyOption(values.workspace as string | undefined, '--workspace');
-  const workspace = validateWorkspace(
-    resolvedEnvironmentValue(environment.GARCON_WORKSPACE) ?? explicitWorkspace ?? 'default',
-  );
+  let configDir: string;
+  try { configDir = resolveConfigDirectory(explicitConfigDir, environment); }
+  catch (error) { throw argumentError(error instanceof Error ? error.message : 'Invalid config directory'); }
+  const runtime = nonEmptyOption(values.runtime as string | undefined, '--runtime')
+    ?? resolvedEnvironmentValue(environment.GARCON_RUNTIME) ?? 'auto';
+  if (runtime !== 'auto' && runtime !== 'controller' && runtime !== 'executor') {
+    throw argumentError('--runtime / GARCON_RUNTIME must be auto, controller, or executor');
+  }
   const serverUrl = nonEmptyOption(values.server as string | undefined, '--server');
   const agentId = nonEmptyOption(values.agent as string | undefined, '--agent');
   const providerId = nonEmptyOption(values.provider as string | undefined, '--provider');
@@ -1575,9 +1569,9 @@ export function parseCliArgs(
   const cwd = nonEmptyOption(values.cwd as string | undefined, '--cwd');
   const parent = nonEmptyOption(values.parent as string | undefined, '--parent');
   const additionalTags = parseAdditionalTags(values.tag);
-  const connection = {
-    workspace,
+  const connection: CliConnectionOptions = {
     configDir,
+    runtime,
     ...(serverUrl === undefined ? {} : { serverUrl }),
   };
 
@@ -1663,10 +1657,8 @@ export function parseCliArgs(
     return {
       kind: 'list',
       resource,
-      workspace,
-      configDir,
+      ...connection,
       json: values.json === true,
-      ...(serverUrl === undefined ? {} : { serverUrl }),
       ...(agentId === undefined ? {} : { agentId }),
       ...(providerId === undefined ? {} : { providerId }),
       ...(endpointId === undefined ? {} : { endpointId }),
@@ -1700,9 +1692,7 @@ export function parseCliArgs(
   const promptInput = parsePrompt(parsed.positionals, commandName === 'resume' ? 2 : 1);
 
   const shared = {
-    workspace,
-    configDir,
-    ...(serverUrl === undefined ? {} : { serverUrl }),
+    ...connection,
     ...(agentId === undefined ? {} : { agentId }),
     ...(providerId === undefined ? {} : { providerId }),
     ...(endpointId === undefined ? {} : { endpointId }),

@@ -1,9 +1,12 @@
+import { webSocketProtocolsForAuth } from '../../common/ws-auth.js';
 import {
   type AgentCatalog,
   type AgentId,
 } from '../../common/agents.js';
 import type { AgentSettingsEnvelope } from '../../common/agent-integration.js';
 import { isRecord } from '../../common/json.js';
+import type { TerminalStreamClientMessage } from '../../common/terminal.js';
+import { parsePrimaryWsServerMessage as parseServerWsMessage, type PrimaryWsServerMessage as ServerWsMessage } from '../../common/ws-protocol.js';
 import type { ApiProtocol, ApiProviderCatalogEntry } from '../../common/api-providers.js';
 import type {
   AgentInterruptAndSendCommandRequest,
@@ -12,8 +15,6 @@ import type {
   AgentStopCommandRequest,
   AgentStopResponse,
 	AgentTurnCommandResponse,
-  GoalControlCommandRequest,
-  GoalControlCommandResponse,
   CommandAcceptedResponse,
   ForkChatCommandRequest,
   ForkChatResponse,
@@ -92,7 +93,6 @@ import type {
 } from '../../common/settings.js';
 import {
   ChatTransientFeedMutationMessage,
-  parseServerWsMessage,
   type AgentRunFailedMessage,
   type AgentRunFinishedMessage,
   type ChatMessagesMessage,
@@ -101,7 +101,6 @@ import {
   type ChatSubscribedMessage,
   type ClientRequestErrorMessage,
   type ReconnectStateMessage,
-  type ServerWsMessage,
   type WsPongMessage,
 } from '../../common/ws-events.js';
 import {
@@ -143,6 +142,7 @@ export interface DirectTestAgents {
 }
 
 export interface DirectStartInput {
+  executorId?: string | null;
   chatId: string;
   content: string;
   projectPath: string;
@@ -161,6 +161,8 @@ export interface DirectRunInput {
 }
 
 export interface DirectHandoffInput extends DirectRunInput {
+  executorId?: string | null;
+  projectPath?: string;
   expectedAgentOwnershipEpoch?: string;
 }
 
@@ -202,7 +204,9 @@ interface GarconWebSocket {
 }
 
 export interface GarconTestClientOptions {
-  createWebSocket?: (url: string) => GarconWebSocket;
+  executorId?: string;
+  authToken?: string | null;
+  createWebSocket?: (url: string, protocols: string[]) => GarconWebSocket;
   redactSensitiveDiagnostics?: boolean;
 }
 
@@ -276,6 +280,8 @@ function redact(
       normalized === 'apikey'
       || normalized === 'api_key'
       || normalized === 'authorization'
+      || normalized === 'secret'
+      || normalized === 'connectionurl'
       || normalized.endsWith('token')
     ) {
       return [key, '[REDACTED]'];
@@ -313,8 +319,10 @@ async function responseBody(response: Response): Promise<unknown> {
 }
 
 export class GarconTestClient {
+  readonly executorId: string;
   readonly #baseUrl: string;
-  readonly #createWebSocket: (url: string) => GarconWebSocket;
+  readonly #authToken: string | null;
+  readonly #createWebSocket: (url: string, protocols: string[]) => GarconWebSocket;
   readonly #redactSensitiveDiagnostics: boolean;
   readonly #exchanges: HttpExchange[] = [];
   readonly #eventRecords: EventRecord[] = [];
@@ -324,8 +332,10 @@ export class GarconTestClient {
   #protocolError: Error | null = null;
 
   private constructor(baseUrl: string, options: GarconTestClientOptions) {
+    this.executorId = options.executorId ?? 'local';
     this.#baseUrl = baseUrl.replace(/\/$/, '');
-    this.#createWebSocket = options.createWebSocket ?? ((url) => new WebSocket(url));
+    this.#authToken = options.authToken ?? null;
+    this.#createWebSocket = options.createWebSocket ?? ((url, protocols) => new WebSocket(url, protocols));
     this.#redactSensitiveDiagnostics = options.redactSensitiveDiagnostics === true;
   }
 
@@ -337,6 +347,14 @@ export class GarconTestClient {
 
   get baseUrl(): string {
     return this.#baseUrl;
+  }
+
+  fetch(path: string, init: RequestInit = {}): Promise<Response> {
+    const url = new URL(path, this.#baseUrl);
+    if (url.origin !== this.#baseUrl) throw new Error('Fixture requests must stay on the controller origin');
+    const headers = new Headers(init.headers);
+    if (this.#authToken && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${this.#authToken}`);
+    return fetch(url, { ...init, headers });
   }
 
   markEvents(): number {
@@ -373,7 +391,7 @@ export class GarconTestClient {
     this.assertProtocolHealthy();
     if (this.#socket && this.#socket.readyState === WEB_SOCKET_OPEN) return;
     const wsUrl = this.#baseUrl.replace(/^http/, 'ws') + '/ws';
-    const socket = this.#createWebSocket(wsUrl);
+    const socket = this.#createWebSocket(wsUrl, webSocketProtocolsForAuth(this.#authToken));
     this.#socket = socket;
     const opened = new Deferred<void>();
     socket.addEventListener('open', () => opened.resolve());
@@ -413,7 +431,7 @@ export class GarconTestClient {
   }
 
   async createOpenAiProvider(providerBaseUrl: string): Promise<ConfiguredTestProvider> {
-    const created = await this.post<ApiProviderCatalogEntry>('/api/v1/api-providers', {
+    const created = await this.post<ApiProviderCatalogEntry>(`/api/v1/api-providers?executorId=${encodeURIComponent(this.executorId)}`, {
       templateId: 'custom',
       label: 'Integration Fake OpenAI',
       endpoint: {
@@ -439,7 +457,7 @@ export class GarconTestClient {
 
   async createOpenAiResponsesProvider(providerBaseUrl: string): Promise<ConfiguredTestProvider> {
     const model = 'integration-responses-echo';
-    const created = await this.post<ApiProviderCatalogEntry>('/api/v1/api-providers', {
+    const created = await this.post<ApiProviderCatalogEntry>(`/api/v1/api-providers?executorId=${encodeURIComponent(this.executorId)}`, {
       templateId: 'custom',
       label: 'Integration Fake OpenAI Responses',
       endpoint: {
@@ -465,7 +483,7 @@ export class GarconTestClient {
 
   async createAnthropicProvider(providerBaseUrl: string): Promise<ConfiguredTestProvider> {
     const model = 'integration-anthropic-echo';
-    const created = await this.post<ApiProviderCatalogEntry>('/api/v1/api-providers', {
+    const created = await this.post<ApiProviderCatalogEntry>(`/api/v1/api-providers?executorId=${encodeURIComponent(this.executorId)}`, {
       templateId: 'custom',
       label: 'Integration Fake Anthropic',
       endpoint: {
@@ -489,7 +507,7 @@ export class GarconTestClient {
   }
 
   listAgentCatalog(): Promise<AgentCatalog> {
-    return this.get<AgentCatalog>('/api/v1/agents');
+    return this.get<AgentCatalog>(`/api/v1/agents?executorId=${encodeURIComponent(this.executorId)}`);
   }
 
   listChats(): Promise<ChatListResponse> {
@@ -562,7 +580,9 @@ export class GarconTestClient {
   }
 
   startChat(request: StartChatCommandRequest): Promise<StartChatCommandResponse> {
-    return this.post<StartChatCommandResponse>('/api/v1/chats/start', request);
+    return this.post<StartChatCommandResponse>('/api/v1/chats/start', {
+      ...(this.executorId === 'local' ? {} : { executorId: this.executorId }), ...request,
+    });
   }
 
   startDirectChat(input: DirectStartInput): Promise<StartChatCommandResponse> {
@@ -571,6 +591,7 @@ export class GarconTestClient {
 
   directStartRequest(input: DirectStartInput): StartChatCommandRequest {
     return {
+      ...(input.executorId === undefined ? (this.executorId === 'local' ? {} : { executorId: this.executorId }) : { executorId: input.executorId }),
       origin: 'interactive',
       clientRequestId: input.clientRequestId ?? crypto.randomUUID(),
       clientMessageId: input.clientMessageId ?? crypto.randomUUID(),
@@ -619,6 +640,8 @@ export class GarconTestClient {
       handoff: {
         expectedAgentOwnershipEpoch,
         target: {
+          ...(input.executorId === undefined ? {} : { executorId: input.executorId }),
+          ...(input.projectPath === undefined ? {} : { projectPath: input.projectPath }),
           agentId: input.agent.agentId,
           model: input.agent.provider.model,
           apiProviderId: input.agent.provider.providerId,
@@ -701,8 +724,14 @@ export class GarconTestClient {
     };
   }
 
-  updateProjectPath(request: ProjectPathPatchRequest): Promise<ProjectPathPatchResponse> {
-    return this.patch<ProjectPathPatchResponse>('/api/v1/chats/project-path', request);
+  async updateProjectPath(request: Pick<ProjectPathPatchRequest, 'chatId' | 'projectPath'>): Promise<ProjectPathPatchResponse> {
+    const { chat } = await this.getChatSnapshot(request.chatId);
+    return this.patch<ProjectPathPatchResponse>('/api/v1/chats/project-path', {
+      ...request,
+      expectedExecutorId: chat.executorId ?? 'local',
+      expectedAgentOwnershipEpoch: chat.agentOwnershipEpoch,
+      expectedProjectPath: chat.projectPath,
+    } satisfies ProjectPathPatchRequest);
   }
 
   deleteChat(chatId: string): Promise<{ success: boolean }> {
@@ -780,10 +809,6 @@ export class GarconTestClient {
       clientMessageId: request.clientMessageId ?? crypto.randomUUID(),
       transcriptViewId: request.transcriptViewId ?? await this.#currentTranscriptViewId(request.chatId),
     });
-  }
-
-  submitGoalControl(request: GoalControlCommandRequest): Promise<GoalControlCommandResponse> {
-    return this.post<GoalControlCommandResponse>('/api/v1/chats/goal-control', request);
   }
 
   async steer(
@@ -1172,7 +1197,7 @@ export class GarconTestClient {
     path: string,
     body?: unknown,
   ): Promise<{ response: Response; parsed: unknown }> {
-    const response = await fetch(`${this.#baseUrl}${path}`, {
+    const response = await this.fetch(path, {
       method,
       headers: body === undefined ? undefined : { 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -1188,6 +1213,11 @@ export class GarconTestClient {
       responseBody: redact(parsed, this.#redactSensitiveDiagnostics),
     });
     return { response, parsed };
+  }
+
+  sendTerminal(message: TerminalStreamClientMessage): void {
+    if (!this.#socket || this.#socket.readyState !== WEB_SOCKET_OPEN) throw new Error('Garcon WebSocket is not connected');
+    this.#socket.send(JSON.stringify(message));
   }
 
   private sendWs(message: ClientWsMessage): void {

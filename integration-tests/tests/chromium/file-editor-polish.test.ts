@@ -114,13 +114,13 @@ describe('File editor controls', () => {
       await page.setViewportSize({ width: 3200, height: 1000 });
       await page.waitForFunction((fullPath) => {
         const heading = document.querySelector('[aria-hidden="false"] [data-file-path-title] h2');
-        return heading?.textContent === fullPath;
+        return heading?.textContent?.trim() === fullPath;
       }, path);
       await page.screenshot({ path: join(integration.dirs.root, 'file-title-wide.png') });
       await page.setViewportSize({ width: 1000, height: 800 });
       await page.waitForFunction((basename) => {
         const heading = document.querySelector('[aria-hidden="false"] [data-file-path-title] h2');
-        return heading?.textContent === basename;
+        return heading?.textContent?.trim() === basename;
       }, filename);
       const titleBounds = await title.boundingBox();
       const copyBounds = await surface
@@ -405,6 +405,6 @@ describe('File editor controls', () => {
       expect(await surface.getByRole('button', { name: 'Reload application' }).count()).toBe(0);
       expect(await source.innerText()).toContain('unsaved one');
       fixture.assertNoBrowserErrors();
-    });
+    }, undefined, { serviceWorkers: 'allow' });
   }, 180_000);
 });

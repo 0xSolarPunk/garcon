@@ -7,8 +7,13 @@ export type AgentIntegrationErrorCode =
   | 'RATE_LIMITED'
   | 'TIMEOUT'
   | 'UNAVAILABLE'
+  | 'STALE_RESOURCE'
+  | 'OUTCOME_UNKNOWN'
   | 'INVALID_SETTINGS'
   | 'INVALID_ENDPOINT'
+  | 'API_PROVIDER_UNAVAILABLE'
+  | 'API_PROVIDER_CONFIGURATION_CHANGED'
+  | 'API_PROVIDER_STORAGE_UNAVAILABLE'
   | 'SESSION_NOT_FOUND'
   | 'SESSION_BUSY'
   | 'PERMISSION_DENIED'
@@ -30,6 +35,19 @@ export class AgentIntegrationError extends Error {
   ) {
     super(message);
     this.name = 'AgentIntegrationError';
+  }
+}
+
+export type AgentDeliveryOutcome = 'not-dispatched' | 'rejected' | 'unknown';
+
+export class AgentCallError extends AgentIntegrationError {
+  constructor(
+    readonly outcome: AgentDeliveryOutcome,
+    message: string,
+    code: AgentIntegrationErrorCode = outcome === 'unknown' ? 'OUTCOME_UNKNOWN' : 'UNAVAILABLE',
+  ) {
+    super(code, message, false);
+    this.name = 'AgentCallError';
   }
 }
 

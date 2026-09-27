@@ -1,32 +1,19 @@
 // Owns chat lifecycle and delegates all viewport operations through the dependency interface.
 
-import { getChatSnapshot, interruptAndSendChat, stopChat } from '$lib/api/chats.js';
+import { getChatSnapshot, handoffChat, interruptAndSendChat, stopChat } from '$lib/api/chats.js';
 import { isStopSatisfied, type ChatImage, type ChatStopOutcome } from '$shared/chat-types';
 import { createClientCommandId } from '$lib/chat/conversation/client-command-id.js';
 import {
 	INITIAL_VISIBLE_MESSAGES,
-	type ActiveTranscriptPort,
 	type ChatLoadMessagesOptions,
 } from '$lib/chat/transcript/active-transcript-state.svelte.js';
-import type { ChatTranscriptCache } from '$lib/chat/transcript/chat-transcript-cache.svelte.js';
-import type { ComposerState } from '$lib/chat/composer/composer.svelte.js';
-import type { AgentState } from '$lib/chat/conversation/agent-state.svelte.js';
-import type { ConversationLifecycleState } from '$lib/chat/conversation/conversation-lifecycle-state.svelte.js';
-import type { ConversationUiPort } from '$lib/chat/conversation/conversation-ui-state.svelte.js';
-import type { ConversationSessionsPort } from './conversation-sessions-port.js';
-import type { StartupCoordinator } from '$lib/chat/conversation/startup-coordinator.js';
 import type { PermissionMode, ThinkingMode } from '$lib/types/chat';
-import type { AgentSettingDescriptor, AgentSettingsEnvelope } from '$shared/agent-integration';
+import type { AgentSettingDescriptor } from '$shared/agent-integration';
 import type { JsonValue } from '$shared/json';
-import {
-	normalizeSupportedPermissionMode,
-	normalizeSupportedThinkingMode,
-} from '$shared/execution-defaults';
-import type { SessionAgentId } from '$lib/types/app';
-import type { ApiProtocol } from '$shared/api-providers';
 import type {
 	PermissionDecisionPayload,
 	QueueEntryPlacement,
+	AgentHandoffRequest,
 } from '$shared/chat-command-contracts';
 import type { QueueEntry } from '$shared/queue-state';
 import {
@@ -40,10 +27,10 @@ import {
 import { ConversationQueueController } from '$lib/chat/conversation/conversation-queue-controller.svelte.js';
 import { ConversationSettingsController } from '$lib/chat/conversation/conversation-settings-controller.svelte.js';
 import { HandoffForkConfirmationState } from './handoff-fork-confirmation.svelte.js';
+import { ExecutorHandoffProjectState } from './executor-handoff-project.svelte.js';
 import { ConversationPermissionService } from './conversation-permission-service.js';
 import { AcceptedInputSubmissionService } from '$lib/chat/conversation/accepted-input-submission-service.js';
 import type { ConversationSubmissionOutcome } from '$lib/chat/conversation/conversation-submission-outcome.js';
-import type { ProjectTarget } from '$shared/project-resolution';
 import { classifySubmission } from '$lib/chat/conversation/submission-classifier.js';
 import {
 	errorDetail,
@@ -51,8 +38,9 @@ import {
 } from '$lib/chat/conversation/conversation-submission-helpers.js';
 import {
 	rejectMissingDraftStartup,
+	rejectUnavailableDraftStart,
+	restoreAutomaticStartDraft,
 	submitDraftRoute,
-	submitGoalControlRoute,
 	submitQueueRoute,
 	submitRunRoute,
 	submitSteerPreferenceRoute,
@@ -60,114 +48,21 @@ import {
 } from '$lib/chat/conversation/submission-routes.js';
 import * as m from '$lib/paraglide/messages.js';
 import {
-	ConversationExecutionDraftState,
 	executionSelectionFromProjection,
 	type ConversationExecutionSelection,
-} from './conversation-execution-draft-state.svelte.js';
+} from './conversation-execution-selection.js';
+import { ApiError } from '$lib/api/client.js';
+import { CommandOutcomeUnknownError } from './idempotent-command.js';
 import { resolveConversationModelSelection } from './conversation-model-selection.js';
-type SessionTranscriptState = Pick<
-	ActiveTranscriptPort,
-	| 'activeChatId'
-	| 'entries'
-	| 'chatMessages'
-	| 'getCursor'
-	| 'isUserScrolledUp'
-	| 'activateChat'
-	| 'appendLocalNotice'
-	| 'clearOptimisticUserInput'
-	| 'markOptimisticUserInputDelivered'
-	| 'clearLocalNotices'
-	| 'loadMessages'
-	| 'upsertOptimisticUserInput'
-	| 'excludedResendOrdinals'
-	| 'clearResendExclusions'
-> & {
-	transcriptCache: Pick<ChatTranscriptCache, 'markValidated' | 'readAppliedCursor'>;
-	hasMountedPresentation(chatId: string): boolean;
-	getCursorForChat(chatId: string): ReturnType<ActiveTranscriptPort['getCursor']>;
-	appendLocalNoticeForChat(
-		chatId: string,
-		noticeType: Parameters<ActiveTranscriptPort['appendLocalNotice']>[0],
-		content: string,
-	): void;
-	clearLocalNoticesForChat(chatId: string, throughRevision?: number): void;
-	noticeRevisionForChat(chatId: string): number;
-};
+import { isCustomProviderSelectionAvailable } from '$lib/agents/provider-selection.js';
+import { isControllerSlashCommand } from '$lib/chat/composer/slash-commands.js';
+import type {
+	SessionControllerDeps,
+	SessionTranscriptLoadTarget,
+	PanelTranscriptSnapshotLoader,
+} from './conversation-session-controller-types.js';
+export type { SessionControllerDeps } from './conversation-session-controller-types.js';
 
-type SessionTranscriptLoadTarget = Pick<
-	ActiveTranscriptPort,
-	'activeChatId' | 'chatMessages' | 'getCursor' | 'activateChat' | 'loadMessages'
-> & {
-	transcriptCache: Pick<ChatTranscriptCache, 'markValidated' | 'readAppliedCursor'>;
-};
-
-type PanelTranscriptSnapshotLoader = (options: ChatLoadMessagesOptions) => Promise<boolean>;
-
-type SessionComposerState = Pick<
-	ComposerState,
-	| 'inputText'
-	| 'images'
-	| 'contentRevision'
-	| 'isSubmitting'
-	| 'clearAfterSubmit'
-	| 'clearImages'
-	| 'draftSnapshot'
-	| 'draftRevision'
-	| 'isDraftEmpty'
-	| 'restoreDraftIfRevision'
-	| 'restoreDraft'
-	| 'saveDraft'
->;
-
-type SessionAgentState = Pick<
-	AgentState,
-	| 'agentId'
-	| 'model'
-	| 'apiProviderId'
-	| 'modelEndpointId'
-	| 'modelProtocol'
-	| 'permissionMode'
-	| 'thinkingMode'
-	| 'agentSettings'
-	| 'setAgentId'
-	| 'setAgentSettings'
-	| 'setModelSelection'
->;
-
-type SessionLifecycleState = Pick<
-	ConversationLifecycleState,
-	| 'currentChatId'
-	| 'loadingStatus'
-	| 'beginTurn'
-	| 'beginStopping'
-	| 'clearTurnStatus'
-	| 'restoreStopping'
-	| 'applyProcessingPhase'
-	| 'markTurnRunning'
-	| 'setCurrentChatId'
-	| 'setLoadingStatus'
->;
-
-type SessionConversationUiState = Pick<
-	ConversationUiPort,
-	| 'pendingPermissionRequests'
-	| 'previousPermissionMode'
-	| 'activateTransientFeed'
-	| 'getExecutionControl'
-	| 'setExecutionControlFromLiveUpdate'
-	| 'setExecutionControlFromRefresh'
-	| 'isExecutionControlSocketInstanceConfirmed'
-	| 'setPendingPermissionRequests'
-	| 'setPreviousPermissionMode'
-	| 'pendingPermissionsFor'
-	| 'updatePendingPermissionsForChat'
-	| 'beginPlanModeForChat'
-	| 'previousPermissionModeFor'
-	| 'finishPlanModeForChat'
-	| 'setTransientFeedFromSnapshot'
->;
-
-type SessionStartupCoordinator = Pick<StartupCoordinator, 'beginLocalStartup' | 'completeStartup'>;
 interface DirectAdmissionBarrier {
 	settled: Promise<void>;
 	release: () => void;
@@ -181,59 +76,6 @@ function createDirectAdmissionBarrier(): DirectAdmissionBarrier {
 	return { settled, release };
 }
 
-export interface SessionControllerDeps {
-	sessions: ConversationSessionsPort;
-	chatState: SessionTranscriptState;
-	composerState: SessionComposerState;
-	agentState: SessionAgentState;
-	lifecycle: SessionLifecycleState;
-	lifecycleForChat(chatId: string): SessionLifecycleState;
-	conversationUi: SessionConversationUiState;
-	startupCoordinator: SessionStartupCoordinator;
-	modelCatalog: {
-		isLocalModel: (
-			agentId: SessionAgentId,
-			model: string,
-			modelEndpointId?: string | null,
-		) => boolean;
-		selectionFor: (
-			agentId: SessionAgentId,
-			model: string,
-			modelEndpointId?: string | null,
-		) => {
-			model: string;
-			apiProviderId: string | null;
-			modelEndpointId: string | null;
-			modelProtocol: ApiProtocol | null;
-		};
-		selectionValueFor: (
-			agentId: SessionAgentId,
-			model: string,
-			modelEndpointId?: string | null,
-		) => string;
-		getAgentLabel: (agentId: SessionAgentId) => string;
-		getDefaultAgentSettings: (agentId: SessionAgentId) => AgentSettingsEnvelope;
-		getPermissionModes: (agentId: SessionAgentId) => readonly PermissionMode[];
-		getThinkingModes: (agentId: SessionAgentId) => readonly ThinkingMode[];
-		supportsFork: (agentId: SessionAgentId) => boolean;
-		supportsForkWhileRunning: (agentId: SessionAgentId) => boolean;
-		supportsSteering: (agentId: SessionAgentId) => boolean;
-		supportsGoals: (agentId: SessionAgentId) => boolean;
-	};
-	getExecutionDefaults(
-		agentId: SessionAgentId,
-	): Pick<ConversationExecutionSelection, 'permissionMode' | 'thinkingMode' | 'agentSettings'>;
-	appShell: {
-		openNewChatDialog: (opts: { prefill: string }) => void;
-	};
-	readReceiptOutbox: { enqueue: (chatId: string, readAt: string) => void };
-	navigation: { navigateToChat?: (chatId: string) => void };
-	requestProcessingSnapshot: (source: 'admission' | 'stop-probe') => Promise<unknown>;
-	setIsViewportPinnedToBottom: (v: boolean) => void;
-	setInitialBottomRestorePending: (chatId: string | null) => void;
-	scrollToBottom: () => void;
-	onProjectUnavailable?: (target: ProjectTarget) => Promise<void> | void;
-}
 export class ConversationSessionController {
 	#lastChatId: string | null = null;
 	#pendingDirectAdmissions = $state.raw<ReadonlyMap<string, DirectAdmissionBarrier>>(new Map());
@@ -243,18 +85,20 @@ export class ConversationSessionController {
 	readonly #queue: ConversationQueueController;
 	readonly #settings: ConversationSettingsController;
 	readonly #permissions: ConversationPermissionService;
-	readonly #executionDraft: ConversationExecutionDraftState;
+	#observedExecutionSelection = '';
 	readonly #handoffForkConfirmation = new HandoffForkConfirmationState();
+	readonly executorHandoff: ExecutorHandoffProjectState;
 
 	constructor(private deps: SessionControllerDeps) {
-		this.#executionDraft = new ConversationExecutionDraftState({
-			get activeChatId() {
-				return deps.sessions.selectedChatId;
-			},
-			get durableSelection() {
-				return executionSelectionFromProjection(deps.sessions.selectedChat);
-			},
-		});
+		this.executorHandoff = new ExecutorHandoffProjectState(
+			(executorId, selection) =>
+				deps.canSubmitToExecutor(executorId) &&
+				Boolean(
+					deps
+						.modelCatalogForExecutor(executorId)
+						.getModelForSelection(selection.agentId, selection.model, selection.modelEndpointId),
+				),
+		);
 		this.#acceptedInputs = new AcceptedInputSubmissionService();
 		this.#slashCommands = new ConversationSlashCommandService(
 			{
@@ -267,13 +111,15 @@ export class ConversationSessionController {
 		this.#agentSwitch = new ConversationAgentSwitchService({
 			sessions: deps.sessions,
 			agentState: deps.agentState,
-			modelCatalog: deps.modelCatalog,
-			executionDraft: this.#executionDraft,
+			modelCatalogForExecutor: (executorId) => deps.modelCatalogForExecutor(executorId),
+			chooseDestination: (chatId, executorId, path, model) =>
+				this.executorHandoff.ask(chatId, executorId, path, model),
+			commitHandoff: (chatId, handoff) => this.#commitHandoff(chatId, handoff),
+			projectUnavailable: (chatId) => deps.isProjectUnavailable?.(chatId) ?? false,
 			getExecutionDefaults: deps.getExecutionDefaults,
 		});
 		const acceptedInputs = this.#acceptedInputs;
 		const agentSwitch = this.#agentSwitch;
-		const executionDraft = this.#executionDraft;
 		this.#queue = new ConversationQueueController({
 			get sessions() {
 				return deps.sessions;
@@ -316,14 +162,7 @@ export class ConversationSessionController {
 			get agentSwitch() {
 				return agentSwitch;
 			},
-			get executionDraft() {
-				return executionDraft;
-			},
 		});
-	}
-
-	#executionModelSelection() {
-		return resolveConversationModelSelection(this.deps.agentState, this.deps.modelCatalog);
 	}
 
 	#executionSelectionForChat(chatId: string): ConversationExecutionSelection | null {
@@ -331,12 +170,18 @@ export class ConversationSessionController {
 		if (!selection) return null;
 		return {
 			...selection,
-			...resolveConversationModelSelection(selection, this.deps.modelCatalog),
+			...resolveConversationModelSelection(
+				selection,
+				this.deps.modelCatalogForExecutor(selection.executorId ?? 'local'),
+			),
 		};
 	}
 
 	#applyExecutionSelection(selection: ConversationExecutionSelection): void {
-		const { agentState, modelCatalog } = this.deps;
+		const { agentState } = this.deps;
+		agentState.executorId = selection.executorId ?? 'local';
+		agentState.projectPath = selection.projectPath ?? '';
+		const modelCatalog = this.deps.modelCatalogForExecutor(agentState.executorId);
 		agentState.setAgentId(selection.agentId);
 		agentState.setModelSelection({
 			model: modelCatalog.selectionValueFor(
@@ -348,19 +193,45 @@ export class ConversationSessionController {
 			modelEndpointId: selection.modelEndpointId,
 			modelProtocol: selection.modelProtocol,
 		});
-		agentState.permissionMode = normalizeSupportedPermissionMode(
-			selection.permissionMode,
-			modelCatalog.getPermissionModes(selection.agentId),
-		);
-		agentState.thinkingMode = normalizeSupportedThinkingMode(
-			selection.thinkingMode,
-			modelCatalog.getThinkingModes(selection.agentId),
-		);
+		agentState.permissionMode = selection.permissionMode;
+		agentState.thinkingMode = selection.thinkingMode;
 		agentState.setAgentSettings(selection.agentSettings);
+	}
+
+	async #commitHandoff(chatId: string, handoff: AgentHandoffRequest): Promise<void> {
+		const admission = this.#claimDirectAdmission(chatId);
+		if (!admission) throw new Error(m.chat_notice_handoff_requires_idle());
+		const request = { chatId, handoff, clientRequestId: createClientCommandId() };
+		try {
+			if (this.#settings.hasPending(chatId) && !(await this.#settings.settlePending(chatId)))
+				return;
+			const response = await handoffChat(request);
+			const current = this.deps.sessions.byId[chatId];
+			if (current?.agentOwnershipEpoch === handoff.expectedAgentOwnershipEpoch) {
+				this.deps.sessions.reconcileAcceptedHandoffProjection(response.chat);
+			} else {
+				// A newer projection may already include later settings or another handoff.
+				await this.deps.sessions.quietRefreshChats();
+			}
+			this.#reconcileExecutionSelection(chatId);
+		} catch (error) {
+			const uncertain =
+				!(error instanceof ApiError) ||
+				error.status >= 500 ||
+				error.errorCode === 'OWNERSHIP_TRANSFER_PENDING';
+			if (uncertain || (error instanceof ApiError && error.errorCode === 'STALE_CHAT_OWNERSHIP')) {
+				await this.deps.sessions.quietRefreshChats().catch(() => undefined);
+				this.#reconcileExecutionSelection(chatId);
+			}
+			throw uncertain ? new CommandOutcomeUnknownError({ cause: error }) : error;
+		} finally {
+			this.#releaseDirectAdmission(chatId, admission);
+		}
 	}
 
 	#resetSelectionState(): void {
 		const { deps } = this;
+		this.#observedExecutionSelection = '';
 		deps.chatState.activateChat(null);
 		deps.lifecycle.setCurrentChatId(null);
 		deps.conversationUi.activateTransientFeed(null);
@@ -368,9 +239,23 @@ export class ConversationSessionController {
 		deps.setInitialBottomRestorePending(null);
 	}
 
+	#reconcileExecutionSelection(chatId: string | null): void {
+		if (!chatId || chatId !== this.deps.sessions.selectedChatId) return;
+		const selection = executionSelectionFromProjection(this.deps.sessions.byId[chatId]);
+		const key = JSON.stringify(selection);
+		if (key === this.#observedExecutionSelection) return;
+		this.#observedExecutionSelection = key;
+		if (selection) this.#applyExecutionSelection(selection);
+	}
+
 	// Deduplicates chat-switch calls so the component effect can be stateless.
 	handleChatSwitchIfChanged(chatId: string | null): void {
-		if (chatId === this.#lastChatId) return;
+		if (this.executorHandoff.target && this.executorHandoff.target.chatId !== chatId)
+			this.executorHandoff.cancel();
+		if (chatId === this.#lastChatId) {
+			this.#reconcileExecutionSelection(chatId);
+			return;
+		}
 		// Route selection can arrive before the chat-list record. Defers the
 		// transition so hydration can retry without poisoning the dedupe key.
 		if (chatId && !this.deps.sessions.byId[chatId]) return;
@@ -409,13 +294,16 @@ export class ConversationSessionController {
 		deps.conversationUi.activateTransientFeed(chatId);
 		if (!preservesMountedPresentation) deps.setIsViewportPinnedToBottom(true);
 
-		const activeSelection = this.#executionDraft.activate(chatId);
-		if (activeSelection) this.#applyExecutionSelection(activeSelection);
+		this.#observedExecutionSelection = '';
+		this.#reconcileExecutionSelection(chatId);
 
 		if (selected.status === 'draft') {
 			deps.lifecycle.setCurrentChatId(null);
+			deps.composerState.restoreDraft(chatId);
 			const startup = deps.sessions.startupByChatId[chatId];
 			if (startup) {
+				deps.agentState.executorId = startup.executorId ?? 'local';
+				deps.agentState.projectPath = selected.projectPath;
 				deps.agentState.setAgentId(
 					startup.agentId as Parameters<typeof deps.agentState.setAgentId>[0],
 				);
@@ -430,15 +318,8 @@ export class ConversationSessionController {
 					modelEndpointId: startup.modelEndpointId ?? null,
 					modelProtocol: startup.modelProtocol ?? null,
 				});
-				const startupAgentId = startup.agentId as SessionAgentId;
-				deps.agentState.permissionMode = normalizeSupportedPermissionMode(
-					startup.permissionMode,
-					deps.modelCatalog.getPermissionModes(startupAgentId),
-				);
-				deps.agentState.thinkingMode = normalizeSupportedThinkingMode(
-					startup.thinkingMode,
-					deps.modelCatalog.getThinkingModes(startupAgentId),
-				);
+				deps.agentState.permissionMode = startup.permissionMode;
+				deps.agentState.thinkingMode = startup.thinkingMode;
 				deps.agentState.setAgentSettings(startup.agentSettings);
 				if (startup.firstMessage?.trim() || (startup.initialImages?.length ?? 0) > 0) {
 					const startupText = startup.firstMessage.trim();
@@ -446,7 +327,7 @@ export class ConversationSessionController {
 					const startupChatId = chatId;
 					queueMicrotask(() => {
 						if (!deps.sessions.byId[startupChatId]) return;
-						void this.submitForChat(startupChatId, startupText, startupImages);
+						void this.#submitForChat('automatic-start', startupChatId, startupText, startupImages);
 					});
 				}
 			}
@@ -600,7 +481,33 @@ export class ConversationSessionController {
 	}
 
 	// Accepts an explicit chat ID so draft startup cannot race selection changes.
-	async submitForChat(
+	submitForChat(
+		chatId: string,
+		messageOverride?: string,
+		imageOverride?: File[],
+	): Promise<ConversationSubmissionOutcome> {
+		return this.#submitForChat('explicit', chatId, messageOverride, imageOverride);
+	}
+
+	async #submitForChat(
+		source: 'explicit' | 'automatic-start',
+		chatId: string,
+		messageOverride?: string,
+		imageOverride?: File[],
+	): Promise<ConversationSubmissionOutcome> {
+		const outcome = await this.#submitInputForChat(source, chatId, messageOverride, imageOverride);
+		if (
+			source === 'automatic-start' &&
+			outcome === 'rejected' &&
+			this.deps.sessions.byId[chatId]?.status === 'draft'
+		) {
+			restoreAutomaticStartDraft(this.deps, chatId, messageOverride ?? '', imageOverride ?? []);
+		}
+		return outcome;
+	}
+
+	async #submitInputForChat(
+		source: 'explicit' | 'automatic-start',
 		chatId: string,
 		messageOverride?: string,
 		imageOverride?: File[],
@@ -608,39 +515,56 @@ export class ConversationSessionController {
 		const { deps } = this;
 		const ownsComposer = messageOverride === undefined && imageOverride === undefined;
 		while (this.isDirectAdmissionPending(chatId)) {
-			if (ownsComposer) return 'no-op';
+			if (
+				ownsComposer ||
+				source === 'automatic-start' ||
+				deps.sessions.byId[chatId]?.status === 'draft'
+			)
+				return 'no-op';
 			await this.#pendingDirectAdmissions.get(chatId)?.settled;
 		}
+		this.#reconcileExecutionSelection(chatId);
 		const selected = deps.sessions.byId[chatId];
 		if (!selected?.projectPath) return 'no-op';
-		if (selected.status === 'draft' && deps.composerState.isSubmitting) return 'no-op';
 		const isDraft = selected.status === 'draft';
-		const startup = deps.sessions.startupByChatId[chatId];
 		const draft = deps.composerState.draftSnapshot(chatId);
 		const text = messageOverride ?? draft.text.trim();
 		const submissionImages = imageOverride ?? draft.attachments;
+		const startup = deps.sessions.startupByChatId[chatId];
+		if (
+			source === 'automatic-start' &&
+			(!isDraft || !startup || (!startup.firstMessage?.trim() && !startup.initialImages?.length))
+		)
+			return 'no-op';
+		let selection: Parameters<typeof isCustomProviderSelectionAvailable>[1] & {
+			executorId?: string | null;
+		} = selected;
+		if (selected.status === 'draft' && startup) {
+			selection = startup;
+		} else if (deps.sessions.selectedChatId === chatId) {
+			selection = deps.agentState;
+		}
+		const executorId = selection.executorId ?? 'local';
+		if (
+			(isDraft || !isControllerSlashCommand(text)) &&
+			(!deps.canSubmitToExecutor(executorId) ||
+				!isCustomProviderSelectionAvailable(deps.modelCatalogForExecutor(executorId), selection))
+		) {
+			return selected.status === 'draft' && source === 'automatic-start'
+				? rejectUnavailableDraftStart(deps, chatId)
+				: 'no-op';
+		}
 		if (!text && submissionImages.length === 0) return 'no-op';
-
 		const previousText = draft.text;
 		const previousImages = [...draft.attachments];
-		const handoffPending = selected.status !== 'draft' && this.#executionDraft.isHandoffPending;
 		const slash = this.#slashCommands.dispatchSubmission({
 			chatId,
 			chat: selected,
 			text,
 			images: [...submissionImages],
 			ownsComposer,
-			handoffPending,
 		});
 		if (slash.kind === 'handled') return slash.outcome;
-		if (handoffPending && slash.kind === 'goal-control') {
-			deps.chatState.appendLocalNoticeForChat(
-				chatId,
-				'error',
-				m.chat_notice_handoff_requires_idle(),
-			);
-			return 'rejected';
-		}
 
 		const specializedContext = {
 			chatId,
@@ -657,16 +581,17 @@ export class ConversationSessionController {
 		if (slash.kind === 'steer') {
 			return submitSteerRoute(deps, this.#acceptedInputs, specializedContext);
 		}
-		if (slash.kind === 'goal-control') {
-			return submitGoalControlRoute(deps, this.#acceptedInputs, this.#queue, specializedContext);
-		}
 		if (isDraft && !startup) return rejectMissingDraftStartup(deps, chatId);
 
 		const activeTurn = selected.status === 'running' && selected.isProcessing;
 		let directAdmission: DirectAdmissionBarrier | null = null;
-		if (!isDraft && !activeTurn) {
+		if (!activeTurn) {
 			directAdmission = this.#claimDirectAdmission(chatId);
 			if (!directAdmission) return 'no-op';
+		}
+		if (source === 'automatic-start') {
+			// Consumes the one-shot trigger even when delivery later becomes uncertain.
+			deps.sessions.patchDraftStartup(chatId, { firstMessage: '', initialImages: [] });
 		}
 
 		let composerRevisionAfterClear: number | null = null;
@@ -675,6 +600,15 @@ export class ConversationSessionController {
 		}
 
 		try {
+			if (this.#settings.hasPending(chatId) && !(await this.#settings.settlePending(chatId))) {
+				this.#restorePreflightSubmission(
+					chatId,
+					previousText,
+					previousImages,
+					composerRevisionAfterClear,
+				);
+				return 'rejected';
+			}
 			const pendingControlRefresh = this.#queue.pendingControlRefresh(chatId);
 			if (!isDraft && !activeTurn && pendingControlRefresh) {
 				await this.#queue.settleControlRefresh(pendingControlRefresh);
@@ -682,7 +616,6 @@ export class ConversationSessionController {
 			const route = classifySubmission({
 				isDraft,
 				isProcessing: activeTurn,
-				handoffPending,
 				control: deps.conversationUi.getExecutionControl(chatId),
 				hasAttachments: submissionImages.length > 0,
 			});
@@ -700,32 +633,16 @@ export class ConversationSessionController {
 				);
 				return 'rejected';
 			}
-			if (route === 'handoff-requires-idle') {
-				this.#restorePreflightSubmission(
-					chatId,
-					previousText,
-					previousImages,
-					composerRevisionAfterClear,
-				);
-				deps.chatState.appendLocalNoticeForChat(
-					chatId,
-					'error',
-					m.chat_notice_handoff_requires_idle(),
-				);
-				return 'rejected';
-			}
-			if (route !== 'direct' && directAdmission) {
+			if (route !== 'direct' && route !== 'draft' && directAdmission) {
 				this.#releaseDirectAdmission(chatId, directAdmission);
 				directAdmission = null;
 			}
 
-			if (route === 'draft') deps.composerState.isSubmitting = true;
 			let imagePayload: ChatImage[] = [];
 			try {
 				if (submissionImages.length > 0) imagePayload = await prepareChatImages(submissionImages);
 			} catch (error) {
 				console.error('[SessionController] Failed to prepare attachment payload:', error);
-				if (route === 'draft') deps.composerState.isSubmitting = false;
 				this.#restorePreflightSubmission(
 					chatId,
 					previousText,
@@ -759,28 +676,10 @@ export class ConversationSessionController {
 			}
 			if (route === 'draft') {
 				if (!startup) return 'rejected';
-				return submitDraftRoute(deps, this.#acceptedInputs, { ...context, startup });
+				return await submitDraftRoute(deps, this.#acceptedInputs, { ...context, startup });
 			}
-			const currentChat = deps.sessions.byId[chatId];
-			const handoff = this.#executionDraft.handoffRequest(currentChat?.agentOwnershipEpoch ?? '');
-			const outcome = await submitRunRoute(
-				deps,
-				this.#acceptedInputs,
-				this.#queue,
-				context,
-				this.#executionModelSelection(),
-				handoff,
-				(chat) => {
-					const acceptedSelection = executionSelectionFromProjection(chat);
-					if (!acceptedSelection) {
-						throw new Error('Accepted handoff projection has incomplete execution settings');
-					}
-					this.#executionDraft.acceptDurable(acceptedSelection);
-					if (deps.sessions.selectedChatId === chatId) {
-						this.#applyExecutionSelection(acceptedSelection);
-					}
-				},
-			);
+			this.#reconcileExecutionSelection(chatId);
+			const outcome = await submitRunRoute(deps, this.#acceptedInputs, this.#queue, context);
 			await deps.requestProcessingSnapshot('admission').catch(() => undefined);
 			return outcome;
 		} finally {
@@ -790,6 +689,7 @@ export class ConversationSessionController {
 
 	async submitComposerWithSteerPreference(chatId: string): Promise<ConversationSubmissionOutcome> {
 		const { deps } = this;
+		this.#reconcileExecutionSelection(chatId);
 		if (deps.sessions.selectedChatId !== chatId || this.isDirectAdmissionPending(chatId)) {
 			return 'no-op';
 		}
@@ -798,6 +698,17 @@ export class ConversationSessionController {
 		const text = deps.composerState.inputText.trim();
 		const hasAttachments = deps.composerState.images.length > 0;
 		if (!text && !hasAttachments) return 'no-op';
+		if (selected.status === 'running' && isControllerSlashCommand(text))
+			return this.submitForChat(chatId);
+		if (
+			!deps.canSubmitToExecutor(deps.agentState.executorId) ||
+			!isCustomProviderSelectionAvailable(
+				deps.modelCatalogForExecutor(deps.agentState.executorId),
+				deps.agentState,
+			)
+		) {
+			return 'no-op';
+		}
 		if (selected.status !== 'running' || !selected.isProcessing || !text) {
 			return this.submitForChat(chatId);
 		}
@@ -805,8 +716,9 @@ export class ConversationSessionController {
 			chatId,
 			chat: selected,
 			text,
-			supportsSteering: deps.modelCatalog.supportsSteering(selected.agentId as SessionAgentId),
-			handoffPending: this.#executionDraft.isHandoffPending,
+			supportsSteering: deps
+				.modelCatalogForExecutor(selected.executorId ?? 'local')
+				.supportsSteering(selected.agentId),
 		});
 	}
 
@@ -960,22 +872,28 @@ export class ConversationSessionController {
 	}
 
 	handleModelSelectionChange(next: AgentSwitchSelection): void {
+		if (this.isDirectAdmissionPending(this.deps.sessions.selectedChatId)) return;
+		this.#reconcileExecutionSelection(this.deps.sessions.selectedChatId);
 		this.#settings.handleModelSelectionChange(next);
 	}
 
 	handleModelChange(model: string): void {
+		if (this.isDirectAdmissionPending(this.deps.sessions.selectedChatId)) return;
 		this.#settings.handleModelChange(model);
 	}
 
 	handlePermissionModeChange(mode: PermissionMode): void {
+		if (this.isDirectAdmissionPending(this.deps.sessions.selectedChatId)) return;
 		this.#settings.handlePermissionModeChange(mode);
 	}
 
 	handleThinkingModeChange(mode: ThinkingMode): void {
+		if (this.isDirectAdmissionPending(this.deps.sessions.selectedChatId)) return;
 		this.#settings.handleThinkingModeChange(mode);
 	}
 
 	handleAgentSettingChange(descriptor: AgentSettingDescriptor, value: JsonValue): void {
+		if (this.isDirectAdmissionPending(this.deps.sessions.selectedChatId)) return;
 		this.#settings.handleAgentSettingChange(descriptor, value);
 	}
 }

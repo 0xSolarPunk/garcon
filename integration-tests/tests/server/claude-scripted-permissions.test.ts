@@ -1,15 +1,17 @@
+import { cliConnectionArguments } from '../../support/cli-fixture.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { messagesOfType } from '../../support/chat-assertions.js';
+import { cliEnvironment } from '../../support/cli-environment.js';
 import {
   claudeText,
   claudeToolUse,
 } from '../../support/fake-claude-model.js';
 import {
   type IntegrationFixture,
-  withIntegrationFixture,
-} from '../../support/integration-fixture.js';
+  withCliFixture,
+} from '../../support/cli-fixture.js';
 import {
   LIVE_TURN_TIMEOUT_MS,
   waitForVisibleResponse,
@@ -21,7 +23,7 @@ import {
 } from '../../support/scripted-claude.js';
 
 const PERMISSION_OCCURRENCE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const CLI_PERMISSION_WORKSPACE = 'cli-permission-integration';
 
 async function runCli(
@@ -32,18 +34,11 @@ async function runCli(
     cmd: [
       process.execPath,
       'cli/main.ts',
-      '--config-dir', fixture.dirs.config,
-      '--workspace', CLI_PERMISSION_WORKSPACE,
-      '--server', fixture.garcon.baseUrl,
+      ...cliConnectionArguments(fixture),
       ...arguments_,
     ],
     cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      GARCON_CONFIG_DIR: '',
-      GARCON_WORKSPACE: '',
-      HOME: fixture.dirs.home,
-    },
+    env: cliEnvironment({ HOME: fixture.executionDirs.home }),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -90,12 +85,12 @@ describe('scripted Claude permissions', () => {
       return [claudeText(reply)];
     });
 
-    await withIntegrationFixture('claude-scripted-permissions', async (fixture) => {
+    await withCliFixture('claude-scripted-permissions', async (fixture) => {
       const chatId = fixture.newChatId();
       const cursor = fixture.client.markEvents();
       const turn = await fixture.client.startChat(liveClaudeStartRequest({
         chatId,
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         command: prompt,
         // AskUserQuestion remains interactive while every other tool bypasses approval.
         permissionMode: 'bypassPermissions',
@@ -210,12 +205,12 @@ describe('scripted Claude permissions', () => {
     ]);
     testEnvironment.model.scriptTurn([claudeText(reply)]);
 
-    await withIntegrationFixture('claude-scripted-allowed-bash', async (fixture) => {
+    await withCliFixture('claude-scripted-allowed-bash', async (fixture) => {
       const chatId = fixture.newChatId();
       const cursor = fixture.client.markEvents();
       const turn = await fixture.client.startChat(liveClaudeStartRequest({
         chatId,
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         command: prompt,
       }));
       const permission = await fixture.client.waitForTransientPermission(
@@ -258,7 +253,7 @@ describe('scripted Claude permissions', () => {
       expect(resolution?.allowed).toBe(true);
       expect(result?.isError).toBe(false);
       expect(JSON.stringify(result?.content)).toContain(output);
-      expect(await Bun.file(join(fixture.dirs.project, outputName)).text()).toBe(output);
+      expect(await Bun.file(join(fixture.executionDirs.project, outputName)).text()).toBe(output);
       testEnvironment.model.assertSettled();
     }, {
       serverEnvironment: testEnvironment.serverEnvironment,
@@ -277,12 +272,12 @@ describe('scripted Claude permissions', () => {
     ]);
     testEnvironment.model.scriptTurn([claudeText(reply)]);
 
-    await withIntegrationFixture('claude-scripted-denied-bash', async (fixture) => {
+    await withCliFixture('claude-scripted-denied-bash', async (fixture) => {
       const chatId = fixture.newChatId();
       const cursor = fixture.client.markEvents();
       const turn = await fixture.client.startChat(liveClaudeStartRequest({
         chatId,
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         command: prompt,
       }));
       const permission = await fixture.client.waitForTransientPermission(
@@ -324,7 +319,7 @@ describe('scripted Claude permissions', () => {
       );
       expect(resolution?.allowed).toBe(false);
       expect(result?.isError).toBe(true);
-      expect(await Bun.file(join(fixture.dirs.project, outputName)).exists()).toBe(false);
+      expect(await Bun.file(join(fixture.executionDirs.project, outputName)).exists()).toBe(false);
       testEnvironment.model.assertSettled();
     }, {
       serverEnvironment: testEnvironment.serverEnvironment,
@@ -343,12 +338,12 @@ describe('scripted Claude permissions', () => {
     ]);
     testEnvironment.model.scriptTurn([claudeText(reply)]);
 
-    await withIntegrationFixture('claude-scripted-cli-permission', async (fixture) => {
+    await withCliFixture('claude-scripted-cli-permission', async (fixture) => {
       const chatId = fixture.newChatId();
       const cursor = fixture.client.markEvents();
       const turn = await fixture.client.startChat(liveClaudeStartRequest({
         chatId,
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         command: prompt,
       }));
       const permission = await fixture.client.waitForTransientPermission(
@@ -412,7 +407,7 @@ describe('scripted Claude permissions', () => {
         marker: reply,
         afterIndex: cursor,
       });
-      expect(await Bun.file(join(fixture.dirs.project, outputName)).exists()).toBe(false);
+      expect(await Bun.file(join(fixture.executionDirs.project, outputName)).exists()).toBe(false);
       testEnvironment.model.assertSettled();
     }, {
       namedWorkspace: CLI_PERMISSION_WORKSPACE,
@@ -438,12 +433,12 @@ describe('scripted Claude permissions', () => {
       }),
     ]);
 
-    await withIntegrationFixture('claude-stale-permission-restart', async (fixture) => {
+    await withCliFixture('claude-stale-permission-restart', async (fixture) => {
       const chatId = fixture.newChatId();
       const cursor = fixture.client.markEvents();
       await fixture.client.startChat(liveClaudeStartRequest({
         chatId,
-        projectPath: fixture.dirs.project,
+        projectPath: fixture.executionDirs.project,
         command: prompt,
         permissionMode: 'bypassPermissions',
       }));

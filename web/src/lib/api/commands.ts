@@ -6,6 +6,7 @@ import type { SlashCommand, SlashCommandsResponse } from '$shared/slash-commands
 export type { SlashCommand, SlashCommandSource } from '$shared/slash-commands';
 
 export interface SlashCommandParams {
+	executorId?: string | null;
 	agent: string;
 	chatId?: string | null;
 	projectPath?: string | null;
@@ -18,6 +19,7 @@ export async function getSlashCommands(
 ): Promise<SlashCommand[]> {
 	const query = new URLSearchParams();
 	query.append('agent', params.agent);
+	if (params.executorId) query.set('executorId', params.executorId);
 	if (params.chatId) query.append('chatId', params.chatId);
 	else if (params.projectPath) query.append('projectPath', params.projectPath);
 

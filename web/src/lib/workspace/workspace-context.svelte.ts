@@ -2,14 +2,19 @@ import type { ChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.
 import type { ModelCatalogStore } from '$lib/agents/model-catalog-store.svelte';
 import type { ProjectTarget, ProjectUnavailableReason } from '$shared/project-resolution';
 import type { ProjectResolutionStore } from './project-resolution-store.svelte.js';
+import { effectiveExecutorId } from '$shared/executors';
+import type { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
 
 export interface WorkspaceContext {
+	target: ProjectTarget;
+	executorId?: string;
 	chatId: string;
 	projectPath: string;
 }
 
 export interface AvailableWorkspaceProject extends WorkspaceContext {
 	effectiveProjectKey: string;
+	executorContextKey?: string;
 }
 
 export type WorkspaceProjectState =
@@ -23,29 +28,76 @@ export type WorkspaceProjectState =
 export class WorkspaceContextStore {
 	constructor(
 		private readonly sessions: Pick<ChatSessionsStore, 'selectedChat'>,
-		private readonly modelCatalog: Pick<ModelCatalogStore, 'supportsUpdateProjectPath'>,
+		private readonly modelCatalog: Pick<ModelCatalogStore, 'forExecutor'>,
 		private readonly projectResolution: Pick<ProjectResolutionStore, 'snapshotFor'>,
+		private readonly executors?: Pick<
+			ExecutorsStore,
+			'filesAvailable' | 'gitAvailable' | 'gitContextKey'
+		>,
 	) {}
 
 	get current(): WorkspaceContext | null {
 		const chat = this.sessions.selectedChat;
 		if (!chat) return null;
 		return {
+			target: this.currentTarget!,
+			executorId: effectiveExecutorId(chat.executorId),
 			chatId: chat.id,
 			projectPath: chat.projectPath,
 		};
 	}
 
 	get currentProject(): AvailableWorkspaceProject | null {
-		const current = this.current;
-		const target = this.currentTarget;
-		if (!current || !target) return null;
-		const resolution = this.projectResolution.snapshotFor(target);
-		if (resolution.kind !== 'available') return null;
-		return { ...current, effectiveProjectKey: resolution.effectiveProjectKey };
+		const project = this.projectState;
+		return project.kind === 'available' ? project.project : null;
 	}
 
 	get projectState(): WorkspaceProjectState {
+		const current = this.current;
+		if (
+			current &&
+			!(
+				this.executors?.gitAvailable(current.executorId) ??
+				effectiveExecutorId(current.executorId) === 'local'
+			)
+		) {
+			return {
+				kind: 'request-failed',
+				context: current,
+				message: 'Git is unavailable on this executor.',
+			};
+		}
+		const project = this.#resolvedProjectState();
+		return project.kind === 'available'
+			? {
+					...project,
+					project: {
+						...project.project,
+						executorContextKey: this.executors?.gitContextKey(current?.executorId),
+					},
+				}
+			: project;
+	}
+
+	get filesProjectState(): WorkspaceProjectState {
+		const current = this.current;
+		if (
+			current &&
+			!(
+				this.executors?.filesAvailable(current.executorId) ??
+				effectiveExecutorId(current.executorId) === 'local'
+			)
+		) {
+			return {
+				kind: 'request-failed',
+				context: current,
+				message: 'Files are unavailable on this executor.',
+			};
+		}
+		return this.#resolvedProjectState();
+	}
+
+	#resolvedProjectState(): WorkspaceProjectState {
 		const current = this.current;
 		const target = this.currentTarget;
 		if (!current || !target) return { kind: 'absent' };
@@ -70,20 +122,33 @@ export class WorkspaceContextStore {
 		const chat = this.sessions.selectedChat;
 		if (!chat) return null;
 		return chat.status === 'draft'
-			? { kind: 'path', projectPath: chat.projectPath }
-			: { kind: 'chat', chatId: chat.id, projectPath: chat.projectPath };
+			? {
+					kind: 'path',
+					executorId: effectiveExecutorId(chat.executorId),
+					projectPath: chat.projectPath,
+				}
+			: {
+					kind: 'chat',
+					executorId: effectiveExecutorId(chat.executorId),
+					chatId: chat.id,
+					projectPath: chat.projectPath,
+				};
 	}
 
 	get canUpdateProjectPath(): boolean {
 		const chat = this.sessions.selectedChat;
-		return chat ? this.modelCatalog.supportsUpdateProjectPath(chat.agentId) : false;
+		return chat
+			? chat.status === 'draft' ||
+					this.modelCatalog.forExecutor(chat.executorId).supportsUpdateProjectPath(chat.agentId)
+			: false;
 	}
 }
 
 export function createWorkspaceContextStore(
 	sessions: Pick<ChatSessionsStore, 'selectedChat'>,
-	modelCatalog: Pick<ModelCatalogStore, 'supportsUpdateProjectPath'>,
+	modelCatalog: Pick<ModelCatalogStore, 'forExecutor'>,
 	projectResolution: Pick<ProjectResolutionStore, 'snapshotFor'>,
+	executors?: Pick<ExecutorsStore, 'filesAvailable' | 'gitAvailable' | 'gitContextKey'>,
 ): WorkspaceContextStore {
-	return new WorkspaceContextStore(sessions, modelCatalog, projectResolution);
+	return new WorkspaceContextStore(sessions, modelCatalog, projectResolution, executors);
 }

@@ -1,8 +1,6 @@
 import * as m from '$lib/paraglide/messages.js';
 import type { TerminalRegistry } from '$lib/terminal/sessions/terminal-registry.svelte.js';
-import { terminalDisplayName } from '$lib/terminal/sessions/terminal-display-name.js';
 import { createRandomId } from '$lib/utils/random-id.js';
-import { TERMINAL_SESSION_LIMIT } from '$shared/terminal';
 import {
 	TERMINAL_LAUNCHER_ID,
 	terminalSurfaceId,
@@ -19,6 +17,7 @@ import type { WorkspaceMutationPlan } from './workspace-transition-arbiter.js';
 import { isCanonicalFirstRunLayout } from './canonical-layout.js';
 import type { WorkspaceSplitAdmissionResolver } from './window-geometry-policy.js';
 import { requireWorkspaceNewWindowEdge } from './workspace-split-blocked-error.js';
+import type { TerminalCreationTarget } from './workspace-project-path-resolution.js';
 
 interface SurfaceReservations {
 	has(surfaceId: string): boolean;
@@ -45,7 +44,8 @@ interface TerminalPlacementServiceDeps {
 	isWindowReserved(windowId: WorkspaceWindowId): boolean;
 	commit: WorkspaceCommit;
 	commitDestroyedRemoval(surfaceId: string, mutations: WorkspaceMutationPlan): Promise<boolean>;
-	resolveCurrentProjectPath(): Promise<string | null>;
+	resolveCurrentProjectPath(executorId?: string): Promise<TerminalCreationTarget>;
+	currentProjectExecutorId(): string;
 	isMobile(): boolean;
 	cancelWorkspaceDrag(): void;
 	windowOf(surfaceId: string): WorkspaceWindowId | null;
@@ -72,16 +72,18 @@ export class TerminalPlacementService {
 
 	constructor(private readonly deps: TerminalPlacementServiceDeps) {}
 
-	async create(windowId: WorkspaceWindowId, requestKey?: string): Promise<string> {
+	async create(windowId: WorkspaceWindowId, requestKey?: string, executorId?: string): Promise<string> {
+		const target = this.#windowCreationTarget(windowId, executorId);
 		this.deps.cancelWorkspaceDrag();
 		const terminalId = requestKey
-			? await this.#retryCreate(requestKey)
-			: await this.#createWithRequestId(createRandomId());
+			? await this.#retryCreate(requestKey, executorId, target)
+			: await this.#createWithRequestId(createRandomId(), executorId, target);
 		const surfaceId = terminalSurfaceId(terminalId);
 		let current = false;
 		try {
 			current = await this.deps.commit(
 				(latest) => {
+					this.#assertRetainedTerminal(terminalId);
 					const destinationWindowId = this.#resolveWindowId(latest, windowId);
 					if (latest.surfaces[surfaceId]) {
 						const existingWindowId = this.#windowOf(latest, surfaceId);
@@ -137,10 +139,15 @@ export class TerminalPlacementService {
 	}
 
 	// Creates a terminal in a new window adjacent to the anchor window.
-	async createInNewWindow(anchorWindowId: WorkspaceWindowId, requestKey?: string): Promise<string> {
-		if (this.deps.isMobile()) return this.create(this.deps.defaultWindowId(), requestKey);
+	async createInNewWindow(
+		anchorWindowId: WorkspaceWindowId,
+		requestKey?: string,
+		executorId?: string,
+	): Promise<string> {
+		if (this.deps.isMobile()) return this.create(this.deps.defaultWindowId(), requestKey, executorId);
+		const target = this.#windowCreationTarget(anchorWindowId, executorId);
 		this.deps.cancelWorkspaceDrag();
-		if (!requestKey || !this.#hasPendingCreate(requestKey)) {
+		if (!requestKey || !this.#hasPendingCreate(this.#createKey(requestKey, executorId, target))) {
 			const snapshot = this.deps.layout.snapshot;
 			const currentAnchorWindowId = this.#resolveWindowId(snapshot, anchorWindowId);
 			const edge = requireWorkspaceNewWindowEdge(
@@ -151,8 +158,8 @@ export class TerminalPlacementService {
 			if (!edge) throw new Error('The target window is no longer available');
 		}
 		const terminalId = requestKey
-			? await this.#retryCreate(requestKey)
-			: await this.#createWithRequestId(createRandomId());
+			? await this.#retryCreate(requestKey, executorId, target)
+			: await this.#createWithRequestId(createRandomId(), executorId, target);
 		const surfaceId = terminalSurfaceId(terminalId);
 		const newWindowId = `window-${createRandomId()}` as WorkspaceWindowId;
 		const partitionId = `partition-${createRandomId()}` as WorkspacePartitionId;
@@ -160,6 +167,7 @@ export class TerminalPlacementService {
 		try {
 			current = await this.deps.commit(
 				(latest) => {
+					this.#assertRetainedTerminal(terminalId);
 					const currentAnchorWindowId = this.#resolveWindowId(latest, anchorWindowId);
 					const mutations: WorkspaceLayoutMutation[] = [];
 					if (
@@ -229,7 +237,18 @@ export class TerminalPlacementService {
 		return terminalId;
 	}
 
-	async createReplacing(currentTerminalId: string, requestKey?: string): Promise<string> {
+	async createReplacing(
+		currentTerminalId: string,
+		requestKey?: string,
+		executorId?: string,
+	): Promise<string> {
+		const source = this.deps.terminals.sessions[currentTerminalId]?.metadata;
+		const sourceExecutor = this.deps.terminals.executorIdFor(currentTerminalId);
+		const target: TerminalCreationTarget = {
+			executorId: executorId ?? sourceExecutor,
+			projectPath:
+				source && (!executorId || executorId === sourceExecutor) ? source.initialWorkingDirectory : null,
+		};
 		const currentSurfaceId = terminalSurfaceId(currentTerminalId);
 		const currentSurface = this.deps.layout.surface(currentSurfaceId);
 		if (currentSurface?.type !== 'terminal' || this.deps.reservations.has(currentSurfaceId)) {
@@ -238,13 +257,14 @@ export class TerminalPlacementService {
 		this.deps.reservations.add(currentSurfaceId);
 		try {
 			const terminalId = requestKey
-				? await this.#retryCreate(requestKey)
-				: await this.#createWithRequestId(createRandomId());
+				? await this.#retryCreate(requestKey, target.executorId, target)
+				: await this.#createWithRequestId(createRandomId(), target.executorId, target);
 			const surfaceId = terminalSurfaceId(terminalId);
 			let current = false;
 			try {
 				current = await this.deps.commit(
 					(latest) => {
+						this.#assertRetainedTerminal(terminalId);
 						const latestSurface = latest.surfaces[currentSurfaceId];
 						if (latestSurface?.type !== 'terminal') {
 							throw new Error('The current terminal tab changed before it could be replaced');
@@ -351,7 +371,9 @@ export class TerminalPlacementService {
 				(session.metadata.processStatus === 'running' || session.attachmentState === 'attached') &&
 				!(await this.deps.confirmClose({
 					surfaceId,
-					title: m.terminal_terminate_title({ name: terminalDisplayName(session.metadata) }),
+					title: m.terminal_terminate_title({
+						name: this.deps.terminals.displayName(session.metadata),
+					}),
 					description: m.terminal_terminate_description(),
 					confirmLabel: m.terminal_terminate(),
 				}))
@@ -449,32 +471,49 @@ export class TerminalPlacementService {
 			return;
 		}
 		let terminal = this.deps.terminals.orderedSessions.at(-1);
-		if (!terminal && this.deps.terminals.listStatus !== 'ready') {
-			await this.deps.terminals.list();
+		const executorId = this.creationExecutorId(preferredWindowId) ?? this.deps.currentProjectExecutorId();
+		if (!terminal && this.deps.terminals.executorInventories[executorId]?.status !== 'ready') {
+			await this.deps.terminals.list(executorId);
 			terminal = this.deps.terminals.orderedSessions.at(-1);
 		}
 		if (terminal) {
 			await this.open(terminal.metadata.terminalId, preferredWindowId);
 			return;
 		}
-		if (
-			this.deps.terminals.listStatus === 'ready' &&
-			this.deps.terminals.orderedSessions.length < TERMINAL_SESSION_LIMIT
-		) {
-			await this.create(preferredWindowId, `terminal-empty-state:${preferredWindowId}`);
-		}
+		await this.create(preferredWindowId, `terminal-empty-state:${preferredWindowId}`, executorId);
 	}
 
 	async reconcile(
 		liveTerminalIds: readonly string[],
-		options: { deriveLauncher: boolean },
+		options: { deriveLauncher: boolean; executorId?: string },
 	): Promise<void> {
-		const live = new Set(liveTerminalIds);
 		let mobileFallbackId: string | null = null;
-		for (const terminalId of this.#terminalTerminateRequestIds.keys()) {
-			if (!live.has(terminalId)) this.#terminalTerminateRequestIds.delete(terminalId);
-		}
 		const current = await this.deps.commit((latest) => {
+			const live = new Set(
+				options.executorId
+					? Object.keys(this.deps.terminals.sessions).filter(
+							(id) => this.deps.terminals.executorIdFor(id) === options.executorId,
+						)
+					: liveTerminalIds,
+			);
+			if (options.executorId) {
+				for (const surface of Object.values(latest.surfaces)) {
+					if (
+						surface.type === 'terminal' &&
+						this.deps.terminals.executorIdFor(surface.terminalId) !== options.executorId
+					)
+						live.add(surface.terminalId);
+				}
+				for (const id of latest.unplacedTerminalIds)
+					if (this.deps.terminals.executorIdFor(id) !== options.executorId) live.add(id);
+			}
+			for (const terminalId of this.#terminalTerminateRequestIds.keys()) {
+				if (
+					(!options.executorId || this.deps.terminals.executorIdFor(terminalId) === options.executorId) &&
+					!live.has(terminalId)
+				)
+					this.#terminalTerminateRequestIds.delete(terminalId);
+			}
 			const mutations: WorkspaceLayoutMutation[] = [];
 			const removedSurfaceIds = new Set<string>();
 			const survivingTerminalIds = new Set<string>();
@@ -550,26 +589,29 @@ export class TerminalPlacementService {
 		if (current && mobileFallbackId) this.deps.present(mobileFallbackId);
 	}
 
-	async activateLauncher(windowId: WorkspaceWindowId): Promise<void> {
+	async activateLauncher(windowId: WorkspaceWindowId, executorId?: string): Promise<void> {
 		const launcherId = TERMINAL_LAUNCHER_ID;
 		if (!this.deps.layout.surface(launcherId) || this.deps.reservations.has(launcherId)) {
 			return;
 		}
 		this.deps.reservations.add(launcherId);
 		try {
-			const terminalId = await this.#retryCreate(`launcher:${windowId}`);
+			const terminalId = await this.#retryCreate(`launcher:${windowId}`, executorId);
 			const surfaceId = terminalSurfaceId(terminalId);
 			let current = false;
 			try {
 				current = await this.deps.commit(
-					[
-						{
-							type: 'replace-surface',
-							previousId: launcherId,
-							surface: { id: surfaceId, type: 'terminal', terminalId },
-						},
-						{ type: 'activate-window-tab', windowId, surfaceId },
-					],
+					() => {
+						this.#assertRetainedTerminal(terminalId);
+						return [
+							{
+								type: 'replace-surface',
+								previousId: launcherId,
+								surface: { id: surfaceId, type: 'terminal', terminalId },
+							},
+							{ type: 'activate-window-tab', windowId, surfaceId },
+						];
+					},
 					{ requiredPublication: true },
 				);
 			} catch (error) {
@@ -618,10 +660,43 @@ export class TerminalPlacementService {
 		return Boolean(requestId && this.deps.terminals.pendingCreates[requestId]);
 	}
 
-	#retryCreate(requestKey: string): Promise<string> {
+	creationExecutorId(windowId: WorkspaceWindowId): string | undefined {
+		return this.#windowCreationTarget(windowId)?.executorId;
+	}
+
+	#windowCreationTarget(
+		windowId: WorkspaceWindowId,
+		executorId?: string,
+	): TerminalCreationTarget | undefined {
+		const window = windowNodeById(this.deps.layout.snapshot.desktopRoot, windowId);
+		const activeId = this.deps.isMobile()
+			? this.deps.layout.snapshot.mobileActiveSurfaceId
+			: window?.tabs.activeId;
+		const surface = activeId ? this.deps.layout.surface(activeId) : null;
+		if (surface?.type !== 'terminal') return undefined;
+		const sourceExecutor = this.deps.terminals.executorIdFor(surface.terminalId);
+		const source = this.deps.terminals.sessions[surface.terminalId]?.metadata;
+		return {
+			executorId: executorId ?? sourceExecutor,
+			projectPath:
+				source && (!executorId || executorId === sourceExecutor) ? source.initialWorkingDirectory : null,
+		};
+	}
+
+	#createKey(requestKey: string, executorId?: string, target?: TerminalCreationTarget): string {
+		return `${requestKey}:${executorId ?? target?.executorId ?? this.deps.currentProjectExecutorId()}`;
+	}
+
+	#retryCreate(
+		requestKey: string,
+		executorId?: string,
+		target?: TerminalCreationTarget,
+	): Promise<string> {
+		executorId ??= target?.executorId ?? this.deps.currentProjectExecutorId();
+		requestKey = this.#createKey(requestKey, executorId, target);
 		const pending = this.#terminalCreatePromises.get(requestKey);
 		if (pending) return pending;
-		const creating = this.#performRetriableCreate(requestKey);
+		const creating = this.#performRetriableCreate(requestKey, executorId, target);
 		const tracked = creating.finally(() => {
 			if (this.#terminalCreatePromises.get(requestKey) === tracked) {
 				this.#terminalCreatePromises.delete(requestKey);
@@ -631,7 +706,11 @@ export class TerminalPlacementService {
 		return tracked;
 	}
 
-	async #performRetriableCreate(requestKey: string): Promise<string> {
+	async #performRetriableCreate(
+		requestKey: string,
+		executorId?: string,
+		target?: TerminalCreationTarget,
+	): Promise<string> {
 		let requestId = this.#terminalCreateRequestIds.get(requestKey);
 		const attempt = requestId ? this.deps.terminals.pendingCreates[requestId] : undefined;
 		if (requestId && !attempt) {
@@ -645,9 +724,10 @@ export class TerminalPlacementService {
 				return await this.deps.terminals.create(
 					attempt.requestedInitialWorkingDirectory,
 					requestId,
+					attempt.executorId,
 				);
 			}
-			return await this.#createWithRequestId(requestId);
+			return await this.#createWithRequestId(requestId, executorId, target);
 		} finally {
 			if (!this.deps.terminals.pendingCreates[requestId]) {
 				this.#terminalCreateRequestIds.delete(requestKey);
@@ -655,9 +735,18 @@ export class TerminalPlacementService {
 		}
 	}
 
-	async #createWithRequestId(requestId: string): Promise<string> {
-		const projectPath = await this.deps.resolveCurrentProjectPath();
-		return this.deps.terminals.create(projectPath, requestId);
+	async #createWithRequestId(
+		requestId: string,
+		executorId?: string,
+		captured?: TerminalCreationTarget,
+	): Promise<string> {
+		const target = captured ?? (await this.deps.resolveCurrentProjectPath(executorId));
+		return this.deps.terminals.create(target.projectPath, requestId, target.executorId);
+	}
+
+	#assertRetainedTerminal(terminalId: string): void {
+		if (!this.deps.terminals.sessions[terminalId])
+			throw new Error('Terminal is no longer available');
 	}
 
 	#placementResolved(terminalId: string): boolean {
@@ -685,7 +774,8 @@ export class TerminalPlacementService {
 	}
 
 	async #rollbackUnplaced(terminalId: string, placementError: unknown): Promise<never> {
-		if (this.#placementResolved(terminalId)) throw placementError;
+		if (!this.deps.terminals.sessions[terminalId] || this.#placementResolved(terminalId))
+			throw placementError;
 		try {
 			await this.#requestTermination(terminalId);
 			this.deps.terminals.disposeTerminatedSession(terminalId);

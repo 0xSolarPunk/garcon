@@ -97,6 +97,7 @@ function commitFiles() {
 
 function snapshot() {
 	return {
+		document: { executorId: 'local', instanceId: 'test-instance', documentId: 'doc-abc' },
 		status: 'ready' as const,
 		project: '/project',
 		documentId: 'doc-abc',
@@ -115,6 +116,7 @@ function snapshot() {
 
 function comparisonSnapshot(): GitComparisonSnapshotReady {
 	return {
+		document: { executorId: 'local', instanceId: 'test-instance', documentId: 'comparison-doc' },
 		status: 'ready',
 		project: '/project',
 		repoRoot: '/repo',
@@ -152,6 +154,7 @@ function bodyForPath(path: string) {
 	const text = path === 'later.ts' ? 'later line' : 'added line';
 	const patch = `diff --git a/${path} b/${path}\n@@ -0,0 +1 @@\n+${text}\n`;
 	return {
+		patchDigest: 'a'.repeat(64),
 		path,
 		bodyFingerprint: fingerprintForPath(path),
 		bodyState: 'loaded' as const,
@@ -190,7 +193,7 @@ function deferred<T>() {
 
 function createHistory(): GitHistoryController {
 	const history = new GitHistoryController();
-	void history.loadInitial('/project');
+	void history.loadInitial({ executorId: 'local', projectPath: '/project' });
 	return history;
 }
 
@@ -234,7 +237,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -292,7 +295,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -319,7 +322,7 @@ describe('GitHistoryView', () => {
 		await fireEvent.scroll(list);
 		await waitFor(() => expect(getGitHistoryCommits).toHaveBeenCalledTimes(2));
 		expect(getGitHistoryCommits).toHaveBeenLastCalledWith(
-			'/project',
+			{ executorId: 'local', projectPath: '/project' },
 			expect.objectContaining({ offset: 50 }),
 		);
 		expect(screen.queryByRole('button', { name: /load more/i })).toBeNull();
@@ -365,7 +368,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -405,7 +408,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -455,7 +458,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'mobile',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -513,7 +516,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -596,7 +599,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -608,7 +611,11 @@ describe('GitHistoryView', () => {
 		await screen.findByText('List commit');
 		await fireEvent.click(screen.getByRole('button', { name: /List commit/ }));
 		await screen.findByText('Commit detail');
-		await vi.waitFor(() => expect(getGitCommitFileBodies).toHaveBeenCalledTimes(2));
+		await vi.waitFor(() => expect(getGitCommitFileBodies).toHaveBeenCalled());
+		expect(requestedPaths(vi.mocked(getGitCommitFileBodies).mock.calls[0]![3])).toEqual([
+			'file-0.ts',
+		]);
+		expect(vi.mocked(getGitCommitFileBodies).mock.calls[0]?.[4]?.purpose).toBe('visible');
 		const firstSignal = vi.mocked(getGitCommitFileBodies).mock.calls[0]?.[4]?.signal;
 		const details = container.querySelector<HTMLElement>('[data-git-diff-document]');
 		const diffRoot = container.querySelector<HTMLElement>('[data-git-virtual-diff-root]');
@@ -648,7 +655,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -708,7 +715,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -762,7 +769,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -789,7 +796,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -815,7 +822,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison,
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -857,7 +864,7 @@ describe('GitHistoryView', () => {
 		const onOpenSelectedComparison = vi.fn(() => {
 			const comparison = comparisonSelection.comparison();
 			if (comparison) {
-				history.openComparison('/project', comparison, {
+				history.openComparison({ executorId: 'local', projectPath: '/project' }, comparison, {
 					diffMode: 'unified',
 					contextLines: 5,
 				});
@@ -869,7 +876,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison,
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-main',
 				diffMode: 'unified',
 				contextLines: 5,
@@ -885,7 +892,7 @@ describe('GitHistoryView', () => {
 		expect(await screen.findByText('newer')).toBeTruthy();
 		expect(screen.queryByText('Compare revisions')).toBeNull();
 		expect(getGitComparisonSnapshot).toHaveBeenCalledWith(
-			'/project',
+			{ executorId: 'local', projectPath: '/project' },
 			{ kind: 'revision', revision: 'older' },
 			{ kind: 'revision', revision: 'newer' },
 			'direct',
@@ -920,7 +927,7 @@ describe('GitHistoryView', () => {
 				comparisonSelection,
 				onOpenSelectedComparison: vi.fn(),
 				onOpenChat: vi.fn(),
-				projectPath: '/project',
+				project: { executorId: 'local', projectPath: '/project' },
 				presentation: 'window-sidebar',
 				diffMode: 'unified',
 				contextLines: 5,

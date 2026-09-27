@@ -3,6 +3,10 @@
 	import FileMentionMenu from './FileMentionMenu.svelte';
 	import SlashCommandMenu from './SlashCommandMenu.svelte';
 	import ComposerBottomBar from './ComposerBottomBar.svelte';
+	import ComposerAttachmentList from './ComposerAttachmentList.svelte';
+	import ComposerAvailabilityNotice from './ComposerAvailabilityNotice.svelte';
+	import { isCustomProviderSelectionAvailable } from '$lib/agents/provider-selection.js';
+	import { resolveComposerAvailabilityNotice } from '$lib/chat/composer/composer-availability.js';
 	import ComposerResizeHandle from './ComposerResizeHandle.svelte';
 	import PromptComposerEditor from './PromptComposerEditor.svelte';
 	import ComposerSnippetPalette from './ComposerSnippetPalette.svelte';
@@ -13,8 +17,8 @@
 		getChatSessions,
 		getAppShell,
 		getModelCatalog,
+		getExecutors,
 		getAgentState,
-		getRemoteSettings,
 		getNotifications,
 		getPreambles,
 		getSnippets,
@@ -25,8 +29,6 @@
 	import {
 		chatAttachmentAccept,
 		ImageAttachmentState,
-		isImageAttachment,
-		isVideoChatAttachment,
 	} from '$lib/chat/composer/image-attachment.svelte.js';
 	import {
 		resolveComposerKeydownAction,
@@ -59,6 +61,7 @@
 	import {
 		applySlashCommand,
 		findSlashCommandTrigger,
+		isControllerSlashCommand,
 		parseSnippetCommand,
 		type SnippetCommandParseResult,
 	} from '$lib/chat/composer/slash-commands.js';
@@ -71,32 +74,28 @@
 		LOCAL_STORAGE_KEYS,
 		setLocalStorageItem,
 	} from '$lib/utils/local-persistence';
-	import FileText from '@lucide/svelte/icons/file-text';
-	import FileVideo from '@lucide/svelte/icons/file-video';
 	import { CHAT_FILE_ATTACHMENT_MIME_TYPES } from '@garcon/common/attachments';
 	import ImagePlus from '@lucide/svelte/icons/image-plus';
-	import X from '@lucide/svelte/icons/x';
-	import ComposerModelSelector from '$lib/components/model-selector/ComposerModelSelector.svelte';
-	import { composerModelSelectorMode } from '$lib/components/model-selector/composer-model-selector-mode';
-	import { buildModelSelectorRecents } from '$lib/components/model-selector/model-selector-recents';
-	import type { ModelSelectorMode } from '$lib/components/model-selector/model-selector-types';
+	import PromptComposerModelSelector from './PromptComposerModelSelector.svelte';
 	import { snippetTemplateUsesArguments } from '$shared/snippets';
-	import { matchesSelectableSnippetExpansion, type SelectableSnippet } from '$lib/snippets/selectable-snippet.js';
+	import {
+		matchesSelectableSnippetExpansion,
+		type SelectableSnippet,
+	} from '$lib/snippets/selectable-snippet.js';
 	import { transientLayerAttachment } from '$lib/workspace/transient-layer-action.js';
 	import { allocateTransientLayerId } from '$lib/workspace/transient-layer-id.js';
-	import { isDirectAgentId, nonDirectAgentIds } from '$lib/agents/direct-agents.js';
 	import ResendCandidateChips from './ResendCandidateChips.svelte';
 	import { PromptComposerAttachmentController } from './prompt-composer-attachment-controller.js';
 	import { PromptComposerRefinementController } from './prompt-composer-refinement-controller.js';
 	import { PromptComposerFocusDelivery } from './prompt-composer-focus-delivery.svelte.js';
 	import { PromptComposerProjectState } from './prompt-composer-project-state.svelte.js';
 	import type { PromptComposerProps } from './prompt-composer-props.js';
-	import ProjectAvailabilityNotice from '$lib/components/workspace/ProjectAvailabilityNotice.svelte';
 
 	let {
 		onsubmit,
 		onSteerPreferredSubmit,
 		onModelChange,
+		onExecutorChange,
 		onPermissionModeChange,
 		onThinkingModeChange,
 		onAgentSettingChange,
@@ -108,6 +107,7 @@
 		isPresented: isPresentedOverride,
 		composerEditorOpenRequestId = 0,
 		onChooseProjectFolder,
+		onAvailabilityNoticeChange,
 	}: PromptComposerProps = $props();
 	const isPresented = $derived(isPresentedOverride ?? isVisible);
 	const composerState = getComposerState();
@@ -115,8 +115,19 @@
 	const localSettings = getLocalSettings();
 	const sessions = getChatSessions();
 	const appShell = getAppShell();
-	const modelCatalog = getModelCatalog();
-	const remoteSettings = getRemoteSettings();
+	const rootModelCatalog = getModelCatalog();
+	const executors = getExecutors();
+	const modelCatalog = $derived(rootModelCatalog.forExecutor(agentState.executorId));
+	const providerAvailable = $derived(isCustomProviderSelectionAvailable(modelCatalog, agentState));
+	const filesAvailable = $derived(executors.filesAvailable(agentState.executorId));
+
+	$effect(() => {
+		if (!sessions.selectedChatId || !executors.isReady(agentState.executorId)) return;
+		const catalog = modelCatalog;
+		// Repeated invalidation must wake consumers even before the first validation.
+		void catalog.version;
+		untrack(() => void catalog.refreshIfStale());
+	});
 	const notifications = getNotifications();
 	const preambles = getPreambles();
 	const snippets = getSnippets();
@@ -147,7 +158,14 @@
 	const focusDelivery = new PromptComposerFocusDelivery();
 	const snippetInteractionKey = $derived.by(() => {
 		const chat = sessions.selectedChat;
-		return chat ? [chat.id, chat.status, chat.projectPath].join('\u0000') : '';
+		return chat
+			? [
+					chat.id,
+					chat.status,
+					agentState.executorId,
+					agentState.projectPath || chat.projectPath,
+				].join('\u0000')
+			: '';
 	});
 	const snippetContextHint = $derived(
 		sessions.selectedChat?.projectPath.trim() ? null : m.snippets_palette_context_hint(),
@@ -157,18 +175,42 @@
 			return sessions.selectedChat;
 		},
 		get completionDemand() {
-			return ui.showFileMenu || ui.showSlashMenu;
+			return (filesAvailable && ui.showFileMenu) || ui.showSlashMenu;
 		},
 		projectResolution,
+		get executionTarget() {
+			return {
+				executorId: agentState.executorId,
+				projectPath: agentState.projectPath || sessions.selectedChat?.projectPath || '',
+			};
+		},
 	});
 	const selectedProjectTarget = $derived(projectState.target);
 	const selectedProjectResolution = $derived(projectState.snapshot);
+	const availabilityNotice = $derived(
+		resolveComposerAvailabilityNotice({
+			executorId: agentState.executorId,
+			executors,
+			projectTarget: selectedProjectTarget,
+			projectResolution: selectedProjectResolution,
+			catalog: modelCatalog,
+			providerAvailable,
+		}),
+	);
+	const showProjectNotice = $derived(availabilityNotice?.kind === 'project-unavailable');
+	// The owning panel renders outside this context tree and hides its Git tray while a notice shows.
+	$effect(() => {
+		const shown = isVisible && availabilityNotice !== null;
+		untrack(() => onAvailabilityNoticeChange?.(shown));
+	});
+	onDestroy(() => onAvailabilityNoticeChange?.(false));
 	const completionProjectPath = $derived(projectState.completionProjectPath);
 	const canChooseProjectFolder = $derived(
 		Boolean(
 			onChooseProjectFolder &&
 			sessions.selectedChat &&
-			modelCatalog.supportsUpdateProjectPath(sessions.selectedChat.agentId),
+			(sessions.selectedChat.status === 'draft' ||
+				modelCatalog.supportsUpdateProjectPath(sessions.selectedChat.agentId)),
 		),
 	);
 
@@ -264,8 +306,6 @@
 		}),
 	);
 
-	// Shared image URL lifecycle management. Syncs blob URLs with
-	// composerState.images and revokes stale URLs automatically.
 	const imageAttachments = new ImageAttachmentState();
 
 	$effect(() => {
@@ -443,7 +483,6 @@
 				};
 			});
 			if (result.kind !== 'expanded') return 'cancelled';
-			const operation = result.prepared;
 			if (!matchesSelectableSnippetExpansion(snippet, result.response)) {
 				if (snippet.source === 'snippet') void snippets.refreshIfLoaded();
 				else void preambles.refreshIfLoaded();
@@ -452,9 +491,7 @@
 				return 'cancelled';
 			}
 			if (
-				sessions.selectedChatId !== operation.chatId ||
-				sessions.selectedChat?.projectPath.trim() !== operation.projectPath ||
-				result.response.contextProjectPath !== operation.projectPath ||
+				!projectState.matchesSnippetContext(result.prepared, result.response) ||
 				composerState.inputText !== sourceText
 			)
 				return 'cancelled';
@@ -499,11 +536,8 @@
 				};
 			});
 			if (result.kind !== 'expanded') return;
-			const operation = result.prepared;
 			if (
-				sessions.selectedChatId !== operation.chatId ||
-				sessions.selectedChat?.projectPath.trim() !== operation.projectPath ||
-				result.response.contextProjectPath !== operation.projectPath ||
+				!projectState.matchesSnippetContext(result.prepared, result.response) ||
 				composerState.inputText !== sourceText
 			)
 				return;
@@ -526,9 +560,11 @@
 	}
 
 	function handleCompletionKeyDown(event: KeyboardEvent): boolean {
-		if (!ui.showFileMenu && !ui.showSlashMenu) return false;
-		const menu = ui.showFileMenu ? fileMentionMenu : slashCommandMenu;
+		const showFileMenu = filesAvailable && ui.showFileMenu;
+		if (!showFileMenu && !ui.showSlashMenu) return false;
+		const menu = showFileMenu ? fileMentionMenu : slashCommandMenu;
 		if (menu?.handleKeyDown(event)) return true;
+		if (menu && !showFileMenu && event.key === 'Enter') return false;
 		if (!['ArrowDown', 'ArrowUp', 'Enter', 'Tab'].includes(event.key)) return false;
 		event.preventDefault();
 		return true;
@@ -601,15 +637,34 @@
 	const thinkingReducedMotion = $derived(selectedIsProcessing && localSettings.reduceMotion);
 	const capabilityAgentId = $derived(sessions.selectedChat?.agentId ?? agentState.agentId);
 	const isDraftStartupSubmitting = $derived(
-		composerState.isSubmitting && sessions.selectedChat?.status === 'draft',
+		directAdmissionPending && sessions.selectedChat?.status === 'draft',
 	);
 	const isQueueMode = $derived(requiresQueuedSubmission);
 	const hasQueuedAttachmentConflict = $derived(isQueueMode && composerState.images.length > 0);
 	const isDisabled = $derived(isDraftStartupSubmitting);
+	const controllerCommand = $derived(
+		sessions.selectedChat?.status === 'running' &&
+			isControllerSlashCommand(composerState.inputText),
+	);
+	// Loading is explained by the disabled send button so the composer keeps its height.
+	const modelsLoading = $derived(
+		executors.isReady(agentState.executorId) && !modelCatalog.isValidated && !modelCatalog.error,
+	);
+	const sendTitle = $derived.by(() => {
+		if (hasQueuedAttachmentConflict) return m.chat_notice_queue_attachments_unavailable();
+		if (modelsLoading && !controllerCommand) return m.chat_composer_loading_models();
+		return isQueueMode ? m.chat_composer_queue_message() : m.chat_composer_send_message();
+	});
 
 	const canSubmit = $derived(
 		canSubmitComposer(
-			isDisabled || directAdmissionPending || promptTransformPending,
+			isDisabled ||
+				directAdmissionPending ||
+				promptTransformPending ||
+				(!controllerCommand &&
+					(!executors.isReady(agentState.executorId) ||
+						!modelCatalog.isValidated ||
+						!providerAvailable)),
 			composerState.inputText,
 			composerState.images.length,
 		) && !hasQueuedAttachmentConflict,
@@ -635,36 +690,6 @@
 	});
 	const canAttachAttachments = $derived(canAttachImages || fileAttachmentMimeTypes.length > 0);
 	const attachmentAccept = $derived(chatAttachmentAccept(attachmentSupport));
-	// Existing (already-started) chats expose the full agent/source picker so a
-	// conversation can move between configured providers and models. Drafts keep
-	// the compact trigger; the new-chat form owns agent selection before start.
-	const isActiveModelSelection = $derived(
-		Boolean(sessions.selectedChat) && sessions.selectedChat?.status !== 'draft',
-	);
-	const modelSelectorAgentIds = $derived.by(() => {
-		const allAgentIds = modelCatalog.getSelectableAgents();
-		const selectedAgentId = sessions.selectedChat?.agentId;
-		if (localSettings.allowDirectChats || (selectedAgentId && isDirectAgentId(selectedAgentId))) {
-			return allAgentIds;
-		}
-		return nonDirectAgentIds(allAgentIds);
-	});
-	const modelSelectorMode: ModelSelectorMode = $derived(
-		isActiveModelSelection
-			? composerModelSelectorMode(modelCatalog, agentState.agentId, modelSelectorAgentIds)
-			: { agent: 'fixed', source: 'hidden', surface: 'composer' },
-	);
-	const modelSelectorValue = $derived({
-		agentId: agentState.agentId,
-		model: agentState.model,
-		apiProviderId: agentState.apiProviderId,
-		modelEndpointId: agentState.modelEndpointId,
-		modelProtocol: agentState.modelProtocol,
-	});
-	const recentSelectorOptions = $derived.by(() =>
-		buildModelSelectorRecents(modelCatalog, remoteSettings.snapshot?.recentAgentSettings ?? []),
-	);
-	const preferRecentsOnOpen = $derived(recentSelectorOptions.length > 1);
 	const sendButtonClass =
 		'bg-primary text-primary-foreground border-primary/30 hover:bg-primary/90';
 	const composerShellClass = $derived(
@@ -697,22 +722,25 @@
 			isPresented &&
 			promptRefinement.layerAttachment}
 	>
-		<FileMentionMenu
-			bind:this={fileMentionMenu}
-			projectPath={completionProjectPath}
-			isVisible={ui.showFileMenu}
-			projectPending={Boolean(
-				selectedProjectTarget &&
-				(selectedProjectResolution.kind === 'unchecked' ||
-					selectedProjectResolution.kind === 'resolving'),
-			)}
-			projectUnavailable={selectedProjectResolution.kind === 'unavailable' ||
-				selectedProjectResolution.kind === 'request-failed'}
-			query={ui.fileQuery}
-			onSelect={insertFileMention}
-			onClose={() => ui.closeFileMenu()}
-		/>
-
+		{#if filesAvailable}
+			<FileMentionMenu
+				executorContextKey={executors.pathContextKey(agentState.executorId)}
+				executorId={agentState.executorId}
+				bind:this={fileMentionMenu}
+				projectPath={completionProjectPath}
+				isVisible={ui.showFileMenu && !showProjectNotice}
+				projectPending={Boolean(
+					selectedProjectTarget &&
+					(selectedProjectResolution.kind === 'unchecked' ||
+						selectedProjectResolution.kind === 'resolving'),
+				)}
+				projectUnavailable={selectedProjectResolution.kind === 'unavailable' ||
+					selectedProjectResolution.kind === 'request-failed'}
+				query={ui.fileQuery}
+				onSelect={insertFileMention}
+				onClose={() => ui.closeFileMenu()}
+			/>
+		{/if}
 		<ComposerSnippetPalette
 			open={ui.snippetPalette.isOpen}
 			onOpenChange={(nextOpen) => {
@@ -771,49 +799,13 @@
 				</div>
 			{/if}
 
-			{#if composerState.images.length > 0}
-				<div class={imageListClass}>
-					<div class="flex flex-wrap gap-2">
-						{#each composerState.images as file, idx (file.name + idx)}
-							<div class="relative group">
-								<div class="w-16 h-16 rounded-lg overflow-hidden border border-border">
-									{#if isImageAttachment(file)}
-										{@const url = imageAttachments.urlFor(file, idx)}
-										{#if url}
-											<img src={url} alt={file.name} class="w-full h-full object-cover" />
-										{/if}
-									{:else}
-										<div
-											class="flex h-full w-full flex-col items-center justify-center gap-1 bg-background px-1 text-muted-foreground"
-										>
-											{#if isVideoChatAttachment(file)}
-												<FileVideo class="h-5 w-5" aria-hidden="true" />
-											{:else}
-												<FileText class="h-5 w-5" aria-hidden="true" />
-											{/if}
-											<span class="w-full truncate text-center text-[10px] leading-tight"
-												>{file.name}</span
-											>
-										</div>
-									{/if}
-								</div>
-								<button
-									type="button"
-									aria-label={m.chat_composer_remove_image({ name: file.name })}
-									title={m.chat_composer_remove_image({ name: file.name })}
-									class="absolute -top-1 -right-1 w-5 h-5 bg-destructive text-destructive-foreground rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-									onclick={() => {
-										if (!promptTransformPending) composerState.removeImage(idx);
-									}}
-									disabled={promptTransformPending}
-								>
-									<X class="w-3 h-3" aria-hidden="true" />
-								</button>
-							</div>
-						{/each}
-					</div>
-				</div>
-			{/if}
+			<ComposerAttachmentList
+				files={composerState.images}
+				previewUrls={imageAttachments.urls}
+				disabled={promptTransformPending}
+				class={imageListClass}
+				onRemove={(index) => composerState.removeImage(index)}
+			/>
 
 			<input
 				bind:this={attachmentController.fileInput}
@@ -861,6 +853,7 @@
 				canRefinePrompt={promptRefinement.canStart}
 				isPromptRefinementPending={promptRefinement.pending}
 				addMenuDisabled={isDisabled}
+				settingsDisabled={directAdmissionPending}
 				isPromptTransformPending={promptTransformPending}
 				{promptTransformStatus}
 				{permissionOptions}
@@ -877,11 +870,7 @@
 				}}
 				canSend={canSubmit}
 				onSend={() => handleFormSubmit()}
-				sendTitle={hasQueuedAttachmentConflict
-					? m.chat_notice_queue_attachments_unavailable()
-					: isQueueMode
-						? m.chat_composer_queue_message()
-						: m.chat_composer_send_message()}
+				{sendTitle}
 				{sendButtonClass}
 			>
 				{#snippet agentSettings()}
@@ -889,19 +878,14 @@
 						descriptors={modelCatalog.getAgentSettingsDescriptors(agentState.agentId)}
 						envelope={agentState.agentSettings}
 						onChange={(descriptor, value) => onAgentSettingChange?.(descriptor, value)}
-						disabled={!onAgentSettingChange}
+						disabled={!onAgentSettingChange || directAdmissionPending}
 					/>
 				{/snippet}
 				{#snippet modelSelector()}
-					<ComposerModelSelector
-						value={modelSelectorValue}
-						mode={modelSelectorMode}
-						onChange={(next) => onModelChange?.(next)}
-						recents={recentSelectorOptions}
-						{preferRecentsOnOpen}
-						selectableAgentIds={modelSelectorAgentIds}
-						align="end"
-						side="top"
+					<PromptComposerModelSelector
+						onChange={onModelChange}
+						{onExecutorChange}
+						disabled={directAdmissionPending}
 					/>
 				{/snippet}
 			</ComposerBottomBar>
@@ -919,11 +903,13 @@
 		<!-- Rendered outside the composer surface, which clips with overflow-hidden,
 		     so the upward-opening menu is not cut off. -->
 		<SlashCommandMenu
+			executorContextKey={executors.pathContextKey(agentState.executorId)}
 			bind:this={slashCommandMenu}
 			agent={agentState.agentId}
+			executorId={agentState.executorId}
 			projectPath={completionProjectPath}
-			chatId={sessions.selectedChatId}
-			isVisible={ui.showSlashMenu}
+			chatId={selectedProjectTarget?.kind === 'chat' ? sessions.selectedChatId : null}
+			isVisible={ui.showSlashMenu && executors.isReady(agentState.executorId) && !showProjectNotice}
 			projectPending={Boolean(
 				selectedProjectTarget &&
 				(selectedProjectResolution.kind === 'unchecked' ||
@@ -934,7 +920,6 @@
 			query={ui.slashQuery}
 			supportsFork={modelCatalog.supportsFork(capabilityAgentId)}
 			supportsSteering={modelCatalog.supportsSteering(capabilityAgentId)}
-			supportsGoals={modelCatalog.supportsGoals(capabilityAgentId)}
 			canScheduleIn={Boolean(sessions.selectedChat && sessions.selectedChat.status !== 'draft')}
 			onSelect={insertSlashCommand}
 			onClose={() => ui.closeSlashMenu()}
@@ -958,25 +943,16 @@
 
 <div class={composerShellClass} data-composer-shell>
 	<div class={composerFrameWrapperClass}>
-		{#if selectedProjectTarget && (selectedProjectResolution.kind === 'unavailable' || selectedProjectResolution.kind === 'request-failed')}
-			<div
-				class="mb-2 rounded-lg border border-border bg-card px-4 py-3"
-				data-project-availability-notice
-			>
-				<ProjectAvailabilityNotice
-					projectPath={selectedProjectTarget.projectPath}
-					reason={selectedProjectResolution.kind === 'unavailable'
-						? selectedProjectResolution.reason
-						: undefined}
-					requestError={selectedProjectResolution.kind === 'request-failed'
-						? selectedProjectResolution.message
-						: undefined}
-					onRetry={() => projectState.retry()}
-					onChooseFolder={canChooseProjectFolder && sessions.selectedChat
-						? () => onChooseProjectFolder?.(sessions.selectedChat!.id)
-						: undefined}
-				/>
-			</div>
+		<!-- Notices sit outside the composer surface so they never resize or restyle it. -->
+		{#if availabilityNotice}
+			<ComposerAvailabilityNotice
+				notice={availabilityNotice}
+				onRetryProject={() => projectState.retry()}
+				onChooseProjectFolder={canChooseProjectFolder && sessions.selectedChat
+					? () => onChooseProjectFolder?.(sessions.selectedChat!.id)
+					: undefined}
+				onRetryCatalog={() => void modelCatalog.forceRefresh()}
+			/>
 		{/if}
 		{@render composerFrame()}
 	</div>

@@ -6,12 +6,15 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Square from '@lucide/svelte/icons/square';
 	import X from '@lucide/svelte/icons/x';
+	import Plug from '@lucide/svelte/icons/plug';
+	import Unplug from '@lucide/svelte/icons/unplug';
+	import Users from '@lucide/svelte/icons/users';
+	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { terminalContextName } from '$lib/terminal/sessions/terminal-display-name.js';
 	import { getLocalSettings, getTerminalRegistry, getWorkspaceCoordinator } from '$lib/context';
 	import { terminalSurfaceId, type WorkspaceWindowId } from '$lib/workspace/surface-types';
 	import { collectWindowNodes, windowIdOfSurface } from '$lib/workspace/window-tree.js';
 	import type { TerminalToolbarKey } from '$lib/terminal/runtime/terminal-input-controls.svelte.js';
-	import { TERMINAL_SESSION_LIMIT } from '$shared/terminal';
-	import { terminalDisplayName } from '$lib/terminal/sessions/terminal-display-name.js';
 	import * as m from '$lib/paraglide/messages.js';
 	import { getSurfaceFrameBridge } from '$lib/workspace/surface-frame-context.js';
 	import { ApiError } from '$lib/api/client.js';
@@ -20,6 +23,7 @@
 	} from '$lib/components/shared/ResponsiveSurfaceActions.svelte';
 	import TerminalSettingsMenu from './TerminalSettingsMenu.svelte';
 	import TerminalRenameDialog from './TerminalRenameDialog.svelte';
+	import TerminalCreateAction from './TerminalCreateAction.svelte';
 	import type {
 		TerminalSurfaceRegistryPort,
 		TerminalSurfaceWorkspacePort,
@@ -46,23 +50,34 @@
 	let observer: ResizeObserver | null = null;
 	let actionError = $state<string | null>(null);
 	let renameDialogOpen = $state(false);
+	let creating = $state(false);
 	let hasCoarsePointer = $state(false);
 	const session = $derived(terminals.sessions[terminalId] ?? null);
+	const executorId = $derived(terminals.executorIdFor(terminalId));
+	const hostLabel = $derived(terminals.executorLabel(executorId));
+	const AttachmentIcon = $derived(
+		{
+			connecting: RefreshCw,
+			attached: Plug,
+			detached: Unplug,
+			'taken-over': Users,
+			unavailable: CircleAlert,
+		}[session?.attachmentState ?? 'detached'],
+	);
+	const sessionLabels = $derived.by(() => {
+		if (!session) return null;
+		const name = terminals.displayName(session.metadata);
+		const initialDirectory = `${hostLabel}: ${session.metadata.initialWorkingDirectory}`;
+		return {
+			initialDirectory: m.terminal_initial_working_directory({ path: initialDirectory }),
+			pickerTitle: `${name} - ${initialDirectory} - ${attachmentLabel(session.attachmentState)}`,
+		};
+	});
 	let runtime = $state<Awaited<ReturnType<typeof terminals.ensureRuntime>> | null>(null);
 	let runtimeTerminalId = $state<string | null>(null);
 	const showInputControls = $derived(host === 'mobile' || hasCoarsePointer);
 	const toolbarActions = $derived.by<ResponsiveSurfaceAction[]>(() => {
 		const actions: ResponsiveSurfaceAction[] = [
-			{
-				id: 'new',
-				label: m.terminal_new(),
-				icon: Plus,
-				onclick: () => void createTerminal(),
-				disabled:
-					terminals.orderedSessions.length >= TERMINAL_SESSION_LIMIT ||
-					terminals.listStatus !== 'ready',
-				priority: 0,
-			},
 			{
 				id: 'rename',
 				label: m.terminal_rename(),
@@ -210,15 +225,23 @@
 		void workspace.switchTerminalSurface(terminalId, value);
 	}
 
-	async function createTerminal(): Promise<void> {
+	async function createTerminal(executorId?: string): Promise<void> {
+		if (creating) return;
+		creating = true;
 		actionError = null;
 		try {
-			await workspace.createTerminalReplacing(terminalId, `terminal-surface:${terminalId}:${host}`);
+			await workspace.createTerminalReplacing(
+				terminalId,
+				`terminal-surface:${terminalId}:${host}`,
+				executorId,
+			);
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : m.terminal_create_failed();
 			if (error instanceof ApiError && error.errorCode === 'terminal-limit') {
 				queueMicrotask(() => sessionPicker?.focus());
 			}
+		} finally {
+			creating = false;
 		}
 	}
 
@@ -258,16 +281,20 @@
 			<div class="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
 				<select
 					bind:this={sessionPicker}
-					class="select-native select-native-surface min-w-24 max-w-56 truncate text-base md:pointer-fine:text-xs"
+					class="select-native select-native-surface min-w-0 max-w-56 flex-1 truncate text-base md:pointer-fine:text-xs"
 					value={terminalId}
 					onchange={(event) => selectTerminal(event.currentTarget.value)}
 					aria-label={m.terminal_session()}
+					title={sessionLabels?.pickerTitle}
 				>
 					{#each terminals.orderedSessions as item (item.metadata.terminalId)}
 						{@const placement = placementLabel(item.metadata.terminalId)}
 						<option value={item.metadata.terminalId}>
 							{m.terminal_session_status({
-								name: terminalDisplayName(item.metadata),
+								name: terminalContextName(
+									item.metadata,
+									terminals.executorLabel(terminals.executorIdFor(item.metadata.terminalId)),
+								),
 								status: item.metadata.processStatus,
 							})}{placement ? ` - ${placement}` : ''}
 						</option>
@@ -275,25 +302,35 @@
 				</select>
 				{#if session}
 					<span
-						class="min-w-0 flex-1 truncate text-xs text-muted-foreground"
-						title={m.terminal_initial_working_directory({
-							path: session.metadata.initialWorkingDirectory,
-						})}
+						class="terminal-context min-w-0 flex-1 truncate text-xs text-muted-foreground"
+						title={sessionLabels?.initialDirectory}
 					>
-						{m.terminal_initial_working_directory({
-							path: session.metadata.initialWorkingDirectory,
-						})}
+						{sessionLabels?.initialDirectory}
 					</span>
-					<span class="shrink-0 text-[11px] text-muted-foreground"
-						>{attachmentLabel(session.attachmentState)}</span
+					<span
+						role="status"
+						aria-label={attachmentLabel(session.attachmentState)}
+						title={attachmentLabel(session.attachmentState)}
+						class="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground"
 					>
+						<AttachmentIcon class="h-4 w-4" />
+						<span class="terminal-context">{attachmentLabel(session.attachmentState)}</span>
+					</span>
 				{/if}
 			</div>
-			<ResponsiveSurfaceActions
-				actions={toolbarActions}
-				menuLabel={m.workspace_surface_actions()}
-				class="max-w-28"
+			<TerminalCreateAction
+				{terminals}
+				icon={Plus}
+				busy={creating}
+				defaultExecutorId={executorId}
+				oncreate={(executorId) => void createTerminal(executorId)}
 			/>
+			<div class="terminal-actions">
+				<ResponsiveSurfaceActions
+					actions={toolbarActions}
+					menuLabel={m.workspace_surface_actions()}
+				/>
+			</div>
 			<TerminalSettingsMenu />
 			<button
 				type="button"
@@ -317,10 +354,11 @@
 	{#if !session}
 		<div class="grid min-h-0 flex-1 place-items-center p-6 text-center">
 			<div class="max-w-sm text-sm text-muted-foreground">
-				<p>{terminals.listError ?? m.terminal_unavailable()}</p>
+				<p>{terminals.executorInventories[executorId]?.error ?? m.terminal_unavailable()}</p>
 				<button
 					class="mt-3 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent hover:text-foreground"
-					onclick={() => void terminals.list()}>{m.common_retry()}</button
+					onclick={() => void terminals.list(executorId).catch(() => undefined)}
+					>{m.common_retry()}</button
 				>
 			</div>
 		</div>
@@ -377,11 +415,29 @@
 
 <TerminalRenameDialog
 	terminal={host === 'mobile' && renameDialogOpen ? (session?.metadata ?? null) : null}
+	{hostLabel}
 	onClose={() => (renameDialogOpen = false)}
 	onRename={(selectedTerminalId, title) => terminals.rename(selectedTerminalId, title)}
 />
 
 <style>
+	.terminal-context {
+		display: none;
+	}
+	.terminal-actions {
+		display: flex;
+		flex: 0 0 auto;
+		width: 2rem;
+	}
+	@container surface-toolbar (min-width: 36rem) {
+		.terminal-context {
+			display: block;
+		}
+		.terminal-actions {
+			width: 7rem;
+		}
+	}
+
 	.mobile-terminal-host :global(.xterm) {
 		padding-inline-start: max(0.5rem, var(--safe-area-inset-left, 0px));
 		padding-inline-end: max(0.5rem, var(--safe-area-inset-right, 0px));

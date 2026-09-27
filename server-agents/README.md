@@ -20,7 +20,7 @@ code remain private behind its facets.
 - Agent-specific runtime code, dependencies, storage formats, native-history
   parsing, and protocol translation belong in `server-agents/<id>/`.
 - Provider packages do not import from `server/`. Core imports provider
-  packages only from `server/agents/default-agent-integrations.ts`.
+  packages only from `server/runtime/agents/default-agent-integrations.ts`.
 - A provider package exports only its default integration class from `.`.
   Runtime handles and implementation helpers remain private.
 - Core does not branch on provider IDs, inspect provider error strings, or add
@@ -44,7 +44,7 @@ not install it dynamically at runtime.
 | `server-agents/interface` | Pure server-side contracts, typed errors, native-session references, and conformance helpers. |
 | `server-agents/common` | Reusable adapters plus the fixed transcript indexer/reader Worker pair, schema, and query implementation. |
 | `server-agents/<id>` | One provider's dependencies, entrypoint, protocol code, private storage, tests, and build contributions. |
-| `server/agents/default-agent-integrations.ts` | The single core composition point for distributed integrations. |
+| `server/runtime/agents/default-agent-integrations.ts` | The single core composition point for distributed integrations. |
 | `server/ledger` | The provider-neutral, append-only transcript serving authority. |
 
 ## Integration Contract
@@ -74,7 +74,6 @@ export default class ExampleAgentIntegration implements AgentIntegration {
   readonly compaction = null;
   readonly forking = null;
   readonly steering = null;
-  readonly goals = null;
   readonly endpoints = null;
   readonly singleQuery = null;
   readonly legacyHistoryImport = null;
@@ -110,7 +109,6 @@ Required service facets are `descriptor`, `execution`, `catalog`, `settings`,
 | `compaction` | Performs provider-native in-place compaction. |
 | `forking` | Creates provider-native transcript forks. |
 | `steering` | Captures and delivers same-turn input to an exact active target. |
-| `goals` | Delivers provider-specific goal control. |
 | `endpoints` | Validates API-provider endpoint selections. |
 | `singleQuery` | Runs bounded one-shot work outside a chat execution. |
 | `legacyHistoryImport` | Imports supported pre-V5 history once during genesis adoption. |
@@ -232,7 +230,7 @@ provider package. Run `bun install` after changing workspace dependencies.
 To distribute an integration:
 
 - Add its workspace dependency to `server/package.json`.
-- Register its default class in `server/agents/default-agent-integrations.ts`.
+- Register its default class in `server/runtime/agents/default-agent-integrations.ts`.
 - Update the expected ordered IDs in the default-integration test.
 - Add unit coverage beside the provider and black-box coverage whenever
   correctness crosses process, persistence, HTTP, WebSocket, permission,

@@ -2,6 +2,7 @@ import {
   AgentIntegrationError,
   type AgentNativeFork,
   type AgentNativeForkRequest,
+  type AgentNativeSessionAccess,
   type AgentEstablishedSession,
 } from '@garcon/server-agent-interface';
 import { missingNativePoint } from '@garcon/server-agent-common/forking/jsonl-forking';
@@ -11,6 +12,7 @@ import { codexTurnIdFromEntryId } from './message-source-identity.js';
 
 export interface CodexForkingOptions {
   readonly journal: AgentNativeFork;
+  readonly resolveNativeSession: AgentNativeSessionAccess['resolveNativeSession'];
   readonly resolveProfile: (request: {
     readonly source: AgentNativeForkRequest['source'];
     // Presence decides missing-source strictness; whole and point forks pass
@@ -32,11 +34,23 @@ export interface CodexForkingOptions {
 export function createCodexForking(options: CodexForkingOptions): AgentNativeFork {
   return {
     async fork(request) {
-      request.admission.signal.throwIfAborted();
+      request.signal.throwIfAborted();
+      try {
+        const nativeSession = await options.resolveNativeSession({ chat: request.source, signal: request.signal });
+        request.signal.throwIfAborted();
+        request = { ...request, source: { ...request.source, nativeSession } };
+      } catch (error) {
+        request.signal.throwIfAborted();
+        if (!request.providerMeta && error instanceof AgentIntegrationError
+          && error.code === 'TRANSCRIPT_UNAVAILABLE' && error.details?.reason === 'empty-source') {
+          return { kind: 'unmaterialized' };
+        }
+        throw error;
+      }
       const profile = await options.resolveProfile({
         source: request.source,
         point: request.providerMeta,
-        signal: request.admission.signal,
+        signal: request.signal,
       });
       if (!profile) return options.journal.fork(request);
       if (profile.mode === 'legacy') return options.journal.fork(request);

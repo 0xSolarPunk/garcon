@@ -13,6 +13,8 @@ import {
 } from '$lib/files/persistence/file-draft-repository.js';
 import { NotificationsStore } from '$lib/stores/notifications.svelte.js';
 import type { WorkspaceProjectState } from '$lib/workspace/workspace-context.svelte.js';
+import { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures.js';
 
 afterEach(cleanup);
 
@@ -24,7 +26,11 @@ describe('FilesPanel', () => {
 			presentation: 'mobile',
 			projectState: {
 				kind: 'unavailable',
-				context: { chatId: 'chat', projectPath: '/workspace' },
+				context: {
+					target: { kind: 'chat' as const, chatId: 'chat', projectPath: '/workspace' },
+					chatId: 'chat',
+					projectPath: '/workspace',
+				},
 				reason: 'not-found',
 			},
 		},
@@ -32,7 +38,11 @@ describe('FilesPanel', () => {
 			presentation: 'mobile',
 			projectState: {
 				kind: 'request-failed',
-				context: { chatId: 'chat', projectPath: '/workspace' },
+				context: {
+					target: { kind: 'chat' as const, chatId: 'chat', projectPath: '/workspace' },
+					chatId: 'chat',
+					projectPath: '/workspace',
+				},
 				message: 'Project request failed',
 			},
 		},
@@ -51,11 +61,32 @@ describe('FilesPanel', () => {
 				userNamespace: 'user',
 				deploymentId: 'deployment',
 				documentId: draftId,
+				executorId: 'local',
 				canonicalFileRootPath: '/workspace',
 				normalizedRelativePath: 'draft.txt',
 				content: 'local text',
 				savedAt: 1,
 			});
+			const remoteDraftId = fileDraftKey(
+				'user',
+				'deployment',
+				'/workspace',
+				'draft.txt',
+				remoteExecutor.id,
+			);
+			await repository.putDraft({
+				schemaVersion: 1,
+				userNamespace: 'user',
+				deploymentId: 'deployment',
+				documentId: remoteDraftId,
+				executorId: remoteExecutor.id,
+				canonicalFileRootPath: '/workspace',
+				normalizedRelativePath: 'draft.txt',
+				content: 'remote text',
+				savedAt: 2,
+			});
+			const executors = new ExecutorsStore();
+			executors.applySnapshot([localExecutor, remoteExecutor]);
 			const fileSessions = new FileSessionRegistry({
 				getIsMobile: () => presentation === 'mobile',
 				getDefaultPlacement: () => ({ type: 'dialog' }),
@@ -73,7 +104,7 @@ describe('FilesPanel', () => {
 				createCommit: () => new CommitController(gitSurfaceDeps),
 				createPullRequests: () => new PullRequestsStore(),
 			});
-			setFilesPanelTestContext({ fileSessions, singletonSurfaces, notifications });
+			setFilesPanelTestContext({ fileSessions, singletonSurfaces, notifications, executors });
 			try {
 				render(FilesPanelTestHost, { presentation, focusFileSession, projectState });
 				expect(Object.keys(fileSessions.sessions)).toHaveLength(0);
@@ -91,6 +122,7 @@ describe('FilesPanel', () => {
 				);
 				await fireEvent.click(screen.getByRole('button', { name: 'draft.txt' }));
 				expect(open).toHaveBeenLastCalledWith({
+					executorId: 'local',
 					fileRootPath: '/workspace',
 					relativePath: 'draft.txt',
 					mode: 'code',
@@ -99,6 +131,20 @@ describe('FilesPanel', () => {
 				});
 				await fireEvent.click(screen.getByRole('button', { name: 'Export draft for draft.txt' }));
 				expect(exportDraft).toHaveBeenCalledWith(draftId);
+				const remoteDraft = screen.getByRole('button', { name: 'Worker: draft.txt' });
+				expect(remoteDraft.getAttribute('title')).toBe('Worker: /workspace/draft.txt');
+				await fireEvent.click(remoteDraft);
+				expect(open).toHaveBeenLastCalledWith(
+					expect.objectContaining({
+						executorId: remoteExecutor.id,
+						fileRootPath: '/workspace',
+						relativePath: 'draft.txt',
+					}),
+				);
+				await fireEvent.click(
+					screen.getByRole('button', { name: 'Export draft for Worker: draft.txt' }),
+				);
+				expect(exportDraft).toHaveBeenLastCalledWith(remoteDraftId);
 				await fileSessions.clearRecovery();
 				await waitFor(() =>
 					expect(screen.queryByRole('region', { name: 'Recovered files' })).toBeNull(),
@@ -115,6 +161,7 @@ describe('FilesPanel', () => {
 			const resolveFileIdentity = vi.fn(async ({ relativePath }: { relativePath: string }) => ({
 				success: true as const,
 				identity: {
+					executorId: 'local',
 					canonicalFileRootPath: '/workspace',
 					normalizedRelativePath: relativePath,
 				},
@@ -204,6 +251,7 @@ describe('FilesPanel', () => {
 
 			await waitFor(() =>
 				expect(resolveFileIdentity).toHaveBeenCalledWith({
+					executorId: 'local',
 					projectPath: '/workspace',
 					relativePath: 'sibling-project/file.ts',
 				}),

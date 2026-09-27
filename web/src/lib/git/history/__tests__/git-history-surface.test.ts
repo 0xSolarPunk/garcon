@@ -45,6 +45,7 @@ function setProject(controller: GitHistorySurfaceController): void {
 	controller.setProjectState({
 		kind: 'available',
 		project: {
+			target: { kind: 'chat' as const, chatId: 'chat', projectPath: '/project' },
 			chatId: 'chat',
 			projectPath: '/project',
 			effectiveProjectKey: 'chat',
@@ -68,7 +69,7 @@ describe('GitHistorySurfaceController', () => {
 		await controller.target.activate();
 		await vi.waitFor(() => expect(api.getGitHistoryCommits).toHaveBeenCalledOnce());
 		expect(api.getGitHistoryCommits).toHaveBeenCalledWith(
-			'/project',
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
 			expect.objectContaining({ offset: 0 }),
 		);
 	});
@@ -90,7 +91,7 @@ describe('GitHistorySurfaceController', () => {
 
 		expect(controller.openSelectedComparison()).toBe(true);
 		expect(openComparison).toHaveBeenCalledWith(
-			'/project',
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
 			{
 				fromRevision: 'older',
 				toKind: 'revision',
@@ -185,29 +186,28 @@ describe('GitHistorySurfaceController', () => {
 		const invalidations = new GitProjectInvalidationStore();
 		const context: { controller?: GitHistorySurfaceController } = {};
 		const gitMutations = new GitMutationCoordinator({
-			onChanged: async (effectiveProjectKey) => {
-				invalidations.markChanged(effectiveProjectKey);
+			onChanged: async (executorId, effectiveProjectKey) => {
+				invalidations.markChanged(executorId);
 				await context.controller?.refreshForInvalidation(
 					effectiveProjectKey,
-					invalidations.version(effectiveProjectKey),
+					invalidations.version(executorId),
 				);
 			},
 		});
 		const deps = {
 			createGitBranchSelector: () =>
 				new GitBranchSelectorState({
-					runMutation: (surfaceId, projectPath, effectiveProjectKey, execute) =>
+					runMutation: (surfaceId, executorId, projectPath, effectiveProjectKey, execute) =>
 						gitMutations.run({
 							surfaceId,
+							executorId,
 							projectPath,
 							effectiveProjectKey,
 							execute,
-							didMutate: (result) => result.success,
 						}),
 				}),
 			gitMutations,
-			invalidationVersion: (effectiveProjectKey: string) =>
-				invalidations.version(effectiveProjectKey),
+			invalidationVersion: (executorId: string) => invalidations.version(executorId),
 			reviewDisplay: new GitReviewDisplaySettingsStore(),
 		} satisfies GitSurfaceControllerDeps;
 		const controller = new GitHistorySurfaceController(deps);
@@ -266,6 +266,30 @@ describe('GitHistorySurfaceController', () => {
 		expect(controller.pendingRevertCommit?.hash).toBe('abc');
 		expect(controller.lastError).toContain('conflict');
 		expect(controller.isRevertingCommit).toBe(false);
+	});
+
+	it('retires revert confirmation when the executor session changes', async () => {
+		const controller = new GitHistorySurfaceController(createGitSurfaceTestDeps());
+		setProject(controller);
+		controller.setPresentationVisible(true);
+		await controller.target.activate();
+		controller.pendingRevertCommit = { hash: 'abc', shortHash: 'abc', subject: 'Change' };
+		controller.setProjectState({
+			kind: 'available',
+			project: {
+				target: { kind: 'chat' as const, chatId: 'chat', projectPath: '/project' },
+				chatId: 'chat',
+				projectPath: '/project',
+				effectiveProjectKey: 'chat',
+				executorContextKey: 'replacement',
+			},
+		});
+		await controller.target.activate();
+
+		expect(controller.pendingRevertCommit).toBeNull();
+		await expect(controller.revertPendingCommit()).resolves.toBe(false);
+		expect(api.gitRevertCommit).not.toHaveBeenCalled();
+		controller.dispose();
 	});
 
 	it('owns successful revert mutations and relies on invalidation for reload', async () => {

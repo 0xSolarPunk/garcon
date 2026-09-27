@@ -8,13 +8,14 @@ import {
   type IntegrationFixture,
 } from '../../support/integration-fixture.js';
 import { withTimeout } from '../../support/deferred.js';
+import { authenticateChromiumContext } from '../../support/chromium-fixture.js';
 import { requireCurrentWebBuild } from '../../support/web-build-gate.js';
 import {
   clickWorkspaceWindowAddAction,
   collapseCanonicalFilesWindow,
 } from '../../support/chromium-workspace.js';
 
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const ARTIFACT_ROOT = join(REPO_ROOT, 'integration-tests', 'artifacts', 'chromium');
 const PANEL_SELECTOR =
   '[role="tabpanel"][data-workspace-surface-id="singleton:git-history"][aria-hidden="false"]';
@@ -95,6 +96,7 @@ async function createChromiumFixture(): Promise<ChromiumFixture> {
   try {
     browser = await chromium.launch({ headless: true });
     context = await browser.newContext({ viewport: WIDE_VIEWPORT });
+    await authenticateChromiumContext(context, integration);
     await context.addInitScript(() => {
       const localSettingsKey = 'pref_local_settings';
       try {

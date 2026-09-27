@@ -1,11 +1,13 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
 	import ConversationFeedVirtualItem from '../ConversationFeedVirtualItem.svelte';
 	import { ConversationFeedItemState } from '../ConversationFeedItemState.svelte.js';
 	import { createChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.js';
 	import { buildConversationFeedRenderModel } from '$lib/chat/transcript/conversation-feed-items.js';
 	import { FileSessionRegistry } from '$lib/files/sessions/file-session-registry.svelte.js';
 	import { createAppShellStore } from '$lib/stores/app-shell.svelte.js';
-	import { setAppShell, setChatSessions, setFileSessions } from '$lib/context';
+	import { setAppShell, setChatSessions, setFileSessions, setNotifications } from '$lib/context';
+	import { createNotificationsStore } from '$lib/stores/notifications.svelte.js';
 	import { ExitPlanModeToolUseMessage } from '$shared/chat-types';
 	import type { PendingPermissionRequest } from '$lib/types/chat';
 	import type { ConversationVirtualFeedItem } from '../conversation-feed-virtual-items.js';
@@ -16,6 +18,8 @@
 	const TIMESTAMP = '2026-09-05T00:00:00.000Z';
 
 	setCanonicalWorkspaceLayout();
+	setNotifications(createNotificationsStore());
+	setExecutorsTestContext();
 	const sessions = createChatSessionsStore();
 	for (const [chatId, title] of [
 		[SOURCE_CHAT_ID, 'Source chat'],

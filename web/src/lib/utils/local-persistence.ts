@@ -23,13 +23,13 @@ export const LOCAL_STORAGE_KEYS = {
 	localSettings: 'pref_local_settings',
 	modelCatalog: 'pref_model_catalog_v4',
 	modelCatalogLegacy: 'pref_model_catalog_v3',
+	modelCatalogExecutors: 'pref_model_catalog_executors_v1',
 	sidebarProjectCollapse: 'pref_sidebar_project_collapse',
 	workspaceLayout: 'workspace_layout_v2',
 } as const;
 
 export const LOCAL_STORAGE_PREFIXES = {
 	chatDraft: 'chat_draft_',
-	chatExecutionDraft: 'chat_execution_draft_v1_',
 } as const;
 
 export const SESSION_STORAGE_KEYS = {
@@ -39,10 +39,7 @@ export const SESSION_STORAGE_KEYS = {
 } as const;
 
 export type ChatDraftStorageKey = `${typeof LOCAL_STORAGE_PREFIXES.chatDraft}${string}`;
-export type ChatExecutionDraftStorageKey =
-	`${typeof LOCAL_STORAGE_PREFIXES.chatExecutionDraft}${string}`;
-export type LocalStorageKey =
-	ValueOf<typeof LOCAL_STORAGE_KEYS> | ChatDraftStorageKey | ChatExecutionDraftStorageKey;
+export type LocalStorageKey = ValueOf<typeof LOCAL_STORAGE_KEYS> | ChatDraftStorageKey;
 export type SessionStorageKey = ValueOf<typeof SESSION_STORAGE_KEYS>;
 
 type BrowserStorageKind = 'local' | 'session';
@@ -57,10 +54,6 @@ function getBrowserStorage(kind: BrowserStorageKind): Storage | null {
 
 export function chatDraftStorageKey(chatId: string): ChatDraftStorageKey {
 	return `${LOCAL_STORAGE_PREFIXES.chatDraft}${chatId}`;
-}
-
-export function chatExecutionDraftStorageKey(chatId: string): ChatExecutionDraftStorageKey {
-	return `${LOCAL_STORAGE_PREFIXES.chatExecutionDraft}${chatId}`;
 }
 
 export function getLocalStorageItem(key: LocalStorageKey): string | null {

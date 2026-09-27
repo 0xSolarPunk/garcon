@@ -22,7 +22,6 @@ import {
 	moveQueuedInput,
 	steerChat,
 	steerQueuedEntry,
-	submitGoalControl,
 	getChatExecutionControl,
 	clearChatQueue,
 	pauseChatQueue,
@@ -130,12 +129,12 @@ describe('chats API contract', () => {
 				pendingChatCount: 0,
 				failedChatCount: 0,
 				unindexedChatCount: 0,
-					unsupportedChatCount: 0,
-					resultsTruncated: false,
-					failedChats: [],
-					failedChatsOmittedCount: 0,
-				},
-				removedStaleResultCount: 0,
+				unsupportedChatCount: 0,
+				resultsTruncated: false,
+				failedChats: [],
+				failedChatsOmittedCount: 0,
+			},
+			removedStaleResultCount: 0,
 			...overrides,
 		};
 	}
@@ -230,12 +229,14 @@ describe('chats API contract', () => {
 			const chatId = '1785337200123456';
 			fetchMock.mockResolvedValue(
 				jsonResponse({
-					sessions: [{
-						...chatEntry(chatId),
-						isActive: processingPhase !== null,
-						isProcessing,
-						processingPhase,
-					}],
+					sessions: [
+						{
+							...chatEntry(chatId),
+							isActive: processingPhase !== null,
+							isProcessing,
+							processingPhase,
+						},
+					],
 					total: 1,
 					lastSelectedChatId: chatId,
 				}),
@@ -623,7 +624,7 @@ describe('chats API contract', () => {
 		});
 
 		expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/chats/permissions/decision');
-			expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+		expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
 			clientRequestId: 'req-perm',
 			chatId: 'c-1',
 			permissionOccurrenceId: 'incarnation-1',
@@ -728,7 +729,7 @@ describe('chats API contract', () => {
 		});
 		expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/chats/queue/entries');
 		expect(fetchMock.mock.calls[1][1].method).toBe('POST');
-			expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+		expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
 			clientRequestId: 'req-queue',
 			clientMessageId: 'message-queue',
 			chatId: 'c/1',
@@ -789,16 +790,6 @@ describe('chats API contract', () => {
 			expectedTargetRevision: 3,
 		});
 
-		await submitGoalControl({
-			clientRequestId: 'req-goal',
-			clientMessageId: 'message-goal',
-			chatId: 'c/1',
-			transcriptViewId: 'view-1',
-			content: '/goal pause',
-		});
-		expect(fetchMock.mock.calls[5][0]).toBe('/api/v1/chats/goal-control');
-		expect(fetchMock.mock.calls[5][1].method).toBe('POST');
-
 		await steerChat({
 			clientRequestId: 'req-steer',
 			clientMessageId: 'message-steer',
@@ -806,9 +797,9 @@ describe('chats API contract', () => {
 			transcriptViewId: 'view-1',
 			content: 'steer now',
 		});
-		expect(fetchMock.mock.calls[6][0]).toBe('/api/v1/chats/steer');
-		expect(fetchMock.mock.calls[6][1].method).toBe('POST');
-		expect(JSON.parse(fetchMock.mock.calls[6][1].body)).toEqual({
+		expect(fetchMock.mock.calls[5][0]).toBe('/api/v1/chats/steer');
+		expect(fetchMock.mock.calls[5][1].method).toBe('POST');
+		expect(JSON.parse(fetchMock.mock.calls[5][1].body)).toEqual({
 			clientRequestId: 'req-steer',
 			clientMessageId: 'message-steer',
 			chatId: 'c/1',
@@ -820,10 +811,10 @@ describe('chats API contract', () => {
 		await pauseChatQueue('c/1');
 		await resumeChatQueue('c/1', 'pause/1');
 
-		expect(fetchMock.mock.calls[7][0]).toBe('/api/v1/chats/queue/clear');
-		expect(fetchMock.mock.calls[8][0]).toBe('/api/v1/chats/queue/pause');
-		expect(fetchMock.mock.calls[9][0]).toBe('/api/v1/chats/queue/resume');
-		expect(JSON.parse(fetchMock.mock.calls[9][1].body)).toEqual({
+		expect(fetchMock.mock.calls[6][0]).toBe('/api/v1/chats/queue/clear');
+		expect(fetchMock.mock.calls[7][0]).toBe('/api/v1/chats/queue/pause');
+		expect(fetchMock.mock.calls[8][0]).toBe('/api/v1/chats/queue/resume');
+		expect(JSON.parse(fetchMock.mock.calls[8][1].body)).toEqual({
 			chatId: 'c/1',
 			pauseId: 'pause/1',
 		});
@@ -999,12 +990,22 @@ describe('chats API contract', () => {
 		expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/chats/model');
 		expect(fetchMock.mock.calls[1][1].method).toBe('PATCH');
 
-		await updateChatProjectPath({ chatId: 'c-1', projectPath: '/workspace/repo-worktree' });
+		const expectedBinding = {
+			expectedExecutorId: 'local',
+			expectedAgentOwnershipEpoch: 'epoch-1',
+			expectedProjectPath: '/workspace/repo',
+		};
+		await updateChatProjectPath({
+			chatId: 'c-1',
+			projectPath: '/workspace/repo-worktree',
+			...expectedBinding,
+		});
 		expect(fetchMock.mock.calls[2][0]).toBe('/api/v1/chats/project-path');
 		expect(fetchMock.mock.calls[2][1].method).toBe('PATCH');
 		expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({
 			chatId: 'c-1',
 			projectPath: '/workspace/repo-worktree',
+			...expectedBinding,
 		});
 
 		const messages = await getChatMessages({
@@ -1066,26 +1067,30 @@ describe('chats API contract', () => {
 	});
 
 	it('[TLV5-PAGE.09-WEB-CONTRACT-01] accepts an all-hidden raw page with a strict continuation', async () => {
-		fetchMock.mockResolvedValueOnce(jsonResponse({
-			historyState: { kind: 'complete' },
-			chatId: 'c-1',
-			messages: [],
-			transcriptViewId: 'view-1',
-			lastOrdinal: 300,
-			pageOldestOrdinal: 0,
-			pageNewestOrdinal: 250,
-			nextBeforeOrdinal: 201,
-			resendCandidates: [],
-			hasMore: true,
-			limit: 50,
-		}));
+		fetchMock.mockResolvedValueOnce(
+			jsonResponse({
+				historyState: { kind: 'complete' },
+				chatId: 'c-1',
+				messages: [],
+				transcriptViewId: 'view-1',
+				lastOrdinal: 300,
+				pageOldestOrdinal: 0,
+				pageNewestOrdinal: 250,
+				nextBeforeOrdinal: 201,
+				resendCandidates: [],
+				hasMore: true,
+				limit: 50,
+			}),
+		);
 
-		await expect(getChatMessages({
-			chatId: 'c-1',
-			transcriptViewId: 'view-1',
-			beforeOrdinal: 251,
-			limit: 50,
-		})).resolves.toMatchObject({
+		await expect(
+			getChatMessages({
+				chatId: 'c-1',
+				transcriptViewId: 'view-1',
+				beforeOrdinal: 251,
+				limit: 50,
+			}),
+		).resolves.toMatchObject({
 			messages: [],
 			pageNewestOrdinal: 250,
 			nextBeforeOrdinal: 201,
@@ -1094,26 +1099,30 @@ describe('chats API contract', () => {
 	});
 
 	it('[TLV5-PAGE.08-WEB-CONTRACT-01] accepts a server-clamped raw interval ceiling', async () => {
-		fetchMock.mockResolvedValueOnce(jsonResponse({
-			historyState: { kind: 'complete' },
-			chatId: 'c-1',
-			messages: [],
-			transcriptViewId: 'view-1',
-			lastOrdinal: 250,
-			pageOldestOrdinal: 0,
-			pageNewestOrdinal: 250,
-			nextBeforeOrdinal: 201,
-			resendCandidates: [],
-			hasMore: true,
-			limit: 50,
-		}));
+		fetchMock.mockResolvedValueOnce(
+			jsonResponse({
+				historyState: { kind: 'complete' },
+				chatId: 'c-1',
+				messages: [],
+				transcriptViewId: 'view-1',
+				lastOrdinal: 250,
+				pageOldestOrdinal: 0,
+				pageNewestOrdinal: 250,
+				nextBeforeOrdinal: 201,
+				resendCandidates: [],
+				hasMore: true,
+				limit: 50,
+			}),
+		);
 
-		await expect(getChatMessages({
-			chatId: 'c-1',
-			transcriptViewId: 'view-1',
-			beforeOrdinal: 999,
-			limit: 50,
-		})).resolves.toMatchObject({
+		await expect(
+			getChatMessages({
+				chatId: 'c-1',
+				transcriptViewId: 'view-1',
+				beforeOrdinal: 999,
+				limit: 50,
+			}),
+		).resolves.toMatchObject({
 			lastOrdinal: 250,
 			pageNewestOrdinal: 250,
 			nextBeforeOrdinal: 201,
@@ -1267,9 +1276,7 @@ describe('chats API contract', () => {
 			chatId: 'c-1',
 			limit: 200,
 		});
-		expect(fetchMock.mock.calls[0][0]).toBe(
-			'/api/v1/chats/messages?chatId=c-1&limit=999999',
-		);
+		expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/chats/messages?chatId=c-1&limit=999999');
 	});
 
 	it('accepts degraded history only without sequence metadata', async () => {

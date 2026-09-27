@@ -1,8 +1,10 @@
 import { apiFetch } from '$lib/api/client.js';
+import { effectiveExecutorId, type ExecutorSnapshot } from '$shared/executors';
 import { agentLabelFor } from './agent-labels.js';
 import {
 	getLocalStorageItem,
 	LOCAL_STORAGE_KEYS,
+	removeLocalStorageItem,
 	setLocalStorageItem,
 } from '$lib/utils/local-persistence';
 import type { SessionAgentId } from '$lib/types/app';
@@ -55,7 +57,6 @@ export interface AgentMetadata {
 	supportsForkWhileRunning: boolean;
 	supportsUpdateProjectPath: boolean;
 	supportsSteering: boolean;
-	supportsGoals: boolean;
 	supportsImages: boolean;
 	fileAttachmentMimeTypes: string[];
 	acceptsApiProviderEndpoints: boolean;
@@ -262,6 +263,7 @@ function normalizeApiProviders(value: unknown): ApiProviderCatalogEntry[] {
 			if (
 				typeof e.id !== 'string' ||
 				typeof e.label !== 'string' ||
+				!Number.isSafeInteger(e.revision) || Number(e.revision) < 1 ||
 				typeof e.createdAt !== 'string' ||
 				typeof e.updatedAt !== 'string' ||
 				!Array.isArray(e.endpoints)
@@ -275,6 +277,7 @@ function normalizeApiProviders(value: unknown): ApiProviderCatalogEntry[] {
 			const templateId = normalizeTemplateId(e.templateId);
 			return {
 				id: e.id,
+				revision: Number(e.revision),
 				label: e.label,
 				...(templateId ? { templateId } : {}),
 				createdAt: e.createdAt,
@@ -300,7 +303,6 @@ function normalizeAgentMetadataMap(agentMetadata: AgentMetadataMap): AgentMetada
 						supportsForkWhileRunning: metadata.supportsForkWhileRunning === true,
 						supportsUpdateProjectPath: metadata.supportsUpdateProjectPath === true,
 						supportsSteering: metadata.supportsSteering === true,
-						supportsGoals: metadata.supportsGoals === true,
 						label: metadata.label ?? id,
 						supportedPermissionModes: normalizePermissionModes(metadata.supportedPermissionModes),
 						supportedThinkingModes: normalizeThinkingModes(metadata.supportedThinkingModes),
@@ -343,7 +345,6 @@ function parseCatalogResponse(data: unknown): {
 			supportsForkWhileRunning: Boolean(entry.supportsForkWhileRunning),
 			supportsUpdateProjectPath: Boolean(entry.supportsUpdateProjectPath),
 			supportsSteering: Boolean(entry.supportsSteering),
-			supportsGoals: Boolean(entry.supportsGoals),
 			supportsImages: Boolean(entry.supportsImages),
 			fileAttachmentMimeTypes: normalizeMimeTypes(entry.fileAttachmentMimeTypes),
 			acceptsApiProviderEndpoints: Boolean(entry.acceptsApiProviderEndpoints),
@@ -406,8 +407,20 @@ function normalizeSnapshot(parsed: Record<string, unknown>): ModelCatalogSnapsho
 	};
 }
 
-function readPersisted(): ModelCatalogSnapshot {
+function readExecutorSnapshots(): Record<string, ModelCatalogSnapshot> {
 	try {
+		const parsed: unknown = JSON.parse(getLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalogExecutors) ?? '{}');
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+		return Object.fromEntries(Object.entries(parsed).flatMap(([id, value]) =>
+			value && typeof value === 'object' && !Array.isArray(value)
+				? [[id, normalizeSnapshot(value)]] : [],
+		));
+	} catch { return {}; }
+}
+
+function readPersisted(executorId: string): ModelCatalogSnapshot {
+	try {
+		if (executorId !== 'local') return readExecutorSnapshots()[executorId] ?? emptySnapshot();
 		const raw =
 			getLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalog) ??
 			getLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalogLegacy);
@@ -418,8 +431,9 @@ function readPersisted(): ModelCatalogSnapshot {
 	}
 }
 
-function persist(snapshot: ModelCatalogSnapshot): void {
-	setLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalog, JSON.stringify(snapshot));
+function persist(executorId: string, snapshot: ModelCatalogSnapshot): void {
+	if (executorId === 'local') setLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalog, JSON.stringify(snapshot));
+	else setLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalogExecutors, JSON.stringify({ ...readExecutorSnapshots(), [executorId]: snapshot }));
 }
 
 interface CatalogApplyResult {
@@ -452,9 +466,64 @@ export class ModelCatalogStore {
 	version = $state(0);
 	#syncPromise: Promise<void> | null = null;
 	#lastSyncAttemptAt = 0;
+	#requestVersion = 0;
+	#executorAvailability = new Map<string, string>();
 
-	constructor() {
+	constructor(readonly executorId = 'local', private readonly catalogs = new Map<string, ModelCatalogStore>()) {
+		this.catalogs.set(executorId, this);
 		this.hydrateFromStorage();
+	}
+
+	forExecutor(executorId?: string | null): ModelCatalogStore {
+		const id = effectiveExecutorId(executorId);
+		return this.catalogs.get(id) ?? new ModelCatalogStore(id, this.catalogs);
+	}
+
+	get isValidated(): boolean {
+		return this.lastValidatedAt !== null && this.error === null;
+	}
+
+	reconcileExecutors(executors: readonly ExecutorSnapshot[]): void {
+		const ids = new Set(executors.map((executor) => executor.id));
+		const persisted = readExecutorSnapshots();
+		for (const id of Object.keys(persisted)) if (!ids.has(id)) delete persisted[id];
+		for (const id of this.#executorAvailability.keys()) if (!ids.has(id)) this.#executorAvailability.delete(id);
+		for (const [id, catalog] of this.catalogs) {
+			if (ids.has(id) || id === 'local') continue;
+			catalog.invalidate();
+			this.catalogs.delete(id);
+		}
+		for (const executor of executors) {
+			const availability = JSON.stringify([executor.enabled, executor.availability, executor.instanceId]);
+			const previous = this.#executorAvailability.get(executor.id);
+			if (previous !== undefined && availability !== previous) {
+				if (executor.id === 'local') {
+					removeLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalog);
+					removeLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalogLegacy);
+				} else delete persisted[executor.id];
+				this.catalogs.get(executor.id)?.invalidate();
+			}
+			this.#executorAvailability.set(executor.id, availability);
+		}
+		setLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalogExecutors, JSON.stringify(persisted));
+	}
+
+	invalidate(): void {
+		this.#requestVersion += 1;
+		this.#lastSyncAttemptAt = 0;
+		this.#syncPromise = null;
+		this.isRefreshing = false;
+		this.lastValidatedAt = null;
+		this.lastFetchedAt = null;
+		this.etag = null;
+		this.version += 1;
+	}
+
+	invalidateAll(): void {
+		for (const catalog of this.catalogs.values()) catalog.invalidate();
+		removeLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalog);
+		removeLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalogLegacy);
+		removeLocalStorageItem(LOCAL_STORAGE_KEYS.modelCatalogExecutors);
 	}
 
 	getAgents(): SessionAgentId[] {
@@ -567,11 +636,6 @@ export class ModelCatalogStore {
 		return this.agentMetadata[agentId]?.supportsSteering ?? false;
 	}
 
-	supportsGoals(agentId: SessionAgentId): boolean {
-		if (!isAgentId(agentId)) return false;
-		return this.agentMetadata[agentId]?.supportsGoals ?? false;
-	}
-
 	supportsImages(
 		agentId: SessionAgentId,
 		model?: string,
@@ -650,7 +714,7 @@ export class ModelCatalogStore {
 	}
 
 	hydrateFromStorage(): void {
-		const snapshot = readPersisted();
+		const snapshot = readPersisted(this.executorId);
 		this.agentModels = snapshot.agentModels;
 		this.agentMetadata = snapshot.agentMetadata;
 		this.apiProviderCatalog = snapshot.apiProviderCatalog;
@@ -681,23 +745,25 @@ export class ModelCatalogStore {
 		if (!options.force && now - this.#lastSyncAttemptAt < VALIDATION_RETRY_MS) return;
 
 		this.#lastSyncAttemptAt = now;
-		this.#syncPromise = this.#syncWithServer(options).finally(() => {
-			this.#syncPromise = null;
+		const requestVersion = this.#requestVersion;
+		this.#syncPromise = this.#syncWithServer(options, requestVersion).finally(() => {
+			if (requestVersion === this.#requestVersion) this.#syncPromise = null;
 		});
 		return this.#syncPromise;
 	}
 
-	async #syncWithServer(options: { force?: boolean }): Promise<void> {
+	async #syncWithServer(options: { force?: boolean }, requestVersion: number): Promise<void> {
 		this.isRefreshing = true;
-		this.error = null;
 
 		try {
 			const response = await this.#fetchCatalogResponse(options);
+			if (requestVersion !== this.#requestVersion) return;
 			const responseEtag = response.headers?.get?.('etag') ?? null;
 
 			if (response.status === 304) {
 				this.etag = responseEtag ?? this.etag;
 				this.lastValidatedAt = Date.now();
+				this.error = null;
 				this.#persistCurrentSnapshot();
 				return;
 			}
@@ -706,6 +772,7 @@ export class ModelCatalogStore {
 				throw new Error(`Failed to fetch model catalog: ${response.status}`);
 			}
 			const data = (await response.json()) as ModelCatalogResponse;
+			if (requestVersion !== this.#requestVersion) return;
 
 			const catalogResult = parseCatalogResponse(data);
 			if (catalogResult && Object.keys(catalogResult.agentMetadata).length > 0) {
@@ -721,24 +788,26 @@ export class ModelCatalogStore {
 			this.etag = responseEtag;
 			this.lastFetchedAt = now;
 			this.lastValidatedAt = now;
-			persist(this.#currentSnapshot());
+			this.error = null;
+			persist(this.executorId, this.#currentSnapshot());
 			this.version += 1;
 		} catch (error) {
-			this.error = error instanceof Error ? error.message : 'Unknown error';
+			if (requestVersion === this.#requestVersion) this.error = error instanceof Error ? error.message : 'Unknown error';
 		} finally {
-			this.isRefreshing = false;
+			if (requestVersion === this.#requestVersion) this.isRefreshing = false;
 		}
 	}
 
 	#fetchCatalogResponse(options: { force?: boolean }): Promise<Response> {
+		const url = this.executorId === 'local' ? '/api/v1/models' : `/api/v1/models?executorId=${encodeURIComponent(this.executorId)}`;
 		if (!options.force && this.etag) {
-			return apiFetch('/api/v1/models', {
+			return apiFetch(url, {
 				headers: {
 					'If-None-Match': this.etag,
 				},
 			});
 		}
-		return apiFetch('/api/v1/models');
+		return apiFetch(url);
 	}
 
 	#currentSnapshot(): ModelCatalogSnapshot {
@@ -753,7 +822,7 @@ export class ModelCatalogStore {
 	}
 
 	#persistCurrentSnapshot(): void {
-		persist(this.#currentSnapshot());
+		persist(this.executorId, this.#currentSnapshot());
 		this.version += 1;
 	}
 }

@@ -1,5 +1,5 @@
 import { untrack } from 'svelte';
-import type { GhCapabilityStore } from '$lib/stores/gh-capability.svelte.js';
+import { effectiveExecutorId } from '$shared/executors';
 import type { GitBranchSelectorState } from '$lib/git/targets/git-branch-selector-state.svelte.js';
 import { gitProjectInvalidations } from '$lib/git/surface/git-project-invalidation.svelte.js';
 import type { GitQuickSummaryStore } from '$lib/git/surface/git-quick-summary.svelte.js';
@@ -14,7 +14,6 @@ import type {
 interface WorkspaceDomainBindingsDeps {
 	workspaceContext: WorkspaceContextStore;
 	projectResolution: ProjectResolutionStore;
-	ghCapability: GhCapabilityStore;
 	localSettings: LocalSettingsStore;
 	singletons: SingletonSurfaceRegistry;
 	gitQuickSummary: GitQuickSummaryStore;
@@ -57,14 +56,9 @@ export class WorkspaceDomainBindings {
 			});
 
 			$effect(() => {
-				deps.singletons.setProjectState(deps.workspaceContext.projectState);
-			});
-
-			$effect(() => {
-				deps.singletons.setPullRequestsCapability(
-					deps.ghCapability.hasChecked,
-					deps.ghCapability.available,
-				);
+				const project = deps.workspaceContext.projectState;
+				const filesProject = deps.workspaceContext.filesProjectState;
+				untrack(() => deps.singletons.setProjectState(project, filesProject));
 			});
 
 			$effect(() => {
@@ -76,19 +70,23 @@ export class WorkspaceDomainBindings {
 				}
 				const currentProject = projectState.kind === 'available' ? projectState.project : null;
 				const projectPath = currentProject?.projectPath ?? null;
-				deps.gitQuickSummary.setProject(projectPath);
+				const executorId = effectiveExecutorId(currentProject?.executorId);
+				const project = projectPath ? { executorId, projectPath } : null;
+				deps.gitQuickSummary.setProject(project);
 				deps.gitBranchActions.setProject(
 					projectPath,
-					deps.gitQuickSummary.summaryFor(projectPath)?.branch,
+					deps.gitQuickSummary.summaryFor(project)?.branch,
 					currentProject?.effectiveProjectKey ?? null,
+					executorId,
 				);
 			});
 
 			$effect(() => {
 				const currentProject = deps.workspaceContext.currentProject;
 				if (!currentProject) return;
-				const version = gitProjectInvalidations.version(currentProject.effectiveProjectKey);
-				const key = `${currentProject.effectiveProjectKey}:${version}`;
+				const executorId = effectiveExecutorId(currentProject.executorId);
+				const version = gitProjectInvalidations.version(executorId);
+				const key = JSON.stringify([executorId, currentProject.effectiveProjectKey, version]);
 				if (version === 0 || key === lastCommitInvalidationKey) return;
 				lastCommitInvalidationKey = key;
 				untrack(() => deps.gitQuickSummary.scheduleRefresh('invalidation', 100));

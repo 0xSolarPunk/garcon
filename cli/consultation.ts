@@ -7,8 +7,7 @@ import type {
   StartChatCommandRequest,
 } from '@garcon/common/chat-command-contracts';
 import { createClientChatId } from '@garcon/common/client-chat-id';
-import type { ChatListEntry } from '@garcon/common/chat-list';
-import type { ChatListResponse } from '@garcon/common/chat-list';
+import { effectiveExecutorId } from '@garcon/common/executors';
 import type { ChatSnapshotResponse } from '@garcon/common/chat-snapshot';
 import type {
   UpdateChatTitleRequest,
@@ -36,14 +35,14 @@ import {
 import { writeTerminalResult } from './terminal-receipt.js';
 
 export interface ConsultationClient extends ReceiptClient {
+  readonly defaultExecutorId: string;
   getChatSnapshot(
     chatId: string,
     messageLimit: number,
     signal?: AbortSignal,
   ): Promise<ChatSnapshotResponse>;
-  getModelCatalog(agentId: string, signal?: AbortSignal): Promise<ModelCatalogResponse>;
+  getModelCatalog(agentId: string, signal?: AbortSignal, executorId?: string): Promise<ModelCatalogResponse>;
   getSettings(signal?: AbortSignal): Promise<RemoteSettingsSnapshot>;
-  listChats(signal?: AbortSignal): Promise<ChatListResponse>;
   startChat(request: StartChatCommandRequest, signal?: AbortSignal): Promise<StartChatCommandResponse>;
   runChat(request: AgentRunCommandRequest, signal?: AbortSignal): Promise<AgentTurnCommandResponse>;
   updateChatTitle(
@@ -98,17 +97,6 @@ export interface ConsultationResult {
   readonly turnReceipt: AgentTurnReceipt;
 }
 
-function requireResumeChat(sessions: readonly ChatListEntry[], chatId: string): ChatListEntry {
-  const chat = sessions.find((entry) => entry?.id === chatId);
-  if (!chat || typeof chat.agentId !== 'string' || chat.agentId.length === 0) {
-    throw new CliError('resume admission', `chat not found: ${chatId}`, 2);
-  }
-  if (typeof chat.agentOwnershipEpoch !== 'string' || chat.agentOwnershipEpoch.length === 0) {
-    throw new CliError('resume admission', `chat ${chatId} has no ownership epoch`, 3);
-  }
-  return chat;
-}
-
 async function submitStart(
   invocation: Extract<CliInvocation, { kind: 'start' }> | StartAsyncCliInvocation,
   prompt: string,
@@ -140,6 +128,7 @@ async function submitStart(
         ? {}
         : { parentChatId: invocation.parentChatId }),
       agentId: invocation.agentId,
+      executorId: client.defaultExecutorId,
       projectPath: invocation.cwd,
       ...selection,
       command: prompt,
@@ -277,35 +266,33 @@ async function submitResume(
   const needsCatalog = invocation.model !== undefined
     || invocation.permissionMode !== undefined
     || invocation.thinkingMode !== undefined;
-  let chat: ChatListEntry | undefined;
-  if (invocation.agentId !== undefined || needsCatalog) {
-    chat = requireResumeChat((await client.listChats(signal)).sessions, invocation.chatId);
-  }
-  if (invocation.agentId !== undefined && invocation.agentId !== chat?.agentId) {
+  const chat = snapshot.chat;
+  const executorId = effectiveExecutorId(chat.executorId);
+  if (invocation.agentId !== undefined && invocation.agentId !== chat.agentId) {
     const [catalog, settings] = await Promise.all([
-      client.getModelCatalog(invocation.agentId, signal),
+      client.getModelCatalog(invocation.agentId, signal, executorId),
       client.getSettings(signal),
     ]);
     request.handoff = {
-      target: resolveHandoffSelection(catalog, settings, {
+      target: { executorId, ...resolveHandoffSelection(catalog, settings, {
         agentId: invocation.agentId,
         model: invocation.model,
         providerId: invocation.providerId,
         endpointId: invocation.endpointId,
         permissionMode: invocation.permissionMode,
         thinkingMode: invocation.thinkingMode,
-      }),
-      expectedAgentOwnershipEpoch: chat!.agentOwnershipEpoch,
+      }) },
+      expectedAgentOwnershipEpoch: chat.agentOwnershipEpoch,
     };
   } else {
     if (invocation.agentId !== undefined) request.expectedAgentId = invocation.agentId;
   }
   if (needsCatalog && !request.handoff) {
-    const owner = chat!;
-    const catalog = await client.getModelCatalog(owner.agentId, signal);
-    validateExplicitModes(catalog, owner.agentId, invocation);
+    const catalog = await client.getModelCatalog(chat.agentId, signal, executorId);
+    request.expectedAgentOwnershipEpoch = chat.agentOwnershipEpoch;
+    validateExplicitModes(catalog, chat.agentId, invocation);
     if (invocation.model !== undefined) {
-      Object.assign(request, resolveModelSelection(catalog, owner.agentId, {
+      Object.assign(request, resolveModelSelection(catalog, chat.agentId, {
         model: invocation.model,
         providerId: invocation.providerId,
         endpointId: invocation.endpointId,

@@ -39,6 +39,7 @@ describe('GitComparePanel', () => {
 		controller.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat', projectPath: '/project' },
 				chatId: 'chat',
 				projectPath: '/project',
 				effectiveProjectKey: '/project',
@@ -52,6 +53,10 @@ describe('GitComparePanel', () => {
 				updatedAt: null,
 			},
 		];
+		vi.spyOn(controller.target, 'appliedIdentity', 'get').mockReturnValue(
+			controller.target.identity,
+		);
+		vi.spyOn(controller.target, 'canChangeTarget', 'get').mockReturnValue(true);
 		const fetchRefs = vi
 			.spyOn(controller.target.branches, 'fetchRefs')
 			.mockResolvedValue(undefined);

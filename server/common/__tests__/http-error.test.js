@@ -1,0 +1,72 @@
+import { describe, expect, it } from 'bun:test';
+
+import { jsonError, jsonErrorFromUnknown } from '../http-error.ts';
+import {
+  STEER_NOT_DELIVERED_MESSAGE,
+  STEER_OUTCOME_UNKNOWN_MESSAGE,
+  SteerDeliveryError,
+} from '../domain-error.ts';
+
+describe('jsonError', () => {
+  it('emits the shared HTTP error envelope', async () => {
+    const response = jsonError(
+      'Rate limited',
+      429,
+      'RATE_LIMITED',
+      true,
+      'Retry after the current window.',
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(429);
+    expect(body).toEqual({
+      success: false,
+      error: 'Rate limited',
+      errorCode: 'RATE_LIMITED',
+      retryable: true,
+      details: 'Retry after the current window.',
+    });
+  });
+});
+
+describe('jsonErrorFromUnknown', () => {
+  it('does not expose unexpected 500 error details', async () => {
+    const response = jsonErrorFromUnknown(new Error('/secret/path failed'));
+    const body = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(body.error).toBe('Internal server error');
+    expect(body.errorCode).toBe('INTERNAL_ERROR');
+  });
+
+  it('keeps explicit non-500 validation messages', async () => {
+    const response = jsonErrorFromUnknown(new Error('name is required'), 400);
+    const body = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(body.error).toBe('name is required');
+    expect(body.errorCode).toBe('VALIDATION_FAILED');
+  });
+
+  it('sanitizes strict steering delivery failures without making them retryable', async () => {
+    const notSent = new SteerDeliveryError(new Error('/secret/pre-send failure'), 'not-sent');
+    const unknown = new SteerDeliveryError(new Error('turn/steer transport closed'), 'unknown');
+    const [notSentBody, unknownBody] = await Promise.all([
+      jsonErrorFromUnknown(notSent).json(),
+      jsonErrorFromUnknown(unknown).json(),
+    ]);
+
+    expect(notSentBody).toMatchObject({
+      error: STEER_NOT_DELIVERED_MESSAGE,
+      errorCode: 'STEER_NOT_DELIVERED',
+      retryable: false,
+    });
+    expect(unknownBody).toMatchObject({
+      error: STEER_OUTCOME_UNKNOWN_MESSAGE,
+      errorCode: 'STEER_OUTCOME_UNKNOWN',
+      retryable: false,
+    });
+    expect(JSON.stringify([notSentBody, unknownBody])).not.toContain('/secret');
+    expect(JSON.stringify([notSentBody, unknownBody])).not.toContain('turn/steer');
+  });
+});

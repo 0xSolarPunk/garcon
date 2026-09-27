@@ -227,7 +227,8 @@ export class GitDiffDocumentController {
 		this.clearCommentFeedback();
 		const generation = this.generation;
 		this.bodyScheduler = new GitReviewBodyScheduler({
-			maxBatchFiles: snapshot.limits.maxBodyBatchFiles || 24,
+			// A single body fits the RPC limit without partial-batch continuation.
+			maxBatchFiles: 1,
 			load: (paths, purpose, signal) => {
 				const requests = paths.map((path) => {
 					const summary = this.summaryForFile(path);
@@ -648,7 +649,12 @@ export class GitDiffDocumentController {
 	}
 
 	private cacheKey(file: GitCommitFileSummary): string {
-		return `${this.contextLines}|${file.bodyFingerprint}|${file.path}`;
+		return JSON.stringify([
+			this.snapshot?.documentId,
+			this.contextLines,
+			file.bodyFingerprint,
+			file.path,
+		]);
 	}
 
 	private cacheBody(file: GitCommitFileSummary, body: GitReviewFileBody, byteLimit: number): void {

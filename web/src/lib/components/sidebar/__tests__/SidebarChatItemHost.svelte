@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
 	import SidebarChatItem from '../SidebarChatItem.svelte';
 	import { setAppShell, setModelCatalog } from '$lib/context';
 	import { setWorkspaceWindowDndTestContext } from './workspace-window-dnd-test-context.js';
@@ -84,6 +86,7 @@
 	} as never);
 
 	setModelCatalog({
+		forExecutor() { return this; },
 		supportsFork() {
 			return supportsFork;
 		},

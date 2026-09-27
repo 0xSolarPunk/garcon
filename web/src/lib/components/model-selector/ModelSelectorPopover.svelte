@@ -1,15 +1,16 @@
 <script lang="ts">
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
-	import { onMount } from 'svelte';
+	import { untrack } from 'svelte';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import * as Popover from '$lib/components/ui/popover';
-	import { getModelCatalog } from '$lib/context';
+	import { getModelCatalog, getExecutors } from '$lib/context';
 	import { cn } from '$lib/utils/cn.js';
 	import * as m from '$lib/paraglide/messages.js';
 	import type { SessionAgentId } from '$lib/types/app';
 	import { ModelSelectorState } from './model-selector-state.svelte';
 	import ModelSelectorColumnsLayout from './ModelSelectorColumnsLayout.svelte';
 	import ModelSelectorCompactLayout from './ModelSelectorCompactLayout.svelte';
+	import { composerSelectionTriggerClass } from '$lib/components/shared/selection-trigger';
 	import type {
 		ModelSelectorChange,
 		ModelSelectorMode,
@@ -21,9 +22,9 @@
 		value: ModelSelectorValue;
 		mode: ModelSelectorMode;
 		onChange: (next: ModelSelectorChange) => void | Promise<void>;
-		recents?: ModelSelectorRecentOption[];
+		getRecents?: (executorId: string) => ModelSelectorRecentOption[];
 		preferRecentsOnOpen?: boolean;
-		selectableAgentIds?: readonly SessionAgentId[];
+		getSelectableAgentIds?: (executorId: string) => readonly SessionAgentId[];
 		disabled?: boolean;
 		align?: 'start' | 'center' | 'end';
 		side?: 'top' | 'right' | 'bottom' | 'left';
@@ -35,9 +36,9 @@
 		value,
 		mode,
 		onChange,
-		recents = [],
+		getRecents = () => [],
 		preferRecentsOnOpen = false,
-		selectableAgentIds,
+		getSelectableAgentIds,
 		disabled = false,
 		align = 'end',
 		side = 'bottom',
@@ -46,7 +47,9 @@
 	}: Props = $props();
 
 	const modelCatalog = getModelCatalog();
+	const executors = getExecutors();
 	const selector = new ModelSelectorState({
+		executors,
 		get modelCatalog() {
 			return modelCatalog;
 		},
@@ -56,14 +59,12 @@
 		get mode() {
 			return mode;
 		},
-		get recents() {
-			return recents;
-		},
+		getRecents: (executorId) => getRecents(executorId),
 		get preferRecentsOnOpen() {
 			return preferRecentsOnOpen;
 		},
-		get selectableAgentIds() {
-			return selectableAgentIds;
+		get getSelectableAgentIds() {
+			return getSelectableAgentIds;
 		},
 		onChange: (next) => onChange(next),
 	});
@@ -76,8 +77,13 @@
 	const sourceSelectionEnabled = $derived(mode.source === 'select');
 	const showSource = $derived(selector.shouldShowSourcePicker);
 	const showEffort = $derived(selector.effortSelectionEnabled);
+	const showExecutor = $derived(selector.showExecutorPicker);
 	const surfaceIsSettings = $derived(mode.surface === 'settings');
 	const contentWidthClass = $derived.by(() => {
+		if (showExecutor) {
+			if (!showAgent && !sourceSelectionEnabled) return 'w-[min(34rem,calc(100vw-1rem))]';
+			return showEffort ? 'w-[min(74rem,calc(100vw-1rem))]' : 'w-[min(62rem,calc(100vw-1rem))]';
+		}
 		if (!showAgent && !sourceSelectionEnabled) return 'w-[min(22rem,calc(100vw-1rem))]';
 		if (showAgent && sourceSelectionEnabled && showEffort) {
 			return 'w-[min(62rem,calc(100vw-1rem))]';
@@ -91,16 +97,16 @@
 	const triggerBaseClass = $derived(
 		surfaceIsSettings
 			? 'inline-flex min-h-9 min-w-0 max-w-[18rem] items-center justify-between gap-2 overflow-hidden rounded-md border border-border bg-muted px-2.5 py-1.5 text-left text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50'
-			: 'inline-flex h-9 min-w-0 max-w-[11rem] items-center gap-1.5 overflow-hidden rounded-lg px-2.5 text-left text-sm text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 sm:max-w-[15rem]',
+			: cn(composerSelectionTriggerClass, 'max-w-[11rem] sm:max-w-[15rem]'),
 	);
 	const showTriggerSecondaryLine = $derived(
 		surfaceIsSettings || mode.agent === 'select' || Boolean(selector.triggerSecondary),
 	);
 	const modelListId = $derived(`model-selector-model-list-${selector.instanceId}`);
 
-	onMount(() => {
+	$effect(() => {
 		if (typeof window.matchMedia !== 'function') return;
-		const compactMaxWidth = showAgent && sourceSelectionEnabled && showEffort ? 899 : 639;
+		const compactMaxWidth = (showAgent && sourceSelectionEnabled && mode.effort === 'select' ? 899 : 639) + (showExecutor ? 176 : 0);
 		const mediaQuery = window.matchMedia(`(max-width: ${compactMaxWidth}px)`);
 		const updateLayout = () => {
 			isCompactLayout = mediaQuery.matches;
@@ -110,8 +116,14 @@
 		return () => mediaQuery.removeEventListener('change', updateLayout);
 	});
 
+	$effect(() => {
+		void selector.committedExecutorId;
+		untrack(() => selector.reconcileExecutor());
+	});
+
 	function handleOpenChange(open: boolean): void {
 		if (open) {
+			void executors.refresh();
 			selector.openDraft();
 			return;
 		}
@@ -121,6 +133,13 @@
 		}
 		selector.commitAndClose();
 	}
+
+	$effect(() => {
+		if (!selector.open || !selector.executorReady) return;
+		const catalog = selector.modelCatalog;
+		void catalog.version;
+		untrack(() => { void catalog.refreshIfStale(); });
+	});
 
 	$effect(() => {
 		if (!selector.open || !triggerNode || !contentNode) return;
@@ -156,7 +175,7 @@
 {#snippet triggerContent()}
 	<span class="flex min-w-0 flex-1 flex-col overflow-hidden leading-tight">
 		<span class="truncate font-medium"
-			>{selector.triggerPrimary || m.model_selector_unavailable()}</span
+			>{selector.executorSelectionEnabled && selector.committedExecutorId !== 'local' ? `${selector.executorLabel} / ` : ''}{selector.triggerPrimary || m.model_selector_unavailable()}</span
 		>
 		{#if showTriggerSecondaryLine}
 			<span
@@ -169,6 +188,19 @@
 		{/if}
 	</span>
 	<ChevronDown class="size-3.5 shrink-0 text-muted-foreground" />
+{/snippet}
+
+{#snippet catalogError()}
+	{#if selector.modelCatalog.error}
+		<div role="alert" class="flex shrink-0 items-center gap-2 px-3 py-2 text-sm text-destructive">
+			<span class="min-w-0 break-words">{selector.modelCatalog.error}</span>
+			<button
+				type="button"
+				class="shrink-0 text-foreground underline focus-visible:ring-2 focus-visible:ring-ring"
+				onclick={() => void selector.modelCatalog.forceRefresh()}>{m.common_retry()}</button
+			>
+		</div>
+	{/if}
 {/snippet}
 
 {#if isCompactLayout}
@@ -185,11 +217,13 @@
 		<Dialog.Content
 			bind:ref={contentNode}
 			class={cn(
-				'safe-viewport-dialog top-[var(--app-viewport-center-y)] h-[min(32rem,calc(var(--app-height)-1rem))] overflow-hidden p-0',
+				'safe-viewport-dialog top-[var(--app-viewport-center-y)] flex h-[min(36rem,calc(var(--app-height)-1rem))] flex-col gap-0 overflow-hidden p-0',
 				contentClass,
 			)}
 			showCloseButton={false}
 		>
+			{@render catalogError()}
+			<div class="min-h-0 flex-1">
 			<ModelSelectorCompactLayout
 				{selector}
 				{showAgent}
@@ -198,6 +232,7 @@
 				onCancel={() => selector.discardAndClose()}
 				onDone={() => selector.commitAndClose()}
 			/>
+			</div>
 		</Dialog.Content>
 	</Dialog.Root>
 {:else}
@@ -220,11 +255,14 @@
 			class={cn(
 				contentWidthClass,
 				contentHeightClass,
-				'max-h-(--bits-popover-content-available-height) overflow-hidden p-0',
+				'flex max-h-(--bits-popover-content-available-height) flex-col overflow-hidden p-0',
 				contentClass,
 			)}
 		>
+			{@render catalogError()}
+			<div class="min-h-0 flex-1">
 			<ModelSelectorColumnsLayout {selector} {showAgent} {showSource} {modelListId} />
+			</div>
 		</Popover.Content>
 	</Popover.Root>
 {/if}

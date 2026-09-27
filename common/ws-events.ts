@@ -24,6 +24,7 @@ import {
   parseExecutionControlServerInstanceId,
 } from './chat-execution-control';
 import type { RemoteSettingsSnapshot } from './settings';
+import { parseExecutors, type ExecutorSnapshot } from './executors';
 import type { ErrorCode } from './error-codes';
 import { normalizeRemoteSettingsSnapshot } from './settings';
 import {
@@ -311,6 +312,7 @@ export const CHAT_LIST_INVALIDATION_REASONS = [
   'tags-updated',
   'chats-reordered',
   'agent-handoff',
+  'execution-settings-updated',
 ] as const;
 
 export type ChatListInvalidationReason =
@@ -349,6 +351,15 @@ export class TicketsInvalidatedMessage {
 export class SettingsChangedMessage {
   readonly type = 'settings-changed' as const;
   constructor(public settings: RemoteSettingsSnapshot) {}
+}
+
+export class ApiProvidersInvalidatedMessage {
+  readonly type = 'api-providers-invalidated' as const;
+}
+
+export class ExecutorsChangedMessage {
+  readonly type = 'executors-changed' as const;
+  constructor(readonly executors: readonly ExecutorSnapshot[]) {}
 }
 
 export class TranscriptSearchStatusMessage {
@@ -446,6 +457,8 @@ export type ServerWsMessage =
   | ChatBoardsInvalidatedMessage
   | TicketsInvalidatedMessage
   | SettingsChangedMessage
+  | ApiProvidersInvalidatedMessage
+  | ExecutorsChangedMessage
   | TranscriptSearchStatusMessage
   | ScheduledPromptsInvalidatedMessage
   | SnippetsInvalidatedMessage
@@ -881,6 +894,12 @@ export function parseServerWsMessage(
     case 'settings-changed': {
       const settings = normalizeRemoteSettingsSnapshot(data.settings);
       return settings ? new SettingsChangedMessage(settings) : null;
+    }
+    case 'api-providers-invalidated':
+      return Object.keys(data).length === 1 ? new ApiProvidersInvalidatedMessage() : null;
+    case 'executors-changed': {
+      const executors = parseExecutors(data.executors);
+      return executors ? new ExecutorsChangedMessage(executors) : null;
     }
     case 'transcript-search-status':
       return isTranscriptSearchStatusV1(data.status)

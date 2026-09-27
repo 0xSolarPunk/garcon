@@ -1,4 +1,5 @@
 import { getTree } from '$lib/api/files.js';
+import { effectiveExecutorId } from '$shared/executors';
 import { ApiError } from '$lib/api/client.js';
 import { buildVisibleFileRows, filterFileRows } from './file-tree-rows.js';
 import { FILE_TREE_PARENT_ROW_KEY } from './file-tree-render-rows.js';
@@ -58,6 +59,7 @@ export interface FileTreeNavigationError {
 
 export type FileTreeDirectoryTargetReason =
 	| 'initial'
+	| 'executor-switch'
 	| 'directory-row'
 	| 'parent-row'
 	| 'breadcrumb'
@@ -188,6 +190,10 @@ export function resizeVisibleFileTreeColumnBoundary(
 }
 
 export class FileTreeStore {
+	#executorId = $state('local');
+	get executorId(): string {
+		return this.#executorId;
+	}
 	navigation = $state.raw<FileTreeNavigationState>({ kind: 'idle' });
 	isRefreshing = $state(false);
 	refreshError = $state.raw<FileTreeNavigationError | null>(null);
@@ -329,12 +335,91 @@ export class FileTreeStore {
 	}
 
 	get knownFiles(): readonly FileTreeEntry[] {
-		return this.#materializedRows.flatMap((row) =>
-			row.entry.type === 'file' ? [row.entry] : [],
-		);
+		return this.#materializedRows.flatMap((row) => (row.entry.type === 'file' ? [row.entry] : []));
+	}
+
+	browseExecutor(executorId: string): void {
+		const directoryPath = this.retainedResponse?.directory.path ?? this.#projectPath ?? '';
+		this.#resetBrowsingState();
+		this.#executorId = executorId;
+		this.#projectPath = null;
+		this.#canonicalChatProjectPath = null;
+		this.#chatProjectBreadcrumbs = [];
+		this.#effectiveProjectKey = `executor:${executorId}`;
+		this.#projectRequestsAllowed = true;
+		void this.navigateTo({
+			path: directoryPath,
+			label: directoryPath,
+			breadcrumbs: [],
+			reason: 'executor-switch',
+		});
+	}
+
+	setExecutorAvailable(available: boolean): void {
+		if (available === this.#projectRequestsAllowed) return;
+		this.#projectRequestsAllowed = available;
+		if (!available) {
+			this.#abortRequests();
+			return;
+		}
+		const response = this.readyResponse;
+		if (response) {
+			void this.navigateTo({
+				path: response.directory.path,
+				label: this.currentDirectoryLabel,
+				breadcrumbs: response.directory.breadcrumbs,
+				reason: 'initial',
+			});
+		} else if (this.navigation.kind === 'error') {
+			void this.retryNavigation();
+		} else {
+			this.#resumePendingWork();
+		}
+	}
+
+	invalidateExecutorPaths(): void {
+		const response = this.retainedResponse;
+		let target: FileTreeDirectoryTarget;
+		if (this.navigation.kind === 'loading' || this.navigation.kind === 'error') {
+			target = this.navigation.target;
+		} else if (response) {
+			target = {
+				path: response.directory.path,
+				label: response.directory.path,
+				breadcrumbs: [],
+				reason: 'initial',
+			};
+		} else {
+			target = this.#initialTarget();
+		}
+		const captureAsChatProject =
+			target.captureAsChatProject || target.path === this.#canonicalChatProjectPath;
+		this.#abortRequests();
+		this.#clearDirectoryCaches();
+		this.#canonicalChatProjectPath = null;
+		this.#chatProjectBreadcrumbs = [];
+		this.refreshError = null;
+		this.navigation = {
+			kind: 'loading',
+			target: { ...target, captureAsChatProject, breadcrumbs: [] },
+			previous: null,
+		};
+		this.#resumePendingWork();
 	}
 
 	setProjectState(projectState: WorkspaceProjectState): void {
+		const target =
+			projectState.kind === 'available'
+				? projectState.project
+				: projectState.kind === 'absent'
+					? null
+					: projectState.context;
+		const executorId = effectiveExecutorId(target?.executorId);
+		if (this.#executorId !== executorId) {
+			this.#resetBrowsingState();
+			this.#effectiveProjectKey = '';
+			this.#executorId = executorId;
+		}
 		if (projectState.kind === 'absent') {
 			this.#projectRequestsAllowed = false;
 			this.#projectPath = null;
@@ -480,7 +565,9 @@ export class FileTreeStore {
 			reason: 'reveal-file',
 			focusPathOnSuccess: `${directoryPath.replace(/\/$/, '')}/${fileName}`,
 		});
-		return this.readyResponse?.entries.some((entry) => entry.relativePath === relativePath) ?? false;
+		return (
+			this.readyResponse?.entries.some((entry) => entry.relativePath === relativePath) ?? false
+		);
 	}
 
 	async retryNavigation(): Promise<void> {
@@ -510,7 +597,10 @@ export class FileTreeStore {
 		this.isRefreshing = true;
 		this.refreshError = null;
 		try {
-			const refreshed = await getTree({ directoryPath }, { signal: controller.signal });
+			const refreshed = await getTree(
+				{ executorId: this.executorId, directoryPath },
+				{ signal: controller.signal },
+			);
 			if (
 				controller.signal.aborted ||
 				token !== this.#refreshToken ||
@@ -568,7 +658,10 @@ export class FileTreeStore {
 		errors.delete(path);
 		this.childErrors = errors;
 		try {
-			const response = await getTree({ directoryPath: path }, { signal: controller.signal });
+			const response = await getTree(
+				{ executorId: this.executorId, directoryPath: path },
+				{ signal: controller.signal },
+			);
 			if (controller.signal.aborted || this.#childControllers.get(path) !== controller) return;
 			const cache = new Map(this.childrenCache);
 			cache.set(path, response.entries);
@@ -713,18 +806,12 @@ export class FileTreeStore {
 			label: path,
 			breadcrumbs: [],
 			reason: 'initial',
-			captureAsChatProject: true,
+			captureAsChatProject: this.#projectPath !== null,
 		};
 	}
 
 	#resumePendingWork(): void {
-		if (
-			!this.#active ||
-			!this.#projectRequestsAllowed ||
-			!this.#effectiveProjectKey ||
-			!this.#projectPath
-		)
-			return;
+		if (!this.#active || !this.#projectRequestsAllowed || !this.#effectiveProjectKey) return;
 		if (this.navigation.kind === 'idle') {
 			void this.navigateTo(this.#initialTarget());
 			return;
@@ -755,7 +842,10 @@ export class FileTreeStore {
 		this.#navigationController = controller;
 		this.navigation = { kind: 'loading', target, previous };
 		try {
-			const response = await getTree({ directoryPath: target.path }, { signal: controller.signal });
+			const response = await getTree(
+				{ executorId: this.executorId, directoryPath: target.path },
+				{ signal: controller.signal },
+			);
 			if (controller.signal.aborted || token !== this.#navigationToken) return;
 			this.navigation = { kind: 'ready', response };
 			this.refreshError = null;
@@ -766,6 +856,19 @@ export class FileTreeStore {
 			}
 		} catch (error) {
 			if (isAbortError(error) || token !== this.#navigationToken) return;
+			if (
+				target.reason === 'executor-switch' &&
+				target.path &&
+				error instanceof ApiError &&
+				[
+					'FILE_TREE_DIRECTORY_NOT_FOUND',
+					'FILE_TREE_DIRECTORY_REQUIRED',
+					'outside_project_base',
+				].includes(error.errorCode ?? '')
+			) {
+				await this.navigateTo(this.#initialTarget());
+				return;
+			}
 			this.navigation = {
 				kind: 'error',
 				target,

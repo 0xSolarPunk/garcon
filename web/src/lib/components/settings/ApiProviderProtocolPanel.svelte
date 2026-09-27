@@ -1,6 +1,5 @@
 <script lang="ts">
-	import { Button } from '$lib/components/ui/button';
-	import { buttonVariants } from '$lib/components/ui/button';
+	import { Button, buttonVariants } from '$lib/components/ui/button';
 	import * as m from '$lib/paraglide/messages.js';
 	import {
 		DropdownMenu,
@@ -11,62 +10,32 @@
 	import { cn } from '$lib/utils/cn.js';
 	import PlusIcon from '@lucide/svelte/icons/plus';
 	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
-	import PencilIcon from '@lucide/svelte/icons/pencil';
-	import TrashIcon from '@lucide/svelte/icons/trash';
-	import { getModelCatalog } from '$lib/context';
+	import { onMount } from 'svelte';
+	import { getApiProviders } from '$lib/context';
 	import type { ApiProtocol, ApiProviderCatalogEntry } from '$shared/api-providers';
-	import type { DeviceAuthInfo, AgentReadiness } from '$lib/api/agents';
 	import { templatesForProtocol, type ApiProviderTemplateId } from '$shared/api-provider-templates';
 	import ApiProviderEndpointDialog from './ApiProviderEndpointDialog.svelte';
-	import AgentCard from './AgentCard.svelte';
-	import { deleteApiProviderEndpoint } from './api-provider-endpoint-dialog-state.svelte';
+	import ApiProviderProfileRow from './ApiProviderProfileRow.svelte';
 
-	interface AuthStatus {
-		authenticated: boolean;
-		canReauth: boolean;
-		label: string;
-		loading: boolean;
-		error: string | null;
-	}
-
-	interface OAuthAgentConfig {
-		id: 'claude' | 'codex';
-		name: string;
-	}
+	type ProviderDialogRequest =
+		| { kind: 'create'; templateId: ApiProviderTemplateId }
+		| { kind: 'edit' | 'duplicate'; endpointId: string };
 
 	let {
 		protocol,
 		title,
 		description,
 		addLabel,
-		oauthAgent = undefined,
-		auth = undefined,
-		readiness = undefined,
-		deviceAuth = undefined,
-		pending = false,
-		onLogin = undefined,
-		onCompleteLogin = undefined,
 	}: {
 		protocol: ApiProtocol;
 		title: string;
 		description: string;
 		addLabel: string;
-		oauthAgent?: OAuthAgentConfig;
-		auth?: AuthStatus;
-		readiness?: AgentReadiness;
-		deviceAuth?: DeviceAuthInfo;
-		pending?: boolean;
-		onLogin?: () => void | Promise<void>;
-		onCompleteLogin?: (code: string) => void;
 	} = $props();
 
-	const modelCatalog = getModelCatalog();
-	let dialogOpen = $state(false);
-	let editingEndpointId = $state<string | null>(null);
-	let createTemplateId = $state<ApiProviderTemplateId>('custom');
-	let deleteEndpointId = $state<string | null>(null);
-	let error = $state<string | null>(null);
-	let oauthOpen = $state(false);
+	const providers = getApiProviders();
+	onMount(() => providers.retain());
+	let dialogRequest = $state<ProviderDialogRequest | null>(null);
 	const templateOptions = $derived(templatesForProtocol(protocol));
 
 	const endpointRows = $derived.by(() => {
@@ -74,7 +43,7 @@
 			apiProvider: ApiProviderCatalogEntry;
 			endpoint: ApiProviderCatalogEntry['endpoints'][number];
 		}> = [];
-		for (const apiProvider of modelCatalog.apiProviderCatalog) {
+		for (const apiProvider of providers.providers) {
 			for (const endpoint of apiProvider.endpoints) {
 				if (endpoint.protocol === protocol) rows.push({ apiProvider, endpoint });
 			}
@@ -88,28 +57,16 @@
 		);
 	});
 
-	function beginCreate(templateId: ApiProviderTemplateId) {
-		editingEndpointId = null;
-		createTemplateId = templateId;
-		error = null;
-		dialogOpen = true;
+	function beginCreate(templateId: ApiProviderTemplateId): void {
+		dialogRequest = { kind: 'create', templateId };
 	}
 
-	function beginEdit(endpointId: string) {
-		editingEndpointId = endpointId;
-		error = null;
-		dialogOpen = true;
+	function beginEdit(endpointId: string): void {
+		dialogRequest = { kind: 'edit', endpointId };
 	}
 
-	async function confirmDelete() {
-		if (!deleteEndpointId) return;
-		error = null;
-		try {
-			await deleteApiProviderEndpoint(modelCatalog, deleteEndpointId);
-			deleteEndpointId = null;
-		} catch (err) {
-			error = err instanceof Error ? err.message : String(err);
-		}
+	function beginDuplicate(endpointId: string): void {
+		dialogRequest = { kind: 'duplicate', endpointId };
 	}
 
 	function templateMenuLabel(templateId: ApiProviderTemplateId): string {
@@ -127,7 +84,7 @@
 <section class="space-y-3">
 	<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 		<div class="space-y-1">
-			<h2 class="text-base font-semibold text-foreground">{title}</h2>
+			<h3 class="text-sm font-semibold text-foreground">{title}</h3>
 			<p class="text-sm text-muted-foreground">{description}</p>
 			<div class="text-xs text-muted-foreground">
 				{m.settings_api_providers_endpoint_count({ count: endpointRows.length })}
@@ -153,106 +110,44 @@
 		</DropdownMenu>
 	</div>
 
-	{#if error}
+	<p class="text-xs text-muted-foreground">
+		Assigned executors can receive this profile's credentials. Removing access does not revoke keys
+		already received.
+	</p>
+	{#if providers.error}
 		<div
 			class="rounded border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
 		>
-			{error}
+			{providers.error}
+			<Button variant="outline" size="sm" onclick={() => providers.refresh()}>Retry</Button>
 		</div>
-	{/if}
-
-	{#if oauthAgent && auth}
-		<AgentCard
-			agentId={oauthAgent.id}
-			agentName={oauthAgent.name}
-			{auth}
-			open={oauthOpen}
-			onOpenChange={(open) => {
-				oauthOpen = open;
-			}}
-			onLogin={onLogin ?? (() => undefined)}
-			onCompleteLogin={onCompleteLogin ?? (() => undefined)}
-			{deviceAuth}
-			{pending}
-			{readiness}
-		/>
 	{/if}
 
 	<div class="space-y-2">
 		{#each endpointRows as row (row.endpoint.id)}
-			<div class="rounded-lg border border-border bg-muted/40 px-4 py-3">
-				<div class="flex items-start justify-between gap-3">
-					<div class="min-w-0 space-y-1">
-						<div class="flex items-center gap-2">
-							<div class="truncate text-sm font-medium text-foreground">
-								{row.apiProvider.label}
-							</div>
-						</div>
-						<div class="truncate text-xs text-muted-foreground">{row.endpoint.baseUrl}</div>
-						<div class="flex flex-wrap gap-1.5 text-xs text-muted-foreground">
-							<span
-								>{m.settings_api_providers_model_count({ count: row.endpoint.models.length })}</span
-							>
-							<span
-								>{m.settings_api_providers_default_model({
-									model: row.endpoint.defaultModel,
-								})}</span
-							>
-							<span
-								>{row.endpoint.hasApiKey
-									? m.settings_api_providers_key_configured()
-									: m.settings_api_providers_no_key()}</span
-							>
-						</div>
-					</div>
-
-					<div class="flex shrink-0 items-center gap-1">
-						<Button variant="outline" size="sm" onclick={() => beginEdit(row.endpoint.id)}>
-							<PencilIcon class="mr-1 size-3" />
-							{m.settings_api_providers_edit()}
-						</Button>
-						<Button
-							variant="ghost"
-							size="icon-sm"
-							onclick={() => {
-								deleteEndpointId = row.endpoint.id;
-							}}
-						>
-							<TrashIcon class="size-4" />
-						</Button>
-					</div>
-				</div>
-
-				{#if deleteEndpointId === row.endpoint.id}
-					<div
-						class="mt-3 flex items-center gap-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-2"
-					>
-						<span class="text-sm text-destructive">{m.settings_api_providers_confirm_delete()}</span
-						>
-						<Button variant="destructive" size="sm" onclick={confirmDelete}
-							>{m.settings_api_providers_delete()}</Button
-						>
-						<Button
-							variant="outline"
-							size="sm"
-							onclick={() => {
-								deleteEndpointId = null;
-							}}>{m.settings_api_providers_cancel()}</Button
-						>
-					</div>
-				{/if}
-			</div>
+			<svelte:boundary>
+				<ApiProviderProfileRow
+					profile={row.apiProvider}
+					endpoint={row.endpoint}
+					onEdit={() => beginEdit(row.endpoint.id)}
+					onDuplicate={() => beginDuplicate(row.endpoint.id)}
+				/>
+				{#snippet failed()}<p class="text-sm text-destructive">
+						Unable to display provider.
+					</p>{/snippet}
+			</svelte:boundary>
 		{/each}
 	</div>
 
-	{#if dialogOpen}
+	{#if dialogRequest}
 		<ApiProviderEndpointDialog
-			open={dialogOpen}
+			open
 			{protocol}
-			endpointId={editingEndpointId}
-			templateId={createTemplateId}
+			duplicate={dialogRequest.kind === 'duplicate'}
+			endpointId={dialogRequest.kind === 'create' ? null : dialogRequest.endpointId}
+			templateId={dialogRequest.kind === 'create' ? dialogRequest.templateId : 'custom'}
 			onOpenChange={(open) => {
-				dialogOpen = open;
+				if (!open) dialogRequest = null;
 			}}
 		/>
 	{/if}

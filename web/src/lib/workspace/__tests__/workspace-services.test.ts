@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
 import { ApiError } from '$lib/api/client.js';
+import { saveText } from '$lib/api/files.js';
+import { gitProjectInvalidations } from '$lib/git/surface/git-project-invalidation.svelte.js';
 import { createAppShellStore } from '$lib/stores/app-shell.svelte.js';
 import { createChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.js';
-import { createGhCapabilityStore } from '$lib/stores/gh-capability.svelte.js';
+import { createGhCapabilityStore } from '$lib/git/pull-requests/gh-capability.svelte.js';
 import {
 	createLocalSettingsStore,
 	type LocalSettingsStore,
@@ -47,6 +49,7 @@ vi.mock('$lib/api/files.js', async (importOriginal) => {
 			}) => ({
 				success: true as const,
 				identity: {
+					executorId: 'local',
 					canonicalFileRootPath: projectPath ?? '/workspace',
 					normalizedRelativePath: relativePath,
 				},
@@ -56,6 +59,12 @@ vi.mock('$lib/api/files.js', async (importOriginal) => {
 			content: '',
 			path: `/workspace/${filePath}`,
 			revision: `v1:${filePath}`,
+		})),
+		saveText: vi.fn<typeof actual.saveText>(async ({ projectPath, filePath }) => ({
+			success: true,
+			path: `${projectPath}/${filePath}`,
+			message: 'saved',
+			revision: 'v1:saved',
 		})),
 	};
 });
@@ -112,8 +121,8 @@ function assembleWorkspaceServices(
 	const notifications = createNotificationsStore();
 	const ghCapability = createGhCapabilityStore();
 	const chatSessions = createChatSessionsStore();
-	ghCapability.hasChecked = true;
-	ghCapability.available = true;
+	ghCapability.forExecutor('local').hasChecked = true;
+	ghCapability.forExecutor('local').available = true;
 	const ws = {
 		isConnected: false,
 		sendMessage: () => false,
@@ -121,6 +130,7 @@ function assembleWorkspaceServices(
 		onConnectionChange: () => () => undefined,
 	} satisfies PrimaryWsConnectionPort;
 	const services = createWorkspaceServices({
+		localProjectBasePath: () => '/workspace',
 		appShell: createAppShellStore(),
 		chatBoardInvalidations: createChatBoardInvalidationHub(),
 		ticketsInvalidations: new TicketsInvalidationHub(),
@@ -151,9 +161,62 @@ describe('createWorkspaceServices', () => {
 		rootLocalSettings?.destroy();
 		rootLocalSettings = null;
 		projectResolutionApiMocks.resolveProject.mockReset();
+		vi.mocked(saveText).mockClear();
+		gitProjectInvalidations.pruneExecutors(new Set());
 		vi.restoreAllMocks();
 		vi.useRealTimers();
 	});
+
+	it.each([
+		{ root: '/workspace', relativePath: 'notes/todo.md', outcome: 'saved' },
+		{ root: '/workspace', relativePath: 'repo-b/src/file.ts', outcome: 'saved' },
+		{ root: '/workspace', relativePath: 'repo-b/src/file.ts', outcome: 'unknown' },
+		{ root: '/', relativePath: 'repo-b/src/file.ts', outcome: 'saved' },
+		{ root: 'C:/workspace', relativePath: 'repo-b/src/file.ts', outcome: 'saved' },
+	])(
+		'refreshes all visible Git projects on the saved file host: $root/$relativePath ($outcome)',
+		async ({ root, relativePath, outcome }) => {
+			rootLocalSettings = createLocalSettingsStore();
+			({ services } = assembleWorkspaceServices(rootLocalSettings));
+			const executorId = '22222222-2222-4222-8222-222222222222';
+			const session = new FileSession(
+				{ executorId, canonicalFileRootPath: root, normalizedRelativePath: relativePath },
+				'file-save',
+			);
+			session.loadedRevision = 'v1:loaded';
+			session.document.applyUserEdit('changed');
+			vi.spyOn(services.files, 'get').mockReturnValue(session);
+			const repoA = `${root === '/' ? '' : root}/repo-a`;
+			const repoB = `${root === '/' ? '' : root}/repo-b`;
+			const projects = [
+				{ executorId, projectPath: repoA, isProcessing: false },
+				{ executorId, projectPath: repoB, isProcessing: false },
+				{ executorId: 'local', projectPath: repoB, isProcessing: false },
+			];
+			services.gitQuickSummary.visibleProjects = projects;
+			const refresh = vi
+				.spyOn(services.gitQuickSummary, 'scheduleRefreshFor')
+				.mockReturnValue(undefined);
+			if (outcome === 'unknown') {
+				vi.mocked(saveText).mockRejectedValueOnce(
+					new ApiError(502, 'Save unconfirmed', 'FILE_SAVE_OUTCOME_UNKNOWN'),
+				);
+			}
+
+			await expect(services.files.save(session.id)).resolves.toBe(outcome === 'saved');
+			expect(saveText).toHaveBeenCalledOnce();
+			expect(saveText).toHaveBeenCalledWith(
+				expect.objectContaining({ executorId, filePath: relativePath }),
+				expect.anything(),
+			);
+			expect(gitProjectInvalidations.version(executorId)).toBeGreaterThan(0);
+			expect(gitProjectInvalidations.version('local')).toBe(0);
+			expect(refresh.mock.calls).toEqual([
+				[projects[0], 'invalidation', 100],
+				[projects[1], 'invalidation', 100],
+			]);
+		},
+	);
 
 	it.each(['known', 'back', 'forward'] as const)(
 		'opens %s file locations in the command context window',
@@ -163,6 +226,7 @@ describe('createWorkspaceServices', () => {
 			await services.files.initializeRecovery('test-user');
 			const location: FileLocation = {
 				key: '["/workspace","first.md"]',
+				executorId: 'local',
 				canonicalFileRootPath: '/workspace',
 				normalizedRelativePath: 'first.md',
 				displayPath: 'first.md',
@@ -203,7 +267,7 @@ describe('createWorkspaceServices', () => {
 			const assembled = assembleWorkspaceServices(rootLocalSettings);
 			services = assembled.services;
 			const session = new FileSession(
-				{ canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
+				{ executorId: 'local', canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
 				'command-copy',
 			);
 			vi.spyOn(services.files, 'get').mockReturnValue(session);
@@ -233,12 +297,33 @@ describe('createWorkspaceServices', () => {
 		},
 	);
 
+	it('refreshes Files on the mutated host after a Git mutation', async () => {
+		rootLocalSettings = createLocalSettingsStore();
+		({ services } = assembleWorkspaceServices(rootLocalSettings));
+		const executorId = '22222222-2222-4222-8222-222222222222';
+		const refreshTree = vi.spyOn(services.singletonSurfaces.files(), 'refreshForExecutorChange');
+		const checkDocuments = vi.spyOn(services.files, 'checkExecutorFreshness');
+		vi.spyOn(services.gitQuickSummary, 'refreshFor').mockResolvedValue(undefined);
+
+		await services.gitMutations.run({
+			executorId,
+			surfaceId: 'singleton:git',
+			effectiveProjectKey: '/repo',
+			projectPath: '/repo',
+			execute: async () => undefined,
+		});
+
+		expect(refreshTree).toHaveBeenCalledWith(executorId);
+		expect(checkDocuments).toHaveBeenCalledWith(executorId);
+		expect(gitProjectInvalidations.version(executorId)).toBeGreaterThan(0);
+	});
+
 	it('keeps the current file command port and reports chat append outcomes', async () => {
 		rootLocalSettings = createLocalSettingsStore();
 		const assembled = assembleWorkspaceServices(rootLocalSettings);
 		services = assembled.services;
 		const session = new FileSession(
-			{ canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
+			{ executorId: 'local', canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
 			'command-chat',
 		);
 		vi.spyOn(services.files, 'get').mockReturnValue(session);
@@ -282,6 +367,7 @@ describe('createWorkspaceServices', () => {
 		expect(services.commands.isEnabled('file.navigate-forward')).toBe(false);
 		const location: FileLocation = {
 			key: 'first',
+			executorId: 'local',
 			canonicalFileRootPath: '/workspace',
 			normalizedRelativePath: 'first.ts',
 			displayPath: 'first.ts',
@@ -308,7 +394,7 @@ describe('createWorkspaceServices', () => {
 		rootLocalSettings = createLocalSettingsStore();
 		({ services } = assembleWorkspaceServices(rootLocalSettings));
 		const session = new FileSession(
-			{ canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
+			{ executorId: 'local', canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
 			'command-reveal',
 		);
 		vi.spyOn(services.files, 'get').mockReturnValue(session);
@@ -324,14 +410,42 @@ describe('createWorkspaceServices', () => {
 		attached.resolve();
 		await pending;
 		expect(controller.tree.readyResponse).toBeNull();
-		expect(reveal).toHaveBeenCalledWith('/workspace', 'file.ts');
+		expect(reveal).toHaveBeenCalledWith('/workspace', 'file.ts', 'local');
+	});
+
+	it.each(['before-open', 'while-opening'])('reports unavailable Reveal without retargeting Files (%s)', async (when) => {
+		rootLocalSettings = createLocalSettingsStore();
+		const assembled = assembleWorkspaceServices(rootLocalSettings);
+		services = assembled.services;
+		const session = new FileSession(
+			{ executorId: 'remote', canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
+			'command-reveal-unavailable',
+		);
+		vi.spyOn(services.files, 'get').mockReturnValue(session);
+		const available = vi.spyOn(session.document, 'executorAvailable', 'get').mockReturnValue(when !== 'before-open');
+		const attached = Promise.withResolvers<void>();
+		const open = vi.spyOn(services.coordinator, 'openSingleton').mockReturnValue(attached.promise);
+		const controller = services.singletonSurfaces.files();
+		const reveal = vi.spyOn(controller, 'revealFile');
+		const pending = services.commands.execute('file.reveal-active', {
+			viewId: session.id, surfaceId: `file:${session.id}`,
+		});
+		available.mockReturnValue(false);
+		attached.resolve();
+		await expect(pending).resolves.toBe(false);
+		expect(open).toHaveBeenCalledTimes(when === 'before-open' ? 0 : 1);
+		expect(reveal).not.toHaveBeenCalled();
+		expect(controller.tree.executorId).toBe('local');
+		expect(assembled.notifications.items).toMatchObject([
+			{ tone: 'error', message: 'Files are unavailable on this executor.' },
+		]);
 	});
 
 	it('opens a side view from the command context window', async () => {
 		rootLocalSettings = createLocalSettingsStore();
 		({ services } = assembleWorkspaceServices(rootLocalSettings));
 		const session = new FileSession(
-			{ canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
+			{ executorId: 'local', canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
 			'command-side',
 		);
 		vi.spyOn(services.files, 'get').mockReturnValue(session);
@@ -349,7 +463,7 @@ describe('createWorkspaceServices', () => {
 		rootLocalSettings = createLocalSettingsStore();
 		({ services } = assembleWorkspaceServices(rootLocalSettings));
 		const session = new FileSession(
-			{ canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
+			{ executorId: 'local', canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.ts' },
 			'command-save',
 		);
 		session.rendererMode = 'code';
@@ -387,7 +501,7 @@ describe('createWorkspaceServices', () => {
 		rootLocalSettings = createLocalSettingsStore();
 		({ services } = assembleWorkspaceServices(rootLocalSettings));
 		const session = new FileSession(
-			{ canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.txt' },
+			{ executorId: 'local', canonicalFileRootPath: '/workspace', normalizedRelativePath: 'file.txt' },
 			'command-editor',
 		);
 		session.content = 'local text';
@@ -525,10 +639,12 @@ describe('createWorkspaceServices', () => {
 		expect(services.commands.knownFileLocations).toEqual([]);
 		expect(services.singletonSurfaces.filesIfPresent()).toBeNull();
 		expect(services.gitQuickSummary.isEnabled).toBe(false);
-		expect(services.singletonSurfaces.pullRequests().capabilityState).toBe('available');
+		const pullRequests = services.singletonSurfaces.pullRequests();
+		await tick();
+		expect(pullRequests.capabilityState).toBe('available');
 
 		rootLocalSettings.showQuickCommitTray = true;
-		ghCapability.available = false;
+		ghCapability.forExecutor('local').available = false;
 		await tick();
 
 		expect(services.gitQuickSummary.isEnabled).toBe(true);

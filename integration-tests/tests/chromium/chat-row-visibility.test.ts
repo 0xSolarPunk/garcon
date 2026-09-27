@@ -11,8 +11,9 @@ import type {
   CliPresentation,
   CliRowFormat,
 } from '../../../common/cli-presentation.js';
-import { TranscriptLedgerStore } from '../../../server/ledger/store.js';
+import { TranscriptLedgerStore } from '../../../server/controller/ledger/store.js';
 import {
+  authenticateChromiumContext,
   withChromiumFixture,
   type ChromiumFixture,
 } from '../../support/chromium-fixture.js';
@@ -340,14 +341,14 @@ async function expectComposerStable(page: Page, value: string): Promise<void> {
         ? feed.scrollHeight - feed.clientHeight - feed.scrollTop
         : Number.POSITIVE_INFINITY,
       focused: document.activeElement === scope.__chatRowComposer,
-      sameNode: scope.__chatRowComposer?.isConnected === true,
+      sameExecutor: scope.__chatRowComposer?.isConnected === true,
       value: scope.__chatRowComposer?.value ?? null,
     };
   });
   expect(snapshot).toEqual({
     distanceFromEnd: expect.any(Number),
     focused: true,
-    sameNode: true,
+    sameExecutor: true,
     value,
   });
   expect(Math.abs(snapshot.distanceFromEnd)).toBeLessThanOrEqual(1);
@@ -454,6 +455,7 @@ describe('Chromium transcript chat rows', () => {
       const observerContext = await fixture.browser.newContext({
         viewport: { width: 1440, height: 900 },
       });
+      await authenticateChromiumContext(observerContext, fixture.integration);
       await allowDirectChats(observerContext);
       await installSocketTracker(observerContext);
       const observerPage = await observerContext.newPage();

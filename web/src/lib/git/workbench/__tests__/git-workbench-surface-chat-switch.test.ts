@@ -89,6 +89,7 @@ function fileNode(path: string): GitTreeNode {
 
 function summaryFor(project: string, paths: string[]): GitReviewDocumentSummary {
 	return {
+		document: { executorId: 'local', instanceId: 'test-instance', documentId: `doc:${project}` },
 		documentId: `doc:${project}`,
 		project,
 		mode: 'working',
@@ -116,6 +117,7 @@ function snapshotFor(project: string, paths: string[]): GitWorkbenchSnapshotResp
 		status: 'ready',
 		project,
 		target: {
+			executorId: 'local',
 			projectPath: project,
 			repoRoot: project,
 			worktreePath: project,
@@ -135,26 +137,40 @@ function snapshotFor(project: string, paths: string[]): GitWorkbenchSnapshotResp
 function availableProject(chatId: string, projectPath: string) {
 	return {
 		kind: 'available' as const,
-		project: { chatId, projectPath, effectiveProjectKey: chatId },
+		project: {
+			target: { kind: 'chat' as const, chatId: chatId, projectPath: projectPath },
+			chatId,
+			projectPath,
+			effectiveProjectKey: chatId,
+		},
 	};
 }
 
 function resolvingProject(chatId: string, projectPath: string) {
 	return {
 		kind: 'resolving' as const,
-		context: { chatId, projectPath },
+		context: {
+			target: { kind: 'chat' as const, chatId: chatId, projectPath: projectPath },
+			chatId,
+			projectPath,
+		},
 	};
 }
 
 function installRouters(): void {
-	api.getGitTargetCandidates.mockImplementation((projectPath: string) =>
+	api.getGitTargetCandidates.mockImplementation(({ projectPath }) =>
 		Promise.resolve({ targets: [candidate(projectPath)] }),
 	);
-	api.getGitWorkbenchSnapshot.mockImplementation((projectPath: string) =>
+	api.getGitWorkbenchSnapshot.mockImplementation(({ projectPath }) =>
 		Promise.resolve(snapshotFor(projectPath, [`${projectPath.slice(1)}.ts`])),
 	);
-	comparisonApi.getGitComparisonSnapshot.mockImplementation((projectPath: string) =>
+	comparisonApi.getGitComparisonSnapshot.mockImplementation(({ projectPath }) =>
 		Promise.resolve({
+			document: {
+				executorId: 'local',
+				instanceId: 'test-instance',
+				documentId: `cmp:${projectPath}`,
+			},
 			status: 'ready',
 			project: projectPath,
 			repoRoot: projectPath,
@@ -189,9 +205,59 @@ async function settle(): Promise<void> {
 }
 
 describe('workbench surface chat-switch repro', () => {
+	it('does not restore old metadata after a held target application finishes', async () => {
+		const surface = new GitWorkbenchSurfaceController(createGitSurfaceTestDeps());
+		let finishOld!: () => void;
+		const old = new Promise<void>((resolve) => {
+			finishOld = resolve;
+		});
+		vi.spyOn(surface.workbench, 'setTarget').mockReturnValueOnce(old).mockResolvedValue(undefined);
+		const metadata = vi.spyOn(surface.repository, 'fetchRemoteStatus').mockResolvedValue(undefined);
+		surface.setProjectState(availableProject('old', '/old'));
+		surface.setPresentationVisible(true);
+		await vi.waitFor(() => expect(surface.workbench.setTarget).toHaveBeenCalledOnce());
+		surface.setProjectState(availableProject('new', '/new'));
+		await surface.target.activate();
+		expect(metadata).toHaveBeenCalledOnce();
+		finishOld();
+		await old;
+		await Promise.resolve();
+		expect(metadata).toHaveBeenCalledOnce();
+		expect(metadata).toHaveBeenCalledWith(expect.objectContaining({ projectPath: '/new' }));
+		surface.dispose();
+	});
 	beforeEach(() => {
 		vi.clearAllMocks();
 		installRouters();
+	});
+
+	it('refreshes retained data when returning to a hidden project after invalidation', async () => {
+		let version = 0;
+		const controller = new GitWorkbenchSurfaceController({
+			...createGitSurfaceTestDeps(),
+			invalidationVersion: () => version,
+		});
+		try {
+			controller.setProjectState(availableProject('chat-a', '/project-a'));
+			controller.setPresentationVisible(true);
+			await controller.target.activate();
+			expect(controller.workbench.files.filePaths).toEqual(['project-a.ts']);
+
+			controller.setPresentationVisible(false);
+			controller.setProjectState(availableProject('chat-b', '/project-b'));
+			controller.setProjectState(availableProject('chat-a', '/project-a'));
+			api.getGitWorkbenchSnapshot.mockResolvedValue(snapshotFor('/project-a', ['changed.ts']));
+			api.getGitWorkbenchSnapshot.mockClear();
+			version++;
+
+			controller.setPresentationVisible(true);
+			await controller.refreshForInvalidation('chat-a', version);
+			await controller.target.activate();
+			expect(api.getGitWorkbenchSnapshot).toHaveBeenCalledOnce();
+			expect(controller.workbench.files.filePaths).toEqual(['changed.ts']);
+		} finally {
+			controller.dispose();
+		}
 	});
 
 	it('W1: select repo X, A->B->A keeps listings and review doc on X', async () => {
@@ -209,8 +275,8 @@ describe('workbench surface chat-switch repro', () => {
 		controller.setProjectState(availableProject('chat-b', '/project-b'));
 		await controller.target.activate();
 		await settle();
-		expect(controller.workbench.projectPath).toBe('/project-b');
-		expect(controller.workbench.review.summary?.project).toBe('/project-b');
+		expect(controller.workbench.projectPath).toBe('/repo-x');
+		expect(controller.workbench.review.summary?.project).toBe('/repo-x');
 
 		controller.setProjectState(resolvingProject('chat-a', '/project-a'));
 		controller.setProjectState(availableProject('chat-a', '/project-a'));
@@ -225,7 +291,7 @@ describe('workbench surface chat-switch repro', () => {
 		expect(controller.workbench.files.filePaths).not.toContain('project-b.ts');
 	});
 
-	it('W2: selecting chat B\'s repo in chat A, then visiting B and returning, stays coherent', async () => {
+	it("W2: selecting chat B's repo in chat A, then visiting B and returning, stays coherent", async () => {
 		const controller = new GitWorkbenchSurfaceController(createGitSurfaceTestDeps());
 		controller.setProjectState(availableProject('chat-a', '/project-a'));
 		controller.setPresentationVisible(true);
@@ -261,8 +327,8 @@ describe('workbench surface chat-switch repro', () => {
 		// snapshot request's tab must equal the current activeTab.
 		const lastSnapshotCall = api.getGitWorkbenchSnapshot.mock.calls.at(-1);
 		expect(lastSnapshotCall?.[1]).toBe(controller.workbench.files.activeTab);
-		// Chat B's open composer must not leak into chat A's surface identity.
-		expect(controller.workbench.drafts.commentComposer.open).toBe(false);
+		// Explicit targets retain their own composer independently of chat selection.
+		expect(controller.workbench.drafts.commentComposer.open).toBe(true);
 		// Comment composer must be functional: open it and confirm the state sticks.
 		controller.workbench.drafts.openCommentComposer('project-b.ts', 'after', 1);
 		expect(controller.workbench.drafts.commentComposer.open).toBe(true);
@@ -291,7 +357,7 @@ describe('compare surface chat-switch repro', () => {
 		controller.setProjectState(availableProject('chat-b', '/project-b'));
 		await controller.target.activate();
 		await settle();
-		expect(controller.comparison.snapshot?.repoRoot).toBe('/project-b');
+		expect(controller.comparison.snapshot?.repoRoot).toBe('/repo-x');
 
 		controller.setProjectState(resolvingProject('chat-a', '/project-a'));
 		controller.setProjectState(availableProject('chat-a', '/project-a'));

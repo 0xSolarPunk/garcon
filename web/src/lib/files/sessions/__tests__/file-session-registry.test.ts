@@ -29,8 +29,9 @@ import {
 const testEditorRuntime: FileEditorRuntimeModule =
 	await import('$lib/files/editor/code-editor-controller.svelte.js');
 
-function identity(path: string): CanonicalFileIdentity {
+function identity(path: string, executorId = 'local'): CanonicalFileIdentity {
 	return {
+		executorId,
 		canonicalFileRootPath: '/workspace',
 		normalizedRelativePath: path,
 	};
@@ -88,6 +89,7 @@ function createHarness(
 		placement?: FilePlacementPort;
 		userNamespace?: string | null;
 		isDocumentVisible?: (documentId: string) => boolean;
+		isExecutorAvailable?: (executorId: string) => boolean;
 	} = {},
 ) {
 	const placementCalls: Array<{ sessionId: string; target: unknown }> = [];
@@ -105,10 +107,12 @@ function createHarness(
 		},
 	};
 	const placement = options.placement ?? defaultPlacement;
-	const resolveFileIdentity = vi.fn(async ({ relativePath }: { relativePath: string }) => ({
-		success: true as const,
-		identity: identity(relativePath.replace(/^alias\//, '')),
-	}));
+	const resolveFileIdentity = vi.fn(
+		async ({ relativePath, executorId }: { relativePath: string; executorId?: string | null }) => ({
+			success: true as const,
+			identity: identity(relativePath.replace(/^alias\//, ''), executorId ?? 'local'),
+		}),
+	);
 	const readText = vi.fn(async () => ({
 		content: 'initial',
 		path: '/workspace/file.ts',
@@ -134,6 +138,7 @@ function createHarness(
 	);
 	const onOpenError = options.onOpenError ?? vi.fn();
 	const registry = new FileSessionRegistry({
+		isExecutorAvailable: options.isExecutorAvailable,
 		getIsMobile: () => options.isMobile ?? false,
 		getDefaultPlacement,
 		getEditorSettings: () => ({
@@ -179,6 +184,84 @@ function createHarness(
 }
 
 describe('FileSessionRegistry', () => {
+	it('isolates same-path documents, IO and recovery by executor across executor loss', async () => {
+		const worker = '22222222-2222-4222-8222-222222222222';
+		let workerReady = true;
+		const repository = createMemoryFileDraftRepository();
+		const harness = createHarness({
+			draftRepository: repository,
+			isExecutorAvailable: (executorId) => executorId === 'local' || workerReady,
+		});
+		const local = (await harness.registry.open(request('same.txt')))!;
+		const remote = (await harness.registry.open({ ...request('same.txt'), executorId: worker }))!;
+		await vi.waitFor(() => expect(local.loading || remote.loading).toBe(false));
+		expect(local.document).not.toBe(remote.document);
+		expect(local.identityKey).not.toBe(remote.identityKey);
+		local.content = 'local edit';
+		remote.content = 'remote edit';
+		await harness.registry.flushRecovery();
+		expect(
+			(await repository.getDrafts('test-user', 'test-deployment'))
+				.map((draft) => draft.executorId)
+				.sort(),
+		).toEqual([worker, 'local'].sort());
+		workerReady = false;
+		await expect(harness.registry.save(remote.id)).resolves.toBe(false);
+		expect(remote.content).toBe('remote edit');
+		expect(remote.dirty).toBe(true);
+		await expect(harness.registry.save(local.id)).resolves.toBe(true);
+		workerReady = true;
+		await expect(harness.registry.save(remote.id)).resolves.toBe(true);
+		expect(harness.saveText).toHaveBeenLastCalledWith(
+			expect.objectContaining({ executorId: worker, filePath: 'same.txt', content: 'remote edit' }),
+			expect.anything(),
+		);
+		await harness.registry.checkFreshness(remote.id);
+		expect(harness.getFileRevision).toHaveBeenLastCalledWith(
+			expect.objectContaining({ executorId: worker }),
+			expect.anything(),
+		);
+		await harness.registry.destroyAll();
+	});
+
+	it('checks only the named executor documents outside the polling cadence', async () => {
+		const worker = '22222222-2222-4222-8222-222222222222';
+		const harness = createHarness();
+		const local = (await harness.registry.open(request('same.txt')))!;
+		const remote = (await harness.registry.open({ ...request('same.txt'), executorId: worker }))!;
+		await vi.waitFor(() => expect(local.loading || remote.loading).toBe(false));
+		await vi.waitFor(() =>
+			expect(local.isCheckingFreshness || remote.isCheckingFreshness).toBe(false),
+		);
+		harness.getFileRevision.mockClear();
+
+		harness.registry.checkExecutorFreshness(worker);
+
+		await vi.waitFor(() => expect(harness.getFileRevision).toHaveBeenCalledOnce());
+		expect(harness.getFileRevision).toHaveBeenCalledWith(
+			expect.objectContaining({ executorId: worker, filePath: 'same.txt' }),
+			expect.anything(),
+		);
+		await harness.registry.destroyAll();
+	});
+
+	it('rejects a canonical identity response from the wrong executor without opening a document', async () => {
+		const harness = createHarness();
+		harness.resolveFileIdentity.mockResolvedValueOnce({
+			success: true,
+			identity: identity('same.txt'),
+		});
+		await expect(
+			harness.registry.open({
+				...request('same.txt'),
+				executorId: '22222222-2222-4222-8222-222222222222',
+			}),
+		).resolves.toBeNull();
+		expect(harness.readText).not.toHaveBeenCalled();
+		expect(harness.onOpenError).toHaveBeenCalled();
+		await harness.registry.destroyAll();
+	});
+
 	it('keeps background polling out of an interactive conflict read', async () => {
 		const harness = createHarness();
 		const session = (await harness.registry.open(request('file.txt')))!;
@@ -513,6 +596,7 @@ describe('FileSessionRegistry', () => {
 		});
 
 		expect(harness.resolveFileIdentity).toHaveBeenCalledWith({
+			executorId: 'local',
 			projectPath: '/workspace',
 			relativePath: 'current/src/file.ts',
 		});
@@ -1163,6 +1247,7 @@ describe('FileSessionRegistry', () => {
 				projectPath: '/workspace',
 				filePath: 'src/file.ts',
 				content: 'newer edit',
+				executorId: 'local',
 				expectedRevision: 'v1:first-save',
 				conflictResolution: 'reject',
 			},
@@ -1539,6 +1624,7 @@ describe('FileSessionRegistry', () => {
 				projectPath: '/workspace',
 				filePath: 'src/file.ts',
 				content: 'merged local',
+				executorId: 'local',
 				expectedRevision: 'v1:initial',
 				conflictResolution: 'reject',
 			},
@@ -1570,6 +1656,7 @@ describe('FileSessionRegistry', () => {
 				projectPath: '/workspace',
 				filePath: 'src/file.ts',
 				content: 'local',
+				executorId: 'local',
 				expectedRevision: 'v1:initial',
 				conflictResolution: 'reject',
 			},
@@ -1699,26 +1786,56 @@ describe('FileSessionRegistry', () => {
 		expect(opened.dirty).toBe(false);
 	});
 
-	it('rejects Accept Disk after the local buffer changes behind the comparison', async () => {
+	it.each(['accept-disk', 'save-checked'] as const)(
+		'rejects %s after the local buffer changes behind the comparison',
+		async (choice) => {
+			const harness = createHarness();
+			const opened = await harness.registry.open(request('src/accept-disk-race.ts'));
+			if (!opened) throw new Error('Expected file session');
+			await vi.waitFor(() => expect(opened.loading).toBe(false));
+			opened.content = 'displayed local';
+			harness.readText.mockResolvedValueOnce({
+				content: 'displayed disk',
+				path: '/workspace/src/accept-disk-race.ts',
+				revision: 'v1:disk',
+			});
+
+			const comparison = harness.registry.showConflict(opened.id);
+			await vi.waitFor(() => expect(harness.registry.overwriteRequest).toBeTruthy());
+			opened.content = 'newer local edit';
+			harness.registry.resolveOverwrite(choice);
+			await comparison;
+
+			expect(opened.content).toBe('newer local edit');
+			expect(opened.dirty).toBe(true);
+			expect(opened.saveError).toContain('buffer changed');
+			expect(harness.saveText).not.toHaveBeenCalled();
+		},
+	);
+
+	it('does not retry a conflicted save with an obsolete comparison buffer', async () => {
 		const harness = createHarness();
-		const opened = await harness.registry.open(request('src/accept-disk-race.ts'));
+		const opened = await harness.registry.open(request('src/save-checked-race.ts'));
 		if (!opened) throw new Error('Expected file session');
 		await vi.waitFor(() => expect(opened.loading).toBe(false));
 		opened.content = 'displayed local';
+		harness.saveText.mockRejectedValueOnce(
+			new ApiError(409, 'File changed on disk', 'FILE_REVISION_CONFLICT'),
+		);
 		harness.readText.mockResolvedValueOnce({
 			content: 'displayed disk',
-			path: '/workspace/src/accept-disk-race.ts',
+			path: '/workspace/src/save-checked-race.ts',
 			revision: 'v1:disk',
 		});
-
-		const comparison = harness.registry.showConflict(opened.id);
+		const save = harness.registry.save(opened.id);
 		await vi.waitFor(() => expect(harness.registry.overwriteRequest).toBeTruthy());
 		opened.content = 'newer local edit';
-		harness.registry.resolveOverwrite('accept-disk');
-		await comparison;
-
+		harness.registry.resolveOverwrite('save-checked', 'obsolete merge');
+		await expect(save).resolves.toBe(false);
+		expect(harness.saveText).toHaveBeenCalledOnce();
 		expect(opened.content).toBe('newer local edit');
 		expect(opened.dirty).toBe(true);
+		expect(opened.saving).toBe(false);
 		expect(opened.saveError).toContain('buffer changed');
 	});
 
@@ -2435,7 +2552,7 @@ describe('best-effort file recovery', () => {
 		await harness.registry.destroyAll();
 	});
 
-	it('releases a timed-out Save and ignores its late response after retry', async () => {
+	it('reconciles a timed-out Save before a deliberate retry and ignores its late response', async () => {
 		const harness = createHarness({ saveTimeoutMs: 5 });
 		const session = (await harness.registry.open(request('file.txt')))!;
 		await vi.waitFor(() => expect(session.loading).toBe(false));
@@ -2447,7 +2564,11 @@ describe('best-effort file recovery', () => {
 		expect(session.document.mutationGuarded).toBe(false);
 		expect(session.saveError).toContain('not confirmed');
 		session.content = 'newer edit';
-		await expect(harness.registry.save(session.id)).resolves.toBe(true);
+		const retry = harness.registry.save(session.id);
+		await vi.waitFor(() => expect(harness.registry.overwriteRequest).not.toBeNull());
+		expect(harness.saveText).toHaveBeenCalledOnce();
+		harness.registry.resolveOverwrite('save-checked');
+		await expect(retry).resolves.toBe(true);
 		pending.resolve({
 			success: true,
 			path: '/workspace/file.txt',
@@ -2458,6 +2579,60 @@ describe('best-effort file recovery', () => {
 		expect(session.content).toBe('newer edit');
 		expect(session.baseline).toBe('newer edit');
 		expect(session.loadedRevision).toBe('v1:saved');
+		await harness.registry.destroyAll();
+	});
+
+	it('retains an unconfirmed remote save and reconciles that same executor before another write', async () => {
+		const executorId = '22222222-2222-4222-8222-222222222222';
+		const harness = createHarness();
+		const session = (await harness.registry.open({ ...request('file.txt'), executorId }))!;
+		await vi.waitFor(() => expect(session.loading).toBe(false));
+		session.content = 'unconfirmed edit';
+		harness.saveText.mockRejectedValueOnce(
+			new ApiError(503, 'Save outcome unknown', 'FILE_SAVE_OUTCOME_UNKNOWN'),
+		);
+		await expect(harness.registry.save(session.id)).resolves.toBe(false);
+		expect(session.content).toBe('unconfirmed edit');
+		expect(session.dirty).toBe(true);
+		expect(session.isExternallyStale).toBe(true);
+		expect(session.loadedRevision).toBe('v1:initial');
+		expect(session.saveError).toBe('Save outcome unknown');
+		expect(harness.readText).toHaveBeenCalledOnce();
+
+		session.content = 'newer edit';
+		const snapshot = deferred<Awaited<ReturnType<typeof harness.readText>>>();
+		harness.readText.mockReturnValueOnce(snapshot.promise);
+		const retry = harness.registry.save(session.id);
+		await vi.waitFor(() => expect(harness.readText).toHaveBeenCalledTimes(2));
+		expect(harness.readText).toHaveBeenLastCalledWith(
+			{ executorId, projectPath: '/workspace', filePath: 'file.txt' },
+			{ signal: expect.any(AbortSignal) },
+		);
+		expect(harness.saveText).toHaveBeenCalledOnce();
+		snapshot.resolve({
+			content: 'unconfirmed edit',
+			path: '/workspace/file.txt',
+			revision: 'v1:remote',
+		});
+		await vi.waitFor(() =>
+			expect(harness.registry.overwriteRequest?.diskRevision).toBe('v1:remote'),
+		);
+		expect(harness.saveText).toHaveBeenCalledOnce();
+		harness.registry.resolveOverwrite('save-checked');
+		await expect(retry).resolves.toBe(true);
+		expect(harness.saveText).toHaveBeenLastCalledWith(
+			{
+				executorId,
+				projectPath: '/workspace',
+				filePath: 'file.txt',
+				content: 'newer edit',
+				expectedRevision: 'v1:remote',
+				conflictResolution: 'reject',
+			},
+			{ signal: expect.any(AbortSignal), timeoutMs: null },
+		);
+		expect(session.content).toBe('newer edit');
+		expect(session.dirty).toBe(false);
 		await harness.registry.destroyAll();
 	});
 

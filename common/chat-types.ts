@@ -70,7 +70,7 @@ export interface TodoItem {
 }
 
 // Lightweight coercion for already-serialized TodoItem arrays.
-// Agent-specific normalization lives in server/agents/shared/normalize-util.
+// Agent-specific normalization lives in server/controller/agents/shared/normalize-util.
 export function coerceTodoItems(raw: unknown): TodoItem[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const items: TodoItem[] = [];
@@ -736,6 +736,8 @@ export class AgentSwitchMessage {
     public toAgentId: string,
     public fromModel?: string,
     public toModel?: string,
+    public fromExecutorId?: string,
+    public toExecutorId?: string,
   ) {}
 }
 
@@ -1236,6 +1238,8 @@ export function parseChatMessage(data: Record<string, unknown>): ChatMessage | n
         str(data.toAgentId),
         asOptionalString(data.fromModel),
         asOptionalString(data.toModel),
+        asOptionalString(data.fromExecutorId),
+        asOptionalString(data.toExecutorId),
       );
     default:
       return null;

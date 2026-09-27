@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	import type { ExecutorSnapshot } from '$shared/executors';
 	import PromptComposer from '../PromptComposer.svelte';
 	import ConversationPanelStatusDock from '../ConversationPanelStatusDock.svelte';
 	import { onDestroy, untrack } from 'svelte';
@@ -53,13 +55,15 @@
 	import type { ProjectTarget } from '$shared/project-resolution';
 
 	interface Props {
+		selectedExecutorId?: string;
+		executors?: readonly ExecutorSnapshot[];
+		catalog?: ModelCatalogStore;
 		selectedChatId?: string;
 		projectPath?: string;
 		selectedAgentId?: SessionAgentId;
 		selectedThinkingMode?: ChatSessionRecord['thinkingMode'];
 		selectedStatus?: ChatStatus;
 		selectedIsProcessing?: boolean;
-		isSubmitting?: boolean;
 		isVisible?: boolean;
 		isPresented?: boolean;
 		focusRequestToken?: number;
@@ -85,16 +89,19 @@
 		onAbort?: () => void;
 		onQuickCommit?: () => void;
 		onChooseProjectFolder?: (chatId: string) => void;
+		onAvailabilityNoticeChange?: (shown: boolean) => void;
 	}
 
 	let {
+		selectedExecutorId = 'local',
+		executors: executorSnapshots,
+		catalog,
 		selectedChatId = 'chat-1',
 		projectPath = '/workspace/project',
 		selectedAgentId = 'claude',
 		selectedThinkingMode = 'none',
 		selectedStatus = 'running',
 		selectedIsProcessing = false,
-		isSubmitting = false,
 		isVisible = true,
 		isPresented,
 		focusRequestToken = 0,
@@ -120,6 +127,7 @@
 		onAbort = () => {},
 		onQuickCommit = () => {},
 		onChooseProjectFolder,
+		onAvailabilityNoticeChange,
 	}: Props = $props();
 
 	const chatDrafts = new ChatDraftStore();
@@ -158,7 +166,15 @@
 			})
 		);
 	}
-	const projectResolution = new ProjectResolutionStore(getInitialProjectResolver());
+	const executors = setExecutorsTestContext(untrack(() => executorSnapshots));
+	export function applyExecutors(snapshot: readonly ExecutorSnapshot[]): void {
+		executors.applySnapshot(snapshot);
+	}
+	const projectResolution = new ProjectResolutionStore(
+		getInitialProjectResolver(),
+		undefined,
+		executors,
+	);
 	const modelOptionsByAgent: Record<string, ModelOption[]> = {
 		claude: [{ value: 'opus', label: 'Opus', supportsImages: true }],
 		codex: [{ value: 'gpt-5', label: 'GPT-5', supportsImages: true }],
@@ -186,7 +202,15 @@
 		version: 1,
 		features: {
 			transcriptSearch: { enabled: false },
-			agentCommands: { enabled: true, chatIdDiscovery: true, sendMessage: true, startAgent: true, resumeAgent: true, schedule: true, tickets: true },
+			agentCommands: {
+				enabled: true,
+				chatIdDiscovery: true,
+				sendMessage: true,
+				startAgent: true,
+				resumeAgent: true,
+				schedule: true,
+				tickets: true,
+			},
 		},
 		ui: {},
 		uiEffective: {},
@@ -231,6 +255,7 @@
 	}
 
 	const selectedChat = $derived<ChatSessionRecord>({
+		executorId: selectedExecutorId,
 		id: selectedChatId,
 		parentChat: null,
 		projectPath,
@@ -256,10 +281,7 @@
 	});
 
 	$effect(() => {
-		composer.isSubmitting = isSubmitting;
-	});
-
-	$effect(() => {
+		agent.executorId = selectedExecutorId;
 		agent.setAgentId(selectedAgentId);
 		agent.setThinkingMode(selectedThinkingMode);
 		agent.setModelSelection({
@@ -314,7 +336,11 @@
 		},
 		startupByChatId: {},
 	} as never);
-	setModelCatalog({
+	const fallbackCatalog = {
+		isValidated: true,
+		forExecutor() {
+			return this;
+		},
 		version: 0,
 		getSelectableAgents: () => selectableAgents,
 		getAgent: (agentId: string) => ({
@@ -325,7 +351,6 @@
 			supportsForkAtMessage: agentId !== 'amp',
 			supportsForkWhileRunning: agentId !== 'amp',
 			supportsSteering: agentId === 'codex',
-			supportsGoals: agentId === 'codex',
 			supportsUpdateProjectPath: true,
 			supportsImages: true,
 			acceptsApiProviderEndpoints: true,
@@ -357,7 +382,6 @@
 		supportsFork: (agentId: string) => agentId !== 'amp',
 		supportsForkWhileRunning: () => true,
 		supportsSteering: (agentId: string) => agentId === 'codex',
-		supportsGoals: (agentId: string) => agentId === 'codex',
 		supportsUpdateProjectPath: () => true,
 		selectionFor: (_agentId: string, model: string) => ({
 			model,
@@ -369,7 +393,8 @@
 		isLocalModel: () => false,
 		findEndpoint: () => null,
 		refreshIfStale: () => Promise.resolve(),
-	} as unknown as ModelCatalogStore);
+	} as unknown as ModelCatalogStore;
+	setModelCatalog(untrack(() => catalog ?? fallbackCatalog));
 	setRemoteSettings({
 		get snapshot() {
 			return remoteSettingsSnapshot;
@@ -473,6 +498,7 @@
 	{directAdmissionPending}
 	{requiresQueuedSubmission}
 	{onChooseProjectFolder}
+	{onAvailabilityNoticeChange}
 	resendCandidates={transcript.resendCandidates}
 	onExcludeResendCandidate={(ordinal) => transcript.excludeResendCandidate(ordinal)}
 />

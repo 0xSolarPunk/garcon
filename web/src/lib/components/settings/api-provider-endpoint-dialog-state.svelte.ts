@@ -1,12 +1,12 @@
 import {
 	createApiProvider,
-	deleteApiProvider,
 	discoverApiProviderModels,
 	testApiProvider,
 	updateApiProvider,
 	type ApiProviderInput,
 } from '$lib/api/api-providers.js';
 import type { ModelCatalogStore, ModelOption } from '$lib/agents/model-catalog-store.svelte.js';
+import type { ApiProvidersStore } from '$lib/api-providers/api-providers-store.svelte.js';
 import * as m from '$lib/paraglide/messages.js';
 import { apiProviderTemplate, type ApiProviderTemplateId } from '$shared/api-provider-templates';
 import {
@@ -16,10 +16,13 @@ import {
 } from '$shared/api-providers';
 
 interface DialogOptions {
-	modelCatalog: ModelCatalogStore;
+	readonly modelCatalog: Pick<ModelCatalogStore, 'executorId' | 'forceRefresh'>;
+	readonly providers: Pick<ApiProvidersStore, 'findEndpoint' | 'isAssigned' | 'invalidate' | 'refresh'>;
+	isExecutorReady: () => boolean;
 	getProtocol: () => ApiProtocol;
 	getEndpointId: () => string | null;
 	getTemplateId?: () => ApiProviderTemplateId;
+	getDuplicate?: () => boolean;
 	onSaved?: () => void;
 }
 
@@ -43,6 +46,10 @@ export class ApiProviderEndpointDialogState {
 	error = $state<string | null>(null);
 	testMessage = $state<string | null>(null);
 	apiProviderId = $state<string | null>(null);
+	revision = $state<number | undefined>();
+	#duplicateRequiresApiKey = $state(false);
+	#savedEndpointId: string | null = null;
+	#contextVersion = 0;
 
 	constructor(private readonly options: DialogOptions) {}
 
@@ -66,13 +73,13 @@ export class ApiProviderEndpointDialogState {
 		if (this.templateId === 'together')
 			return m.settings_api_provider_dialog_api_key_placeholder_together();
 		if (this.templateId === 'zai') return m.settings_api_provider_dialog_api_key_placeholder_zai();
-		if (this.templateId === 'ollama')
+		if (this.templateId === 'ollama' && !this.#duplicateRequiresApiKey)
 			return m.settings_api_provider_dialog_api_key_placeholder_ollama();
 		return m.settings_api_provider_dialog_api_key_placeholder();
 	}
 
 	get apiKeyRequired(): boolean {
-		return apiProviderTemplate(this.protocol, this.templateId)?.apiKeyRequired === true;
+		return this.#duplicateRequiresApiKey || apiProviderTemplate(this.protocol, this.templateId)?.apiKeyRequired === true;
 	}
 
 	get title(): string {
@@ -132,6 +139,7 @@ export class ApiProviderEndpointDialogState {
 
 	get canFetchModels(): boolean {
 		return Boolean(
+			this.canProbe &&
 			this.baseUrl.trim() &&
 			(!this.apiKeyRequired || Boolean(this.apiProviderId) || Boolean(this.apiKey.trim())) &&
 			!this.isFetchingModels,
@@ -139,7 +147,12 @@ export class ApiProviderEndpointDialogState {
 	}
 
 	get canTest(): boolean {
-		return this.canSave && !this.isTesting;
+		return this.canProbe && this.canSave && !this.isTesting;
+	}
+
+	get canProbe(): boolean {
+		return this.options.isExecutorReady() && (!this.apiProviderId || Boolean(this.apiKey)
+			|| this.options.providers.isAssigned(this.options.modelCatalog.executorId, this.apiProviderId));
 	}
 
 	get canSave(): boolean {
@@ -156,21 +169,22 @@ export class ApiProviderEndpointDialogState {
 	}
 
 	async load(): Promise<void> {
-		this.error = null;
-		this.testMessage = null;
+		this.dispose();
 		const endpointId = this.endpointId;
 		if (!endpointId) {
 			this.beginCreate();
 			return;
 		}
 
-		const found = this.options.modelCatalog.findEndpoint(endpointId);
+		const found = this.options.providers.findEndpoint(endpointId);
 		if (!found) {
 			this.error = m.settings_api_provider_dialog_endpoint_missing();
 			return;
 		}
 
 		this.apiProviderId = found.apiProvider.id;
+		this.#savedEndpointId = found.endpoint.id;
+		this.revision = found.apiProvider.revision;
 		this.label = found.apiProvider.label;
 		this.baseUrl = found.endpoint.baseUrl;
 		this.defaultModel = found.endpoint.defaultModel;
@@ -179,10 +193,36 @@ export class ApiProviderEndpointDialogState {
 		this.templateId = found.apiProvider.templateId ?? 'custom';
 		this.modelsText = found.endpoint.models.map((model) => formatModelLine(model)).join('\n');
 		this.openAiCapabilities = this.openAiCapabilitiesFrom(found.endpoint.capabilities);
+		if (this.options.getDuplicate?.()) {
+			this.#duplicateRequiresApiKey = found.endpoint.hasApiKey;
+			this.apiProviderId = null;
+			this.#savedEndpointId = null;
+			this.revision = undefined;
+			this.label += ' copy';
+		}
+	}
+
+	dispose(): void {
+		this.clearProbeResults();
+		this.isSaving = false;
 		this.apiKey = '';
+		this.#duplicateRequiresApiKey = false;
+	}
+
+	clearProbeResults(): void {
+		this.#contextVersion++;
+		this.isTesting = false;
+		this.isFetchingModels = false;
+		this.testMessage = null;
+		this.error = null;
+	}
+
+	#isCurrent(catalog: DialogOptions['modelCatalog'], version: number): boolean {
+		return this.options.modelCatalog === catalog && this.#contextVersion === version;
 	}
 
 	beginCreate(): void {
+		this.#duplicateRequiresApiKey = false;
 		const template =
 			apiProviderTemplate(this.protocol, this.options.getTemplateId?.() ?? 'custom') ??
 			apiProviderTemplate(this.protocol, 'custom');
@@ -193,6 +233,8 @@ export class ApiProviderEndpointDialogState {
 			return;
 		}
 		this.apiProviderId = null;
+		this.#savedEndpointId = null;
+		this.revision = undefined;
 		this.templateId = template.id;
 		this.label = template.label;
 		this.baseUrl = template.baseUrl;
@@ -237,9 +279,13 @@ export class ApiProviderEndpointDialogState {
 
 	payload(): ApiProviderInput {
 		return {
+			revision: this.revision,
+			apiProviderId: this.apiProviderId ?? undefined,
+			endpointId: this.#savedEndpointId ?? undefined,
 			templateId: this.templateId,
 			label: this.label.trim(),
 			endpoint: {
+				id: this.#savedEndpointId ?? undefined,
 				protocol: this.protocol,
 				baseUrl: this.baseUrl.trim(),
 				apiKey: this.apiKey || undefined,
@@ -254,25 +300,40 @@ export class ApiProviderEndpointDialogState {
 
 	async save(): Promise<void> {
 		if (!this.canSave) return;
+		const catalog = this.options.modelCatalog;
+		const version = this.#contextVersion;
 		this.isSaving = true;
 		this.error = null;
 		try {
 			if (this.apiProviderId) {
 				await updateApiProvider(this.apiProviderId, this.payload());
 			} else {
-				await createApiProvider(this.payload());
+				const created = await createApiProvider(this.payload(), catalog.executorId);
+				if (this.#isCurrent(catalog, version)) {
+					this.apiProviderId = created.id;
+					this.#savedEndpointId = created.endpoints[0]?.id ?? null;
+					this.revision = created.revision;
+				}
+				if (created.assignment.status !== 'assigned') throw new Error(created.assignment.error);
 			}
-			await this.options.modelCatalog.forceRefresh();
+			this.options.providers.invalidate();
+			await this.options.providers.refresh();
+			if (this.options.isExecutorReady()) await catalog.forceRefresh();
+			if (!this.#isCurrent(catalog, version)) return;
 			this.options.onSaved?.();
 		} catch (err) {
-			this.error = err instanceof Error ? err.message : String(err);
+			this.options.providers.invalidate();
+			if (this.#isCurrent(catalog, version)) this.error = err instanceof Error ? err.message : String(err);
 		} finally {
-			this.isSaving = false;
+			if (this.#isCurrent(catalog, version)) this.isSaving = false;
 		}
 	}
 
 	async fetchModels(): Promise<void> {
 		if (!this.canFetchModels) return;
+		const catalog = this.options.modelCatalog;
+		const version = this.#contextVersion;
+		const draft = JSON.stringify(this.payload());
 		this.isFetchingModels = true;
 		this.error = null;
 		this.testMessage = null;
@@ -286,9 +347,11 @@ export class ApiProviderEndpointDialogState {
 				baseUrl: this.baseUrl.trim(),
 				apiKey: this.apiKey || undefined,
 				apiProviderId: this.apiProviderId,
-				endpointId: this.endpointId,
+				endpointId: this.#savedEndpointId,
+				revision: this.revision,
 				modelDiscovery: discoveryKind,
-			});
+			}, catalog.executorId);
+			if (!this.#isCurrent(catalog, version) || draft !== JSON.stringify(this.payload())) return;
 			if (!result.success) {
 				this.error = result.error || m.settings_api_provider_dialog_fetch_failed();
 				return;
@@ -305,19 +368,23 @@ export class ApiProviderEndpointDialogState {
 				count: result.models.length,
 			});
 		} catch (err) {
-			this.error = err instanceof Error ? err.message : String(err);
+			if (this.#isCurrent(catalog, version)) this.error = err instanceof Error ? err.message : String(err);
 		} finally {
-			this.isFetchingModels = false;
+			if (this.#isCurrent(catalog, version)) this.isFetchingModels = false;
 		}
 	}
 
 	async test(): Promise<void> {
 		if (!this.canTest) return;
+		const catalog = this.options.modelCatalog;
+		const version = this.#contextVersion;
+		const draft = JSON.stringify(this.payload());
 		this.isTesting = true;
 		this.error = null;
 		this.testMessage = null;
 		try {
-			const result = await testApiProvider(this.payload());
+			const result = await testApiProvider(this.payload(), catalog.executorId);
+			if (!this.#isCurrent(catalog, version) || draft !== JSON.stringify(this.payload())) return;
 			if (!result.success) {
 				this.error = result.error || m.settings_api_provider_dialog_test_failed();
 				return;
@@ -330,21 +397,11 @@ export class ApiProviderEndpointDialogState {
 				this.syncDefaultModelWithModels();
 			}
 		} catch (err) {
-			this.error = err instanceof Error ? err.message : String(err);
+			if (this.#isCurrent(catalog, version)) this.error = err instanceof Error ? err.message : String(err);
 		} finally {
-			this.isTesting = false;
+			if (this.#isCurrent(catalog, version)) this.isTesting = false;
 		}
 	}
-}
-
-export async function deleteApiProviderEndpoint(
-	modelCatalog: ModelCatalogStore,
-	endpointId: string,
-): Promise<void> {
-	const found = modelCatalog.findEndpoint(endpointId);
-	if (!found) throw new Error(m.settings_api_provider_dialog_endpoint_missing());
-	await deleteApiProvider(found.apiProvider.id);
-	await modelCatalog.forceRefresh();
 }
 
 function parseModelsText(text: string): ModelOption[] {

@@ -1,3 +1,4 @@
+import type { GarconTestClient } from "../../support/garcon-client.js";
 import { describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -42,19 +43,19 @@ async function commitAt(
 }
 
 async function getRefs(
-  baseUrl: string,
+  client: GarconTestClient,
   project: string,
   sort?: GitRefSort,
   options: { query?: string; limit?: number } = {},
 ): Promise<GitRefsResponse> {
-  const params = new URLSearchParams({ project });
+  const params = new URLSearchParams({ executorId: client.executorId, project });
   if (sort) {
     params.set("sort", sort.key);
     params.set("direction", sort.direction);
   }
   if (options.query) params.set("query", options.query);
   if (options.limit) params.set("limit", String(options.limit));
-  const response = await fetch(`${baseUrl}/api/v1/git/refs?${params}`);
+  const response = await client.fetch(`/api/v1/git/refs?${params}`);
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(
@@ -67,7 +68,7 @@ async function getRefs(
 describe("Git refs HTTP API", () => {
   test("sorts before limiting and exposes canonical branch and tag timestamps", async () => {
     await withIntegrationFixture("git-refs", async (fixture) => {
-      const project = fixture.dirs.project;
+      const project = fixture.executionDirs.project;
       const oldTimestamp = "2024-01-01T00:00:00Z";
       const newTimestamp = "2024-03-01T00:00:00Z";
       const tagTimestamp = "2024-04-01T00:00:00Z";
@@ -89,7 +90,7 @@ describe("Git refs HTTP API", () => {
       );
 
       const defaultName = await getRefs(
-        fixture.garcon.baseUrl,
+        fixture.client,
         project,
         undefined,
         { query: "candidate" },
@@ -100,7 +101,7 @@ describe("Git refs HTTP API", () => {
       ]);
 
       const newest = await getRefs(
-        fixture.garcon.baseUrl,
+        fixture.client,
         project,
         { key: "updated", direction: "desc" },
         { query: "candidate", limit: 1 },
@@ -113,7 +114,7 @@ describe("Git refs HTTP API", () => {
       ]);
 
       const oldest = await getRefs(
-        fixture.garcon.baseUrl,
+        fixture.client,
         project,
         { key: "updated", direction: "asc" },
         { query: "candidate" },
@@ -132,7 +133,7 @@ describe("Git refs HTTP API", () => {
       ]);
 
       const tags = await getRefs(
-        fixture.garcon.baseUrl,
+        fixture.client,
         project,
         { key: "updated", direction: "desc" },
         { query: "release" },
@@ -151,31 +152,35 @@ describe("Git refs HTTP API", () => {
       ]);
 
       const invalid = new URLSearchParams({
+        executorId: fixture.client.executorId,
         project,
         sort: "updated",
       });
-      const invalidResponse = await fetch(
-        `${fixture.garcon.baseUrl}/api/v1/git/refs?${invalid}`,
+      const invalidResponse = await fixture.client.fetch(
+        `/api/v1/git/refs?${invalid}`,
       );
       expect(invalidResponse.status).toBe(400);
       expect(await invalidResponse.json()).toMatchObject({
         error:
           "Invalid ref sort. Expected sort=name|updated and direction=asc|desc together.",
       });
-    });
+    }, { projectRoots: 'separate' });
   });
 
   test("preserves the non-repository API error", async () => {
     await withIntegrationFixture("git-refs-non-repository", async (fixture) => {
-      const params = new URLSearchParams({ project: fixture.dirs.project });
-      const response = await fetch(
-        `${fixture.garcon.baseUrl}/api/v1/git/refs?${params}`,
+      const params = new URLSearchParams({ executorId: fixture.client.executorId, project: fixture.executionDirs.project });
+      const response = await fixture.client.fetch(
+        `/api/v1/git/refs?${params}`,
       );
 
       expect(response.status).toBe(400);
       expect(await response.json()).toEqual({
+        success: false,
+        errorCode: 'GIT_NOT_REPO',
+        retryable: false,
         error: "Path is not a Git repository.",
       });
-    });
+    }, { projectRoots: 'separate' });
   });
 });

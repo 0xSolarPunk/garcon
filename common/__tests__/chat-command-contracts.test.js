@@ -7,15 +7,16 @@ import {
   CommandRequestValidationError,
   normalizeAskUserQuestionDecisionResponse,
   parseAgentRunCommandRequest,
+  parseAgentHandoffCommandRequest,
   parseForkChatCommandRequest,
   parseForkRunCommandRequest,
-  parseGoalControlCommandRequest,
   parsePermissionDecisionCommandRequest,
   parseQueueEntryMoveCommandRequest,
   parseQueueEntrySteerCommandRequest,
   parseQueueEntryReplaceCommandRequest,
   parseStartChatCommandRequest,
   parseSteerCommandRequest,
+  parseProjectPathPatchRequest,
 } from '../chat-command-contracts.ts';
 import {
   CHAT_STOP_OUTCOMES,
@@ -32,6 +33,28 @@ function agentSettings(ownerId = 'claude') {
 }
 
 describe('chat command request parsers', () => {
+  it('requires the captured executor, ownership epoch and path for folder changes', () => {
+    const input = {
+      chatId: CHAT_ID, projectPath: '/next', expectedExecutorId: 'local',
+      expectedAgentOwnershipEpoch: 'epoch-1', expectedProjectPath: '/previous',
+    };
+    expect(parseProjectPathPatchRequest(input)).toEqual(input);
+    for (const key of ['expectedExecutorId', 'expectedAgentOwnershipEpoch', 'expectedProjectPath']) {
+      expect(() => parseProjectPathPatchRequest({ ...input, [key]: undefined })).toThrow();
+      expect(() => parseProjectPathPatchRequest({ ...input, [key]: '' })).toThrow();
+    }
+    expect(() => parseProjectPathPatchRequest({ ...input, expectedExecutorId: 'not-an-executor' })).toThrow();
+  });
+  it('parses a promptless handoff with explicit ownership and bounded request identity', () => {
+    const input = { chatId: CHAT_ID, clientRequestId: 'request-handoff', handoff: {
+      expectedAgentOwnershipEpoch: 'epoch-source', target: { executorId: 'local', agentId: 'codex', model: 'synthetic-model' },
+    } };
+    expect(parseAgentHandoffCommandRequest(input)).toMatchObject(input);
+    expect(() => parseAgentHandoffCommandRequest({ ...input, handoff: undefined })).toThrow('handoff is required');
+    expect(() => parseAgentHandoffCommandRequest({ ...input, chatId: '../invalid' })).toThrow();
+    expect(() => parseAgentHandoffCommandRequest({ ...input, clientRequestId: 'x'.repeat(COMMAND_CORRELATION_ID_MAX_BYTES + 1) })).toThrow();
+    expect(() => parseAgentHandoffCommandRequest({ ...input, handoff: { ...input.handoff, expectedAgentOwnershipEpoch: '' } })).toThrow();
+  });
   it('classifies every Stop outcome by command satisfaction and provider acknowledgement', () => {
     expect(CHAT_STOP_OUTCOMES.map((outcome) => ({
       outcome,
@@ -140,6 +163,7 @@ describe('chat command request parsers', () => {
       agentSettings: agentSettings(),
       model: 'opus',
       expectedAgentId: 'claude',
+      expectedAgentOwnershipEpoch: 'epoch-1',
       tagsToAdd: ['CLI', 'cli', ' Review '],
       permissionFallbackPolicy: 'require-explicit-bypass',
     });
@@ -148,6 +172,7 @@ describe('chat command request parsers', () => {
     expect(parsed.thinkingMode).toBeUndefined();
     expect(parsed.agentSettings).toEqual(agentSettings());
     expect(parsed.expectedAgentId).toBe('claude');
+    expect(parsed.expectedAgentOwnershipEpoch).toBe('epoch-1');
     expect(parsed.tagsToAdd).toEqual(['cli', 'review']);
     expect(parsed.permissionFallbackPolicy).toBe('require-explicit-bypass');
   });
@@ -388,22 +413,6 @@ describe('chat command request parsers', () => {
       ...base,
       entryId: '\u00e9'.repeat((QUEUE_ENTRY_ID_MAX_BYTES / 2) + 1),
     })).toThrow(`entryId must be at most ${QUEUE_ENTRY_ID_MAX_BYTES} bytes`);
-  });
-
-  it('qualifies goal control with logical message and transcript identities', () => {
-    expect(parseGoalControlCommandRequest({
-      clientRequestId: 'request-goal',
-      clientMessageId: 'message-goal',
-      chatId: CHAT_ID,
-      transcriptViewId: TRANSCRIPT_VIEW_ID,
-      content: '/goal pause',
-    })).toEqual({
-      clientRequestId: 'request-goal',
-      clientMessageId: 'message-goal',
-      chatId: CHAT_ID,
-      transcriptViewId: TRANSCRIPT_VIEW_ID,
-      content: '/goal pause',
-    });
   });
 
   it('rejects malformed command identities and fork cutoffs', () => {

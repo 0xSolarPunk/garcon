@@ -56,6 +56,20 @@ describe('native session lookup contract', () => {
     }
   });
 
+  it('preserves the remote executor and treats null as Local without backfilling omission', () => {
+    const request = { nativeSessionId: 'session-123', agent: 'codex' };
+    const executorId = '22222222-2222-4222-8222-222222222222';
+    expect(parseNativeSessionLookupRequest(request)).toEqual(request);
+    expect(parseNativeSessionLookupRequest({ ...request, executorId })).toEqual({ ...request, executorId });
+    for (const value of ['local', null]) {
+      expect(parseNativeSessionLookupRequest({ ...request, executorId: value })).toEqual({ ...request, executorId: 'local' });
+    }
+    for (const value of ['', 'worker', 1, {}, []]) {
+      expect(() => parseNativeSessionLookupRequest({ ...request, executorId: value }))
+        .toThrow('executorId must be a valid executor ID');
+    }
+  });
+
   it('parses only responses with a valid Garcon chat ID', () => {
     expect(parseNativeSessionLookupResponse({ chatId: CHAT_ID })).toEqual({ chatId: CHAT_ID });
     for (const value of [null, [], {}, { chatId: '123' }, { chatId: 1783725900000200 }]) {

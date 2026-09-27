@@ -39,7 +39,9 @@ async function fixture(overrides: Record<string, unknown> = {}): Promise<{
   roots.push(configDir);
   const workspaceDir = path.join(configDir, 'workspace-review');
   await fs.mkdir(workspaceDir);
-  const descriptorPath = path.join(workspaceDir, SERVER_RUNTIME_FILENAME);
+  const directory = overrides.kind === 'executor-cli' ? path.join(configDir, 'executor') : configDir;
+  await fs.mkdir(directory, { recursive: true });
+  const descriptorPath = path.join(directory, SERVER_RUNTIME_FILENAME);
   const descriptor = {
     schemaVersion: SERVER_RUNTIME_SCHEMA_VERSION,
     instanceId: crypto.randomUUID(),
@@ -55,15 +57,35 @@ async function fixture(overrides: Record<string, unknown> = {}): Promise<{
 }
 
 describe('discoverRuntime', () => {
+  test('explicit gateway discovery separates endpoint and controller identities without a local workspace', async () => {
+    const testFixture = await fixture({ kind: 'executor-cli', workspaceDir: undefined });
+    const executorId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const options = { configDir: testFixture.configDir, runtime: 'executor' as const };
+    const fetch: typeof globalThis.fetch = async (input) => String(input).endsWith('/cli/context')
+      ? Response.json({ serverInstanceId: 'controller', defaultExecutorId: executorId, workspaceName: null })
+      : Response.json({ schemaVersion: 1, instanceId: testFixture.descriptor.instanceId,
+        proof: runtimeProof(String(testFixture.descriptor.localCapability), String(testFixture.descriptor.instanceId), input) });
+    expect(await discoverRuntime(options, { fetch })).toMatchObject({
+      instanceId: 'controller', endpointInstanceId: testFixture.descriptor.instanceId,
+      defaultExecutorId: executorId, workspaceName: null, workspaceDir: null,
+    });
+    await expect(discoverRuntime({ ...options, runtime: 'controller' }, { fetch })).rejects.toThrow('no controller runtime file');
+    if (process.platform !== 'win32') {
+      await fs.rename(testFixture.descriptorPath, `${testFixture.descriptorPath}.real`);
+      await fs.symlink(`${testFixture.descriptorPath}.real`, testFixture.descriptorPath);
+      await expect(discoverRuntime(options, { fetch })).rejects.toThrow('symbolic link');
+    }
+  });
   test('verifies the credential-free probe before returning the capability', async () => {
     const testFixture = await fixture();
     const authorizationHeaders: Array<string | null> = [];
     const connection = await discoverRuntime({
       configDir: testFixture.configDir,
-      workspace: 'review',
+      runtime: 'controller',
     }, {
       fetch: async (input, init) => {
         authorizationHeaders.push(new Headers(init?.headers).get('authorization'));
+        if (String(input).endsWith('/cli/context')) return Response.json({ serverInstanceId: testFixture.descriptor.instanceId, defaultExecutorId: 'local', workspaceName: 'review' });
         return Response.json({
           schemaVersion: SERVER_RUNTIME_SCHEMA_VERSION,
           instanceId: testFixture.descriptor.instanceId,
@@ -76,45 +98,40 @@ describe('discoverRuntime', () => {
       },
     });
 
-    expect(authorizationHeaders).toEqual([null]);
+    expect(authorizationHeaders).toEqual([null, `Bearer ${testFixture.descriptor.localCapability}`]);
     expect(connection).toEqual({
       baseUrl: 'http://127.0.0.1:8080',
       instanceId: testFixture.descriptor.instanceId,
+      endpointInstanceId: testFixture.descriptor.instanceId,
+      defaultExecutorId: 'local',
+      workspaceName: 'review',
       localCapability: testFixture.descriptor.localCapability,
       workspaceDir: testFixture.workspaceDir,
+      selector: { runtime: 'controller' },
     });
   });
 
-  test('re-reads the descriptor once when the runtime rotates', async () => {
+  test('a replacement during proof cannot change the selected endpoint snapshot', async () => {
     const testFixture = await fixture();
     const rotatedInstanceId = crypto.randomUUID();
     let probes = 0;
-    const connection = await discoverRuntime({
+    await expect(discoverRuntime({
       configDir: testFixture.configDir,
-      workspace: 'review',
+      runtime: 'controller',
     }, {
       fetch: async (input) => {
         probes += 1;
-        const capability = probes === 1
-          ? String(testFixture.descriptor.localCapability)
-          : String((JSON.parse(await fs.readFile(testFixture.descriptorPath, 'utf8')) as Record<string, unknown>).localCapability);
+        const capability = `${LOCAL_CAPABILITY_PREFIX}${crypto.randomBytes(32).toString('base64url')}`;
+        await fs.writeFile(testFixture.descriptorPath, JSON.stringify({ ...testFixture.descriptor,
+          instanceId: rotatedInstanceId, localCapability: capability }), { mode: 0o600 });
         return Response.json({
           schemaVersion: 1,
           instanceId: rotatedInstanceId,
           proof: runtimeProof(capability, rotatedInstanceId, input),
         });
       },
-      delay: async () => {
-        const rotated = {
-          ...testFixture.descriptor,
-          instanceId: rotatedInstanceId,
-          localCapability: `${LOCAL_CAPABILITY_PREFIX}${crypto.randomBytes(32).toString('base64url')}`,
-        };
-        await fs.writeFile(testFixture.descriptorPath, JSON.stringify(rotated), { mode: 0o600 });
-      },
-    });
-    expect(probes).toBe(2);
-    expect(connection.instanceId).toBe(rotatedInstanceId);
+    })).rejects.toThrow('does not match');
+    expect(probes).toBe(1);
   });
 
   test('rejects a replayed instance identity without a fresh capability proof', async () => {
@@ -124,7 +141,7 @@ describe('discoverRuntime', () => {
 
     await expect(discoverRuntime({
       configDir: testFixture.configDir,
-      workspace: 'review',
+      runtime: 'controller',
     }, {
       fetch: async (_input, init) => {
         authorization = new Headers(init?.headers).get('authorization');
@@ -134,7 +151,6 @@ describe('discoverRuntime', () => {
           proof: replayedProof,
         });
       },
-      delay: async () => undefined,
     })).rejects.toThrow('does not match');
 
     expect(authorization).toBeNull();
@@ -146,7 +162,7 @@ describe('discoverRuntime', () => {
 
     await expect(discoverRuntime({
       configDir: testFixture.configDir,
-      workspace: 'review',
+      runtime: 'controller',
       serverUrl: 'http://127.0.0.1:9090',
     }, {
       fetch: async () => {
@@ -164,8 +180,8 @@ describe('discoverRuntime', () => {
     await fs.chmod(testFixture.descriptorPath, 0o644);
     await expect(discoverRuntime({
       configDir: testFixture.configDir,
-      workspace: 'review',
-    }, { fetch: async () => Response.json({}) })).rejects.toThrow('secure runtime descriptor');
+      runtime: 'controller',
+    }, { fetch: async () => Response.json({}) })).rejects.toThrow('readable only by its owner');
   });
 
   test('reports an actionable upgrade diagnostic for an unsupported descriptor schema', async () => {
@@ -173,11 +189,11 @@ describe('discoverRuntime', () => {
 
     await expect(discoverRuntime({
       configDir: testFixture.configDir,
-      workspace: 'review',
+      runtime: 'controller',
     })).rejects.toThrow('upgrade Garcon and garcon-cli together');
   });
 
-  test('follows a named workspace symlink to a sibling workspace directory', async () => {
+  test('workspace location and name do not participate in runtime selection', async () => {
     if (process.platform === 'win32') return;
     const testFixture = await fixture();
     const targetWorkspaceDir = `${testFixture.workspaceDir}-target`;
@@ -188,16 +204,18 @@ describe('discoverRuntime', () => {
       workspaceDir: targetWorkspaceDir,
     };
     await fs.writeFile(
-      path.join(targetWorkspaceDir, SERVER_RUNTIME_FILENAME),
+      testFixture.descriptorPath,
       JSON.stringify(descriptor),
       { mode: 0o600 },
     );
 
     const connection = await discoverRuntime({
       configDir: testFixture.configDir,
-      workspace: 'review',
+      runtime: 'controller',
     }, {
-      fetch: async (input) => Response.json({
+      fetch: async (input) => String(input).endsWith('/cli/context')
+        ? Response.json({ serverInstanceId: descriptor.instanceId, defaultExecutorId: 'local', workspaceName: 'review-target' })
+        : Response.json({
         schemaVersion: SERVER_RUNTIME_SCHEMA_VERSION,
         instanceId: descriptor.instanceId,
         proof: runtimeProof(
@@ -209,17 +227,20 @@ describe('discoverRuntime', () => {
     });
 
     expect(connection.workspaceDir).toBe(targetWorkspaceDir);
+    expect(connection.workspaceName).toBe('review-target');
   });
 
-  test('rejects a workspace symlink that escapes the config directory', async () => {
+  test('supports config directory aliases without scanning workspace directories', async () => {
     if (process.platform === 'win32') return;
-    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-cli-config-'));
-    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-cli-outside-'));
-    roots.push(configDir, outside);
-    await fs.symlink(outside, path.join(configDir, 'workspace-review'));
-    await expect(discoverRuntime({ configDir, workspace: 'review' })).rejects.toThrow(
-      'named workspace "review" is unavailable',
-    );
+    const f = await fixture();
+    const alias = `${f.configDir}-alias`;
+    roots.push(alias);
+    await fs.symlink(f.configDir, alias, 'dir');
+    const fetch: typeof globalThis.fetch = async (input) => String(input).endsWith('/cli/context')
+      ? Response.json({ serverInstanceId: f.descriptor.instanceId, defaultExecutorId: 'local', workspaceName: 'review' })
+      : Response.json({ schemaVersion: 1, instanceId: f.descriptor.instanceId,
+        proof: runtimeProof(String(f.descriptor.localCapability), String(f.descriptor.instanceId), input) });
+    expect((await discoverRuntime({ configDir: alias }, { fetch })).instanceId).toBe(f.descriptor.instanceId);
   });
 });
 

@@ -2,6 +2,8 @@
 // Replaces string-keyed getContext/setContext with compile-time-safe accessors.
 
 import { createContext } from 'svelte';
+import type { ApiProvidersStore } from '$lib/api-providers/api-providers-store.svelte.js';
+import type { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
 import type { AuthStore } from '$lib/stores/auth.svelte';
 import type { TicketSourceNavigationController } from '$lib/tickets/navigation/ticket-source-navigation-controller.js';
 import type { LocalSettingsStore } from '$lib/stores/local-settings.svelte';
@@ -25,7 +27,7 @@ import type { SidebarSearchStore } from '$lib/sidebar/search/sidebar-search-stor
 import type { SidebarProjectCollapseStore } from '$lib/sidebar/projects/sidebar-project-collapse.svelte.js';
 import type { AppTitleStore } from '$lib/stores/app-title.svelte';
 import type { MinuteClockStore } from '$lib/stores/minute-clock.svelte';
-import type { GhCapabilityContext } from '$lib/stores/gh-capability.svelte';
+import type { GhCapabilityContext } from '$lib/git/pull-requests/gh-capability.svelte';
 import type { ScheduledPromptsStore } from '$lib/scheduling/scheduled-prompts-store.svelte';
 import type { PreamblesStore } from '$lib/preambles/preambles-store.svelte';
 import type { ChatPreambleSelectionInvalidationHub } from '$lib/preambles/chat-selection-invalidation-hub.js';
@@ -67,6 +69,8 @@ export const [getChatProcessingReconciler, setChatProcessingReconciler] =
 export const [getFileSessions, setFileSessions] = createContext<FileSessionRegistry>();
 export const [getReadReceiptOutbox, setReadReceiptOutbox] = createContext<ReadReceiptOutboxStore>();
 export const [getModelCatalog, setModelCatalog] = createContext<ModelCatalogStore>();
+export const [getExecutors, setExecutors, hasExecutors] = createContext<ExecutorsStore>();
+export const [getApiProviders, setApiProviders] = createContext<ApiProvidersStore>();
 export const [getNotifications, setNotifications] = createContext<NotificationsStore>();
 export const [getSidebarSearch, setSidebarSearch] = createContext<SidebarSearchStore>();
 export const [getGhCapability, setGhCapability] = createContext<GhCapabilityContext>();

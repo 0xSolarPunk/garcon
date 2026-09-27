@@ -41,7 +41,13 @@ export interface JsonlNativeForkingOptions {
 export function createJsonlNativeForking(options: JsonlNativeForkingOptions): AgentNativeFork {
   return {
     async fork(request) {
-      request.admission.signal.throwIfAborted();
+      request.signal.throwIfAborted();
+      const nativeSession = await options.nativeEvidence.resolveNativeSession({
+        chat: request.source,
+        signal: request.signal,
+      });
+      request.signal.throwIfAborted();
+      request = { ...request, source: { ...request.source, nativeSession } };
       if (!request.providerMeta && options.forkWholeSession) {
         const result = await options.forkWholeSession(request);
         if (result) return { kind: 'materialized', session: result };
@@ -61,8 +67,7 @@ async function forkJsonlAtProviderPoint(
   options: JsonlNativeForkingOptions,
   request: AgentNativeForkRequest,
 ): Promise<AgentNativeForkOutcome> {
-  const resolvedReference = await resolveSourceReference(options, request);
-  const sourceNative = options.nativeSessions.decode(resolvedReference);
+  const sourceNative = options.nativeSessions.decode(request.source.nativeSession);
   const sourceAgentSessionId = request.source.agentSessionId ?? sourceNative.agentSessionId;
   const sourcePath = sourceNative.path;
   if (!sourceAgentSessionId || !sourcePath) {
@@ -116,7 +121,7 @@ async function forkJsonlAtProviderPoint(
           nativeSeedReceipt: null,
           settings: request.settings,
         },
-        signal: request.admission.signal,
+        signal: request.signal,
       });
       forkedMessages = forked.messages;
       if (
@@ -152,12 +157,16 @@ async function resolveProviderPoint(
   if (!expected) throw missingNativePoint();
   const native = await options.nativeEvidence.load({
     chat: request.source,
-    signal: request.admission.signal,
+    signal: request.signal,
   }).catch((error) => {
     // A source file the provider has not written yet holds no native
     // positions; the typed source-level refusal keeps the retry and
     // handoff-consent flow instead of surfacing a raw filesystem error.
-    if (hasNodeErrorCode(error, 'ENOENT')) throw missingNativeSource();
+    if (hasNodeErrorCode(error, 'ENOENT') || (
+      error instanceof AgentIntegrationError
+      && error.code === 'TRANSCRIPT_UNAVAILABLE'
+      && error.details?.reason === 'source-missing'
+    )) throw missingNativeSource();
     throw error;
   });
   for (const message of native.messages) {
@@ -185,18 +194,6 @@ function matchesProviderMeta(
     if (source[key] !== value) return false;
   }
   return compared;
-}
-
-async function resolveSourceReference(
-  options: JsonlNativeForkingOptions,
-  request: AgentNativeForkRequest,
-) {
-  const current = options.nativeSessions.decode(request.source.nativeSession);
-  if (current.path) return request.source.nativeSession;
-  return options.nativeEvidence.resolveNativeSession({
-    chat: request.source,
-    signal: request.admission.signal,
-  });
 }
 
 function positiveSafeInteger(value: unknown): number | null {

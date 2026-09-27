@@ -1,4 +1,5 @@
 import { SvelteMap } from 'svelte/reactivity';
+import { effectiveExecutorId } from '$shared/executors';
 import {
 	projectTargetKey,
 	type ProjectResolution,
@@ -6,6 +7,7 @@ import {
 } from '$shared/project-resolution';
 import { ApiError } from '$lib/api/client.js';
 import { resolveProject } from '$lib/api/project-resolution.js';
+import type { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
 
 export type ProjectResolutionSnapshot =
 	| { readonly kind: 'unchecked' }
@@ -33,6 +35,7 @@ interface PendingResolution {
 }
 
 interface ChatBinding {
+	executorId: string;
 	projectPath: string;
 	revision: number;
 }
@@ -50,7 +53,7 @@ class ProjectResolutionRecord {
 	) {}
 
 	resolve(): Promise<void> {
-		if (this.#disposed) return Promise.resolve();
+		if (this.#disposed || !this.isRetained()) return Promise.resolve();
 		if (this.#request) return this.#request.waiter;
 		const controller = new AbortController();
 		if (this.snapshot.kind === 'unchecked') this.snapshot = { kind: 'resolving' };
@@ -128,17 +131,24 @@ export class ProjectResolutionStore {
 		private readonly onBindingChanged: (
 			target: Extract<ProjectTarget, { kind: 'chat' }>,
 		) => void = () => undefined,
+		private readonly executors?: Pick<ExecutorsStore, 'pathContextKey' | 'isReady'>,
 	) {}
 
 	retain(target: ProjectTarget): ProjectResolutionLease {
 		if (this.#destroyed) throw new Error('Project resolution store has been destroyed');
-		const key = projectTargetKey(target);
+		const key = this.#targetKey(target);
+		const contextMatches = () => this.#targetKey(target) === key;
 		let retained = this.#records.get(key);
 		if (!retained) {
 			const record = new ProjectResolutionRecord(
 				target,
-				this.fetchResolution,
-				(): boolean => this.#records.get(key)?.record === record,
+				(requested, signal) => {
+					if (this.executors && !this.executors.isReady(requested.executorId)) {
+						throw new ApiError(503, 'Executor is unavailable', 'EXECUTOR_UNAVAILABLE');
+					}
+					return this.fetchResolution(requested, signal);
+				},
+				(): boolean => this.#records.get(key)?.record === record && contextMatches(),
 				this.onBindingChanged,
 			);
 			retained = { record, references: 0 };
@@ -150,7 +160,7 @@ export class ProjectResolutionStore {
 		return {
 			target: record.target,
 			get snapshot() {
-				return record.snapshot;
+				return contextMatches() ? record.snapshot : { kind: 'unchecked' as const };
 			},
 			resolve: () =>
 				released
@@ -174,19 +184,27 @@ export class ProjectResolutionStore {
 	}
 
 	snapshotFor(target: ProjectTarget): ProjectResolutionSnapshot {
-		return this.#records.get(projectTargetKey(target))?.record.snapshot ?? { kind: 'unchecked' };
+		return this.#records.get(this.#targetKey(target))?.record.snapshot ?? { kind: 'unchecked' };
 	}
 
 	lifecycleKey(target: ProjectTarget): string {
-		const key = projectTargetKey(target);
+		const key = this.#targetKey(target);
 		if (target.kind === 'path') return key;
 		return `${key}\u0000${this.#chatBindings.get(target.chatId)?.revision ?? 0}`;
 	}
 
-	markObsoleteChatTargets(chatId: string, currentProjectPath: string): void {
+	#targetKey(target: ProjectTarget): string {
+		const key = projectTargetKey(target);
+		const context = this.executors?.pathContextKey(target.executorId);
+		return context ? JSON.stringify([key, context]) : key;
+	}
+
+	markObsoleteChatTargets(chatId: string, currentProjectPath: string, currentExecutorId?: string | null): void {
+		const executorId = effectiveExecutorId(currentExecutorId);
 		const binding = this.#chatBindings.get(chatId);
-		if (binding?.projectPath === currentProjectPath) return;
+		if (binding?.projectPath === currentProjectPath && binding.executorId === executorId) return;
 		this.#chatBindings.set(chatId, {
+			executorId,
 			projectPath: currentProjectPath,
 			revision: (binding?.revision ?? 0) + 1,
 		});
@@ -195,7 +213,7 @@ export class ProjectResolutionStore {
 			if (
 				target.kind !== 'chat' ||
 				target.chatId !== chatId ||
-				target.projectPath === currentProjectPath
+				(target.projectPath === currentProjectPath && effectiveExecutorId(target.executorId) === executorId)
 			)
 				continue;
 			retained.record.dispose();

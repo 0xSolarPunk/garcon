@@ -1,4 +1,6 @@
 import type { FileRevision } from '$shared/file-contracts';
+import { effectiveExecutorId, parseExecutorId } from '$shared/executors';
+import { fileIdentityKey } from '$lib/files/documents/file-identity.js';
 import {
 	FILE_RECENT_LIMIT,
 	navigationKey,
@@ -9,6 +11,7 @@ export const FILE_NAVIGATION_LIMIT = 200;
 export const FILE_NAVIGATION_BYTE_LIMIT = 256 * 1024;
 
 export interface FileLocation {
+	executorId?: string | null;
 	key: string;
 	canonicalFileRootPath: string;
 	normalizedRelativePath: string;
@@ -44,11 +47,18 @@ export class FileNavigationStore {
 			this.repository.getRecents(this.scope.userNamespace, this.scope.deploymentId),
 			this.repository.getNavigation(this.scope.userNamespace, this.scope.deploymentId),
 		]);
-		this.recents = records
+		const recents = new Map<string, FileLocation>();
+		for (const record of records
 			.filter(isValidRecentRecord)
-			.sort((a, b) => b.timestamp - a.timestamp)
-			.slice(0, FILE_RECENT_LIMIT)
-			.map(toLocation);
+			.sort((a, b) => b.timestamp - a.timestamp)) {
+			const location = toLocation(record);
+			if (!recents.has(location.key)) recents.set(location.key, location);
+		}
+		this.recents = pruneLocations(
+			[...recents.values()],
+			FILE_RECENT_LIMIT,
+			FILE_NAVIGATION_BYTE_LIMIT,
+		);
 		if (history?.schemaVersion === 1) {
 			this.#history = pruneLocations(
 				history.entries.filter(isValidRecentRecord).map(toLocation),
@@ -164,6 +174,7 @@ function pruneNewestLocations(
 
 function isValidRecentRecord(record: FileRecentLocationV1): boolean {
 	return (
+		Boolean(parseExecutorId(record.executorId)) &&
 		record.schemaVersion === 1 &&
 		typeof record.key === 'string' &&
 		typeof record.canonicalFileRootPath === 'string' &&
@@ -178,5 +189,10 @@ function toLocation(record: FileRecentLocationV1): FileLocation {
 		userNamespace: _userNamespace,
 		...location
 	} = record;
-	return location;
+	const executorId = effectiveExecutorId(record.executorId);
+	return {
+		...location,
+		executorId,
+		key: fileIdentityKey(record.canonicalFileRootPath, record.normalizedRelativePath, executorId),
+	};
 }

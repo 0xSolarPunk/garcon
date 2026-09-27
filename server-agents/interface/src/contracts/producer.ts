@@ -3,6 +3,12 @@ import type { ChatMessage, ToolUseChatMessage } from '@garcon/common/chat-types'
 import type { JsonObject } from '@garcon/common/json';
 import type { NativeSeedReceipt } from '@garcon/common/transcript-seed';
 import type { AgentNativeSessionRef } from './transcript.js';
+import type {
+  AgentPermissionResponseRef,
+  AgentProducerBinding,
+  AgentResourceScope,
+  ExecutorCallOptions,
+} from './resources.js';
 
 export interface AgentProducedRow {
   readonly message: ChatMessage;
@@ -49,7 +55,7 @@ export type AgentProviderPermissionLifecycle = Exclude<
 
 export interface AgentPermissionResponseCapability {
   readonly permissionOccurrenceId: string;
-  respond(decision: PermissionDecisionPayload): Promise<void>;
+  readonly response: AgentPermissionResponseRef;
 }
 
 type AgentPermissionRequestedEvent = {
@@ -117,4 +123,33 @@ export type AgentProducerEvent =
 
 export interface AgentProducerSink {
   publish(event: AgentProducerEvent): void;
+}
+
+export interface AgentProducerNotification {
+  readonly binding: AgentProducerBinding;
+  readonly event: AgentProducerEvent
+    | { readonly type: 'started'; readonly runId: string }
+    | { readonly type: 'publication-failed'; readonly error: AgentRunFailureDetail };
+}
+
+export interface AgentProducers {
+  readonly scope: AgentResourceScope;
+  bind(request: {
+    readonly binding: AgentProducerBinding;
+    readonly chatId: string;
+  }, options?: ExecutorCallOptions): Promise<void>;
+  // Closes the binding and best-effort aborts active work, never a completed operation.
+  // A start still pending at closure rejects with STALE_RESOURCE.
+  close(binding: AgentProducerBinding, options?: ExecutorCallOptions): Promise<void>;
+  // Drops publication and denies permissions without aborting native work.
+  detach(binding: AgentProducerBinding): void;
+  // Listeners are process-local; remote adapters dispatch the fixed event channel here.
+  subscribe(listener: (notification: AgentProducerNotification) => void): () => void;
+}
+
+export interface AgentPermissions {
+  respond(request: {
+    readonly response: AgentPermissionResponseRef;
+    readonly decision: PermissionDecisionPayload;
+  }, options?: ExecutorCallOptions): Promise<void>;
 }

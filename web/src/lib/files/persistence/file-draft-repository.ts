@@ -1,4 +1,5 @@
 import type { FileRevision } from '$shared/file-contracts';
+import { effectiveExecutorId, parseExecutorId } from '$shared/executors';
 import * as m from '$lib/paraglide/messages.js';
 import { indexedDbRequest, indexedDbTransactionCompletion } from '$lib/utils/indexed-db.js';
 
@@ -13,6 +14,7 @@ export const FILE_DRAFT_LIMIT = 20;
 export const FILE_RECENT_LIMIT = 100;
 
 export interface FileDraft {
+	executorId?: string | null;
 	schemaVersion: 1;
 	deploymentId: string;
 	userNamespace: string;
@@ -24,6 +26,7 @@ export interface FileDraft {
 }
 
 export interface FileRecentLocationV1 {
+	executorId?: string | null;
 	schemaVersion: 1;
 	deploymentId: string;
 	userNamespace: string;
@@ -318,7 +321,16 @@ export function fileDraftKey(
 	deploymentId: string,
 	canonicalFileRootPath: string,
 	normalizedRelativePath: string,
+	executorId?: string | null,
 ): string {
+	if (effectiveExecutorId(executorId) !== 'local')
+		return scopedRecordKey(
+			userNamespace,
+			deploymentId,
+			effectiveExecutorId(executorId),
+			canonicalFileRootPath,
+			normalizedRelativePath,
+		);
 	return scopedRecordKey(
 		userNamespace,
 		deploymentId,
@@ -335,6 +347,7 @@ function latestDrafts(
 	const latest = new Map<string, FileDraft>();
 	for (const record of [...records].sort((a, b) => b.savedAt - a.savedAt)) {
 		if (
+			!parseExecutorId(record.executorId) ||
 			record.schemaVersion !== 1 ||
 			record.userNamespace !== userNamespace ||
 			record.deploymentId !== deploymentId
@@ -345,6 +358,7 @@ function latestDrafts(
 			deploymentId,
 			record.canonicalFileRootPath,
 			record.normalizedRelativePath,
+			record.executorId,
 		);
 		if (!latest.has(key)) latest.set(key, record);
 	}
@@ -360,7 +374,8 @@ function draftEvictions(record: FileDraft, records: readonly FileDraft[]): strin
 		if (entry.userNamespace !== record.userNamespace || entry.deploymentId !== record.deploymentId)
 			continue;
 		if (
-			(entry.canonicalFileRootPath === record.canonicalFileRootPath &&
+			(effectiveExecutorId(entry.executorId) === effectiveExecutorId(record.executorId) &&
+				entry.canonicalFileRootPath === record.canonicalFileRootPath &&
 				entry.normalizedRelativePath === record.normalizedRelativePath) ||
 			count >= FILE_DRAFT_LIMIT ||
 			bytes + entry.content.length * 2 > FILE_DRAFT_TOTAL_LIMIT_BYTES

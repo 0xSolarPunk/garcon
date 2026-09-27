@@ -1,9 +1,11 @@
 import { parseChatId } from './chat-id.js';
 import { isRecord } from './json.js';
+import type { ExecutorPath } from './executor-path.js';
+import { effectiveExecutorId, isExecutorId } from './executors.js';
 
 export type ProjectTarget =
-  | { readonly kind: 'chat'; readonly chatId: string; readonly projectPath: string }
-  | { readonly kind: 'path'; readonly projectPath: string };
+  | { readonly kind: 'chat'; readonly chatId: string; readonly executorId?: string | null; readonly projectPath: string }
+  | { readonly kind: 'path'; readonly executorId?: string | null; readonly projectPath: string };
 
 export const PROJECT_UNAVAILABLE_REASONS = [
   'not-found',
@@ -15,8 +17,14 @@ export const PROJECT_UNAVAILABLE_REASONS = [
 export type ProjectUnavailableReason = (typeof PROJECT_UNAVAILABLE_REASONS)[number];
 
 export type ProjectResolution =
-  | { readonly kind: 'available'; readonly effectiveProjectKey: string }
+  | { readonly kind: 'available'; readonly effectiveProjectKey: ExecutorPath }
   | { readonly kind: 'unavailable'; readonly reason: ProjectUnavailableReason };
+
+export type ProjectInspector = (
+  projectPath: ExecutorPath,
+  executorId?: string | null,
+  options?: { readonly signal?: AbortSignal },
+) => Promise<ProjectResolution>;
 
 export interface ProjectResolutionResponse {
   readonly target: ProjectTarget;
@@ -25,8 +33,8 @@ export interface ProjectResolutionResponse {
 
 export function projectTargetKey(target: ProjectTarget): string {
   return target.kind === 'chat'
-    ? JSON.stringify(['chat', target.chatId, target.projectPath])
-    : JSON.stringify(['path', target.projectPath]);
+    ? JSON.stringify(['chat', target.chatId, effectiveExecutorId(target.executorId), target.projectPath])
+    : JSON.stringify(['path', effectiveExecutorId(target.executorId), target.projectPath]);
 }
 
 export function isProjectUnavailableReason(value: unknown): value is ProjectUnavailableReason {
@@ -45,12 +53,16 @@ function parseProjectTarget(value: unknown): ProjectTarget | null {
   if (!isRecord(value) || typeof value.projectPath !== 'string' || !value.projectPath.trim()) {
     return null;
   }
-  if (value.kind === 'path' && hasExactKeys(value, ['kind', 'projectPath'])) {
-    return { kind: 'path', projectPath: value.projectPath };
+  const executorId = value.executorId;
+  if (executorId != null && !isExecutorId(executorId)) return null;
+  const executorKeys = Object.hasOwn(value, 'executorId') ? ['executorId'] : [];
+  const executor = executorId === undefined ? {} : { executorId };
+  if (value.kind === 'path' && hasExactKeys(value, ['kind', 'projectPath', ...executorKeys])) {
+    return { kind: 'path', ...executor, projectPath: value.projectPath };
   }
-  if (value.kind !== 'chat' || !hasExactKeys(value, ['kind', 'chatId', 'projectPath'])) return null;
+  if (value.kind !== 'chat' || !hasExactKeys(value, ['kind', 'chatId', 'projectPath', ...executorKeys])) return null;
   try {
-    return { kind: 'chat', chatId: parseChatId(value.chatId), projectPath: value.projectPath };
+    return { kind: 'chat', chatId: parseChatId(value.chatId), ...executor, projectPath: value.projectPath };
   } catch {
     return null;
   }

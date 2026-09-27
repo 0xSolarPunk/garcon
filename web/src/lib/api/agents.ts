@@ -1,6 +1,7 @@
 // Agent HTTP client. Agents own runtime auth, readiness, and catalog state.
 
 import { apiGet, apiPost } from './client.js';
+import { effectiveExecutorId } from '$shared/executors';
 import type { AgentCatalog, AgentId } from '$shared/agents';
 import type {
 	AgentAuthLoginCompleteResult,
@@ -30,32 +31,34 @@ export type DeviceAuthInfo = AgentDeviceAuthInfo;
 export type AgentAuthLoginResult = AgentAuthLoginLaunchResult;
 export type { AgentAuthLoginStatus };
 
-export async function getAgentAuthStatus(agent: AgentName): Promise<AgentAuthStatus> {
+export async function getAgentAuthStatus(agent: AgentName, executorId?: string): Promise<AgentAuthStatus> {
 	const result = await apiGet<Record<string, AgentAuthStatus>>(
-		`/api/v1/agents/auth?agent=${encodeURIComponent(agent)}`,
+		`/api/v1/agents/auth?agent=${encodeURIComponent(agent)}&executorId=${encodeURIComponent(effectiveExecutorId(executorId))}`,
 	);
 	return result[agent];
 }
 
-export async function getAgentReadiness(): Promise<Record<string, AgentReadiness>> {
-	return apiGet<Record<string, AgentReadiness>>('/api/v1/agents/readiness');
+export async function getAgentReadiness(executorId?: string): Promise<Record<string, AgentReadiness>> {
+	return apiGet<Record<string, AgentReadiness>>(`/api/v1/agents/readiness?executorId=${encodeURIComponent(effectiveExecutorId(executorId))}`);
 }
 
-export async function getAgentCatalog(): Promise<AgentCatalog> {
-	return apiGet<AgentCatalog>('/api/v1/agents');
+export async function getAgentCatalog(executorId?: string): Promise<AgentCatalog> {
+	return apiGet<AgentCatalog>(`/api/v1/agents?executorId=${encodeURIComponent(effectiveExecutorId(executorId))}`);
 }
 
-export async function launchAgentAuthLogin(agent: AgentName): Promise<AgentAuthLoginResult> {
-	return apiPost<AgentAuthLoginResult>('/api/v1/agents/auth/login', { agentId: agent });
+export async function launchAgentAuthLogin(agent: AgentName, executorId?: string): Promise<AgentAuthLoginResult> {
+	return apiPost<AgentAuthLoginResult>('/api/v1/agents/auth/login', { agentId: agent, executorId: effectiveExecutorId(executorId) });
 }
 
 export async function completeAgentAuthLogin(
 	agent: AgentName,
 	sessionId: string,
 	code: string,
+	executorId?: string,
 ): Promise<AgentAuthLoginCompleteResult> {
 	return apiPost<AgentAuthLoginCompleteResult>('/api/v1/agents/auth/login/complete', {
 		agentId: agent,
+		executorId: effectiveExecutorId(executorId),
 		sessionId,
 		code,
 	});
@@ -64,9 +67,10 @@ export async function completeAgentAuthLogin(
 export async function getAgentAuthLoginStatus(
 	agent: AgentName,
 	expectedSessionId?: string,
+	executorId?: string,
 ): Promise<AgentAuthLoginStatus> {
 	const sessionQuery = expectedSessionId ? `&session=${encodeURIComponent(expectedSessionId)}` : '';
 	return apiGet<AgentAuthLoginStatus>(
-		`/api/v1/agents/auth/login?agent=${encodeURIComponent(agent)}${sessionQuery}`,
+		`/api/v1/agents/auth/login?agent=${encodeURIComponent(agent)}&executorId=${encodeURIComponent(effectiveExecutorId(executorId))}${sessionQuery}`,
 	);
 }

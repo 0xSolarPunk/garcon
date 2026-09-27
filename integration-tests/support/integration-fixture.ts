@@ -1,5 +1,4 @@
 import {
-  appendFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -27,8 +26,9 @@ import {
   type DirectTestAgents,
 } from './garcon-client.js';
 import { GarconProcess } from './garcon-process.js';
+import { ExecutionBackendFixture, executionBackend, type ExecutionBackend } from './execution-backend.js';
 
-const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const ARTIFACT_ROOT = join(REPO_ROOT, 'integration-tests', 'artifacts', 'server');
 let chatIdSequence = 0;
 
@@ -52,10 +52,15 @@ export interface IntegrationDirectories {
 }
 
 export interface IntegrationFixtureOptions {
+  executionBackend?: ExecutionBackend;
+  interceptExecutorConnection?: (url: URL) => Promise<string>;
+  projectRoots?: 'shared' | 'separate';
+  sharedConfigRoot?: boolean;
   chatTitleEnabled?: boolean;
   chatTitleAgent?: keyof DirectTestAgents;
   forbiddenPersistedValues?: readonly string[];
   prepareWorkspace?: (directories: IntegrationDirectories) => Promise<void>;
+  prepareControllerWorkspace?: (directories: IntegrationDirectories) => Promise<void>;
   // Runs after the final Garcon child exits and before the fixture root can be removed;
   // the only reliable place to inspect provider grandchildren. Hook failures join the
   // fixture's cleanup errors and preserve its artifact root.
@@ -130,6 +135,8 @@ interface IntegrationProcessRunDiagnostics {
 export interface IntegrationDiagnostics {
   directories: IntegrationDirectories;
   processRuns: readonly IntegrationProcessRunDiagnostics[];
+  executionBackend: ExecutionBackend;
+  workerLogs: readonly string[];
   providers: {
     openAi: {
       requests: ReturnType<FakeOpenAiServer['requests']>;
@@ -179,6 +186,8 @@ function redactedFailure(error: unknown, artifact: string | null, diagnostics: s
 
 export class IntegrationFixture {
   readonly dirs: IntegrationDirectories;
+  readonly executionDirs: IntegrationDirectories;
+  readonly #backend: ExecutionBackendFixture;
   readonly fakeProviders: {
     openAi: FakeOpenAiServer;
     openAiResponses: FakeOpenAiResponsesServer;
@@ -199,6 +208,8 @@ export class IntegrationFixture {
 
   private constructor(input: {
     dirs: IntegrationDirectories;
+    executionDirs: IntegrationDirectories;
+    backend: ExecutionBackendFixture;
     fakeProviders: IntegrationFixture['fakeProviders'];
     garcon: GarconProcess;
     client: GarconTestClient;
@@ -211,6 +222,8 @@ export class IntegrationFixture {
     extraDiagnostics?: (directories: IntegrationDirectories) => Record<string, unknown>;
   }) {
     this.dirs = input.dirs;
+    this.executionDirs = input.executionDirs;
+    this.#backend = input.backend;
     this.fakeProviders = input.fakeProviders;
     this.garcon = input.garcon;
     this.client = input.client;
@@ -237,6 +250,16 @@ export class IntegrationFixture {
       home: join(root, 'home'),
     };
     await Promise.all(Object.values(dirs).map((directory) => mkdir(directory, { recursive: true })));
+    const backendKind = options.executionBackend ?? executionBackend();
+    const workerConfigDir = options.sharedConfigRoot ? configDir : join(root, 'worker-config');
+    const executionDirs: IntegrationDirectories = backendKind === 'in-process' ? dirs : {
+      ...dirs,
+      project: options.projectRoots === 'separate' ? join(root, 'worker-project') : dirs.project,
+      config: workerConfigDir,
+      workspace: join(workerConfigDir, 'executor'),
+      home: join(root, 'worker-home'),
+    };
+    await Promise.all(Object.values(executionDirs).map((directory) => mkdir(directory, { recursive: true })));
 
     const fakeProviders = {
       openAi: FakeOpenAiServer.start(),
@@ -245,17 +268,20 @@ export class IntegrationFixture {
     };
     let garcon: GarconProcess | null = null;
     let client: GarconTestClient | null = null;
+    let backend: ExecutionBackendFixture | null = null;
     try {
       // The resolver runs before prepareWorkspace so preparation can depend on derived paths;
       // the static record is spread afterwards because legacy tests mutate it during
       // preparation. Resolver values still win on conflicts.
-      const resolvedEnvironment = options.resolveServerEnvironment?.(dirs) ?? {};
-      await options.prepareWorkspace?.(dirs);
+      const resolvedEnvironment = options.resolveServerEnvironment?.(executionDirs) ?? {};
+      await options.prepareControllerWorkspace?.(dirs);
+      await options.prepareWorkspace?.(executionDirs);
       const serverEnvironment = {
         ...(options.serverEnvironment ?? {}),
         ...resolvedEnvironment,
       };
-      garcon = await GarconProcess.start({
+      backend = new ExecutionBackendFixture(backendKind, executionDirs, serverEnvironment, options.interceptExecutorConnection);
+      garcon = await backend.start({
         repoRoot: REPO_ROOT,
         configDir: dirs.config,
         workspaceDir: dirs.workspace,
@@ -266,6 +292,8 @@ export class IntegrationFixture {
         redactEnvironmentValues: options.redactSensitiveDiagnostics,
       });
       client = await GarconTestClient.connect(garcon.baseUrl, {
+        authToken: garcon.authToken,
+        executorId: backend.executorId,
         redactSensitiveDiagnostics: options.redactSensitiveDiagnostics,
       });
       await client.ping();
@@ -293,6 +321,7 @@ export class IntegrationFixture {
       await client.updateSettings({
         ui: {
           chatTitle: options.chatTitleEnabled || hasExplicitTitleAgent ? {
+            executorId: backend.executorId,
             enabled: options.chatTitleEnabled === true,
             agentId: titleAgent.agentId,
             model: titleAgent.provider.model,
@@ -305,6 +334,8 @@ export class IntegrationFixture {
       });
       return new IntegrationFixture({
         dirs,
+        executionDirs,
+        backend,
         fakeProviders,
         garcon,
         client,
@@ -313,16 +344,17 @@ export class IntegrationFixture {
         redactSensitiveDiagnostics: options.redactSensitiveDiagnostics,
         serverEnvironment,
         workspaceName: options.namedWorkspace,
-        afterGarconStop: options.afterGarconStop,
-        extraDiagnostics: options.extraDiagnostics,
+        afterGarconStop: options.afterGarconStop ? () => options.afterGarconStop!(executionDirs) : undefined,
+        extraDiagnostics: options.extraDiagnostics ? () => options.extraDiagnostics!(executionDirs) : undefined,
       });
     } catch (error) {
       await client?.close().catch(() => undefined);
       await garcon?.stop().catch(() => undefined);
+      await backend?.stop().catch(() => undefined);
       fakeProviders.openAi.stop();
       fakeProviders.openAiResponses.stop();
       fakeProviders.anthropic.stop();
-      const cleanupError = await options.afterGarconStop?.(dirs).then(
+      const cleanupError = await options.afterGarconStop?.(executionDirs).then(
         () => null,
         (hookError: unknown) => hookError,
       ) ?? null;
@@ -339,6 +371,12 @@ export class IntegrationFixture {
     return String(Date.now() * 1_000 + chatIdSequence);
   }
 
+  get executionProcessIds(): ReadonlySet<number> { return this.#backend.executionProcessIds; }
+
+  get executionLogs(): readonly string[] {
+    return this.#backend.backend === 'in-process' ? this.garcon.logs : this.#backend.logs;
+  }
+
   async connectObserver(name: string): Promise<GarconTestClient> {
     const normalizedName = name.trim();
     if (!normalizedName || normalizedName === 'primary') {
@@ -348,6 +386,8 @@ export class IntegrationFixture {
       throw new Error(`Integration client already exists: ${normalizedName}`);
     }
     const observer = await GarconTestClient.connect(this.garcon.baseUrl, {
+      authToken: this.garcon.authToken,
+      executorId: this.#backend.executorId,
       redactSensitiveDiagnostics: this.#redactSensitiveDiagnostics,
     });
     try {
@@ -363,6 +403,7 @@ export class IntegrationFixture {
   async restartGarcon(options: { beforeStart?: () => Promise<void> } = {}): Promise<void> {
     await this.#closeClients();
     await this.garcon.stop();
+    await this.#backend.stop();
     this.#archiveCurrentRun();
     this.#clients.clear();
     await options.beforeStart?.();
@@ -372,60 +413,24 @@ export class IntegrationFixture {
   async crashAndRestartGarcon(options: {
     reusePort?: boolean;
     beforeStart?: () => Promise<void>;
+    preserveExecutorWorker?: boolean;
   } = {}): Promise<void> {
     const previousPort = Number(new URL(this.garcon.baseUrl).port);
     await this.#closeClients();
     await this.garcon.crash();
+    if (!options.preserveExecutorWorker) await this.#backend.stop();
     const expiredAt = new Date(Date.now() - 60_000);
-    await utimes(
-      join(this.dirs.workspace, '.garcon-workspace.lock'),
-      expiredAt,
-      expiredAt,
-    );
+    for (const directory of new Set([this.dirs.config, this.dirs.workspace])) {
+      await utimes(join(directory, '.garcon-workspace.lock'), expiredAt, expiredAt);
+    }
     this.#archiveCurrentRun();
     this.#clients.clear();
     await options.beforeStart?.();
     await this.#startReplacementGarcon(options.reusePort ? previousPort : undefined);
   }
 
-  async crashAndRestartBeforeNativeUserPersistence(input: {
-    chatId: string;
-    clientRequestId: string;
-    afterCrash?: () => Promise<void>;
-  }): Promise<void> {
-    await this.client.close();
-    await this.garcon.crash();
-    const expiredAt = new Date(Date.now() - 60_000);
-    await utimes(
-      join(this.dirs.workspace, '.garcon-workspace.lock'),
-      expiredAt,
-      expiredAt,
-    );
-    await this.#removeFinalNativeUserRow(input);
-    await input.afterCrash?.();
-    this.#archiveCurrentRun();
-    await this.#startReplacementGarcon();
-  }
-
-  async appendDirectOpenAiNativeMessage(input: {
-    chatId: string;
-    role: 'user' | 'assistant';
-    content: string;
-    clientRequestId?: string;
-    turnId?: string;
-  }): Promise<void> {
-    const nativePath = await this.directOpenAiNativePath(input.chatId);
-    const raw = await readFile(nativePath, 'utf8');
-    if (raw.length > 0 && !raw.endsWith('\n')) {
-      throw new Error('Direct native transcript has an incomplete tail.');
-    }
-    await appendFile(nativePath, `${JSON.stringify({
-      role: input.role,
-      content: input.content,
-      timestamp: new Date().toISOString(),
-      ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}),
-      ...(input.turnId ? { turnId: input.turnId } : {}),
-    })}\n`, 'utf8');
+  async crashAndRestartExecutorWorker(projectBasePath?: string): Promise<void> {
+    await this.#backend.crashAndRestartWorker(projectBasePath);
   }
 
   async directOpenAiNativePath(chatId: string): Promise<string> {
@@ -443,55 +448,26 @@ export class IntegrationFixture {
     const nativeValue = nativeSession?.value && typeof nativeSession.value === 'object'
       ? nativeSession.value as Record<string, unknown>
       : null;
-    const nativePath = typeof nativeValue?.path === 'string' ? nativeValue.path : '';
-    const endpointId = typeof chat.modelEndpointId === 'string' ? chat.modelEndpointId : '';
     const sessionId = typeof chat.agentSessionId === 'string' ? chat.agentSessionId : '';
-    const expectedPath = resolve(
-      this.dirs.workspace,
-      'agent-data',
-      DIRECT_OPENAI_CHAT_COMPLETIONS_COMPATIBLE_AGENT_ID,
-      'openai-compatible-sessions',
-      endpointId,
-      `${sessionId}.jsonl`,
-    );
     if (
       nativeSession?.ownerId !== DIRECT_OPENAI_CHAT_COMPLETIONS_COMPATIBLE_AGENT_ID
       || nativeSession.schemaVersion !== 1
-      || !nativePath
-      || resolve(nativePath) !== expectedPath
+      || nativeValue?.sessionId !== sessionId
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sessionId)
     ) {
-      throw new Error(`Chat ${chatId} has an unexpected native transcript path.`);
+      throw new Error(`Chat ${chatId} has an unexpected native session reference.`);
     }
-    return expectedPath;
-  }
-
-  async #removeFinalNativeUserRow(input: { chatId: string; clientRequestId: string }): Promise<void> {
-    const expectedPath = await this.directOpenAiNativePath(input.chatId);
-    const raw = await readFile(expectedPath, 'utf8');
-    if (!raw.endsWith('\n')) throw new Error('Direct native transcript has an incomplete tail.');
-    const lines = raw.split('\n').filter((line) => line.length > 0);
-    const rows = lines.map((line, index) => {
-      try {
-        const parsed = JSON.parse(line) as unknown;
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
-        return parsed as Record<string, unknown>;
-      } catch {
-        throw new Error(`Direct native transcript has malformed JSON at line ${index + 1}.`);
-      }
-    });
-    const matchingIndexes = rows.flatMap((row, index) => (
-      row.role === 'user' && row.clientRequestId === input.clientRequestId ? [index] : []
-    ));
-    if (matchingIndexes.length !== 1 || matchingIndexes[0] !== rows.length - 1) {
-      throw new Error('Expected exactly one final native user row with the accepted request identity.');
-    }
-    const retained = lines.slice(0, -1);
-    await writeFile(expectedPath, retained.length > 0 ? `${retained.join('\n')}\n` : '', 'utf8');
+    return resolve(
+      this.executionDirs.workspace, 'agent-data', DIRECT_OPENAI_CHAT_COMPLETIONS_COMPATIBLE_AGENT_ID,
+      'direct-sessions-v1', `${sessionId}.jsonl`,
+    );
   }
 
   diagnostics(): IntegrationDiagnostics {
     return {
       directories: this.dirs,
+      executionBackend: this.#backend.backend,
+      workerLogs: this.#backend.logs,
       processRuns: [...this.#completedRuns, this.#currentRunDiagnostics()],
       providers: {
         openAi: {
@@ -554,6 +530,11 @@ export class IntegrationFixture {
       errors.push(error);
     }
     try {
+      await this.#backend.stop();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
       this.fakeProviders.openAi.assertNoProtocolViolations();
       this.fakeProviders.openAiResponses.assertNoProtocolViolations();
       this.fakeProviders.anthropic.assertNoProtocolViolations();
@@ -604,7 +585,7 @@ export class IntegrationFixture {
   }
 
   async #startReplacementGarcon(port?: number): Promise<void> {
-    this.garcon = await GarconProcess.start({
+    this.garcon = await this.#backend.start({
       repoRoot: REPO_ROOT,
       configDir: this.dirs.config,
       workspaceDir: this.dirs.workspace,
@@ -616,6 +597,8 @@ export class IntegrationFixture {
       port,
     });
     this.client = await GarconTestClient.connect(this.garcon.baseUrl, {
+      authToken: this.garcon.authToken,
+      executorId: this.#backend.executorId,
       redactSensitiveDiagnostics: this.#redactSensitiveDiagnostics,
     });
     this.#clients.set('primary', this.client);

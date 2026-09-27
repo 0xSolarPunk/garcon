@@ -22,6 +22,7 @@ afterEach(() => {
 function markdownSession(content: string, relativePath = 'docs/guides/current.md'): FileSession {
 	const session = new FileSession(
 		{
+			executorId: 'local',
 			canonicalFileRootPath: '/workspace/project',
 			normalizedRelativePath: relativePath,
 		},
@@ -198,6 +199,7 @@ describe('MarkdownViewer', () => {
 			await fireEvent.click(screen.getByRole('link', { name: 'Sibling' }));
 
 			expect(onOpen).toHaveBeenCalledWith({
+				executorId: 'local',
 				fileRootPath: '/workspace/project',
 				relativePath: 'docs/guides/sibling.md',
 				mode: 'auto',

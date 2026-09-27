@@ -9,8 +9,8 @@ import { GitWorkbenchSurfaceController } from '$lib/git/workbench/git-workbench-
 import { GitHistorySurfaceController } from '$lib/git/history/git-history-surface.svelte.js';
 import { GitCompareSurfaceController } from '$lib/git/review/git-compare-surface.svelte.js';
 import type { GitComparisonPreferences } from '$lib/git/review/git-comparison-preferences.js';
-import type { PullRequestsStore } from '$lib/git/pull-requests/pull-requests-store.svelte.js';
-import type { CommitController } from '$lib/git/commit/commit-controller.svelte.js';
+import { PullRequestsStore } from '$lib/git/pull-requests/pull-requests-store.svelte.js';
+import { CommitController } from '$lib/git/commit/commit-controller.svelte.js';
 import { ChatMapController } from '$lib/chat-map/chat-map-controller.svelte.js';
 import { CanvasController } from '$lib/chat-canvas/canvas-controller.svelte.js';
 import { CanvasExitGuard } from '$lib/chat-canvas/canvas-exit-guard.js';
@@ -19,7 +19,18 @@ import type { ChatBoardController } from '$lib/chat-board/catalog/chat-board-con
 import type { TicketsController } from '$lib/tickets/catalog/tickets-controller.svelte.js';
 import type { WorkspaceProjectState } from '$lib/workspace/workspace-context.svelte.js';
 import { untrack } from 'svelte';
+import { effectiveExecutorId } from '$shared/executors';
 import { filePathRelativeToTreeRoot } from '$lib/files/tree/file-tree-path.js';
+import type { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
+import {
+	resolveExecutorServiceNotice,
+	type ExecutorServiceNotice,
+} from '$lib/executors/executor-service-notice.js';
+
+type FilesExecutorsPort = Pick<
+	ExecutorsStore,
+	'filesAvailable' | 'gitAvailable' | 'pathContextKey' | 'isReady' | 'hasSnapshot' | 'get' | 'label'
+>;
 
 export interface SingletonSurfaceRegistryDeps extends GitSurfaceControllerDeps {
 	createCommit(): CommitController;
@@ -27,22 +38,43 @@ export interface SingletonSurfaceRegistryDeps extends GitSurfaceControllerDeps {
 	comparisonPreferences: GitComparisonPreferences;
 	createChatBoard?(): ChatBoardController;
 	createTickets?(): TicketsController;
+	executors?: FilesExecutorsPort;
 }
 
 export class FilesSurfaceController implements PortableSingletonController {
 	readonly tree = new FileTreeStore();
 	presentationVisible = $state(false);
-	#projectAvailable = $state(false);
+	#projectState = $state.raw<WorkspaceProjectState>({ kind: 'absent' });
+	#selectedExecutorId = $state<string | null>(null);
 	#projectPath: string | null = null;
-	#pendingReveal = $state.raw<{ fileRootPath: string; relativePath: string } | null>(null);
+	#pendingReveal = $state.raw<{
+		executorId: string;
+		fileRootPath: string;
+		relativePath: string;
+	} | null>(null);
 
-	constructor() {
+	constructor(private readonly executors?: FilesExecutorsPort) {
+		let previous: { executorId: string; key: string } | null = null;
+		$effect(() => {
+			const executorId = this.tree.executorId;
+			const key = this.executors?.pathContextKey(executorId) ?? executorId;
+			const browsingExecutor = this.browsingExecutor;
+			const available = this.#filesAvailable(executorId);
+			untrack(() => {
+				if (!available) this.tree.setExecutorAvailable(false);
+				if (previous?.executorId === executorId && previous.key !== key) this.tree.invalidateExecutorPaths();
+				previous = { executorId, key };
+				if (browsingExecutor && available) this.tree.setExecutorAvailable(true);
+			});
+		});
 		$effect(() => {
 			const pending = this.#pendingReveal;
 			const response = this.tree.readyResponse;
-			if (!pending || !response || !this.presentationVisible || !this.#projectAvailable) return;
+			if (!pending || !response || !this.presentationVisible) return;
+			if (!this.browsingExecutor && this.#projectState.kind !== 'available') return;
 			untrack(() => {
 				this.#pendingReveal = null;
+				if (pending.executorId !== this.tree.executorId) return;
 				const relativePath = filePathRelativeToTreeRoot(
 					response.fileRootPath,
 					pending.fileRootPath,
@@ -53,17 +85,64 @@ export class FilesSurfaceController implements PortableSingletonController {
 		});
 	}
 
-	revealFile(fileRootPath: string, relativePath: string): void {
-		this.#pendingReveal = { fileRootPath, relativePath };
+	get browsingExecutor(): boolean {
+		return this.#selectedExecutorId !== null || this.#projectState.kind === 'absent';
+	}
+
+	get canGoToChatProject(): boolean {
+		return this.#projectState.kind === 'available';
+	}
+
+	get serviceNotice(): ExecutorServiceNotice | null {
+		return this.executors
+			? resolveExecutorServiceNotice(this.executors, this.tree.executorId, 'files')
+			: null;
+	}
+
+	selectExecutor(executorId: string): void {
+		if (!this.#filesAvailable(executorId)) return;
+		this.#pendingReveal = null;
+		this.#selectedExecutorId = executorId;
+		this.tree.browseExecutor(executorId);
+	}
+
+	goToChatProject(): void {
+		const wasBrowsingExecutor = this.browsingExecutor;
+		this.#selectedExecutorId = null;
+		this.#pendingReveal = null;
+		this.setProjectState(this.#projectState);
+		if (!wasBrowsingExecutor) void this.tree.goToChatProject();
+	}
+
+	refreshForExecutorChange(executorId: string): void {
+		if (this.tree.executorId === executorId) void this.tree.refresh();
+	}
+
+	revealFile(fileRootPath: string, relativePath: string, executorId?: string | null): void {
+		if (effectiveExecutorId(executorId) !== this.tree.executorId) this.selectExecutor(effectiveExecutorId(executorId));
+		this.#pendingReveal = { executorId: effectiveExecutorId(executorId), fileRootPath, relativePath };
 	}
 
 	setProjectState(projectState: WorkspaceProjectState): void {
-		let projectPath: string | null = null;
-		if (projectState.kind === 'available') projectPath = projectState.project.projectPath;
-		else if (projectState.kind !== 'absent') projectPath = projectState.context.projectPath;
+		const wasAbsent = this.#projectState.kind === 'absent';
+		this.#projectState = projectState;
+		if (this.#selectedExecutorId !== null) return;
+		if (projectState.kind === 'absent') {
+			if (!wasAbsent || this.tree.effectiveProjectKey !== 'executor:local') {
+				this.#pendingReveal = null;
+				this.#projectPath = null;
+				this.tree.setProjectState(projectState);
+				this.tree.browseExecutor('local');
+			}
+			this.tree.setExecutorAvailable(this.#filesAvailable('local'));
+			return;
+		}
+		const projectPath =
+			projectState.kind === 'available'
+				? projectState.project.projectPath
+				: projectState.context.projectPath;
 		if (projectPath !== this.#projectPath) this.#pendingReveal = null;
 		this.#projectPath = projectPath;
-		this.#projectAvailable = projectState.kind === 'available';
 		this.tree.setProjectState(projectState);
 	}
 
@@ -79,8 +158,13 @@ export class FilesSurfaceController implements PortableSingletonController {
 
 	dispose(): void {
 		this.presentationVisible = false;
+		this.#selectedExecutorId = null;
 		this.#pendingReveal = null;
 		this.tree.reset();
+	}
+
+	#filesAvailable(executorId: string): boolean {
+		return this.executors?.filesAvailable(executorId) ?? executorId === 'local';
 	}
 }
 
@@ -110,10 +194,7 @@ export class SingletonSurfaceRegistry {
 	#controllers = new Map<PortableSingletonKind, OwnedSingletonController>();
 	readonly #factories: SingletonControllerFactories;
 	#projectState: WorkspaceProjectState = { kind: 'absent' };
-	#pullRequestsCapability: {
-		hasChecked: boolean;
-		available: boolean;
-	} = { hasChecked: false, available: false };
+	#filesProjectState: WorkspaceProjectState = { kind: 'absent' };
 	#visible: Record<PortableSingletonKind, boolean> = {
 		git: false,
 		'git-history': false,
@@ -142,7 +223,7 @@ export class SingletonSurfaceRegistry {
 			git: () => new GitWorkbenchSurfaceController(this.deps),
 			'git-history': () => new GitHistorySurfaceController(this.deps),
 			'git-compare': () => new GitCompareSurfaceController(this.deps),
-			files: () => new FilesSurfaceController(),
+			files: () => new FilesSurfaceController(this.deps.executors),
 			commit: () => this.deps.createCommit(),
 			'chat-map': () => new ChatMapController(),
 			'chat-canvas': () => new CanvasController(),
@@ -150,14 +231,7 @@ export class SingletonSurfaceRegistry {
 				if (!this.deps.createChatBoard) throw new Error('Chat Board factory is unavailable');
 				return this.deps.createChatBoard();
 			},
-			'pull-requests': () => {
-				const controller = this.deps.createPullRequests();
-				controller.setCapability(
-					this.#pullRequestsCapability.hasChecked,
-					this.#pullRequestsCapability.available,
-				);
-				return controller;
-			},
+			'pull-requests': () => this.deps.createPullRequests(),
 		};
 	}
 
@@ -220,18 +294,28 @@ export class SingletonSurfaceRegistry {
 		return this.#controller('pull-requests');
 	}
 
-	setProjectState(projectState: WorkspaceProjectState): void {
+	setProjectState(projectState: WorkspaceProjectState, filesProjectState = projectState): void {
 		this.#projectState = projectState;
-		for (const owned of this.#controllers.values()) {
-			owned.controller.setProjectState(projectState);
+		this.#filesProjectState = filesProjectState;
+		for (const [kind, owned] of this.#controllers) {
+			owned.controller.setProjectState(kind === 'files' ? filesProjectState : projectState);
 		}
 	}
 
-	setPullRequestsCapability(hasChecked: boolean, available: boolean): void {
-		this.#pullRequestsCapability = { hasChecked, available };
-		const controller = this.#controllers.get('pull-requests')?.controller as
-			PullRequestsStore | undefined;
-		controller?.setCapability(hasChecked, available);
+	pruneGitExecutors(executorIds: ReadonlySet<string>): void {
+		for (const { controller } of this.#controllers.values()) {
+			if (
+				controller instanceof GitWorkbenchSurfaceController ||
+				controller instanceof CommitController ||
+				controller instanceof PullRequestsStore
+			)
+				controller.pruneExecutors(executorIds);
+			else if (
+				controller instanceof GitHistorySurfaceController ||
+				controller instanceof GitCompareSurfaceController
+			)
+				controller.target.pruneExecutors(executorIds);
+		}
 	}
 
 	setPresentationVisible(kind: PortableSingletonKind, visible: boolean): void {
@@ -290,7 +374,7 @@ export class SingletonSurfaceRegistry {
 		// A registry-owned root keeps lazy rune state alive across presentation remounts.
 		const destroyRoot = $effect.root(() => {
 			controller = this.#factories[kind]();
-			controller.setProjectState(this.#projectState);
+			controller.setProjectState(kind === 'files' ? this.#filesProjectState : this.#projectState);
 			controller.setPresentationVisible(this.#visible[kind]);
 		});
 		this.#controllers.set(kind, { controller, destroyRoot });

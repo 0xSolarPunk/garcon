@@ -5,6 +5,7 @@
 	import ModelSelectorSearchInput from './ModelSelectorSearchInput.svelte';
 	import type { ModelSelectorState } from './model-selector-state.svelte';
 	import VirtualModelList from './VirtualModelList.svelte';
+	import ModelSelectorExecutorPicker from './ModelSelectorExecutorPicker.svelte';
 
 	interface Props {
 		selector: ModelSelectorState;
@@ -48,6 +49,9 @@
 </script>
 
 <div data-slot="model-selector-columns" class="flex h-full min-h-0">
+	{#if selector.showExecutorPicker}
+		<div class="min-h-0 w-44 shrink-0 border-r border-border"><ModelSelectorExecutorPicker {selector} /></div>
+	{/if}
 	{#if showAgent}
 		<section
 			class="min-h-0 touch-pan-y overflow-y-auto overscroll-contain border-r border-border p-1 [-webkit-overflow-scrolling:touch] sm:w-56"

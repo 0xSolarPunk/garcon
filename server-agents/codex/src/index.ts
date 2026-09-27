@@ -22,8 +22,10 @@ import { createVersionedSettings } from '@garcon/server-agent-common/settings/ve
 import {
   singleQueryRuntimeOptions,
   withSingleQueryControl,
+  withSingleQueryDirectory,
 } from '@garcon/server-agent-common/shared/single-query-control';
 import { createAgentProducerAdapter } from '@garcon/server-agent-common/execution/producer-adapter';
+import { createAgentSteering } from '@garcon/server-agent-common/execution/control-adapters';
 import {
   createHistoryImport,
   createNativeHistoryImport,
@@ -81,6 +83,8 @@ export default class CodexAgentIntegration implements AgentIntegration {
     fileMimeTypes: CHAT_FILE_ATTACHMENT_MIME_TYPES,
   } as const;
   readonly execution;
+  readonly producers;
+  readonly permissions;
   readonly legacyHistoryImport;
   readonly nativeHistoryImport;
   readonly nativeActivity;
@@ -96,7 +100,6 @@ export default class CodexAgentIntegration implements AgentIntegration {
   readonly compaction: NonNullable<AgentIntegration['compaction']>;
   readonly forking;
   readonly steering: NonNullable<AgentIntegration['steering']>;
-  readonly goals: NonNullable<AgentIntegration['goals']>;
   readonly endpoints: NonNullable<AgentIntegration['endpoints']>;
   readonly singleQuery: NonNullable<AgentIntegration['singleQuery']>;
 
@@ -150,33 +153,28 @@ export default class CodexAgentIntegration implements AgentIntegration {
     };
     const nativeEvidence = createCodexNativeEvidence(runtime, nativeSessions, logger);
     this.nativeSessions = nativeEvidence;
-    const producer = createAgentProducerAdapter(execution, logger);
+    const producer = createAgentProducerAdapter(execution, host);
     this.execution = producer.execution;
+    this.producers = producer.producers;
+    this.permissions = producer.permissions;
     this.legacyHistoryImport = createHistoryImport({ load: nativeEvidence.loadLegacy });
     this.nativeHistoryImport = createNativeHistoryImport(nativeEvidence);
     this.nativeActivity = createCodexNativeActivityProbe(nativeSessions);
     // Codex compacts natively through its app-server; the execution object owns
     // the call, the facet advertises that it exists.
     this.compaction = {
-      compact: async (request) => (
+      compact: async (request, options) => (
         await producer.runExisting(
           request,
           (runtimeRequest, publish) => execution.compact(runtimeRequest, publish),
+          options,
         )
       ).handle,
     };
-    this.steering = {
-      captureTarget: (request) => runtime.captureSteerTarget(request.agentSessionId),
+    this.steering = createAgentSteering(producer, {
+      captureTarget: (agentSessionId) => runtime.captureSteerTarget(agentSessionId),
       steer: (request) => runtime.steer(request),
-    };
-    this.goals = {
-      submitControl: async (request) => (
-        await producer.runExisting(
-          request,
-          (runtimeRequest, publish) => execution.submitGoalControl(runtimeRequest, publish),
-        )
-      ).value,
-    };
+    });
     this.catalog = createModelCatalog({
       logger: host.logger,
       defaultModel: CODEX_MODELS.DEFAULT,
@@ -200,7 +198,7 @@ export default class CodexAgentIntegration implements AgentIntegration {
         authStatus.invalidate();
         return login.launch();
       },
-      loginStatus: (expectedSessionId) => {
+      loginStatus: async (expectedSessionId) => {
         const status = login.status(expectedSessionId);
         authStatus.invalidate();
         return status;
@@ -229,16 +227,9 @@ export default class CodexAgentIntegration implements AgentIntegration {
     });
     this.forking = createCodexForking({
       journal: journalForking,
+      resolveNativeSession: nativeEvidence.resolveNativeSession,
       resolveProfile: async (request) => {
-        let reference = request.source.nativeSession;
-        let source = nativeSessions.decode(reference);
-        if (!source.path) {
-          reference = await nativeEvidence.resolveNativeSession({
-            chat: request.source,
-            signal: request.signal,
-          });
-          source = nativeSessions.decode(reference);
-        }
+        const source = nativeSessions.decode(request.source.nativeSession);
         if (!source.path) {
           if (!request.point) return null;
           throw transcriptUnavailableForFork();
@@ -305,10 +296,10 @@ export default class CodexAgentIntegration implements AgentIntegration {
                 false,
               );
             }
-            return runSingleQuery(request.prompt, {
-              projectPath: request.projectPath,
+            return withSingleQueryDirectory(signal, async (directory) => runSingleQuery(request.prompt, {
               model: request.model,
               ...runtimeOptions,
+              projectPath: directory,
               timeoutMs: undefined,
               signal,
               permissionMode: 'default',
@@ -317,7 +308,7 @@ export default class CodexAgentIntegration implements AgentIntegration {
                 ?? buildCodexHostProviderConfig(
                   await resolveCodexExecAuthStatus(config, authStatus.current, signal),
                 ),
-            });
+            }));
           });
         } catch (error) {
           throw classifyCodexError(error);
@@ -345,7 +336,7 @@ async function forkCodexNativeSession(
   lastTurnId?: string,
 ) {
   const source = nativeSessions.decode(request.source.nativeSession);
-  const endpoint = await resolveAgentEndpoint(host, request.endpoint, request.admission.signal);
+  const endpoint = await resolveAgentEndpoint(host, request.endpoint, request.signal);
   const endpointRuntime = endpoint ? buildCodexAppServerEndpointRuntime(endpoint) : null;
   if (endpoint && !endpointRuntime) {
     throw new AgentIntegrationError(
@@ -366,7 +357,7 @@ async function forkCodexNativeSession(
       },
       envOverrides: buildCodexHostEnvironment(config),
       codexConfig: endpointRuntime?.codexConfig
-        ?? buildCodexHostProviderConfig(await resolveAuthStatus(request.admission.signal)),
+        ?? buildCodexHostProviderConfig(await resolveAuthStatus(request.signal)),
       lastTurnId: lastTurnId ?? null,
     });
   } catch (error) {

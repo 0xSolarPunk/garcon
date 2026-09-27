@@ -8,6 +8,7 @@ export interface PromptComposerProps {
 	onsubmit: () => void;
 	onSteerPreferredSubmit: () => void;
 	onModelChange?: (selection: ModelSelectorChange) => void;
+	onExecutorChange?: (executorId: string) => void;
 	onPermissionModeChange?: (mode: PermissionMode) => void;
 	onThinkingModeChange?: (mode: ThinkingMode) => void;
 	onAgentSettingChange?: (descriptor: AgentSettingDescriptor, value: JsonValue) => void;
@@ -19,4 +20,5 @@ export interface PromptComposerProps {
 	isPresented?: boolean;
 	composerEditorOpenRequestId?: number;
 	onChooseProjectFolder?: (chatId: string) => void;
+	onAvailabilityNoticeChange?: (shown: boolean) => void;
 }

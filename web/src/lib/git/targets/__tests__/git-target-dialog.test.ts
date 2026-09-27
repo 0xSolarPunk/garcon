@@ -4,6 +4,7 @@ import * as gitApi from '$lib/api/git';
 import type { GitTargetCandidate, GitWorktreeItem } from '$lib/api/git';
 import * as m from '$lib/paraglide/messages.js';
 import { GitTargetDialogState } from '$lib/git/targets/git-target-dialog.svelte.js';
+import { ApiError } from '$lib/api/client.js';
 
 vi.mock('$lib/api/chats', () => ({
 	validateStart: vi.fn(),
@@ -70,13 +71,81 @@ afterEach(() => {
 });
 
 describe('GitTargetDialogState', () => {
+	it('ignores list refresh while creation is pending without losing the result or busy state', async () => {
+		const creation = deferred<Awaited<ReturnType<typeof gitApi.gitCreateWorktree>>>();
+		vi.mocked(gitApi.gitCreateWorktree).mockReturnValueOnce(creation.promise);
+		const dialog = new GitTargetDialogState({
+			executorId: 'remote',
+			executorContextKey: 'first',
+			available: true,
+			initialPath: '/repo',
+		});
+		const pending = dialog.createWorktree('/repo/feature', 'feature');
+		await dialog.loadWorktrees();
+		expect(gitApi.getGitWorktrees).not.toHaveBeenCalled();
+		expect(dialog.isCreatingWorktree).toBe(true);
+		creation.resolve({ success: true, worktreePath: '/repo/feature' });
+		await pending;
+		expect(dialog.isCreatingWorktree).toBe(false);
+		expect(dialog.candidatePath).toBe('/repo/feature');
+	});
+
+	it.each(['disconnect', 'dispose', 'switch'] as const)(
+		'reports captured creation uncertainty after %s without stale publication',
+		async (transition) => {
+			let available = true;
+			let executorId = 'remote';
+			const onMutationError = vi.fn();
+			const creation = deferred<Awaited<ReturnType<typeof gitApi.gitCreateWorktree>>>();
+			vi.mocked(gitApi.gitCreateWorktree).mockReturnValueOnce(creation.promise);
+			const dialog = new GitTargetDialogState({
+				get executorId() {
+					return executorId;
+				},
+				executorContextKey: 'first',
+				get available() {
+					return available;
+				},
+				initialPath: '/repo',
+				onMutationError,
+			});
+			const pending = dialog.createWorktree('/repo/feature', 'feature');
+			if (transition === 'disconnect') available = false;
+			else if (transition === 'dispose') dialog.dispose();
+			else {
+				executorId = 'local';
+				dialog.setCandidatePath('/other');
+			}
+			dialog.scheduleValidation();
+			const failure = new ApiError(
+				503,
+				'Worktree creation outcome unknown',
+				'GIT_MUTATION_OUTCOME_UNKNOWN',
+			);
+			creation.reject(failure);
+			await pending;
+			expect(onMutationError).toHaveBeenCalledExactlyOnceWith(failure, {
+				executorId: 'remote',
+				projectPath: '/repo',
+			});
+			expect(dialog.worktreeError).toBeNull();
+			expect(dialog.candidatePath).toBe(transition === 'switch' ? '/other' : '/repo');
+			dialog.dispose();
+		},
+	);
+
 	it('debounces validation and ignores an aborted stale response', async () => {
 		const first = deferred<Awaited<ReturnType<typeof chatsApi.validateStart>>>();
 		const second = deferred<Awaited<ReturnType<typeof chatsApi.validateStart>>>();
 		vi.mocked(chatsApi.validateStart)
 			.mockImplementationOnce(() => first.promise)
 			.mockImplementationOnce(() => second.promise);
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/first' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/first',
+		});
 
 		dialog.scheduleValidation();
 		await advanceValidation();
@@ -99,7 +168,12 @@ describe('GitTargetDialogState', () => {
 	});
 
 	it('maps invalid paths and non-Git directories to actionable validation errors', async () => {
-		const dialog = new GitTargetDialogState({ initialPath: '/outside' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/outside',
+		});
 		vi.mocked(chatsApi.validateStart).mockResolvedValueOnce({
 			valid: false,
 			errorCode: 'outside_base_dir',
@@ -119,7 +193,12 @@ describe('GitTargetDialogState', () => {
 	});
 
 	it('returns blank candidates to idle and cancels pending validation', async () => {
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/repo' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/repo',
+		});
 		dialog.scheduleValidation();
 		dialog.setCandidatePath('   ');
 		dialog.scheduleValidation();
@@ -137,7 +216,12 @@ describe('GitTargetDialogState', () => {
 		vi.mocked(gitApi.getGitWorktrees)
 			.mockImplementationOnce(() => first.promise)
 			.mockImplementationOnce(() => second.promise);
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/repo' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/repo',
+		});
 
 		const firstLoad = dialog.loadWorktrees();
 		const firstSignal = vi.mocked(gitApi.getGitWorktrees).mock.calls[0]?.[1]?.signal;
@@ -159,7 +243,12 @@ describe('GitTargetDialogState', () => {
 	it('cancels and ignores a pending worktree load when the picker closes', async () => {
 		const request = deferred<Awaited<ReturnType<typeof gitApi.getGitWorktrees>>>();
 		vi.mocked(gitApi.getGitWorktrees).mockImplementationOnce(() => request.promise);
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/repo' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/repo',
+		});
 		dialog.worktreePickerOpen = true;
 		const load = dialog.loadWorktrees();
 		const signal = vi.mocked(gitApi.getGitWorktrees).mock.calls[0]?.[1]?.signal;
@@ -175,7 +264,12 @@ describe('GitTargetDialogState', () => {
 
 	it('reports current worktree load failures without retaining stale rows', async () => {
 		vi.mocked(gitApi.getGitWorktrees).mockRejectedValueOnce(new Error('offline'));
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/repo' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/repo',
+		});
 		dialog.worktrees = [makeWorktree('/workspace/old', 'old')];
 
 		await dialog.loadWorktrees();
@@ -186,7 +280,12 @@ describe('GitTargetDialogState', () => {
 	});
 
 	it('selects a successfully created worktree and preserves server failures', async () => {
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/repo' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/repo',
+		});
 		dialog.worktreePickerOpen = true;
 		vi.mocked(gitApi.gitCreateWorktree).mockResolvedValueOnce({
 			success: true,
@@ -195,10 +294,14 @@ describe('GitTargetDialogState', () => {
 
 		await dialog.createWorktree('/workspace/feature', 'feature', 'main');
 
-		expect(gitApi.gitCreateWorktree).toHaveBeenCalledWith('/workspace/repo', '/workspace/feature', {
-			branch: 'feature',
-			baseRef: 'main',
-		});
+		expect(gitApi.gitCreateWorktree).toHaveBeenCalledWith(
+			expect.objectContaining({ executorId: 'local', projectPath: '/workspace/repo' }),
+			'/workspace/feature',
+			{
+				branch: 'feature',
+				baseRef: 'main',
+			},
+		);
 		expect(dialog.candidatePath).toBe('/workspace/canonical-feature');
 		expect(dialog.validationStatus).toBe('valid');
 		expect(dialog.worktreePickerOpen).toBe(false);
@@ -223,13 +326,18 @@ describe('GitTargetDialogState', () => {
 		vi.mocked(gitApi.getGitTargetCandidates).mockResolvedValueOnce({
 			targets: [byProjectPath, exactWorktree],
 		});
-		const dialog = new GitTargetDialogState({ initialPath: ' /workspace/repo ' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: ' /workspace/repo ',
+		});
 		dialog.validationStatus = 'valid';
 
 		const target = await dialog.resolveConfirmedTarget();
 
 		expect(gitApi.getGitTargetCandidates).toHaveBeenCalledWith(
-			'/workspace/repo',
+			expect.objectContaining({ executorId: 'local', projectPath: '/workspace/repo' }),
 			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
 		expect(target).toBe(exactWorktree);
@@ -240,7 +348,12 @@ describe('GitTargetDialogState', () => {
 		vi.mocked(gitApi.getGitTargetCandidates).mockResolvedValueOnce({
 			targets: [makeTarget({ isMissing: true })],
 		});
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/repo' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/repo',
+		});
 		dialog.validationStatus = 'valid';
 
 		await expect(dialog.resolveConfirmedTarget()).resolves.toBeNull();
@@ -253,7 +366,12 @@ describe('GitTargetDialogState', () => {
 	it('aborts pending work and prevents disposed requests from publishing', async () => {
 		const targets = deferred<Awaited<ReturnType<typeof gitApi.getGitTargetCandidates>>>();
 		vi.mocked(gitApi.getGitTargetCandidates).mockImplementationOnce(() => targets.promise);
-		const dialog = new GitTargetDialogState({ initialPath: '/workspace/repo' });
+		const dialog = new GitTargetDialogState({
+			executorId: 'local',
+			executorContextKey: 'local-instance',
+			available: true,
+			initialPath: '/workspace/repo',
+		});
 		dialog.scheduleValidation();
 		dialog.validationStatus = 'valid';
 		const confirmation = dialog.resolveConfirmedTarget();

@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '$lib/api/client';
 import type { ProjectTarget } from '$shared/project-resolution';
 import { ProjectResolutionStore } from '../project-resolution-store.svelte';
+import { ExecutorsStore } from '$lib/executors/executors-store.svelte';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
 
 const CHAT_ID = '1783725900000800';
 const target = {
@@ -21,6 +23,59 @@ function deferred<T>() {
 }
 
 describe('ProjectResolutionStore', () => {
+	it('does not dispatch path inspection while the selected executor is offline', async () => {
+		const executors = new ExecutorsStore();
+		executors.applySnapshot([localExecutor, { ...remoteExecutor, availability: 'offline' }]);
+		const fetchResolution = vi.fn<typeof import('$lib/api/project-resolution').resolveProject>()
+			.mockRejectedValue(new ApiError(503, 'Offline', 'EXECUTOR_UNAVAILABLE'));
+		const store = new ProjectResolutionStore(fetchResolution, undefined, executors);
+		const lease = store.retain({ ...target, executorId: remoteExecutor.id });
+		await lease.resolve();
+		expect(fetchResolution).not.toHaveBeenCalled();
+		expect(lease.snapshot.kind).toBe('request-failed');
+		executors.applySnapshot([localExecutor, remoteExecutor]);
+		fetchResolution.mockResolvedValue({ target, resolution: { kind: 'available', effectiveProjectKey: '/worker/project' } });
+		await lease.resolve();
+		expect(fetchResolution).not.toHaveBeenCalled();
+		const ready = store.retain({ ...target, executorId: remoteExecutor.id });
+		await ready.resolve();
+		expect(fetchResolution).toHaveBeenCalledTimes(1);
+		expect(ready.snapshot.kind).toBe('available');
+		ready.release();
+		lease.release();
+		store.destroy();
+	});
+
+	it('fences retained and pending resolutions when only the accepted executor instance changes', async () => {
+		const executors = new ExecutorsStore();
+		executors.applySnapshot([localExecutor, remoteExecutor]);
+		const pending = deferred<Awaited<ReturnType<typeof import('$lib/api/project-resolution').resolveProject>>>();
+		const fetchResolution = vi.fn<typeof import('$lib/api/project-resolution').resolveProject>()
+			.mockResolvedValueOnce({ target, resolution: { kind: 'available', effectiveProjectKey: '/local' } })
+			.mockReturnValueOnce(pending.promise)
+			.mockResolvedValueOnce({ target, resolution: { kind: 'unavailable', reason: 'outside-base' } });
+		const store = new ProjectResolutionStore(fetchResolution, undefined, executors);
+		const remoteTarget = { ...target, executorId: remoteExecutor.id };
+		const local = store.retain(target);
+		await local.resolve();
+		const old = store.retain(remoteTarget);
+		const loading = old.resolve();
+		const localKey = store.lifecycleKey(target);
+		const oldKey = store.lifecycleKey(remoteTarget);
+		executors.applySnapshot([localExecutor, { ...remoteExecutor, instanceId: 'replacement' }]);
+		expect(store.lifecycleKey(remoteTarget)).not.toBe(oldKey);
+		expect(store.lifecycleKey(target)).toBe(localKey);
+		expect(store.snapshotFor(remoteTarget).kind).toBe('unchecked');
+		expect(old.snapshot.kind).toBe('unchecked');
+		const replacement = store.retain(remoteTarget);
+		await replacement.resolve();
+		pending.resolve({ target: remoteTarget, resolution: { kind: 'available', effectiveProjectKey: '/stale' } });
+		await loading;
+		expect(store.snapshotFor(remoteTarget)).toEqual({ kind: 'unavailable', reason: 'outside-base' });
+		expect(store.snapshotFor(target)).toEqual({ kind: 'available', effectiveProjectKey: '/local' });
+		old.release(); replacement.release(); local.release(); store.destroy();
+	});
+
 	it('retains observations without fetching until an owner requests resolution', () => {
 		const fetchResolution = vi.fn();
 		const store = new ProjectResolutionStore(fetchResolution);

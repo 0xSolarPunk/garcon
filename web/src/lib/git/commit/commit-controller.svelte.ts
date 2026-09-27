@@ -34,12 +34,16 @@ export interface QuickCommitPathIntent {
 
 export interface CommitControllerDeps extends GitSurfaceControllerDeps {
 	refreshSummary?: () => Promise<void>;
-	markProjectChanged?: (effectiveProjectKey: string, projectPath: string) => void;
+	markProjectChanged?: (
+		executorId: string,
+		effectiveProjectKey: string,
+		projectPath: string,
+	) => void;
 	runMutation?: <T>(request: {
+		executorId: string;
 		effectiveProjectKey: string;
 		projectPath: string;
 		execute: () => Promise<T>;
-		didMutate: (result: T) => boolean;
 	}) => Promise<T>;
 }
 
@@ -63,7 +67,16 @@ export class CommitController implements PortableSingletonController {
 	tree = $state<GitTreeNode[]>([]);
 	intents = $state<Record<string, QuickCommitPathIntent>>({});
 	readonly fileNodes = $derived.by(() => flattenCommitFileNodes(this.tree));
-	message = $state('');
+	#message = $state('');
+	#messageRevision = 0;
+
+	get message(): string {
+		return this.#message;
+	}
+	set message(value: string) {
+		this.#message = value;
+		this.#messageRevision++;
+	}
 	treeLoadState = $state<QuickCommitTreeLoadState>('idle');
 	isProcessingQueue = $state(false);
 	isGeneratingMessage = $state(false);
@@ -82,6 +95,9 @@ export class CommitController implements PortableSingletonController {
 	private activationPromise: Promise<void> | null = null;
 	private disposed = false;
 	private contextGeneration = 0;
+	private treeRequestGeneration = 0;
+	private sessionGeneration = 0;
+	private treeValidated = $state(false);
 	private loadedTargetIdentity: string | null = null;
 	private selectedChangeStats = $derived.by(() => {
 		let additions = 0;
@@ -99,8 +115,16 @@ export class CommitController implements PortableSingletonController {
 	constructor(private readonly deps: CommitControllerDeps) {
 		this.target = new GitTargetSessionController({
 			kind: 'commit',
+			projectSelection: deps.projectSelection,
 			createBranchSelector: deps.createGitBranchSelector,
 			invalidationVersion: deps.invalidationVersion,
+			onUnavailable: () => {
+				this.treeRequestGeneration++;
+				this.sessionGeneration++;
+				this.treeValidated = false;
+				this.isGeneratingMessage = false;
+				this.preparingAction = null;
+			},
 			canChangeTarget: () =>
 				this.canClose && deps.gitMutations.pendingCount(singletonSurfaceId('commit')) === 0,
 			onTargetChanged: (_target, identity, reason, identityChanged) =>
@@ -117,11 +141,17 @@ export class CommitController implements PortableSingletonController {
 	}
 
 	get projectIdentityPending(): boolean {
-		return this.target.projectIdentityPending;
+		return (
+			this.target.projectIdentityPending || this.target.identity !== this.target.appliedIdentity
+		);
 	}
 
 	get isLoadingTree(): boolean {
 		return this.treeLoadState === 'initial-loading';
+	}
+
+	get isRepositoryReady(): boolean {
+		return !this.projectIdentityPending && this.treeValidated;
 	}
 
 	get isRefreshingTree(): boolean {
@@ -130,7 +160,7 @@ export class CommitController implements PortableSingletonController {
 
 	get hasPendingStageOperations(): boolean {
 		return Object.values(this.intents).some(
-			(item) => item.desiredSelected !== item.actualSelected || item.isRunning,
+			(item) => item.isRunning || (!item.error && item.desiredSelected !== item.actualSelected),
 		);
 	}
 
@@ -181,7 +211,7 @@ export class CommitController implements PortableSingletonController {
 
 	get canCommit(): boolean {
 		return (
-			!this.projectIdentityPending &&
+			this.isRepositoryReady &&
 			this.message.trim().length > 0 &&
 			this.desiredSelectedFiles.length > 0 &&
 			!this.isCommitting &&
@@ -212,6 +242,7 @@ export class CommitController implements PortableSingletonController {
 				? {
 						kind: 'available',
 						project: {
+							target: { kind: 'path', executorId: 'local', projectPath },
 							chatId: effectiveProjectKey,
 							effectiveProjectKey,
 							projectPath,
@@ -223,6 +254,7 @@ export class CommitController implements PortableSingletonController {
 
 	async setProjectState(projectState: WorkspaceProjectState): Promise<void> {
 		this.target.setProjectState(projectState);
+		if (this.isPresentationVisible) await this.target.activate();
 	}
 
 	async setPresentationVisible(visible: boolean): Promise<void> {
@@ -236,7 +268,7 @@ export class CommitController implements PortableSingletonController {
 			this.treeLoadState = 'initial-loading';
 		}
 		this.target.setPresentationVisible(visible);
-		if (!visible || this.projectIdentityPending) return;
+		if (!visible || this.target.projectIdentityPending) return;
 		await this.target.activate();
 		if (resumeExistingTarget && this.target.appliedIdentity === this.target.identity) {
 			await this.activate();
@@ -271,13 +303,13 @@ export class CommitController implements PortableSingletonController {
 	}
 
 	togglePath(path: string, desiredSelected: boolean): void {
-		if (this.projectIdentityPending) return;
+		if (!this.isRepositoryReady) return;
 		const queued = this.enqueueStageIntent(path, desiredSelected);
 		if (queued) void this.drainQueue();
 	}
 
 	toggleDirectory(path: string, desiredSelected: boolean): void {
-		if (this.projectIdentityPending) return;
+		if (!this.isRepositoryReady) return;
 		const node = findCommitTreeNode(this.tree, path);
 		if (!node) return;
 		let queued = false;
@@ -288,7 +320,7 @@ export class CommitController implements PortableSingletonController {
 	}
 
 	includeUnstaged(path: string): void {
-		if (this.projectIdentityPending) return;
+		if (!this.isRepositoryReady) return;
 		const queued = this.enqueueStageIntent(path, true, true);
 		if (queued) void this.drainQueue();
 	}
@@ -310,21 +342,29 @@ export class CommitController implements PortableSingletonController {
 	}
 
 	async generateMessage(): Promise<void> {
-		const projectPath = this.projectPath;
+		const project = this.target.requestTarget;
+		const projectPath = project?.projectPath;
 		const effectiveProjectKey = this.effectiveProjectKey;
 		const targetIdentity = this.target.identity;
 		const generation = this.contextGeneration;
+		const sessionGeneration = this.sessionGeneration;
 		if (
-			this.projectIdentityPending ||
+			!this.isRepositoryReady ||
+			!project ||
 			!projectPath ||
 			!effectiveProjectKey ||
 			!targetIdentity ||
 			this.isGeneratingMessage
 		)
 			return;
+		const isCurrent = () =>
+			this.isCurrentTarget(targetIdentity, generation) &&
+			sessionGeneration === this.sessionGeneration;
+		const messageRevision = this.#messageRevision;
 		this.preparingAction = 'generate';
 		const queueReady = await this.waitForQueue();
-		if (!this.isCurrentTarget(targetIdentity, generation)) {
+		if (!isCurrent() || !this.isRepositoryReady) {
+			if (isCurrent()) this.preparingAction = null;
 			return;
 		}
 		this.preparingAction = null;
@@ -341,33 +381,38 @@ export class CommitController implements PortableSingletonController {
 
 		this.isGeneratingMessage = true;
 		try {
-			const data = await generateCommitMessageApi(projectPath, files);
-			if (!this.isCurrentTarget(targetIdentity, generation)) {
+			const data = await generateCommitMessageApi(project, files);
+			if (!isCurrent() || !this.isRepositoryReady) {
 				return;
 			}
 			if (!data.message) {
 				this.lastError = data.error ?? m.commit_surface_generate_failed();
 				return;
 			}
+			if (messageRevision !== this.#messageRevision) return;
 			this.message = data.message;
 			this.lastError = null;
 		} catch (error) {
-			if (this.isCurrentTarget(targetIdentity, generation)) {
+			if (isCurrent()) {
 				this.lastError = this.commitMessageGenerationErrorMessage(error);
 			}
 		} finally {
-			if (this.isCurrentTarget(targetIdentity, generation)) this.isGeneratingMessage = false;
+			if (isCurrent()) this.isGeneratingMessage = false;
 		}
 	}
 
 	async commit(): Promise<boolean> {
-		const projectPath = this.projectPath;
+		const project = this.target.requestTarget;
+		const projectPath = project?.projectPath;
 		const effectiveProjectKey = this.effectiveProjectKey;
 		const targetIdentity = this.target.identity;
 		const message = this.message.trim();
+		const messageRevision = this.#messageRevision;
 		const generation = this.contextGeneration;
+		const sessionGeneration = this.sessionGeneration;
 		if (
-			this.projectIdentityPending ||
+			!this.isRepositoryReady ||
+			!project ||
 			!projectPath ||
 			!effectiveProjectKey ||
 			!targetIdentity ||
@@ -377,7 +422,13 @@ export class CommitController implements PortableSingletonController {
 			return false;
 		this.preparingAction = 'commit';
 		const queueReady = await this.waitForQueue();
-		if (!this.isCurrentTarget(targetIdentity, generation)) {
+		if (
+			!this.isCurrentTarget(targetIdentity, generation) ||
+			!this.isRepositoryReady ||
+			sessionGeneration !== this.sessionGeneration
+		) {
+			if (generation === this.contextGeneration && sessionGeneration === this.sessionGeneration)
+				this.preparingAction = null;
 			return false;
 		}
 		this.preparingAction = null;
@@ -393,13 +444,13 @@ export class CommitController implements PortableSingletonController {
 		this.isCommitting = true;
 		this.pendingMutationCount += 1;
 		try {
-			const execute = () => gitCommitIndex(projectPath, message);
+			const execute = () => gitCommitIndex(project, message);
 			const result = this.deps.runMutation
 				? await this.deps.runMutation({
+						executorId: project.executorId,
 						effectiveProjectKey,
 						projectPath,
 						execute,
-						didMutate: (response) => response.success,
 					})
 				: await execute();
 			if (!result.success) {
@@ -410,11 +461,11 @@ export class CommitController implements PortableSingletonController {
 				return false;
 			}
 			if (this.isCurrentTarget(targetIdentity, generation)) {
-				this.message = '';
+				if (messageRevision === this.#messageRevision) this.message = '';
 				this.lastError = null;
 			}
 			if (!this.deps.runMutation) {
-				this.deps.markProjectChanged?.(effectiveProjectKey, projectPath);
+				this.deps.markProjectChanged?.(project.executorId, effectiveProjectKey, projectPath);
 			}
 			if (this.isCurrentTarget(targetIdentity, generation)) {
 				try {
@@ -430,10 +481,16 @@ export class CommitController implements PortableSingletonController {
 			return true;
 		} catch (error) {
 			if (this.isCurrentTarget(targetIdentity, generation)) {
-				this.lastError = m.commit_surface_commit_failed_detail({
-					detail: error instanceof Error ? error.message : String(error),
-				});
-				await this.refreshAfterMutation();
+				try {
+					await this.refreshAfterMutation();
+				} catch {
+					// The mutation failure remains authoritative if reconciliation also fails.
+				}
+				if (this.isCurrentTarget(targetIdentity, generation)) {
+					this.lastError = m.commit_surface_commit_failed_detail({
+						detail: error instanceof Error ? error.message : String(error),
+					});
+				}
 			}
 			return false;
 		} finally {
@@ -506,11 +563,12 @@ export class CommitController implements PortableSingletonController {
 	}
 
 	private async applyStageBatch(batch: QuickCommitStageBatch): Promise<void> {
-		const projectPath = this.projectPath;
+		const project = this.target.requestTarget;
+		const projectPath = project?.projectPath;
 		const effectiveProjectKey = this.effectiveProjectKey;
 		const targetIdentity = this.target.identity;
 		const generation = this.contextGeneration;
-		if (!projectPath || !effectiveProjectKey || !targetIdentity) return;
+		if (!project || !projectPath || !effectiveProjectKey || !targetIdentity) return;
 		for (const path of batch.paths) {
 			this.setIntent(path, {
 				isRunning: true,
@@ -520,13 +578,15 @@ export class CommitController implements PortableSingletonController {
 		}
 		this.pendingMutationCount += 1;
 		try {
-			const execute = () => gitStagePaths(projectPath, batch.paths, batch.mode);
+			if (!this.isRepositoryReady)
+				throw new Error('Executor is unavailable. Inspect the repository before staging again.');
+			const execute = () => gitStagePaths(project, batch.paths, batch.mode);
 			const result = this.deps.runMutation
 				? await this.deps.runMutation({
+						executorId: project.executorId,
 						effectiveProjectKey,
 						projectPath,
 						execute,
-						didMutate: (response) => response.success,
 					})
 				: await execute();
 			if (!result.success) {
@@ -534,7 +594,7 @@ export class CommitController implements PortableSingletonController {
 			}
 			if (!this.isCurrentTarget(targetIdentity, generation)) {
 				if (!this.deps.runMutation) {
-					this.deps.markProjectChanged?.(effectiveProjectKey, projectPath);
+					this.deps.markProjectChanged?.(project.executorId, effectiveProjectKey, projectPath);
 				}
 				return;
 			}
@@ -547,15 +607,24 @@ export class CommitController implements PortableSingletonController {
 			}
 			this.shouldRefreshAfterDrain = true;
 			if (!this.deps.runMutation) {
-				this.deps.markProjectChanged?.(effectiveProjectKey, projectPath);
+				this.deps.markProjectChanged?.(project.executorId, effectiveProjectKey, projectPath);
 			}
 		} catch (error) {
 			if (!this.isCurrentTarget(targetIdentity, generation)) return;
 			const message = error instanceof Error ? error.message : String(error);
-			for (const path of batch.paths) {
+			const uncertain =
+				error instanceof ApiError && error.errorCode === 'GIT_MUTATION_OUTCOME_UNKNOWN';
+			const failedPaths = uncertain
+				? new Set([...batch.paths, ...this.queue])
+				: new Set(batch.paths);
+			this.queue = this.queue.filter((path) => !failedPaths.has(path));
+			for (const path of failedPaths) {
+				this.forcedStagePaths.delete(path);
 				const current = this.intents[path];
 				this.setIntent(path, {
-					desiredSelected: current?.actualSelected ?? false,
+					desiredSelected: uncertain
+						? (current?.desiredSelected ?? false)
+						: (current?.actualSelected ?? false),
 					error: message,
 				});
 			}
@@ -595,19 +664,33 @@ export class CommitController implements PortableSingletonController {
 		preserveDesired: boolean;
 		clearOnNotReady: boolean;
 	}): Promise<void> {
-		const projectPath = this.projectPath;
+		const project = this.target.requestTarget;
+		const projectPath = project?.projectPath;
 		const effectiveProjectKey = this.effectiveProjectKey;
 		const targetIdentity = this.target.identity;
 		const generation = this.contextGeneration;
-		if (!projectPath || !effectiveProjectKey || !targetIdentity) return;
+		const requestGeneration = ++this.treeRequestGeneration;
+		if (
+			this.projectIdentityPending ||
+			!project ||
+			!projectPath ||
+			!effectiveProjectKey ||
+			!targetIdentity
+		)
+			return;
 		try {
-			const snapshot = await getGitWorkbenchSnapshot(projectPath, 'unstaged', 0, {
+			const snapshot = await getGitWorkbenchSnapshot(project, 'unstaged', 0, {
 				bodyCandidateCount: 1,
 			});
-			if (!this.isCurrentTarget(targetIdentity, generation)) {
+			if (
+				!this.isCurrentTarget(targetIdentity, generation) ||
+				requestGeneration !== this.treeRequestGeneration ||
+				this.projectIdentityPending
+			) {
 				return;
 			}
 			if (snapshot.status !== 'ready') {
+				this.treeValidated = false;
 				if (options.clearOnNotReady) {
 					this.tree = [];
 					this.intents = {};
@@ -616,9 +699,15 @@ export class CommitController implements PortableSingletonController {
 				return;
 			}
 			this.applyTree(snapshot.tree.root, options.preserveDesired);
+			this.treeValidated = true;
 			this.lastError = null;
 		} catch (error) {
-			if (this.isCurrentTarget(targetIdentity, generation)) {
+			if (
+				this.isCurrentTarget(targetIdentity, generation) &&
+				requestGeneration === this.treeRequestGeneration &&
+				!this.projectIdentityPending
+			) {
+				this.treeValidated = false;
 				this.lastError = m.commit_surface_load_failed_detail({
 					detail: error instanceof Error ? error.message : String(error),
 				});
@@ -635,7 +724,9 @@ export class CommitController implements PortableSingletonController {
 			const hasPendingOperation =
 				Boolean(previousIntent?.isRunning) || this.queue.includes(node.path);
 			const shouldPreserveDesired =
-				preserveDesired && Boolean(previousIntent) && !previousIntent?.error && hasPendingOperation;
+				preserveDesired &&
+				Boolean(previousIntent) &&
+				(Boolean(previousIntent?.error) || hasPendingOperation);
 			nextIntents[node.path] = {
 				path: node.path,
 				actualSelected,
@@ -663,7 +754,9 @@ export class CommitController implements PortableSingletonController {
 	}
 
 	private startRefreshAfterMutation(): void {
+		const generation = this.contextGeneration;
 		void this.refreshAfterMutation().catch((error) => {
+			if (generation !== this.contextGeneration) return;
 			this.lastError = m.commit_surface_refresh_failed_detail({
 				detail: error instanceof Error ? error.message : String(error),
 			});
@@ -726,6 +819,7 @@ export class CommitController implements PortableSingletonController {
 	private resetForTargetIdentity(identity: string | null, preserveMessage: boolean): void {
 		const message = preserveMessage ? this.message : '';
 		this.contextGeneration += 1;
+		this.treeValidated = false;
 		this.resolveQueueSettled?.();
 		this.loadedTargetIdentity = identity;
 		this.tree = [];
@@ -767,7 +861,7 @@ export class CommitController implements PortableSingletonController {
 			if (this.isPresentationVisible) await this.activate();
 			return;
 		}
-		if (reason === 'invalidation' && this.isPresentationVisible) {
+		if ((reason === 'invalidation' || reason === 'session') && this.isPresentationVisible) {
 			const generation = this.contextGeneration;
 			await this.waitForQueue();
 			if (generation === this.contextGeneration && identity === this.target.identity) {
@@ -820,13 +914,36 @@ export class CommitController implements PortableSingletonController {
 		this.pruneSnapshots();
 	}
 
+	pruneExecutors(executorIds: ReadonlySet<string>): void {
+		this.target.pruneExecutors(executorIds);
+		for (const [key, snapshot] of this.snapshots) {
+			if (executorIds.has(JSON.parse(key)[0])) continue;
+			if (snapshot.message.trim()) {
+				this.snapshots.set(key, { ...snapshot, tree: [], intents: {} });
+			} else this.snapshots.delete(key);
+		}
+	}
+
 	private restoreSnapshot(key: string): void {
 		const snapshot = this.snapshots.get(key);
 		if (!snapshot) return;
 		this.snapshots.delete(key);
 		this.snapshots.set(key, { ...snapshot, accessedAt: Date.now() });
 		this.tree = snapshot.tree;
-		this.intents = snapshot.intents;
+		this.intents = Object.fromEntries(
+			Object.entries(snapshot.intents).map(([path, intent]) => [
+				path,
+				{
+					...intent,
+					isRunning: false,
+					runningMode: null,
+					desiredSelected: intent.error ? intent.desiredSelected : intent.actualSelected,
+					error: intent.isRunning
+						? 'Git operation was interrupted. Inspect the repository before trying again.'
+						: intent.error,
+				},
+			]),
+		);
 		this.message = snapshot.message;
 	}
 

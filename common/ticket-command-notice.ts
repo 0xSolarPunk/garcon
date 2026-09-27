@@ -31,6 +31,8 @@ function listFilterValues(filters: NonNullable<TicketNoticeContext['filters']>):
     values.push(['assignee', assignee]);
   } else if (assignee?.kind === 'user') {
     values.push(['assignee', assignee.username]);
+  } else if (assignee?.kind === 'executor') {
+    values.push(['assignee', `executor ${assignee.executorId}`]);
   } else if (assignee) {
     values.push(['assignee', `chat ${assignee.chatId}`]);
   }

@@ -4,6 +4,7 @@
 	import type { SidebarVirtualProjectHeaderRow } from './sidebar-virtual-chat-list';
 	import { formatCompactProjectPath } from '$lib/chat/project-paths/compact-project-path';
 	import SidebarGroupHeaderContent from './SidebarGroupHeaderContent.svelte';
+	import { getExecutors } from '$lib/context';
 
 	interface SidebarProjectHeaderRowProps {
 		row: SidebarVirtualProjectHeaderRow;
@@ -12,8 +13,10 @@
 	}
 
 	let { row, containsSelectedChat = false, onToggle }: SidebarProjectHeaderRowProps = $props();
-	let fullLabel = $derived(row.projectPath || m.sidebar_project_unknown());
-	let displayLabel = $derived(formatCompactProjectPath(fullLabel));
+	const executors = getExecutors();
+	const executorLabel = $derived((row.executorId ?? 'local') === 'local' ? '' : `${executors.label(row.executorId)} / `);
+	let fullLabel = $derived(executorLabel + (row.projectPath || m.sidebar_project_unknown()));
+	let displayLabel = $derived(executorLabel + formatCompactProjectPath(row.projectPath || m.sidebar_project_unknown()));
 
 	function handleToggle(): void {
 		onToggle?.(row.collapseKey);

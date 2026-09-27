@@ -1,11 +1,13 @@
-import type { RemoteSettingsSnapshot, RemotePathSettings } from '$shared/settings';
+import type { RemoteSettingsSnapshot, RemotePathSettings, RemotePathSettingsPatch } from '$shared/settings';
 import type { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte.js';
+import { effectiveExecutorId } from '$shared/executors';
 import {
 	nextPinnedProjectPaths,
 	sortedPinnedProjectPaths,
 } from '$lib/chat/project-paths/project-pinned-paths.js';
 
 interface PinnedProjectPathUpdateOptions {
+	executorId?: string;
 	browseStartPath?: string;
 }
 
@@ -28,12 +30,18 @@ async function persistPinnedProjectPathsOptimistically(
 	pinnedProjectPaths: string[],
 	options?: PinnedProjectPathUpdateOptions,
 ): Promise<RemoteSettingsSnapshot> {
-	const pathsPatch = buildPathsPatch(pinnedProjectPaths, options);
+	const executorId = effectiveExecutorId(options?.executorId);
+	const pinnedPaths = sortedPinnedProjectPaths(pinnedProjectPaths);
+	const pathsPatch: RemotePathSettingsPatch = executorId === 'local'
+		? buildPathsPatch(pinnedPaths, options)
+		: { byExecutor: { [executorId]: { pinnedPaths } } };
 	const rollback = remoteSettings.applyOptimisticSnapshot({
 		...snap,
-		paths: {
+		paths: executorId === 'local' ? { ...snap.paths, ...buildPathsPatch(pinnedPaths, options) } : {
 			...snap.paths,
-			...pathsPatch,
+			byExecutor: { ...snap.paths.byExecutor, [executorId]: {
+				recentPaths: [], ...snap.paths.byExecutor?.[executorId], pinnedPaths,
+			} },
 		},
 	});
 
@@ -60,6 +68,8 @@ export async function togglePinnedProjectPathOptimistically(
 	options?: PinnedProjectPathUpdateOptions,
 ): Promise<RemoteSettingsSnapshot> {
 	const snap = await remoteSettings.ensureLoaded();
-	const nextPinnedPaths = nextPinnedProjectPaths(snap.paths.pinnedProjectPaths, path);
+	const executorId = effectiveExecutorId(options?.executorId);
+	const current = executorId === 'local' ? snap.paths.pinnedProjectPaths : snap.paths.byExecutor?.[executorId]?.pinnedPaths ?? [];
+	const nextPinnedPaths = nextPinnedProjectPaths(current, path);
 	return persistPinnedProjectPathsOptimistically(remoteSettings, snap, nextPinnedPaths, options);
 }

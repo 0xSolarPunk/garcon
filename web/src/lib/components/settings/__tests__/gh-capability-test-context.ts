@@ -1,10 +1,8 @@
-import type { GhCapabilityContext } from '$lib/stores/gh-capability.svelte';
-
-let ghCapability: GhCapabilityContext | null = null;
+import type { GhExecutorCapabilityContext } from '$lib/git/pull-requests/gh-capability.svelte';
 
 export function makeTestGhCapability(
-	overrides: Partial<GhCapabilityContext> = {},
-): GhCapabilityContext {
+	overrides: Partial<GhExecutorCapabilityContext> = {},
+): GhExecutorCapabilityContext {
 	return {
 		available: true,
 		authenticated: true,
@@ -18,13 +16,4 @@ export function makeTestGhCapability(
 		refresh: async () => {},
 		...overrides,
 	};
-}
-
-export function setTestGhCapability(capability: GhCapabilityContext): void {
-	ghCapability = capability;
-}
-
-export function getTestGhCapability(): GhCapabilityContext {
-	if (!ghCapability) return makeTestGhCapability();
-	return ghCapability;
 }

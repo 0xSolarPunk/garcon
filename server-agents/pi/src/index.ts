@@ -18,8 +18,10 @@ import { createScopedAgentLogger } from '@garcon/server-agent-common/logging/sco
 import { createVersion1RecordMigration } from '@garcon/server-agent-common/migration/version-1-record-migration';
 import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
 import { createVersionedSettings } from '@garcon/server-agent-common/settings/versioned-settings';
-import { singleQueryRuntimeOptions } from '@garcon/server-agent-common/shared/single-query-control';
+import { singleQueryRuntimeOptions, withSingleQueryDirectory } from '@garcon/server-agent-common/shared/single-query-control';
 import { createAgentProducerAdapter } from '@garcon/server-agent-common/execution/producer-adapter';
+import { createAgentProjectPathUpdates } from '@garcon/server-agent-common/execution/project-path-adapter';
+import { createAgentSteering } from '@garcon/server-agent-common/execution/control-adapters';
 import {
   createHistoryImport,
   createNativeHistoryImport,
@@ -61,6 +63,8 @@ export default class PiAgentIntegration implements AgentIntegration {
   readonly descriptor = PI_DESCRIPTOR;
   readonly attachments = null;
   readonly execution;
+  readonly producers;
+  readonly permissions;
   readonly legacyHistoryImport;
   readonly nativeHistoryImport;
   readonly nativeActivity;
@@ -76,7 +80,6 @@ export default class PiAgentIntegration implements AgentIntegration {
   readonly compaction = null;
   readonly forking = null;
   readonly steering: NonNullable<AgentIntegration['steering']>;
-  readonly goals = null;
   readonly endpoints = null;
   readonly singleQuery: NonNullable<AgentIntegration['singleQuery']>;
 
@@ -97,12 +100,14 @@ export default class PiAgentIntegration implements AgentIntegration {
       descriptors: [],
     });
     const providerExecution = new PiExecution(runtime, nativeSessions);
-    this.projectPathUpdates = {
-      prepare: (request) => providerExecution.prepareProjectPathUpdate(request),
-    };
+    this.projectPathUpdates = createAgentProjectPathUpdates(host.scope,
+      (request) => providerExecution.prepareProjectPathUpdate(request));
     const nativeEvidence = createPiNativeEvidence(config, nativeSessions, runtime);
     this.nativeSessions = nativeEvidence;
-    this.execution = createAgentProducerAdapter(providerExecution, logger).execution;
+    const producer = createAgentProducerAdapter(providerExecution, host);
+    this.execution = producer.execution;
+    this.producers = producer.producers;
+    this.permissions = producer.permissions;
     this.legacyHistoryImport = createHistoryImport({ load: nativeEvidence.loadLegacy });
     this.nativeHistoryImport = createNativeHistoryImport(nativeEvidence);
     this.nativeActivity = createPiNativeActivityProbe(nativeSessions);
@@ -130,11 +135,11 @@ export default class PiAgentIntegration implements AgentIntegration {
         request.signal.throwIfAborted();
         try {
           const { runSingleQuery } = await import('./agents/pi/pi-cli.js');
-          return await runSingleQuery(request.prompt, {
-            projectPath: request.projectPath,
+          return await withSingleQueryDirectory(request.signal, (directory) => runSingleQuery(request.prompt, {
             model: request.model,
             ...singleQueryRuntimeOptions(request),
-          }, config);
+            projectPath: directory,
+          }, config));
         } catch (error) {
           if (error instanceof AgentIntegrationError) throw error;
           throw new AgentIntegrationError(
@@ -145,10 +150,10 @@ export default class PiAgentIntegration implements AgentIntegration {
         }
       },
     };
-    this.steering = {
-      captureTarget: (request) => runtime.captureSteerTarget(request.agentSessionId),
+    this.steering = createAgentSteering(producer, {
+      captureTarget: (agentSessionId) => runtime.captureSteerTarget(agentSessionId),
       steer: (request) => runtime.steer(request),
-    };
+    });
     this.lifecycle = createIntegrationLifecycle({
       start: () => runtime.startPurgeTimer(),
       stop: async () => {

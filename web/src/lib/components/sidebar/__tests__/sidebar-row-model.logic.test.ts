@@ -91,6 +91,19 @@ function rowLabels(model: ReturnType<typeof buildSidebarRowModel>): string[] {
 }
 
 describe('sidebar row model', () => {
+	it.each([false, true])('keeps same-path projects on different executors separate with nested grouping=%s', (groupNestedProjectPaths) => {
+		const executorId = '22222222-2222-4222-8222-222222222222';
+		const chats = [chat('local', '/repo'), chat('remote', '/repo', { executorId })];
+		const model = buildSidebarRowModel({
+			displayedChats: chats, orders: buildSidebarChatOrderMap(chats), grouping: 'project',
+			currentTime: TEST_NOW, groupNestedProjectPaths,
+		});
+		expect(model.projectKeys).toEqual([sidebarProjectKey('/repo'), sidebarProjectKey('/repo', executorId)]);
+		expect(model.rows.filter((row) => row.type === 'project-header').map((row) => row.executorId)).toEqual(['local', executorId]);
+		expect(model.reorderScopesByChatId.get('local')).toEqual(['local']);
+		expect(model.reorderScopesByChatId.get('remote')).toEqual(['remote']);
+	});
+
 	it('keeps ungrouped rows in pinned, normal, archived order', () => {
 		const chats = [
 			chat('normal-a', '/p1'),

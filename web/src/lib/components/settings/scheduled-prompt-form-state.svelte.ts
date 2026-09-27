@@ -1,4 +1,5 @@
 import type { ModelCatalogStore } from '$lib/agents/model-catalog-store.svelte';
+import type { ExecutorsStore } from '$lib/executors/executors-store.svelte';
 import type { SessionAgentId } from '$lib/types/app';
 import type { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte';
 import type { ChatSessionsStore } from '$lib/chat/sessions/chat-sessions.svelte.js';
@@ -23,6 +24,7 @@ import * as m from '$lib/paraglide/messages.js';
 const MINUTES_BY_UNIT = { minutes: 1, hours: 60, days: 1440 } as const;
 
 export interface ScheduledPromptFormStateOptions {
+	executors?: ExecutorsStore;
 	get selectableAgentIds(): readonly SessionAgentId[];
 }
 
@@ -49,13 +51,14 @@ export class ScheduledPromptFormState {
 	#originalEndDate: string | null = null;
 
 	constructor(
-		private readonly modelCatalog: ModelCatalogStore,
+		modelCatalog: ModelCatalogStore,
 		remoteSettings: RemoteSettingsStore,
 		private readonly sessions: Pick<ChatSessionsStore, 'hasChat' | 'isDraft'>,
 		private readonly options: ScheduledPromptFormStateOptions,
 	) {
 		this.startup = new NewChatFormState({
 			modelCatalog,
+			executors: options.executors,
 			remoteSettings,
 			get selectableAgentIds() {
 				return options.selectableAgentIds;
@@ -97,6 +100,8 @@ export class ScheduledPromptFormState {
 		}
 		return (
 			this.startup.settingsLoaded &&
+			this.startup.executorReady &&
+			this.startup.modelCatalogValidated &&
 			this.options.selectableAgentIds.includes(this.startup.agentId) &&
 			this.startup.validationStatus === 'valid' &&
 			this.startup.resolvedModelSelection !== null
@@ -151,6 +156,7 @@ export class ScheduledPromptFormState {
 			this.busyBehavior = scheduledPrompt.target.busyBehavior;
 			return;
 		}
+		this.startup.selectExecutor(scheduledPrompt.target.executorId);
 		this.startup.restoreSelection(scheduledPrompt.target.agentId, {
 			model: scheduledPrompt.target.model,
 			apiProviderId: scheduledPrompt.target.apiProviderId,
@@ -158,8 +164,7 @@ export class ScheduledPromptFormState {
 			modelProtocol: scheduledPrompt.target.modelProtocol,
 		});
 		this.startup.projectPath = scheduledPrompt.target.projectPath;
-		this.startup.setPermissionMode(scheduledPrompt.target.permissionMode);
-		this.startup.setThinkingMode(scheduledPrompt.target.thinkingMode);
+		this.startup.restoreExecutionModes(scheduledPrompt.target.permissionMode, scheduledPrompt.target.thinkingMode);
 		this.startup.replaceAgentSettingsById(scheduledPrompt.target.agentSettingsById);
 		this.startup.chatTags = [...scheduledPrompt.target.tags];
 		this.startup.showTagInput = false;
@@ -188,6 +193,7 @@ export class ScheduledPromptFormState {
 			schedule,
 			target: {
 				type: 'new-chat',
+				...(this.startup.executorId === 'local' ? {} : { executorId: this.startup.executorId }),
 				agentId: this.startup.agentId,
 				projectPath: this.startup.trimmedPath,
 				model: selection.model,

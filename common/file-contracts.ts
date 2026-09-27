@@ -1,6 +1,8 @@
 import { isRecord } from './json.js';
+import { parseExecutorId } from './executors.js';
 
 export interface CanonicalFileIdentity {
+  executorId: string;
   canonicalFileRootPath: string;
   normalizedRelativePath: string;
 }
@@ -13,7 +15,9 @@ export interface FileIdentityResponse {
 export type FileRevision = string;
 
 export const FILE_REVISION_HEADER = 'X-Garcon-File-Revision';
-export const MAX_FILE_VIEW_BYTES = 25 * 1024 * 1024;
+export const MAX_FILE_REVISION_LENGTH = 128;
+export const MAX_FILE_VIEW_BYTES = 4 * 1024 * 1024;
+export const MAX_FILE_SAVE_BYTES = 4 * 1024 * 1024;
 
 export type FileRevisionResponse =
   | { status: 'ready'; revision: FileRevision }
@@ -82,7 +86,8 @@ function isNonEmptyString(value: unknown): value is string {
 
 export function isFileRevision(value: unknown): value is FileRevision {
   return (
-    typeof value === 'string' && /^v1:[A-Za-z0-9_-]+$/.test(value)
+    typeof value === 'string' && value.length <= MAX_FILE_REVISION_LENGTH
+    && /^v1:[A-Za-z0-9_-]+$/.test(value)
   );
 }
 
@@ -269,7 +274,9 @@ export function parseFileIdentityResponse(
   if (record.success !== true || !identity || typeof identity !== 'object')
     return null;
   const fields = identity as Record<string, unknown>;
+  const executorId = parseExecutorId(fields.executorId);
   if (
+    !executorId ||
     typeof fields.canonicalFileRootPath !== 'string' ||
     !fields.canonicalFileRootPath ||
     typeof fields.normalizedRelativePath !== 'string' ||
@@ -279,6 +286,7 @@ export function parseFileIdentityResponse(
   return {
     success: true,
     identity: {
+      executorId,
       canonicalFileRootPath: fields.canonicalFileRootPath,
       normalizedRelativePath: fields.normalizedRelativePath,
     },

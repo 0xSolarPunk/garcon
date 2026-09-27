@@ -4,20 +4,26 @@
 	import type { WorkspaceProjectState } from '$lib/workspace/workspace-context.svelte.js';
 	import { getProjectResolution } from '$lib/context';
 	import type { ProjectTarget } from '$shared/project-resolution';
+	import type { ExecutorServiceNotice as ExecutorServiceNoticeState } from '$lib/executors/executor-service-notice.js';
+	import ExecutorServiceNotice from './ExecutorServiceNotice.svelte';
 	import ProjectAvailabilityNotice from './ProjectAvailabilityNotice.svelte';
 
 	let {
 		projectState,
 		retainedProjectPath,
 		retainedEffectiveProjectKey,
+		retainedExecutorId,
 		target,
+		serviceNotice = null,
 		onChooseFolder,
 		children,
 	}: {
 		projectState: WorkspaceProjectState;
 		retainedProjectPath: string | null;
 		retainedEffectiveProjectKey: string | null;
+		retainedExecutorId?: string;
 		target: ProjectTarget | null;
+		serviceNotice?: ExecutorServiceNoticeState | null;
 		onChooseFolder?: () => void;
 		children: Snippet;
 	} = $props();
@@ -25,12 +31,18 @@
 
 	const synchronized = $derived.by(() => {
 		if (projectState.kind === 'absent') return retainedEffectiveProjectKey === null;
-		return projectState.kind === 'available'
-			&& retainedEffectiveProjectKey === projectState.project.effectiveProjectKey;
+		return (
+			projectState.kind === 'available' &&
+			(retainedExecutorId === undefined ||
+				retainedExecutorId === (projectState.project.executorId ?? 'local')) &&
+			retainedEffectiveProjectKey === projectState.project.effectiveProjectKey
+		);
 	});
 	const resolvingSamePath = $derived(
 		(projectState.kind === 'unchecked' || projectState.kind === 'resolving') &&
 			retainedEffectiveProjectKey !== null &&
+			(retainedExecutorId === undefined ||
+				retainedExecutorId === (projectState.context.executorId ?? 'local')) &&
 			retainedProjectPath === projectState.context.projectPath,
 	);
 	const blocked = $derived(projectState.kind === 'resolving' || !synchronized);
@@ -54,7 +66,11 @@
 	>
 		{@render children()}
 	</div>
-	{#if concealed && (projectState.kind === 'unchecked' || projectState.kind === 'resolving')}
+	{#if concealed && serviceNotice && projectState.kind !== 'available'}
+		<div class="absolute inset-0 grid place-items-center bg-background px-6">
+			<ExecutorServiceNotice notice={serviceNotice} />
+		</div>
+	{:else if concealed && (projectState.kind === 'unchecked' || projectState.kind === 'resolving')}
 		<div
 			class="absolute inset-0 grid place-items-center bg-background px-6 text-center text-sm text-muted-foreground"
 			role="status"

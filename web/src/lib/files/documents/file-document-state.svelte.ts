@@ -12,6 +12,7 @@ export interface FileDocumentRuntimePort {
 }
 
 export class FileDocumentState {
+	readonly executorId: string;
 	readonly id: string;
 	readonly identityKey: string;
 	readonly canonicalFileRootPath: string;
@@ -54,11 +55,20 @@ export class FileDocumentState {
 	readonly viewIds = new Set<string>();
 	readonly #changeListeners = new Set<() => void>();
 
-	constructor(identity: CanonicalFileIdentity, identityKey: string, id = createRandomId()) {
-		this.id = id;
+	constructor(
+		identity: CanonicalFileIdentity,
+		identityKey: string,
+		private readonly options: { id?: string; isExecutorAvailable?: () => boolean } = {},
+	) {
+		this.executorId = identity.executorId;
+		this.id = options.id ?? createRandomId();
 		this.identityKey = identityKey;
 		this.canonicalFileRootPath = identity.canonicalFileRootPath;
 		this.relativePath = identity.normalizedRelativePath;
+	}
+
+	get executorAvailable(): boolean {
+		return this.options.isExecutorAvailable?.() ?? true;
 	}
 
 	get fileName(): string {

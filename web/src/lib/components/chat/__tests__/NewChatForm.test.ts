@@ -201,6 +201,40 @@ function previewResponse(
 }
 
 describe('NewChatForm', () => {
+	it('retains cached selection and text while catalog failure blocks click and Enter until retry', async () => {
+		stubMatchMedia(false);
+		const chatsApi = await import('$lib/api/chats');
+		vi.mocked(chatsApi.validateStart).mockResolvedValue({ valid: true, isGitRepo: false });
+		vi.mocked(settingsApi.getRemoteSettings).mockResolvedValueOnce(makeSnapshot({ paths: { recentProjectPaths: ['/workspace/project'] } }));
+		const onStartChat = vi.fn();
+		const onRetryCatalog = vi.fn(async () => {});
+		const view = render(NewChatFormTestHost, { onStartChat, onRetryCatalog });
+		await waitFor(() => {
+			expect(screen.queryByRole('status', { name: 'Loading chat defaults...' })).toBeNull();
+		});
+		const input = screen.getByPlaceholderText('How can I help you today?');
+		await fireEvent.input(input, { target: { value: 'Synthetic cached-catalog prompt' } });
+		const submit = screen.getByRole('button', { name: 'Start session' }) as HTMLButtonElement;
+		await waitFor(() => expect(submit.disabled).toBe(false));
+
+		await view.rerender({ catalogValidated: false });
+		expect(screen.getByText('Loading models...')).toBeTruthy();
+		expect(submit.disabled).toBe(true);
+		await view.rerender({ catalogValidated: false, catalogError: 'Synthetic catalog failure' });
+		expect(screen.getByText('Synthetic catalog failure')).toBeTruthy();
+		await fireEvent.click(submit);
+		expect(await fireEvent.keyDown(input, { key: 'Enter' })).toBe(false);
+		expect(onStartChat).not.toHaveBeenCalled();
+		expect((input as HTMLTextAreaElement).value).toBe('Synthetic cached-catalog prompt');
+		await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+		expect(onRetryCatalog).toHaveBeenCalledOnce();
+
+		await view.rerender({ catalogValidated: true, catalogError: null });
+		await waitFor(() => expect(submit.disabled).toBe(false));
+		await fireEvent.keyDown(input, { key: 'Enter' });
+		expect(onStartChat).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ firstMessage: 'Synthetic cached-catalog prompt' }), PROSPECTIVE_CHAT_ID);
+	});
+
 	afterEach(() => {
 		vi.unstubAllGlobals();
 		vi.mocked(snippetsApi.expandSnippet).mockReset();
@@ -962,6 +996,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'Review the API in /workspace/project',
 		});
@@ -981,6 +1016,7 @@ describe('NewChatForm', () => {
 				arguments: { type: 'value', value: 'the API' },
 				context: {
 					type: 'new-chat',
+					executorId: 'local',
 					chatId: PROSPECTIVE_CHAT_ID,
 					projectPath: '/workspace/project',
 				},
@@ -1004,6 +1040,7 @@ describe('NewChatForm', () => {
 			sourceId: '00000000-0000-4000-8000-000000000001',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'manual',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'PREAMBLE',
 		});
@@ -1047,6 +1084,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'expanded prompt',
 		});
@@ -1100,6 +1138,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1134,6 +1173,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'expanded',
 		});
@@ -1153,6 +1193,7 @@ describe('NewChatForm', () => {
 				arguments: { type: 'default' },
 				context: {
 					type: 'new-chat',
+					executorId: 'local',
 					chatId: PROSPECTIVE_CHAT_ID,
 					projectPath: '/workspace/project',
 				},
@@ -1166,6 +1207,7 @@ describe('NewChatForm', () => {
 				arguments: { type: 'value', value: '' },
 				context: {
 					type: 'new-chat',
+					executorId: 'local',
 					chatId: PROSPECTIVE_CHAT_ID,
 					projectPath: '/workspace/project',
 				},
@@ -1182,6 +1224,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'EXPANDED',
 		});
@@ -1207,6 +1250,7 @@ describe('NewChatForm', () => {
 				arguments: { type: 'value', value: '' },
 				context: {
 					type: 'new-chat',
+					executorId: 'local',
 					chatId: PROSPECTIVE_CHAT_ID,
 					projectPath: '/workspace/project',
 				},
@@ -1223,6 +1267,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'EXPANDED',
 		});
@@ -1247,6 +1292,7 @@ describe('NewChatForm', () => {
 				arguments: { type: 'value', value: 'saved default' },
 				context: {
 					type: 'new-chat',
+					executorId: 'local',
 					chatId: PROSPECTIVE_CHAT_ID,
 					projectPath: '/workspace/project',
 				},
@@ -1280,6 +1326,7 @@ describe('NewChatForm', () => {
 			...identity,
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1307,6 +1354,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-02T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1391,6 +1439,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1435,6 +1484,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1475,6 +1525,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1516,6 +1567,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'expansion still applies',
 		});
@@ -1550,6 +1602,7 @@ describe('NewChatForm', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});

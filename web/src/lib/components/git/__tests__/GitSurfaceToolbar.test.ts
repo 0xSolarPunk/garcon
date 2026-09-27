@@ -4,6 +4,7 @@ import GitSurfaceToolbarTestHost from './GitSurfaceToolbarTestHost.svelte';
 import { GitTargetSessionController } from '$lib/git/targets/git-target-session.svelte.js';
 import { GitBranchSelectorState } from '$lib/git/targets/git-branch-selector-state.svelte.js';
 import * as m from '$lib/paraglide/messages.js';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures.js';
 
 vi.mock('$lib/api/git.js', () => ({
 	getGitTargetCandidates: vi.fn().mockResolvedValue({ targets: [] }),
@@ -11,7 +12,7 @@ vi.mock('$lib/api/git.js', () => ({
 	getGitWorktrees: vi.fn().mockResolvedValue({ worktrees: [] }),
 }));
 
-function target(): GitTargetSessionController {
+async function target(): Promise<GitTargetSessionController> {
 	const controller = new GitTargetSessionController({
 		kind: 'git-history',
 		createBranchSelector: () => new GitBranchSelectorState(),
@@ -22,21 +23,77 @@ function target(): GitTargetSessionController {
 	controller.setProjectState({
 		kind: 'available',
 		project: {
+			target: {
+				kind: 'chat' as const,
+				chatId: 'chat',
+				projectPath: '/very/long/workspace/project/path',
+			},
 			chatId: 'chat',
 			projectPath: '/very/long/workspace/project/path',
 			effectiveProjectKey: 'chat',
 		},
 	});
+	controller.setPresentationVisible(true);
+	await controller.activate();
 	return controller;
 }
 
 afterEach(cleanup);
 
-describe('GitSurfaceToolbar', () => {
-	it('exposes the full target path while visually truncating it', () => {
+describe('GitSurfaceToolbar', async () => {
+	it('keeps executor navigation before the branch control when the current executor is unavailable', async () => {
+		const controller = await target();
+		controller.setProjectState({
+			kind: 'request-failed',
+			context: {
+				target: {
+					kind: 'chat' as const,
+					chatId: 'remote',
+					projectPath: '/worker',
+					executorId: remoteExecutor.id,
+				},
+				chatId: 'remote',
+				executorId: remoteExecutor.id,
+				projectPath: '/worker',
+			},
+			message: 'Offline',
+		});
+		const chooseExecutor = vi.spyOn(controller, 'selectExecutor').mockResolvedValue();
+		const { container } = render(GitSurfaceToolbarTestHost, {
+			props: {
+				target: controller,
+				presentation: 'mobile',
+				executors: [localExecutor, { ...remoteExecutor, availability: 'offline' }],
+			},
+		});
+		const picker = screen.getByRole('button', { name: 'Executor: Worker' });
+		expect(picker.hasAttribute('disabled')).toBe(false);
+		expect(container.querySelector('[data-git-project-selector]')?.firstElementChild).toBe(picker);
+		expect(screen.getByRole('button', { name: /current ref/i }).hasAttribute('disabled')).toBe(
+			true,
+		);
+		await fireEvent.click(picker);
+		await fireEvent.click(screen.getByRole('menuitemradio', { name: 'Local' }));
+		expect(chooseExecutor).toHaveBeenCalledWith('local');
+	});
+
+	it('allows folder selection without a chat while keeping repository actions disabled', async () => {
+		const controller = await target();
+		controller.setProjectState({ kind: 'absent' });
+		render(GitSurfaceToolbarTestHost, {
+			props: { target: controller, presentation: 'window-main' },
+		});
+		const folder = screen.getByRole('button', { name: m.git_panel_select_project() });
+		expect(folder.hasAttribute('disabled')).toBe(false);
+		expect(screen.getByRole('button', { name: 'Refresh' }).hasAttribute('disabled')).toBe(true);
+		await fireEvent.click(folder);
+		expect(screen.getByRole('dialog', { name: m.git_target() })).toBeTruthy();
+	});
+
+	it('exposes the full target path while visually truncating it', async () => {
 		render(GitSurfaceToolbarTestHost, {
 			props: {
-				target: target(),
+				target: await target(),
 				presentation: 'window-sidebar',
 			},
 		});
@@ -45,13 +102,14 @@ describe('GitSurfaceToolbar', () => {
 		});
 
 		expect(folder.getAttribute('title')).toBe('/very/long/workspace/project/path');
-		expect(folder.textContent).toContain('...');
+		expect(folder.querySelector('span')?.className).toContain('truncate');
+		expect(screen.queryByRole('button', { name: /Executor:/ })).toBeNull();
 		expect(screen.getByRole('button', { name: /current ref HEAD/i })).toBeTruthy();
 	});
 
-	it('expands the branch control on wide screens without wrapping on narrow screens', () => {
+	it('expands the branch control on wide screens without wrapping on narrow screens', async () => {
 		const longBranch = 'feature/a-long-current-branch-name';
-		const controller = target();
+		const controller = await target();
 		controller.branches.currentBranch = longBranch;
 		render(GitSurfaceToolbarTestHost, {
 			props: {
@@ -72,7 +130,7 @@ describe('GitSurfaceToolbar', () => {
 	});
 
 	it('forwards branch sort intent with the current query', async () => {
-		const controller = target();
+		const controller = await target();
 		controller.branches.refs = [
 			{
 				name: 'feature/sort',
@@ -107,7 +165,7 @@ describe('GitSurfaceToolbar', () => {
 	it('opens the shared target dialog from the folder control', async () => {
 		render(GitSurfaceToolbarTestHost, {
 			props: {
-				target: target(),
+				target: await target(),
 				presentation: 'window-main',
 			},
 		});
@@ -124,7 +182,7 @@ describe('GitSurfaceToolbar', () => {
 		const onClose = vi.fn();
 		const rendered = render(GitSurfaceToolbarTestHost, {
 			props: {
-				target: target(),
+				target: await target(),
 				presentation: 'mobile',
 				onClose,
 			},
@@ -141,7 +199,7 @@ describe('GitSurfaceToolbar', () => {
 		const onClose = vi.fn();
 		const rendered = render(GitSurfaceToolbarTestHost, {
 			props: {
-				target: target(),
+				target: await target(),
 				presentation: 'mobile',
 				onClose,
 				closeDisabled: true,
@@ -152,7 +210,7 @@ describe('GitSurfaceToolbar', () => {
 		).toBe(true);
 
 		await rendered.rerender({
-			target: target(),
+			target: await target(),
 			presentation: 'window-sidebar',
 			onClose,
 			closeDisabled: false,
@@ -163,7 +221,7 @@ describe('GitSurfaceToolbar', () => {
 	it('places persistent Git controls in the responsive action menu', async () => {
 		render(GitSurfaceToolbarTestHost, {
 			props: {
-				target: target(),
+				target: await target(),
 				presentation: 'window-main',
 				showMenuLeadingContent: true,
 			},

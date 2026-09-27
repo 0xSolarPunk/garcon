@@ -10,6 +10,7 @@ import * as m from '$lib/paraglide/messages.js';
 function makeController(): CommitController {
 	const controller = new CommitController(createGitSurfaceTestDeps());
 	void controller.setContext('/project', '/project');
+	vi.spyOn(controller, 'projectIdentityPending', 'get').mockReturnValue(false);
 	return controller;
 }
 
@@ -17,14 +18,14 @@ function installTree(controller: CommitController, tree: GitTreeNode[]): void {
 	controller.tree = tree;
 	controller.intents = Object.fromEntries(
 		tree
-			.flatMap((node) => node.children ?? [node])
-			.filter((node) => node.kind === 'file')
-			.map((node) => [
-				node.path,
+			.flatMap((executor) => executor.children ?? [executor])
+			.filter((executor) => executor.kind === 'file')
+			.map((executor) => [
+				executor.path,
 				{
-					path: node.path,
-					desiredSelected: node.staged,
-					actualSelected: node.staged,
+					path: executor.path,
+					desiredSelected: Boolean(executor.staged),
+					actualSelected: Boolean(executor.staged),
 					isRunning: false,
 					runningMode: null,
 					error: null,
@@ -71,8 +72,11 @@ describe('CommitSurface', () => {
 
 		const folder = screen.getByRole('button', { name: '/project' });
 		const toolbar = container.querySelector('[data-git-surface-toolbar]');
-		expect(toolbar?.querySelector('button')).toBe(folder);
-		expect(screen.getByRole('button', { name: /current ref HEAD/i })).toBeTruthy();
+		expect(toolbar?.querySelector('[data-git-folder-picker]')).toBe(folder);
+		expect(toolbar?.querySelector('button')).toBe(
+			screen.getByRole('button', { name: /current ref HEAD/i }),
+		);
+		expect(screen.queryByRole('button', { name: /Executor:/ })).toBeNull();
 	});
 
 	it('places the selected-file summary between the file tree and commit message', () => {
@@ -165,8 +169,9 @@ describe('CommitSurface', () => {
 				],
 			},
 		]);
-		const toggleDirectory = vi.spyOn(controller, 'toggleDirectory');
-		const togglePath = vi.spyOn(controller, 'togglePath');
+		vi.spyOn(controller, 'isRepositoryReady', 'get').mockReturnValue(true);
+		const toggleDirectory = vi.spyOn(controller, 'toggleDirectory').mockImplementation(() => {});
+		const togglePath = vi.spyOn(controller, 'togglePath').mockImplementation(() => {});
 		const { container } = render(CommitSurfaceTestHost, {
 			controller,
 			presentation: 'window-sidebar',

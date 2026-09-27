@@ -11,9 +11,7 @@ import {
 	rendererModeForNavigation,
 	resolveFileRendererMode,
 } from '$lib/files/sessions/file-open-mode.js';
-import type { GhCapabilityStore } from '$lib/stores/gh-capability.svelte.js';
 import type { TerminalRegistry } from '$lib/terminal/sessions/terminal-registry.svelte.js';
-import { TERMINAL_SESSION_LIMIT } from '$shared/terminal';
 import type { FileLocation } from '$lib/files/navigation/file-navigation-store.svelte.js';
 import type { FilesSurfaceController } from './singleton-surfaces.svelte.js';
 import type { WorkspaceCoordinator } from './workspace-coordinator.svelte.js';
@@ -47,7 +45,6 @@ export interface WorkbenchCommandRegistryDeps {
 	files: FileSessionRegistry;
 	terminals: TerminalRegistry;
 	appShell: AppShellStore;
-	ghCapability: GhCapabilityStore;
 	filesSurface(): FilesSurfaceController;
 	filesSurfaceIfPresent(): FilesSurfaceController | null;
 	onError(error: unknown): void;
@@ -56,10 +53,25 @@ export interface WorkbenchCommandRegistryDeps {
 
 export class WorkbenchCommandRegistry {
 	readonly #surfacePorts = new Map<string, FileCommandSurfacePort>();
-	readonly commands: readonly WorkbenchCommand[];
+	readonly #baseCommands: readonly WorkbenchCommand[];
 
 	constructor(private readonly deps: WorkbenchCommandRegistryDeps) {
-		this.commands = this.#createCommands();
+		this.#baseCommands = this.#createCommands();
+	}
+
+	get commands(): readonly WorkbenchCommand[] {
+		if (!this.deps.terminals.hasRemoteHosts) return this.#baseCommands;
+		return [
+			...this.#baseCommands,
+			...this.deps.terminals.hosts.map((host) => ({
+				id: `workspace-new-terminal:${host.id}`,
+				label: `${m.workspace_new_terminal()}: ${host.label}`,
+				category: 'Workspace' as const,
+				isEnabled: () => this.deps.terminals.canCreate(host.id),
+				run: () =>
+					this.deps.workspace.createTerminalInAvailableSpace('command-menu:new-terminal', host.id),
+			})),
+		];
 	}
 
 	get knownFileLocations(): readonly FileLocation[] {
@@ -70,9 +82,10 @@ export class WorkbenchCommandRegistry {
 		);
 		if (tree && fileRootPath) {
 			for (const entry of tree.knownFiles) {
-				const key = fileIdentityKey(fileRootPath, entry.relativePath);
+				const key = fileIdentityKey(fileRootPath, entry.relativePath, tree.executorId);
 				if (byKey.has(key)) continue;
 				byKey.set(key, {
+					executorId: tree.executorId,
 					key,
 					canonicalFileRootPath: fileRootPath,
 					normalizedRelativePath: entry.relativePath,
@@ -137,6 +150,7 @@ export class WorkbenchCommandRegistry {
 			? windowIdOfSurface(this.deps.workspace.layout.snapshot.desktopRoot, context.surfaceId)
 			: null;
 		const opened = await this.deps.files.open({
+			executorId: location.executorId,
 			fileRootPath: location.canonicalFileRootPath,
 			relativePath: location.normalizedRelativePath,
 			mode: rendererModeForNavigation(location.viewPreference),
@@ -199,6 +213,13 @@ export class WorkbenchCommandRegistry {
 				category: 'Navigation',
 				isEnabled: always,
 				run: () => this.deps.appShell.openSettings(),
+			},
+			{
+				id: 'open-app-settings',
+				label: m.command_open_app_settings(),
+				category: 'Navigation',
+				isEnabled: always,
+				run: () => this.deps.appShell.openAppSettings(),
 			},
 			...this.#workspaceCommands(always),
 			{
@@ -282,8 +303,12 @@ export class WorkbenchCommandRegistry {
 				run: async ({ viewId }) => {
 					const session = viewId ? this.deps.files.get(viewId) : null;
 					if (!session) return;
+					if (!session.document.executorAvailable) throw new Error(m.file_command_executor_unavailable());
 					await this.deps.workspace.openSingleton('files');
-					this.deps.filesSurface().revealFile(session.canonicalFileRootPath, session.relativePath);
+					if (!session.document.executorAvailable) throw new Error(m.file_command_executor_unavailable());
+					this.deps
+						.filesSurface()
+						.revealFile(session.canonicalFileRootPath, session.relativePath, session.executorId);
 				},
 			},
 			{
@@ -369,18 +394,15 @@ export class WorkbenchCommandRegistry {
 				label: m.workspace_new_terminal(),
 				category: 'Workspace',
 				isVisible: () =>
-					this.deps.terminals.listStatus === 'ready' &&
-					this.deps.terminals.orderedSessions.length < TERMINAL_SESSION_LIMIT,
-				isEnabled: always,
+					!this.deps.terminals.hasRemoteHosts &&
+					this.deps.terminals.canCreate(this.deps.workspace.terminalCreationExecutorId),
+				isEnabled: () => this.deps.terminals.canCreate(this.deps.workspace.terminalCreationExecutorId),
 				run: () => this.deps.workspace.createTerminalInAvailableSpace('command-menu:new-terminal'),
 			},
 			open('workspace-git', m.command_switch_to_git(), 'git'),
 			open('workspace-git-history', m.workspace_surface_git_history(), 'git-history'),
 			open('workspace-git-compare', m.workspace_surface_git_compare(), 'git-compare'),
-			{
-				...open('workspace-pull-requests', m.workspace_surface_pull_requests(), 'pull-requests'),
-				isVisible: () => this.deps.ghCapability.available || !this.deps.ghCapability.hasChecked,
-			},
+			open('workspace-pull-requests', m.workspace_surface_pull_requests(), 'pull-requests'),
 			open('workspace-commit', m.workspace_surface_commit(), 'commit'),
 		];
 	}

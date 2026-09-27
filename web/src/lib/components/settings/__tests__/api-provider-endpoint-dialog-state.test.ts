@@ -1,13 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	createApiProvider,
+	updateApiProvider,
 	deleteApiProvider,
 	discoverApiProviderModels,
+	testApiProvider,
 } from '$lib/api/api-providers.js';
 import {
 	ApiProviderEndpointDialogState,
-	deleteApiProviderEndpoint,
-} from '../api-provider-endpoint-dialog-state.svelte';
+} from '../api-provider-endpoint-dialog-state.svelte.ts';
+import { ModelCatalogStore } from '$lib/agents/model-catalog-store.svelte';
+import type { ApiProviderCatalogEntry } from '$shared/api-providers';
 
 vi.mock('$lib/api/api-providers.js', () => ({
 	createApiProvider: vi.fn(),
@@ -17,21 +20,40 @@ vi.mock('$lib/api/api-providers.js', () => ({
 	updateApiProvider: vi.fn(),
 }));
 
-function makeModelCatalog(endpoint: unknown = null) {
+function makeModelCatalog(endpoint: ReturnType<ModelCatalogStore['findEndpoint']> = null) {
 	return {
+		executorId: 'local',
 		findEndpoint: vi.fn(() => endpoint),
 		forceRefresh: vi.fn().mockResolvedValue(undefined),
+		invalidateAll: vi.fn(),
 	};
+}
+
+function dialogPorts(catalog: Pick<ModelCatalogStore, 'executorId' | 'findEndpoint' | 'forceRefresh' | 'invalidateAll'> = makeModelCatalog()) {
+	return {
+		modelCatalog: catalog,
+		providers: {
+			findEndpoint: catalog.findEndpoint,
+			isAssigned: () => true,
+			invalidate: () => catalog.invalidateAll(),
+			refresh: async () => {},
+		},
+		isExecutorReady: () => true,
+	} satisfies Pick<ConstructorParameters<typeof ApiProviderEndpointDialogState>[0], 'modelCatalog' | 'providers' | 'isExecutorReady'>;
 }
 
 describe('ApiProviderEndpointDialogState', () => {
 	beforeEach(() => {
+		vi.mocked(createApiProvider).mockReset();
+		vi.mocked(updateApiProvider).mockReset();
+		vi.mocked(deleteApiProvider).mockReset();
 		vi.mocked(discoverApiProviderModels).mockReset();
+		vi.mocked(testApiProvider).mockReset();
 	});
 
 	it('omits OpenAI capabilities for Anthropic-compatible endpoints', () => {
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'anthropic-messages',
 			getEndpointId: () => null,
 			getTemplateId: () => 'custom',
@@ -48,7 +70,7 @@ describe('ApiProviderEndpointDialogState', () => {
 
 	it('maps OpenAI capability toggles to endpoint capabilities', () => {
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'custom',
@@ -82,9 +104,10 @@ describe('ApiProviderEndpointDialogState', () => {
 	});
 
 	it('loads edit state without exposing the stored API key', async () => {
-		const endpoint = {
+		const endpoint: NonNullable<ReturnType<ModelCatalogStore['findEndpoint']>> = {
 			apiProvider: {
 				id: 'zai',
+				revision: 1, createdAt: '', updatedAt: '', endpoints: [],
 				label: 'Z.AI',
 				templateId: 'zai',
 			},
@@ -101,7 +124,7 @@ describe('ApiProviderEndpointDialogState', () => {
 			},
 		};
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog(endpoint) as never,
+			...dialogPorts(makeModelCatalog(endpoint)),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => 'zai_openai',
 			getTemplateId: () => 'custom',
@@ -118,7 +141,7 @@ describe('ApiProviderEndpointDialogState', () => {
 
 	it('prefills OpenRouter template values for OpenAI-compatible creation', () => {
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'openrouter',
@@ -135,15 +158,97 @@ describe('ApiProviderEndpointDialogState', () => {
 		expect(dialog.apiKeyRequired).toBe(true);
 	});
 
+	it.each(['custom', 'ollama'] as const)('requires a fresh key when duplicating a keyed %s profile', async (templateId) => {
+		const provider: ApiProviderCatalogEntry = {
+			id: 'synthetic', revision: 1, label: 'Synthetic', templateId, createdAt: '', updatedAt: '',
+			endpoints: [{
+				id: 'synthetic_openai', protocol: 'openai-compatible', baseUrl: 'https://example.test/v1',
+				defaultModel: 'model', models: [{ value: 'model', label: 'Model' }],
+				supportsImages: false, hasApiKey: true,
+			}],
+		};
+		let duplicate = true;
+		const dialog = new ApiProviderEndpointDialogState({
+			...dialogPorts(makeModelCatalog({ apiProvider: provider, endpoint: provider.endpoints[0]! })),
+			getProtocol: () => 'openai-compatible', getEndpointId: () => 'synthetic_openai',
+			getTemplateId: () => templateId, getDuplicate: () => duplicate,
+		});
+		await dialog.load();
+		expect(dialog.apiProviderId).toBeNull();
+		expect(dialog.apiKey).toBe('');
+		expect(dialog.apiKeyRequired).toBe(true);
+		expect(dialog.canSave).toBe(false);
+		expect(dialog.apiKeyPlaceholder).toBe('API key or token');
+		expect(dialog.canFetchModels).toBe(false);
+		expect(dialog.canTest).toBe(false);
+		await dialog.save();
+		expect(createApiProvider).not.toHaveBeenCalled();
+
+		dialog.apiKey = 'synthetic-new-key';
+		expect(dialog.canSave).toBe(true);
+		vi.mocked(createApiProvider).mockResolvedValueOnce({
+			...provider, id: 'synthetic_copy', assignment: { executorId: 'local', status: 'assigned' },
+		});
+		await dialog.save();
+		expect(createApiProvider).toHaveBeenCalledWith(expect.objectContaining({
+			apiProviderId: undefined, endpoint: expect.objectContaining({ apiKey: 'synthetic-new-key' }),
+		}), 'local');
+
+		duplicate = false;
+		await dialog.load();
+		expect(dialog.apiKeyRequired).toBe(false);
+		expect(dialog.canSave).toBe(true);
+		expect(dialog.canFetchModels).toBe(true);
+		duplicate = true;
+		await dialog.load();
+		dialog.beginCreate();
+		expect(dialog.apiKeyRequired).toBe(false);
+		await dialog.load();
+		dialog.dispose();
+		expect(dialog.apiKeyRequired).toBe(false);
+
+		provider.endpoints[0]!.hasApiKey = false;
+		await dialog.load();
+		expect(dialog.canSave).toBe(true);
+		expect(dialog.canFetchModels).toBe(true);
+		expect(dialog.payload().endpoint.apiKey).toBeUndefined();
+	});
+
+	it.each([
+		['alibaba-cloud', 'Alibaba Cloud API key'],
+		['fireworks', 'Fireworks.ai API key'],
+		['gemini', 'Gemini API key'],
+		['openrouter', 'OpenRouter API key'],
+		['together', 'Together.ai API key'],
+		['zai', 'Z.AI API key'],
+	] as const)('preserves the %s key hint when duplicating a keyed profile', async (templateId, placeholder) => {
+		const provider: ApiProviderCatalogEntry = {
+			id: 'synthetic', revision: 1, label: 'Synthetic', templateId, createdAt: '', updatedAt: '',
+			endpoints: [{
+				id: 'synthetic_openai', protocol: 'openai-compatible', baseUrl: 'https://example.test/v1',
+				defaultModel: 'model', models: [{ value: 'model', label: 'Model' }],
+				supportsImages: false, hasApiKey: true,
+			}],
+		};
+		const dialog = new ApiProviderEndpointDialogState({
+			...dialogPorts(makeModelCatalog({ apiProvider: provider, endpoint: provider.endpoints[0]! })),
+			getProtocol: () => 'openai-compatible', getEndpointId: () => 'synthetic_openai',
+			getTemplateId: () => templateId, getDuplicate: () => true,
+		});
+		await dialog.load();
+		expect(dialog.apiKeyPlaceholder).toBe(placeholder);
+		expect(dialog.apiKeyRequired).toBe(true);
+	});
+
 	it('prefills Alibaba Cloud Singapore URLs for both protocols', () => {
 		const anthropicDialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'anthropic-messages',
 			getEndpointId: () => null,
 			getTemplateId: () => 'alibaba-cloud',
 		});
 		const openAiDialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'alibaba-cloud',
@@ -165,25 +270,25 @@ describe('ApiProviderEndpointDialogState', () => {
 
 	it('prefills Fireworks, Gemini, and Together provider templates', () => {
 		const fireworksAnthropicDialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'anthropic-messages',
 			getEndpointId: () => null,
 			getTemplateId: () => 'fireworks',
 		});
 		const fireworksOpenAiDialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'fireworks',
 		});
 		const geminiDialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'gemini',
 		});
 		const togetherDialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'together',
@@ -217,7 +322,7 @@ describe('ApiProviderEndpointDialogState', () => {
 
 	it('prefills Ollama template with blank key support', () => {
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'ollama',
@@ -236,7 +341,7 @@ describe('ApiProviderEndpointDialogState', () => {
 
 	it('requires a parsed model, valid default model, and at least one API capability before saving', () => {
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'custom',
@@ -275,7 +380,7 @@ describe('ApiProviderEndpointDialogState', () => {
 			],
 		});
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'custom',
@@ -292,8 +397,9 @@ describe('ApiProviderEndpointDialogState', () => {
 			apiKey: undefined,
 			apiProviderId: null,
 			endpointId: null,
+			revision: undefined,
 			modelDiscovery: 'openai-models',
-		});
+		}, 'local');
 		expect(dialog.modelsText).toBe('acme-code|Acme Code\nacme-fast|Acme Fast');
 		expect(dialog.defaultModel).toBe('acme-code');
 		expect(dialog.modelOptions.map((model) => model.value)).toEqual(['acme-code', 'acme-fast']);
@@ -305,7 +411,7 @@ describe('ApiProviderEndpointDialogState', () => {
 			models: [{ value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' }],
 		});
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'anthropic-messages',
 			getEndpointId: () => null,
 			getTemplateId: () => 'custom',
@@ -322,8 +428,9 @@ describe('ApiProviderEndpointDialogState', () => {
 			apiKey: undefined,
 			apiProviderId: null,
 			endpointId: null,
+			revision: undefined,
 			modelDiscovery: 'anthropic-models',
-		});
+		}, 'local');
 		expect(dialog.modelDiscovery).toBe('anthropic-models');
 		expect(dialog.defaultModel).toBe('claude-sonnet-4-20250514');
 	});
@@ -334,7 +441,7 @@ describe('ApiProviderEndpointDialogState', () => {
 			models: [{ value: 'acme-sonnet', label: 'Acme Sonnet' }],
 		});
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog() as never,
+			...dialogPorts(makeModelCatalog()),
 			getProtocol: () => 'anthropic-messages',
 			getEndpointId: () => null,
 			getTemplateId: () => 'custom',
@@ -351,8 +458,9 @@ describe('ApiProviderEndpointDialogState', () => {
 			apiKey: undefined,
 			apiProviderId: null,
 			endpointId: null,
+			revision: undefined,
 			modelDiscovery: 'anthropic-models',
-		});
+		}, 'local');
 		expect(dialog.payload().endpoint.capabilities).toBeUndefined();
 		expect(dialog.defaultModel).toBe('acme-sonnet');
 	});
@@ -362,9 +470,10 @@ describe('ApiProviderEndpointDialogState', () => {
 			success: true,
 			models: [{ value: 'glm-5.1', label: 'GLM-5.1' }],
 		});
-		const endpoint = {
+		const endpoint: NonNullable<ReturnType<ModelCatalogStore['findEndpoint']>> = {
 			apiProvider: {
 				id: 'zai',
+				revision: 1, createdAt: '', updatedAt: '', endpoints: [],
 				label: 'Z.AI',
 				templateId: 'zai',
 			},
@@ -381,7 +490,7 @@ describe('ApiProviderEndpointDialogState', () => {
 			},
 		};
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: makeModelCatalog(endpoint) as never,
+			...dialogPorts(makeModelCatalog(endpoint)),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => 'zai_openai',
 			getTemplateId: () => 'custom',
@@ -400,15 +509,154 @@ describe('ApiProviderEndpointDialogState', () => {
 			apiKey: undefined,
 			apiProviderId: 'zai',
 			endpointId: 'zai_openai',
+			revision: 1,
 			modelDiscovery: 'openai-models',
+		}, 'local');
+	});
+
+	it.each(['fetchModels', 'test'] as const)('runs %s on the selected executor and discards a response after switching executors', async (operation) => {
+		const executorId = '22222222-2222-4222-8222-222222222222';
+		const remote = { ...makeModelCatalog(), executorId, findEndpoint: () => null };
+		let catalog = remote;
+		const dialog = new ApiProviderEndpointDialogState({
+			...dialogPorts(remote),
+			get modelCatalog() { return catalog; },
+			getProtocol: () => 'openai-compatible',
+			getEndpointId: () => null,
 		});
+		await dialog.load();
+		dialog.label = 'Synthetic endpoint';
+		dialog.baseUrl = 'http://localhost:11434/v1';
+		dialog.modelsText = 'synthetic-model';
+		dialog.defaultModel = 'synthetic-model';
+		const api = operation === 'fetchModels' ? discoverApiProviderModels : testApiProvider;
+		const pending = Promise.withResolvers<Awaited<ReturnType<typeof api>>>();
+		vi.mocked(api).mockReturnValueOnce(pending.promise);
+		const request = dialog[operation]();
+		expect(api).toHaveBeenLastCalledWith(expect.any(Object), executorId);
+
+		catalog = { ...remote, executorId: 'local' };
+		await dialog.load();
+		dialog.modelsText = 'current-model';
+		pending.resolve({ success: true, models: [{ value: 'stale-model', label: 'Stale Model' }] });
+		await request;
+		expect(dialog.modelsText).toBe('current-model');
+		expect(dialog.testMessage).toBeNull();
+		expect(dialog.error).toBeNull();
+		expect(dialog.isTesting).toBe(false);
+		expect(dialog.isFetchingModels).toBe(false);
+	});
+
+	it.each(['fetchModels', 'test'] as const)('preserves the editor draft and fences %s across a host round trip', async (operation) => {
+		const remote = { ...makeModelCatalog(), executorId: '22222222-2222-4222-8222-222222222222' };
+		let catalog = remote;
+		const dialog = new ApiProviderEndpointDialogState({
+			...dialogPorts(remote), get modelCatalog() { return catalog; },
+			getProtocol: () => 'openai-compatible', getEndpointId: () => null,
+		});
+		await dialog.load();
+		dialog.label = 'Synthetic draft';
+		dialog.apiKey = 'synthetic-key';
+		dialog.baseUrl = 'http://localhost:11434/v1';
+		dialog.modelsText = 'synthetic-model';
+		dialog.defaultModel = 'synthetic-model';
+		const draft = dialog.payload();
+		const api = operation === 'fetchModels' ? discoverApiProviderModels : testApiProvider;
+		const pending = Promise.withResolvers<Awaited<ReturnType<typeof api>>>();
+		vi.mocked(api).mockReturnValueOnce(pending.promise);
+		const request = dialog[operation]();
+		dialog.clearProbeResults();
+		catalog = { ...remote, executorId: 'local' };
+		expect(dialog.payload()).toEqual(draft);
+		expect(dialog.isTesting).toBe(false);
+		expect(dialog.isFetchingModels).toBe(false);
+		dialog.clearProbeResults();
+		catalog = remote;
+		pending.resolve({ success: true, models: [{ value: 'stale', label: 'Stale' }] });
+		await request;
+		expect(dialog.payload()).toEqual(draft);
+		expect(dialog.testMessage).toBeNull();
+	});
+
+	it('refreshes the captured remote catalog after saving without closing a replacement dialog', async () => {
+		const remote = { ...makeModelCatalog(), executorId: '22222222-2222-4222-8222-222222222222', findEndpoint: () => null };
+		const local = { ...remote, executorId: 'local', forceRefresh: vi.fn(async () => {}) };
+		let catalog = remote;
+		const onSaved = vi.fn();
+		const dialog = new ApiProviderEndpointDialogState({
+			...dialogPorts(remote),
+			get modelCatalog() { return catalog; },
+			getProtocol: () => 'openai-compatible', getEndpointId: () => null, onSaved,
+		});
+		await dialog.load();
+		dialog.label = 'Synthetic endpoint';
+		dialog.baseUrl = 'http://localhost:11434/v1';
+		dialog.modelsText = 'synthetic-model';
+		dialog.defaultModel = 'synthetic-model';
+		const pending = Promise.withResolvers<Awaited<ReturnType<typeof createApiProvider>>>();
+		vi.mocked(createApiProvider).mockReturnValueOnce(pending.promise);
+		const request = dialog.save();
+		catalog = local;
+		await dialog.load();
+		pending.resolve({ id: 'synthetic', revision: 1, assignment: { executorId: remote.executorId, status: 'assigned' }, label: 'Synthetic', createdAt: '', updatedAt: '', endpoints: [] });
+		await request;
+		expect(remote.forceRefresh).toHaveBeenCalledOnce();
+		expect(local.forceRefresh).not.toHaveBeenCalled();
+		expect(onSaved).not.toHaveBeenCalled();
+	});
+
+	it.each(['create', 'update'] as const)('invalidates every executor catalog after a remote %s', async (operation) => {
+		const provider: ApiProviderCatalogEntry = {
+			id: 'synthetic', revision: 1, label: 'Synthetic endpoint', templateId: 'custom', createdAt: '', updatedAt: '',
+			endpoints: [{
+				id: 'synthetic_openai', protocol: 'openai-compatible', baseUrl: 'http://localhost:11434/v1',
+				defaultModel: 'synthetic-model', models: [{ value: 'synthetic-model', label: 'Synthetic Model' }],
+				supportsImages: false, hasApiKey: false, modelDiscovery: 'openai-models',
+			}],
+		};
+		const root = new ModelCatalogStore();
+		const remote = root.forExecutor('22222222-2222-4222-8222-222222222222');
+		const other = root.forExecutor('33333333-3333-4333-8333-333333333333');
+		for (const catalog of [root, remote, other]) {
+			catalog.apiProviderCatalog = [provider];
+			catalog.lastValidatedAt = Date.now();
+			expect(catalog.isValidated).toBe(true);
+		}
+		const refresh = vi.spyOn(remote, 'forceRefresh').mockImplementation(async () => {
+			for (const catalog of [root, remote, other]) expect(catalog.isValidated).toBe(false);
+			remote.lastValidatedAt = Date.now();
+		});
+		vi.mocked(createApiProvider).mockResolvedValueOnce({ ...provider, assignment: { executorId: remote.executorId, status: 'assigned' } });
+		vi.mocked(updateApiProvider).mockResolvedValueOnce(provider);
+		vi.mocked(deleteApiProvider).mockResolvedValueOnce({ success: true });
+		{
+			const dialog = new ApiProviderEndpointDialogState({
+				providers: { findEndpoint: (id) => remote.findEndpoint(id), isAssigned: () => true,
+					invalidate: () => root.invalidateAll(), refresh: async () => {} },
+				isExecutorReady: () => true,
+				modelCatalog: remote, getProtocol: () => 'openai-compatible',
+				getEndpointId: () => operation === 'update' ? 'synthetic_openai' : null,
+			});
+			await dialog.load();
+			dialog.label = 'Synthetic endpoint';
+			dialog.baseUrl = 'http://localhost:11434/v1';
+			dialog.modelsText = 'synthetic-model';
+			dialog.defaultModel = 'synthetic-model';
+			await dialog.save();
+			expect(dialog.error).toBeNull();
+		}
+		expect(refresh).toHaveBeenCalledOnce();
+		expect(root.isValidated).toBe(false);
+		expect(other.isValidated).toBe(false);
+		expect(remote.isValidated).toBe(true);
 	});
 
 	it('calls forceRefresh after saving a new provider to refresh agentModels', async () => {
-		vi.mocked(createApiProvider).mockResolvedValueOnce({} as never);
+		vi.mocked(createApiProvider).mockResolvedValueOnce({ id: 'synthetic', revision: 1,
+			assignment: { executorId: 'local', status: 'assigned' }, label: 'Synthetic', createdAt: '', updatedAt: '', endpoints: [] });
 		const catalog = makeModelCatalog();
 		const dialog = new ApiProviderEndpointDialogState({
-			modelCatalog: catalog as never,
+			...dialogPorts(catalog),
 			getProtocol: () => 'openai-compatible',
 			getEndpointId: () => null,
 			getTemplateId: () => 'custom',
@@ -427,17 +675,54 @@ describe('ApiProviderEndpointDialogState', () => {
 		expect(catalog.forceRefresh).toHaveBeenCalledOnce();
 	});
 
-	it('calls forceRefresh after deleting a provider endpoint', async () => {
-		vi.mocked(deleteApiProvider).mockResolvedValueOnce({ success: true } as never);
-		const endpoint = {
-			apiProvider: { id: 'test-provider' },
-			endpoint: { id: 'test-endpoint' },
-		};
-		const catalog = makeModelCatalog(endpoint);
-
-		await deleteApiProviderEndpoint(catalog as never, 'test-endpoint');
-
-		expect(deleteApiProvider).toHaveBeenCalledWith('test-provider');
-		expect(catalog.forceRefresh).toHaveBeenCalledOnce();
+	it.each(['not-assigned', 'unknown'] as const)('retains the saved identity after a %s create outcome without duplicating it', async (status) => {
+		const catalog = makeModelCatalog();
+		const onSaved = vi.fn();
+		const dialog = new ApiProviderEndpointDialogState({ ...dialogPorts(catalog),
+			getProtocol: () => 'openai-compatible', getEndpointId: () => null, onSaved });
+		await dialog.load();
+		dialog.label = 'Synthetic'; dialog.baseUrl = 'http://localhost:1234/v1';
+		dialog.modelsText = 'synthetic-model'; dialog.defaultModel = 'synthetic-model';
+		vi.mocked(createApiProvider).mockResolvedValueOnce({ id: 'synthetic', revision: 1,
+			assignment: { executorId: 'local', status, error: 'Assignment incomplete' }, label: 'Synthetic', createdAt: '', updatedAt: '', endpoints: [] });
+		await dialog.save();
+		expect(dialog.apiProviderId).toBe('synthetic');
+		expect(dialog.error).toBe('Assignment incomplete');
+		expect(onSaved).not.toHaveBeenCalled();
+		expect(catalog.forceRefresh).not.toHaveBeenCalled();
+		vi.mocked(updateApiProvider).mockResolvedValueOnce({ id: 'synthetic', revision: 2, label: 'Synthetic', createdAt: '', updatedAt: '', endpoints: [] });
+		await dialog.save();
+		expect(createApiProvider).toHaveBeenCalledTimes(1);
+		expect(updateApiProvider).toHaveBeenCalledWith('synthetic', expect.objectContaining({ revision: 1 }));
 	});
+
+	it('allows saving an offline configuration without testing or fetching models', async () => {
+		const catalog = makeModelCatalog();
+		const dialog = new ApiProviderEndpointDialogState({ ...dialogPorts(catalog), isExecutorReady: () => false,
+			getProtocol: () => 'openai-compatible', getEndpointId: () => null });
+		await dialog.load();
+		dialog.label = 'Synthetic'; dialog.baseUrl = 'http://localhost:1234/v1';
+		dialog.modelsText = 'synthetic-model'; dialog.defaultModel = 'synthetic-model';
+		expect(dialog.canSave).toBe(true); expect(dialog.canFetchModels).toBe(false); expect(dialog.canTest).toBe(false);
+		await dialog.fetchModels(); await dialog.test();
+		expect(testApiProvider).not.toHaveBeenCalled(); expect(discoverApiProviderModels).not.toHaveBeenCalled();
+		vi.mocked(createApiProvider).mockResolvedValueOnce({ id: 'synthetic', revision: 1,
+			assignment: { executorId: 'local', status: 'assigned' }, label: 'Synthetic', createdAt: '', updatedAt: '', endpoints: [] });
+		await dialog.save();
+		expect(dialog.error).toBeNull(); expect(catalog.forceRefresh).not.toHaveBeenCalled();
+	});
+
+	it('does not replace newer model edits with an in-flight discovery result', async () => {
+		const dialog = new ApiProviderEndpointDialogState({ ...dialogPorts(), getProtocol: () => 'openai-compatible', getEndpointId: () => null });
+		await dialog.load();
+		dialog.baseUrl = 'http://localhost:1234/v1';
+		const pending = Promise.withResolvers<Awaited<ReturnType<typeof discoverApiProviderModels>>>();
+		vi.mocked(discoverApiProviderModels).mockReturnValueOnce(pending.promise);
+		const request = dialog.fetchModels();
+		dialog.modelsText = 'newer-edit';
+		pending.resolve({ success: true, models: [{ value: 'stale', label: 'Stale' }] });
+		await request;
+		expect(dialog.modelsText).toBe('newer-edit'); expect(dialog.testMessage).toBeNull();
+	});
+
 });

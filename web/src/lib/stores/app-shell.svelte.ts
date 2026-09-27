@@ -3,15 +3,15 @@
 import { untrack } from 'svelte';
 import { createActionSignal } from '$lib/utils/action-signal';
 
-export type SettingsTab = 'providers' | 'other-agents' | 'local' | 'remote' | 'shortcuts';
+export type SettingsTab = 'executors' | 'providers' | 'other-agents' | 'github' | 'general';
+export type AppSettingsTab = 'general' | 'shortcuts';
 
 function normalizeSettingsTab(value: string): SettingsTab {
 	if (value === 'providers') return 'providers';
 	if (value === 'other-agents') return 'other-agents';
-	if (value === 'local') return 'local';
-	if (value === 'remote') return 'remote';
-	if (value === 'shortcuts') return 'shortcuts';
-	return 'providers';
+	if (value === 'github') return 'github';
+	if (value === 'general') return 'general';
+	return 'executors';
 }
 
 export interface NewChatDialogSeed {
@@ -26,12 +26,14 @@ export interface ChatPreambleSelectionTarget {
 
 export class AppShellStore {
 	showSettings = $state(false);
+	showAppSettings = $state(false);
 	showScheduledPrompts = $state(false);
 	showPreambles = $state(false);
 	showSnippets = $state(false);
 	showOnboardingWizard = $state(false);
 	chatPreambleSelectionTarget = $state<ChatPreambleSelectionTarget | null>(null);
-	settingsTab = $state<SettingsTab>('providers');
+	settingsTab = $state<SettingsTab>('executors');
+	appSettingsTab = $state<AppSettingsTab>('general');
 	sidebarOpen = $state(false);
 	isMobile = $state(false);
 	composerFocusRequestId = $state(0);
@@ -54,7 +56,8 @@ export class AppShellStore {
 	#snippetsReturnFocus: (() => void) | null = null;
 	#preamblesReturnFocus: (() => void) | null = null;
 
-	openSettings(section: string = 'providers'): void {
+	openSettings(section: string = 'executors'): void {
+		this.showAppSettings = false;
 		this.dismissSnippets();
 		this.showScheduledPrompts = false;
 		this.showOnboardingWizard = false;
@@ -67,7 +70,22 @@ export class AppShellStore {
 		this.showSettings = false;
 	}
 
+	openAppSettings(section: string = 'general'): void {
+		this.dismissSnippets();
+		this.dismissPreambles();
+		this.showSettings = false;
+		this.showScheduledPrompts = false;
+		this.showOnboardingWizard = false;
+		this.showAppSettings = true;
+		this.setAppSettingsTab(section);
+	}
+
+	closeAppSettings(): void {
+		this.showAppSettings = false;
+	}
+
 	openOnboardingWizard(): void {
+		this.showAppSettings = false;
 		this.dismissSnippets();
 		this.showSettings = false;
 		this.showScheduledPrompts = false;
@@ -80,6 +98,7 @@ export class AppShellStore {
 	}
 
 	openScheduledPrompts(): void {
+		this.showAppSettings = false;
 		this.dismissSnippets();
 		this.showSettings = false;
 		this.showOnboardingWizard = false;
@@ -92,6 +111,7 @@ export class AppShellStore {
 	}
 
 	openPreambles(returnFocus?: () => void): void {
+		this.showAppSettings = false;
 		this.dismissSnippets();
 		this.showSettings = false;
 		this.showScheduledPrompts = false;
@@ -103,6 +123,7 @@ export class AppShellStore {
 	openPreamblesOverScheduledPrompts(returnFocus?: () => void): void {
 		this.dismissSnippets();
 		this.showSettings = false;
+		this.showAppSettings = false;
 		this.showOnboardingWizard = false;
 		this.#preamblesReturnFocus = returnFocus ?? null;
 		this.showPreambles = true;
@@ -129,6 +150,7 @@ export class AppShellStore {
 	}
 
 	openSnippets(returnFocus?: () => void): void {
+		this.showAppSettings = false;
 		this.showSettings = false;
 		this.showScheduledPrompts = false;
 		this.showOnboardingWizard = false;
@@ -151,6 +173,10 @@ export class AppShellStore {
 
 	setSettingsTab(tab: string): void {
 		this.settingsTab = normalizeSettingsTab(tab);
+	}
+
+	setAppSettingsTab(tab: string): void {
+		this.appSettingsTab = tab === 'shortcuts' ? 'shortcuts' : 'general';
 	}
 
 	setSidebarOpen(open: boolean): void {

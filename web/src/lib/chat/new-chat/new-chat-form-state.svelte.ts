@@ -2,7 +2,9 @@
 // model, permission/thinking mode, path validation, image attachments, and
 // the config payload used to start a session.
 
-import { browseDirectory } from '$lib/api/files.js';
+import { ProjectPathCompletionController } from '$lib/chat/project-paths/project-path-completion.js';
+import { effectiveExecutorId } from '$shared/executors';
+import type { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
 import { validateStart, type ValidateStartErrorCode } from '$lib/api/chats.js';
 import {
 	ImageAttachmentState,
@@ -26,6 +28,7 @@ import {
 	withAgentSetting,
 } from '$shared/agent-settings';
 import type { ModelCatalogStore, ModelOption } from '$lib/agents/model-catalog-store.svelte.js';
+import { firstSelectableExecutorRecent, newChatExecutorPreferences } from './new-chat-executor-preferences';
 import type { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte.js';
 import type { ResolvedModelSelection } from '$shared/start-selection';
 import {
@@ -46,6 +49,7 @@ import * as m from '$lib/paraglide/messages.js';
 
 export interface NewChatFormStateOptions {
 	modelCatalog: ModelCatalogStore;
+	executors?: ExecutorsStore;
 	remoteSettings: RemoteSettingsStore;
 	get selectableAgentIds(): readonly SessionAgentId[];
 }
@@ -53,15 +57,17 @@ export interface NewChatFormStateOptions {
 export class NewChatFormState {
 	// Agent and model
 	agentId = $state<SessionAgentId>(DEFAULT_AGENT_ID);
+	executorId = $state('local');
 	selectedModelsByAgent = $state<Record<string, string>>({});
 	#selectedModelTargetsByAgent = $state<Record<string, ResolvedModelSelection>>({});
 	#catalogRefreshCompleted = $state(false);
+	#executorModelCandidate: ResolvedModelSelection | null = null;
 
 	// Path
 	projectPath = $state('');
 	pinnedProjectPaths = $state<string[]>([]);
 	browseStartPath = $state('');
-	projectBasePath = $state('/');
+	#localProjectBasePath = $state('/');
 
 	// Path validation
 	validationStatus = $state<PathValidationStatus>('idle');
@@ -110,6 +116,7 @@ export class NewChatFormState {
 
 	// Injected dependencies
 	readonly #options: NewChatFormStateOptions;
+	readonly #pathCompletion = new ProjectPathCompletionController(this);
 
 	constructor(options: NewChatFormStateOptions) {
 		this.#options = options;
@@ -119,7 +126,55 @@ export class NewChatFormState {
 	// Derived accessors
 
 	get #modelCatalog(): ModelCatalogStore {
-		return this.#options.modelCatalog;
+		return this.executorId === 'local'
+			? this.#options.modelCatalog
+			: this.#options.modelCatalog.forExecutor(this.executorId);
+	}
+
+	get localMachine(): boolean {
+		return this.executorId === 'local';
+	}
+	get projectBasePath(): string {
+		return this.localMachine
+			? this.#localProjectBasePath
+			: (this.#options.executors?.get(this.executorId)?.projectBasePath ?? '');
+	}
+	get pathContextKey(): string {
+		return this.#options.executors?.pathContextKey(this.executorId) ?? this.executorId;
+	}
+	get filesAvailable(): boolean {
+		return this.#options.executors?.filesAvailable(this.executorId) ?? this.localMachine;
+	}
+	get gitAvailable(): boolean {
+		return this.#options.executors?.gitAvailable(this.executorId) ?? this.localMachine;
+	}
+	get executorReady(): boolean {
+		return this.#options.executors?.isReady(this.executorId) ?? true;
+	}
+	get modelCatalogValidated(): boolean {
+		return this.#modelCatalog.isValidated;
+	}
+
+	selectExecutor(value?: string | null): void {
+		const executorId = effectiveExecutorId(value);
+		if (executorId === this.executorId) return;
+		this.#executorModelCandidate ??= this.resolvedModelSelection;
+		this.executorId = executorId;
+		this.#catalogRefreshCompleted = false;
+		this.#startupSelectionAutomatic = false;
+		this.#clearValidation();
+		this.#cancelWorktreeLoad();
+		this.worktreeModalOpen = false;
+		this.showBrowser = false;
+		this.resetTabCompletions();
+		this.selectedModelsByAgent = {};
+		this.#selectedModelTargetsByAgent = {};
+		const snapshot = this.#remoteSettings.snapshot;
+		this.#localProjectBasePath = snapshot?.projectBasePath ?? '';
+		Object.assign(this, newChatExecutorPreferences(snapshot, executorId, this.projectBasePath));
+		this.validateAllModelsAgainstLive();
+		this.validatePath();
+		void this.#refreshModelsInBackground();
 	}
 
 	get #remoteSettings(): RemoteSettingsStore {
@@ -149,6 +204,8 @@ export class NewChatFormState {
 	get canSubmit(): boolean {
 		return (
 			this.settingsLoaded &&
+			this.executorReady &&
+			this.modelCatalogValidated &&
 			this.#selectableAgentIds.includes(this.agentId) &&
 			!this.modelSelectionPending &&
 			!this.modelSelectionError &&
@@ -196,6 +253,9 @@ export class NewChatFormState {
 	}
 
 	get modelSelectionPending(): boolean {
+		if (!this.executorReady) return false;
+		if (!this.modelCatalogValidated)
+			return this.#modelCatalog.isRefreshing || !this.#modelCatalog.error;
 		return (
 			!this.resolvedModelSelection &&
 			!this.#catalogRefreshCompleted &&
@@ -204,7 +264,11 @@ export class NewChatFormState {
 	}
 
 	get modelSelectionError(): string | null {
-		if (this.resolvedModelSelection || this.modelSelectionPending) return null;
+		if (!this.executorReady) return 'Executor is unavailable';
+		if (this.modelSelectionPending) return null;
+		if (!this.modelCatalogValidated)
+			return this.#modelCatalog.error ?? m.model_selector_unavailable();
+		if (this.resolvedModelSelection) return null;
 		return m.model_selector_unavailable();
 	}
 
@@ -224,6 +288,7 @@ export class NewChatFormState {
 
 	selectAgent(next: SessionAgentId): void {
 		if (!this.#selectableAgentIds.includes(next)) return;
+		this.#executorModelCandidate = null;
 		this.#startupSelectionAutomatic = false;
 		this.#applyAgent(next);
 	}
@@ -259,6 +324,14 @@ export class NewChatFormState {
 		this.#modesTouched = true;
 	}
 
+	restoreExecutionModes(permissionMode: PermissionMode, thinkingMode: ThinkingMode): void {
+		this.#startupSelectionAutomatic = false;
+		this.#modesTouched = true;
+		// Saved modes must survive an empty catalog while executor discovery is pending.
+		this.permissionMode = permissionMode;
+		this.thinkingMode = thinkingMode;
+	}
+
 	setAgentSetting(descriptor: AgentSettingDescriptor, value: JsonValue): void {
 		this.#startupSelectionAutomatic = false;
 		this.#configuredAgentSettings.add(this.agentId);
@@ -289,6 +362,7 @@ export class NewChatFormState {
 	// Model
 
 	selectModel(value: string, selection?: ResolvedModelSelection): void {
+		this.#executorModelCandidate = null;
 		this.#startupSelectionAutomatic = false;
 		this.#setModelSelection(
 			this.agentId,
@@ -298,6 +372,7 @@ export class NewChatFormState {
 	}
 
 	restoreSelection(agentId: SessionAgentId, selection: ResolvedModelSelection): void {
+		this.#executorModelCandidate = null;
 		this.#startupSelectionAutomatic = false;
 		this.agentId = agentId;
 		this.#setModelSelection(
@@ -316,6 +391,12 @@ export class NewChatFormState {
 	}
 
 	validateAllModelsAgainstLive(): void {
+		if (!this.#modelCatalog.isValidated) return;
+		const candidate = this.#executorModelCandidate;
+		this.#executorModelCandidate = null;
+		if (candidate && this.#modelCatalog.getModelForSelection(this.agentId, candidate.model, candidate.modelEndpointId)) {
+			this.restoreSelection(this.agentId, candidate);
+		}
 		for (const agentId of this.#selectableAgentIds) {
 			this.validateModelAgainstLive(agentId);
 		}
@@ -426,6 +507,7 @@ export class NewChatFormState {
 	// Worktree modal
 
 	openWorktreeModal(): void {
+		if (!this.gitAvailable) return;
 		this.worktreeModalOpen = true;
 		this.worktreeError = null;
 		this.worktreeItems = [];
@@ -439,7 +521,10 @@ export class NewChatFormState {
 	}
 
 	async loadWorktrees(): Promise<void> {
+		if (!this.gitAvailable) return;
 		const projectPath = this.trimmedPath;
+		const executorId = this.executorId;
+		const contextKey = this.pathContextKey;
 		if (!projectPath) return;
 
 		this.#worktreeAbort?.abort();
@@ -450,11 +535,23 @@ export class NewChatFormState {
 		this.worktreeError = null;
 
 		try {
-			const result = await getGitWorktrees(projectPath, { signal: abort.signal });
+			const result = await getGitWorktrees({ executorId, projectPath }, { signal: abort.signal });
+			if (
+				executorId !== this.executorId ||
+				projectPath !== this.trimmedPath ||
+				contextKey !== this.pathContextKey
+			)
+				return;
 			if (!this.#isCurrentWorktreeLoad(requestVersion, abort.signal)) return;
 			this.worktreeItems = result.worktrees;
 		} catch (error) {
-			if (isAbortError(error) || !this.#isCurrentWorktreeLoad(requestVersion, abort.signal)) {
+			if (
+				isAbortError(error) ||
+				!this.#isCurrentWorktreeLoad(requestVersion, abort.signal) ||
+				executorId !== this.executorId ||
+				projectPath !== this.trimmedPath ||
+				contextKey !== this.pathContextKey
+			) {
 				return;
 			}
 			this.worktreeError = m.git_target_load_worktrees_failed();
@@ -472,6 +569,7 @@ export class NewChatFormState {
 		this.#worktreeAbort = null;
 		this.#worktreeRequestVersion += 1;
 		this.isLoadingWorktrees = false;
+		this.isCreatingWorktree = false;
 	}
 
 	#isCurrentWorktreeLoad(requestVersion: number, signal: AbortSignal): boolean {
@@ -479,6 +577,7 @@ export class NewChatFormState {
 	}
 
 	selectWorktree(worktreePath: string): void {
+		if (!this.gitAvailable) return;
 		this.#cancelWorktreeLoad();
 		this.projectPath = worktreePath;
 		this.worktreeModalOpen = false;
@@ -486,26 +585,40 @@ export class NewChatFormState {
 	}
 
 	async createWorktree(worktreePath: string, branch?: string, baseRef?: string): Promise<boolean> {
-		if (!this.trimmedPath) return false;
+		if (!this.gitAvailable || this.isCreatingWorktree) return false;
+		const projectPath = this.trimmedPath;
+		const executorId = this.executorId;
+		const contextKey = this.pathContextKey;
+		if (!projectPath) return false;
+		const generation = this.#worktreeRequestVersion;
+		const current = () =>
+			generation === this.#worktreeRequestVersion &&
+			executorId === this.executorId &&
+			projectPath === this.trimmedPath &&
+			contextKey === this.pathContextKey;
 		this.isCreatingWorktree = true;
 		this.worktreeError = null;
 
 		try {
-			const result = await gitCreateWorktree(this.trimmedPath, worktreePath, { branch, baseRef });
+			const result = await gitCreateWorktree({ executorId, projectPath }, worktreePath, {
+				branch,
+				baseRef,
+			});
+			if (!current()) return false;
 			if (!result.success) {
 				this.worktreeError =
 					result.error || result.message || m.chat_new_chat_create_worktree_failed();
 				return false;
 			}
-			await this.loadWorktrees();
 			this.selectWorktree(result.worktreePath || worktreePath);
 			return true;
 		} catch (err) {
+			if (!current()) return false;
 			this.worktreeError =
 				err instanceof Error ? err.message : m.chat_new_chat_create_worktree_failed();
 			return false;
 		} finally {
-			this.isCreatingWorktree = false;
+			if (generation === this.#worktreeRequestVersion) this.isCreatingWorktree = false;
 		}
 	}
 
@@ -514,6 +627,8 @@ export class NewChatFormState {
 	/** Debounced validation of the project path against the server. */
 	validatePath(): void {
 		const path = this.trimmedPath;
+		const executorId = this.executorId;
+		const contextKey = this.pathContextKey;
 		if (!path) {
 			this.#clearValidation();
 			return;
@@ -529,8 +644,9 @@ export class NewChatFormState {
 
 		this.#validationTimer = setTimeout(async () => {
 			try {
-				const data = await validateStart(path);
-				if (requestVersion !== this.#validationRequestVersion) return;
+				const data = await validateStart(path, { executorId });
+				if (requestVersion !== this.#validationRequestVersion || contextKey !== this.pathContextKey)
+					return;
 				if (data.valid) {
 					this.validationStatus = 'valid';
 					this.validationError = null;
@@ -543,9 +659,11 @@ export class NewChatFormState {
 					this.preambles.invalidatePreview();
 				}
 			} catch (err) {
-				if (requestVersion !== this.#validationRequestVersion) return;
+				if (requestVersion !== this.#validationRequestVersion || contextKey !== this.pathContextKey)
+					return;
 				this.validationStatus = 'invalid';
-				this.validationError = m.chat_new_chat_errors_invalid_directory();
+				this.validationError =
+					err instanceof Error ? err.message : m.chat_new_chat_errors_invalid_directory();
 				this.gitRepoStatus = 'non-git';
 				this.preambles.invalidatePreview();
 				console.warn('[NewChatFormState] Path validation request failed', err);
@@ -577,6 +695,7 @@ export class NewChatFormState {
 
 	async togglePinnedPath(): Promise<void> {
 		const path = this.trimmedPath;
+		const executorId = this.executorId;
 		if (!path || this.isUpdatingPinnedPath) return;
 		const previous = this.pinnedProjectPaths;
 		const next = nextPinnedProjectPaths(this.pinnedProjectPaths, path);
@@ -584,12 +703,18 @@ export class NewChatFormState {
 		this.isUpdatingPinnedPath = true;
 		try {
 			const snap = await savePinnedProjectPathsOptimistically(this.#remoteSettings, next, {
+				executorId,
 				browseStartPath: this.browseStartPath || path,
 			});
-			this.pinnedProjectPaths = snap.paths.pinnedProjectPaths;
-			this.browseStartPath = snap.paths.browseStartPath;
+			if (executorId === this.executorId) {
+				this.pinnedProjectPaths =
+					executorId === 'local'
+						? snap.paths.pinnedProjectPaths
+						: (snap.paths.byExecutor?.[executorId]?.pinnedPaths ?? []);
+				if (executorId === 'local') this.browseStartPath = snap.paths.browseStartPath;
+			}
 		} catch (err) {
-			this.pinnedProjectPaths = previous;
+			if (executorId === this.executorId) this.pinnedProjectPaths = previous;
 			console.warn('[NewChatFormState] Failed to persist pinned project paths', err);
 		} finally {
 			this.isUpdatingPinnedPath = false;
@@ -619,6 +744,7 @@ export class NewChatFormState {
 	}
 
 	dispose(): void {
+		this.#pathCompletion.reset();
 		if (this.#validationTimer) {
 			clearTimeout(this.#validationTimer);
 			this.#validationTimer = null;
@@ -635,6 +761,10 @@ export class NewChatFormState {
 
 	/** Validates and builds the config, returning null if validation fails. */
 	buildConfig(): NewChatConfig | null {
+		if (!this.executorReady) {
+			this.error = 'Executor is unavailable';
+			return null;
+		}
 		if (!this.settingsLoaded) {
 			this.error = m.chat_new_chat_errors_defaults_loading();
 			return null;
@@ -643,7 +773,8 @@ export class NewChatFormState {
 			this.error = m.chat_new_chat_errors_agent_unavailable();
 			return null;
 		}
-		if (this.modelSelectionError) return null;
+		if (!this.modelCatalogValidated || this.modelSelectionPending || this.modelSelectionError)
+			return null;
 		if (!this.trimmedPath) {
 			this.error = m.chat_new_chat_errors_project_path_required();
 			return null;
@@ -666,6 +797,7 @@ export class NewChatFormState {
 
 		return {
 			agentId: this.agentId,
+			executorId: this.executorId,
 			projectPath: this.trimmedPath,
 			model: selection.model,
 			apiProviderId: selection.apiProviderId,
@@ -685,6 +817,7 @@ export class NewChatFormState {
 
 	/** Resets form state when the dialog opens. */
 	reseed(prefill: string): void {
+		this.#pathCompletion.reset();
 		this.firstMessage = prefill;
 		this.attachedImages = [];
 		this.error = null;
@@ -725,8 +858,10 @@ export class NewChatFormState {
 	}
 
 	async #refreshModelsInBackground(): Promise<void> {
+		const catalog = this.#modelCatalog;
 		try {
-			await this.#modelCatalog.refreshIfStale();
+			await catalog.refreshIfStale();
+			if (catalog !== this.#modelCatalog) return;
 			this.#catalogRefreshCompleted = true;
 			this.#reconcileAgentSettingsWithCatalog();
 			const previousAgentId = this.agentId;
@@ -751,22 +886,15 @@ export class NewChatFormState {
 	}
 
 	#applySettings(snap: RemoteSettingsSnapshot): void {
-		this.projectBasePath = snap.projectBasePath;
+		this.#localProjectBasePath = snap.projectBasePath;
 		this.#executionDefaults = snap.executionDefaults;
 		this.#startupRecents = snap.recentAgentSettings;
 		this.#seedAgentSettings(snap.executionDefaults);
 
-		this.pinnedProjectPaths = snap.paths.pinnedProjectPaths ?? [];
-		this.browseStartPath = snap.paths.browseStartPath ?? '';
-
-		const defaultPath = snap.paths.recentProjectPaths[0] || this.browseStartPath;
-		if (defaultPath && !this.projectPath) {
-			this.projectPath = defaultPath;
-		}
-
-		if (!this.projectPath) {
-			this.projectPath = this.projectBasePath;
-		}
+		const preferences = newChatExecutorPreferences(snap, this.executorId, this.projectBasePath);
+		this.pinnedProjectPaths = preferences.pinnedProjectPaths;
+		this.browseStartPath = preferences.browseStartPath;
+		if (!this.projectPath) this.projectPath = preferences.projectPath;
 
 		const recent = this.#firstSelectableRecent(snap.recentAgentSettings);
 		if (recent) {
@@ -787,18 +915,7 @@ export class NewChatFormState {
 		recents: RecentAgentSetting[],
 		selectableAgentIds: readonly SessionAgentId[] = this.#selectableAgentIds,
 	): RecentAgentSetting | null {
-		const selectable = new Set(selectableAgentIds);
-		for (const recent of recents) {
-			const agentId = recent.agentId as SessionAgentId;
-			if (!selectable.has(agentId)) continue;
-			const model = this.#modelCatalog.getModelForSelection(
-				agentId,
-				recent.model,
-				recent.modelEndpointId,
-			);
-			if (model) return recent;
-		}
-		return null;
+		return firstSelectableExecutorRecent(recents, this.executorId, selectableAgentIds, this.#modelCatalog);
 	}
 
 	#applyExecutionDefaultsForAgent(agentId: SessionAgentId): void {
@@ -864,75 +981,15 @@ export class NewChatFormState {
 	// Auto-open browser on first path focus
 
 	handlePathFocus(): void {
-		this.showBrowser = true;
+		if (this.filesAvailable) this.showBrowser = true;
 	}
 
-	// Tab-completion for the path input
-
-	tabCompletions = $state<string[]>([]);
-	#tabCompletionIndex = 0;
-
-	/** Handles Tab key in the path input. Completes the path like a terminal. */
-	async handleTabCompletion(): Promise<void> {
-		const raw = this.projectPath;
-		if (!raw) return;
-
-		// If we already have multiple completions, cycle through them.
-		if (this.tabCompletions.length > 1) {
-			this.#tabCompletionIndex = (this.#tabCompletionIndex + 1) % this.tabCompletions.length;
-			this.projectPath = this.tabCompletions[this.#tabCompletionIndex];
-			return;
-		}
-
-		// Determine the parent directory and partial name to match.
-		const lastSlash = raw.lastIndexOf('/');
-		const parentDir = lastSlash >= 0 ? raw.slice(0, lastSlash) || '/' : '/';
-		const partial = lastSlash >= 0 ? raw.slice(lastSlash + 1).toLowerCase() : '';
-
-		try {
-			const entries = await browseDirectory(parentDir);
-			const matches = partial
-				? entries.filter((e) => e.name.toLowerCase().startsWith(partial))
-				: entries;
-
-			if (matches.length === 0) return;
-
-			const matchPaths = matches.map((e) => e.path);
-
-			if (matches.length === 1) {
-				// Single match — complete it and add trailing slash.
-				this.projectPath = matchPaths[0] + '/';
-				this.tabCompletions = [];
-			} else {
-				// Multiple matches — fill common prefix and open browser.
-				const common = longestCommonPrefix(matchPaths);
-				if (common.length > raw.length) {
-					this.projectPath = common;
-				}
-				this.tabCompletions = matchPaths;
-				this.#tabCompletionIndex = 0;
-				this.showBrowser = true;
-			}
-		} catch {
-			// Silently ignore browse errors on tab.
-		}
+	handleTabCompletion(): Promise<void> {
+		return this.#pathCompletion.complete();
 	}
 
 	/** Resets tab-completion state when the user types. */
 	resetTabCompletions(): void {
-		this.tabCompletions = [];
-		this.#tabCompletionIndex = 0;
+		this.#pathCompletion.reset();
 	}
-}
-
-function longestCommonPrefix(strings: string[]): string {
-	if (strings.length === 0) return '';
-	let prefix = strings[0];
-	for (let i = 1; i < strings.length; i++) {
-		while (!strings[i].startsWith(prefix)) {
-			prefix = prefix.slice(0, -1);
-			if (!prefix) return '';
-		}
-	}
-	return prefix;
 }

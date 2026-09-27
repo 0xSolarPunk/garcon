@@ -1,6 +1,10 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	import type { ExecutorSnapshot } from '$shared/executors';
+	import type { ConversationMessageChatContext } from '$lib/chat/transcript/conversation-message-context';
 	import ConversationMessage from '../ConversationMessage.svelte';
-	import { setAppShell, setChatSessions, setFileSessions, setLocalSettings } from '$lib/context';
+	import { setNotifications, setAppShell, setChatSessions, setFileSessions, setLocalSettings } from '$lib/context';
+	import { createNotificationsStore } from '$lib/stores/notifications.svelte.js';
 	import type { ChatMessage } from '$shared/chat-types';
 	import {
 		FileSessionRegistry,
@@ -16,6 +20,8 @@
 	type OpenAutoInput = FileOpenRequest;
 
 	interface Props {
+		executors?: readonly ExecutorSnapshot[];
+		chatContext?: ConversationMessageChatContext;
 		message: ChatMessage;
 		rowId?: string;
 		openAuto?: (input: OpenAutoInput) => void;
@@ -36,6 +42,8 @@
 	}
 
 	let {
+		executors,
+		chatContext,
 		message,
 		rowId,
 		openAuto = () => {},
@@ -54,7 +62,9 @@
 		selectedChatId = 'chat-1',
 		removableChatId,
 	}: Props = $props();
+	setExecutorsTestContext(untrack(() => executors));
 	setCanonicalWorkspaceLayout();
+	const notifications = setNotifications(createNotificationsStore());
 	const initialHost = untrack(() => ({
 		projectBasePath,
 		chatProjectPath,
@@ -121,6 +131,7 @@
 </script>
 
 <ConversationMessage
+	{chatContext}
 	{message}
 	{rowId}
 	{forkUpToSeq}
@@ -132,6 +143,9 @@
 />
 
 <output data-testid="draft-preview">{draftPreview}</output>
+{#each notifications.items as notification (notification.id)}
+	<output>{notification.message}</output>
+{/each}
 
 {#if chatTitleUpdate}
 	<button

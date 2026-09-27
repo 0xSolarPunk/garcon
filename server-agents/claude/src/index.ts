@@ -18,8 +18,10 @@ import { hasNodeErrorCode } from '@garcon/server-agent-common/lib/errors';
 import { createVersion1RecordMigration } from '@garcon/server-agent-common/migration/version-1-record-migration';
 import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
 import { createVersionedSettings } from '@garcon/server-agent-common/settings/versioned-settings';
-import { singleQueryRuntimeOptions } from '@garcon/server-agent-common/shared/single-query-control';
+import { singleQueryRuntimeOptions, withSingleQueryDirectory } from '@garcon/server-agent-common/shared/single-query-control';
 import { createAgentProducerAdapter } from '@garcon/server-agent-common/execution/producer-adapter';
+import { createAgentProjectPathUpdates } from '@garcon/server-agent-common/execution/project-path-adapter';
+import { createAgentSteering } from '@garcon/server-agent-common/execution/control-adapters';
 import {
   createHistoryImport,
   createNativeHistoryImport,
@@ -42,10 +44,7 @@ import {
   transformClaudeForkTranscript,
 } from './agents/claude/fork-transcript.js';
 import { loadClaudeChatMessages } from './agents/claude/history-loader.js';
-import {
-  createClaudeNativePath,
-  resolveClaudeNativePath,
-} from './agents/claude/native-path.js';
+import { resolveClaudeNativePath } from './agents/claude/native-path.js';
 import { ClaudeSlashCommandDiscovery } from './agents/claude/slash-command-discovery.js';
 import { createClaudeNativeActivityProbe } from './agents/claude/native-activity.js';
 import { resolveClaudeModel } from './agents/claude/model-context.js';
@@ -76,6 +75,8 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
     fileMimeTypes: CHAT_FILE_ATTACHMENT_MIME_TYPES,
   } as const;
   readonly execution;
+  readonly producers;
+  readonly permissions;
   readonly legacyHistoryImport;
   readonly nativeHistoryImport;
   readonly nativeActivity;
@@ -96,7 +97,6 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
   readonly compaction = null;
   readonly forking;
   readonly steering: NonNullable<AgentIntegration['steering']>;
-  readonly goals = null;
   readonly endpoints: NonNullable<AgentIntegration['endpoints']>;
   readonly singleQuery: NonNullable<AgentIntegration['singleQuery']>;
 
@@ -168,9 +168,8 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
         providerExecution.applySessionConfiguration(agentSessionId, configuration)
       ),
     };
-    this.projectPathUpdates = {
-      prepare: (request) => providerExecution.prepareProjectPathUpdate(request),
-    };
+    this.projectPathUpdates = createAgentProjectPathUpdates(host.scope,
+      (request) => providerExecution.prepareProjectPathUpdate(request));
     const nativeEvidence = createClaudeNativeEvidence({
       runtime,
       nativeSessions,
@@ -178,7 +177,10 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
       logger,
     });
     this.nativeSessions = nativeEvidence;
-    this.execution = createAgentProducerAdapter(providerExecution, logger).execution;
+    const producer = createAgentProducerAdapter(providerExecution, host);
+    this.execution = producer.execution;
+    this.producers = producer.producers;
+    this.permissions = producer.permissions;
     this.legacyHistoryImport = createHistoryImport({ load: nativeEvidence.loadLegacy });
     this.nativeHistoryImport = createNativeHistoryImport(nativeEvidence);
     this.nativeActivity = createClaudeNativeActivityProbe(nativeSessions);
@@ -203,7 +205,7 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
       },
       launchLogin: () => login.launch(),
       completeLogin: (sessionId, code) => login.complete(sessionId, code),
-      loginStatus: (expectedSessionId) => login.status(expectedSessionId),
+      loginStatus: async (expectedSessionId) => login.status(expectedSessionId),
     };
     this.commands = {
       discover: (projectPath, signal) => {
@@ -219,10 +221,10 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
       semanticDigest: claudeForkSemanticDigest,
       allowUnmaterializedWholeSession: true,
     });
-    this.steering = {
-      captureTarget: request => runtime.captureSteerTarget(request.agentSessionId),
-      steer: request => runtime.steer(request),
-    };
+    this.steering = createAgentSteering(producer, {
+      captureTarget: (agentSessionId) => runtime.captureSteerTarget(agentSessionId),
+      steer: (request) => runtime.steer(request),
+    });
     this.endpoints = {
       async validate(selection) {
         if (selection.protocol !== 'anthropic-messages') {
@@ -246,15 +248,15 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
           );
         }
         try {
-          return await runSingleQuery(request.prompt, {
-            cwd: request.projectPath,
+          return await withSingleQueryDirectory(request.signal, (directory) => runSingleQuery(request.prompt, {
             model: request.model,
             ...singleQueryRuntimeOptions(request),
+            cwd: directory,
             envOverrides: {
               ...buildClaudeHostEnvironment(config),
               ...endpointRuntime?.envOverrides,
             },
-          }, { binary: config.binary, logger, versionProbe });
+          }, { binary: config.binary, logger, versionProbe }));
         } catch (error) {
           throw classifyClaudeError(error);
         }
@@ -287,14 +289,14 @@ function createClaudeNativeEvidence(options: {
       nativePath: native.path,
     };
   };
-  const derivedPath = async (chat: AgentChatReference) => {
-    const value = reference(chat);
-    return value.nativePath ?? (value.agentSessionId
-      ? createClaudeNativePath(chat.projectPath, value.agentSessionId, {
-          configHomeDir: options.configHomeDir() ?? undefined,
-          logger: options.logger,
-        })
-      : null);
+  const resolvePath = async (chat: AgentChatReference, signal: AbortSignal) => {
+    signal.throwIfAborted();
+    const nativePath = await resolveClaudeNativePath(reference(chat), {
+      configHomeDir: options.configHomeDir() ?? undefined,
+      logger: options.logger,
+    });
+    signal.throwIfAborted();
+    return nativePath;
   };
   return {
     async resolveNativeSession({ chat, signal }) {
@@ -302,10 +304,7 @@ function createClaudeNativeEvidence(options: {
       const current = options.nativeSessions.decode(chat.nativeSession);
       const agentSessionId = chat.agentSessionId ?? current.agentSessionId;
       if (!agentSessionId) return null;
-      const nativePath = await resolveClaudeNativePath(reference(chat), {
-        configHomeDir: options.configHomeDir() ?? undefined,
-        logger: options.logger,
-      });
+      const nativePath = await resolvePath(chat, signal);
       if (!nativePath && chat.nativeSession) return chat.nativeSession;
       return options.nativeSessions.encode({
         path: nativePath,
@@ -315,12 +314,13 @@ function createClaudeNativeEvidence(options: {
     },
     async load({ chat, signal }) {
       signal.throwIfAborted();
-      const nativePath = await derivedPath(chat);
+      const nativePath = await resolvePath(chat, signal);
       if (!nativePath) {
         throw new AgentIntegrationError(
           'TRANSCRIPT_UNAVAILABLE',
-          'Claude native transcript has no selected session',
+          'Claude native transcript is unavailable',
           false,
+          { reason: 'source-missing' },
         );
       }
       return {
@@ -333,7 +333,7 @@ function createClaudeNativeEvidence(options: {
     },
     async loadLegacy({ chat, signal }) {
       signal.throwIfAborted();
-      const nativePath = await derivedPath(chat);
+      const nativePath = await resolvePath(chat, signal);
       if (!nativePath) return { messages: [] };
       try {
         return {
@@ -352,7 +352,7 @@ function createClaudeNativeEvidence(options: {
     },
     async describeSource({ chat, signal }) {
       signal.throwIfAborted();
-      const nativePath = await derivedPath(chat);
+      const nativePath = await resolvePath(chat, signal);
       return nativePath ? { kind: 'filesystem-path', value: nativePath } : null;
     },
     async release({ chat, signal }) {

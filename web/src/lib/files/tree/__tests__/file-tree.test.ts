@@ -82,7 +82,15 @@ function availableProject(
 	effectiveProjectKey = '/workspace/project',
 	chatId = 'chat-1',
 ): WorkspaceProjectState {
-	return { kind: 'available', project: { projectPath, effectiveProjectKey, chatId } };
+	return {
+		kind: 'available',
+		project: {
+			target: { kind: 'chat' as const, chatId: chatId, projectPath: projectPath },
+			projectPath,
+			effectiveProjectKey,
+			chatId,
+		},
+	};
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -113,9 +121,32 @@ describe('FileTreeStore', () => {
 		expect(store.fileRootPath).toBe('/workspace');
 		expect(store.isAtChatProject).toBe(true);
 		expect(filesApi.getTree).toHaveBeenCalledWith(
-			{ directoryPath: '/workspace/project' },
+			{ directoryPath: '/workspace/project', executorId: 'local' },
 			expect.any(Object),
 		);
+	});
+
+	it('preserves the chat-project target when a replacement interrupts child navigation', async () => {
+		const pending = Promise.withResolvers<FileTreeResponse>();
+		vi.mocked(filesApi.getTree)
+			.mockResolvedValueOnce(response('/workspace/project'))
+			.mockReturnValueOnce(pending.promise)
+			.mockResolvedValueOnce(response('/workspace/project/src'))
+			.mockResolvedValueOnce(response('/workspace/project'));
+		store.setProjectState(availableProject());
+		store.activate();
+		await tick();
+		const navigation = store.enterDirectory(entry('src', 'directory'));
+		store.invalidateExecutorPaths();
+		await tick();
+		expect(store.currentDirectoryPath).toBe('/workspace/project/src');
+		expect(store.isAtChatProject).toBe(false);
+		await store.goToChatProject();
+		expect(store.currentDirectoryPath).toBe('/workspace/project');
+		expect(store.isAtChatProject).toBe(true);
+		pending.resolve(response('/workspace/project/src'));
+		await navigation;
+		expect(store.currentDirectoryPath).toBe('/workspace/project');
 	});
 
 	it('captures the chat-project anchor when returning after the initial load fails', async () => {
@@ -197,6 +228,50 @@ describe('FileTreeStore', () => {
 		expect(store.currentDirectoryPath).toBe('/workspace/project/b');
 	});
 
+	it('discards same-path navigation and child results from the previous executor', async () => {
+		const executorId = '22222222-2222-4222-8222-222222222222';
+		const child = Promise.withResolvers<FileTreeResponse>();
+		const refresh = Promise.withResolvers<FileTreeResponse>();
+		vi.mocked(filesApi.getTree)
+			.mockResolvedValueOnce(response('/workspace/project', [entry('src', 'directory')]))
+			.mockReturnValueOnce(child.promise)
+			.mockReturnValueOnce(refresh.promise)
+			.mockResolvedValueOnce(response('/workspace/project', [entry('remote.ts', 'file')]));
+		store.setProjectState(availableProject());
+		store.activate();
+		await tick();
+		store.toggleDirectory('/workspace/project/src');
+		const refreshing = store.refresh();
+		store.setProjectState({
+			kind: 'available',
+			project: {
+				target: {
+					kind: 'chat' as const,
+					chatId: 'remote',
+					projectPath: '/workspace/project',
+					executorId: executorId,
+				},
+				executorId,
+				chatId: 'remote',
+				projectPath: '/workspace/project',
+				effectiveProjectKey: '/workspace/project',
+			},
+		});
+		await tick();
+		child.resolve(response('/workspace/project/src', [entry('local.ts', 'file')]));
+		refresh.resolve(response('/workspace/project', [entry('stale.ts', 'file')]));
+		await refreshing;
+		await tick();
+		expect(store.executorId).toBe(executorId);
+		expect(store.rootEntries.map((file) => file.name)).toEqual(['remote.ts']);
+		expect(store.childrenCache.size).toBe(0);
+		expect(filesApi.getTree).toHaveBeenLastCalledWith(
+			{ directoryPath: '/workspace/project', executorId },
+			expect.anything(),
+		);
+		store.reset();
+	});
+
 	it('retains ready rows while refresh is pending or fails', async () => {
 		let rejectRefresh!: (error: Error) => void;
 		const initial = response('/workspace/project', [entry('old.ts', 'file')]);
@@ -243,7 +318,7 @@ describe('FileTreeStore', () => {
 		expect(store.expandedDirs.has(first.path)).toBe(false);
 		expect(store.expandedDirs.has(second.path)).toBe(true);
 		expect(filesApi.getTree).toHaveBeenLastCalledWith(
-			{ directoryPath: second.path },
+			{ directoryPath: second.path, executorId: 'local' },
 			expect.any(Object),
 		);
 	});
@@ -301,7 +376,11 @@ describe('FileTreeStore', () => {
 		await tick();
 		store.setProjectState({
 			kind: 'resolving',
-			context: { chatId: 'draft', projectPath: '/workspace/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'draft', projectPath: '/workspace/project' },
+				chatId: 'draft',
+				projectPath: '/workspace/project',
+			},
 		});
 		expect(store.currentDirectoryPath).toBe('/workspace/project');
 
@@ -316,14 +395,22 @@ describe('FileTreeStore', () => {
 			label: 'unchecked',
 			projectState: {
 				kind: 'unchecked' as const,
-				context: { chatId: 'chat-1', projectPath: '/workspace/project' },
+				context: {
+					target: { kind: 'chat' as const, chatId: 'chat-1', projectPath: '/workspace/project' },
+					chatId: 'chat-1',
+					projectPath: '/workspace/project',
+				},
 			},
 		},
 		{
 			label: 'unavailable',
 			projectState: {
 				kind: 'unavailable' as const,
-				context: { chatId: 'chat-1', projectPath: '/workspace/project' },
+				context: {
+					target: { kind: 'chat' as const, chatId: 'chat-1', projectPath: '/workspace/project' },
+					chatId: 'chat-1',
+					projectPath: '/workspace/project',
+				},
 				reason: 'not-found' as const,
 			},
 		},
@@ -380,7 +467,7 @@ describe('FileTreeStore', () => {
 		expect(store.rootEntries[0]?.name).toBe('new.ts');
 		await store.refresh();
 		expect(filesApi.getTree).toHaveBeenLastCalledWith(
-			{ directoryPath: '/workspace/project/packages/app' },
+			{ directoryPath: '/workspace/project/packages/app', executorId: 'local' },
 			expect.any(Object),
 		);
 	});

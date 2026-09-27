@@ -13,8 +13,12 @@ const CHAT_ID = '1785337200123456';
 const stubDiscovery = async () => ({
   baseUrl: 'http://127.0.0.1:8080',
   instanceId: 'instance',
+  endpointInstanceId: 'instance',
+  defaultExecutorId: 'local',
+  workspaceName: 'default',
   localCapability: 'cap',
   workspaceDir: '/tmp/ws',
+  selector: { runtime: 'controller' },
 });
 
 function capturedOutput(): {
@@ -337,7 +341,7 @@ describe('main', () => {
     });
 
     expect(exitCode).toBe(0);
-    expect(submitted).toEqual({ nativeSessionId: 'session-123', agent: 'codex' });
+    expect(submitted).toEqual({ executorId: 'local', nativeSessionId: 'session-123', agent: 'codex' });
     expect(capture.stdout.join('')).toBe(`${CHAT_ID}\n`);
     expect(capture.stderr.join('')).toBe('');
   });

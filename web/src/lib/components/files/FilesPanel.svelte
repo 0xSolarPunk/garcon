@@ -1,16 +1,21 @@
 <script lang="ts">
 	import FileTree from './FileTree.svelte';
+	import ExecutorSelector from '$lib/components/shared/ExecutorSelector.svelte';
+	import type { Snippet } from 'svelte';
 	import type { FileTreeEntry } from '$shared/file-contracts';
+	import { effectiveExecutorId } from '$shared/executors';
 	import {
 		getFileSessions,
 		getNotifications,
 		getSingletonSurfaces,
 		getWorkspaceCoordinator,
+		getExecutors,
 	} from '$lib/context';
 	import type { WorkspaceWindowId } from '$lib/workspace/surface-types.js';
 	import type { WorkspaceProjectState } from '$lib/workspace/workspace-context.svelte.js';
 	import type { ProjectTarget } from '$shared/project-resolution';
 	import ProjectSurfaceGate from '$lib/components/workspace/ProjectSurfaceGate.svelte';
+	import ExecutorServiceNotice from '$lib/components/workspace/ExecutorServiceNotice.svelte';
 	import { filePathRelativeToTreeRoot } from '$lib/files/tree/file-tree-path.js';
 	import Download from '@lucide/svelte/icons/download';
 	import { Button } from '$lib/components/ui/button';
@@ -33,7 +38,9 @@
 	const files = getFileSessions();
 	const notifications = getNotifications();
 	const workspace = getWorkspaceCoordinator();
-	const tree = getSingletonSurfaces().files().tree;
+	const controller = getSingletonSurfaces().files();
+	const tree = controller.tree;
+	const executors = getExecutors();
 	const selectedPath = $derived.by(() => {
 		const owner = workspace.focusOwner;
 		if (owner.kind === 'chat-list') return null;
@@ -41,17 +48,18 @@
 		if (surface?.type !== 'file') return null;
 		const session = files.get(surface.fileSessionId);
 		const treeRoot = tree.fileRootPath;
-		return session && treeRoot
+		return session && session.executorId === tree.executorId && treeRoot
 			? filePathRelativeToTreeRoot(treeRoot, session.canonicalFileRootPath, session.relativePath)
 			: null;
 	});
 
-	function handleFileSelect(node: FileTreeEntry): void {
+	function handleFileSelect(executor: FileTreeEntry): void {
 		const fileRootPath = tree.fileRootPath;
 		if (!fileRootPath) return;
 		void files.open({
+			executorId: tree.executorId,
 			fileRootPath,
-			relativePath: node.relativePath,
+			relativePath: executor.relativePath,
 			mode: 'auto',
 			origin: presentation,
 			reason: 'user-open',
@@ -61,6 +69,7 @@
 	async function openRecoveredFile(draft: FileDraft): Promise<void> {
 		try {
 			await files.open({
+				executorId: draft.executorId,
 				fileRootPath: draft.canonicalFileRootPath,
 				relativePath: draft.normalizedRelativePath,
 				mode: 'code',
@@ -71,7 +80,46 @@
 			notifications.error(error instanceof Error ? error.message : m.workspace_open_failed());
 		}
 	}
+
+	function recoveredFileLabel(draft: FileDraft, path: string): string {
+		return effectiveExecutorId(draft.executorId) === 'local'
+			? path
+			: `${executors.label(draft.executorId)}: ${path}`;
+	}
 </script>
+
+{#snippet executorCrumb()}
+	<ExecutorSelector
+		{executors}
+		executorId={tree.executorId}
+		service="files"
+		class="h-6 max-w-[35%] shrink-0 px-1"
+		onSelect={(executorId) => controller.selectExecutor(executorId)}
+	/>
+{/snippet}
+
+{#snippet contentGate(contents: Snippet)}
+	{#if controller.browsingExecutor}
+		{#if controller.serviceNotice}
+			<div class="grid h-full place-items-center px-6 text-sm">
+				<ExecutorServiceNotice notice={controller.serviceNotice} />
+			</div>
+		{:else}
+			{@render contents()}
+		{/if}
+	{:else}
+		<ProjectSurfaceGate
+			{projectState}
+			{target}
+			retainedProjectPath={tree.projectPath}
+			retainedEffectiveProjectKey={tree.effectiveProjectKey}
+			serviceNotice={controller.serviceNotice}
+			onChooseFolder={onChooseProjectFolder}
+		>
+			<div class="flex h-full min-h-0 flex-col">{@render contents()}</div>
+		</ProjectSurfaceGate>
+	{/if}
+{/snippet}
 
 <div class="flex h-full min-h-0 flex-col overflow-hidden">
 	{#if files.recoveryError}
@@ -97,17 +145,24 @@
 					<button
 						type="button"
 						class="flex min-h-10 min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2"
-						title={draft.canonicalFileRootPath + '/' + draft.normalizedRelativePath}
+						title={recoveredFileLabel(
+							draft,
+							draft.canonicalFileRootPath + '/' + draft.normalizedRelativePath,
+						)}
 						onclick={() => void openRecoveredFile(draft)}
 					>
 						<FileText class="size-4 shrink-0 text-muted-foreground" />
-						<span class="min-w-0 break-all">{draft.normalizedRelativePath}</span>
+						<span class="min-w-0 break-all"
+							>{recoveredFileLabel(draft, draft.normalizedRelativePath)}</span
+						>
 					</button>
 					<Button
 						variant="ghost"
 						size="icon-sm"
 						onclick={() => files.exportDraft(draft.documentId)}
-						aria-label={m.file_recovery_export_draft({ fileName: draft.normalizedRelativePath })}
+						aria-label={m.file_recovery_export_draft({
+							fileName: recoveredFileLabel(draft, draft.normalizedRelativePath),
+						})}
 						title={m.file_session_export_local_copy()}
 					>
 						<Download class="size-4" />
@@ -117,20 +172,16 @@
 		</section>
 	{/if}
 	<div class="min-h-0 min-w-0 flex-1">
-		<!-- Recovered drafts remain accessible even when their project folder is unavailable. -->
-		<ProjectSurfaceGate
-			{projectState}
-			{target}
-			retainedProjectPath={tree.projectPath}
-			retainedEffectiveProjectKey={tree.effectiveProjectKey}
-			onChooseFolder={onChooseProjectFolder}
-		>
-			<FileTree
-				{selectedPath}
-				store={tree}
-				onFileSelect={handleFileSelect}
-				onImageSelect={handleFileSelect}
-			/>
-		</ProjectSurfaceGate>
+		<FileTree
+			executorCrumb={executors.hasRemoteExecutors || tree.executorId !== 'local' ? executorCrumb : undefined}
+			{contentGate}
+			onGoToChatProject={() => controller.goToChatProject()}
+			canGoToChatProject={controller.canGoToChatProject}
+			isAtChatProject={!controller.browsingExecutor && tree.isAtChatProject}
+			{selectedPath}
+			store={tree}
+			onFileSelect={handleFileSelect}
+			onImageSelect={handleFileSelect}
+		/>
 	</div>
 </div>

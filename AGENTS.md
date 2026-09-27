@@ -6,6 +6,8 @@ This is the operating model for how engineers design, implement, review, and evo
 
 - If there was a design doc, ALWAYS re-read it after compaction.
 - `docs/transcript-ledger-v5-design.md` is the governing transcript design; re-read it before changing transcript, ledger, history migration, provider publication, paging, replay, or transcript UX behavior.
+- Before changing execution, machine services, provider configuration, or their UI, read `docs/executor/transport.md`, `docs/file-structure.md`, and the relevant contract under `docs/executor/` or `docs/providers.md`. Current contracts supersede historical executor proposals.
+- Before changing `garcon-cli`, runtime discovery, or HTTP APIs used by the CLI, read `docs/cli.md` and `docs/executor/cli.md`. Executor CLI forwarding is part of the CLI contract, not optional follow-up work.
 - Always git clone dependencies into /tmp to inspect if necessary
 - ALWAYS refer to Svelte 5, either docs or by cloning the repo, to make sure we're following best practices and canonical patterns
 - DO NOT add to tech debt. It is CRITICAL that we keep the architecture clean and rational, even if that means taking longer to fix or refactor what we're working on.
@@ -21,14 +23,14 @@ This is the operating model for how engineers design, implement, review, and evo
 - DO NOT consider backwards compatibility, as the server and client are always distributed together.
 - DO NOT use emojis
 - Never commit real transcripts or excerpts; durable transcript fixtures must replace all content and identifying values with deterministic generic content and synthetic identities while preserving only the required structure.
-- Keep Garcon core lean and agent agnostic. All agent-specific runtime, dependencies, storage, native-history parsing, and translation code must stay behind `@garcon/server-agent-interface` in `server-agents/<id>/`; `server/agents/default-agent-integrations.ts` is the only core provider import point. The authoritative provider-neutral transcript ledger lives in `server/ledger/` as one SQLite database per chat. Provider-neutral transcript search, its separate derived workspace database, and its fixed Worker pair live in `server-agents/common`.
+- Keep Garcon core lean and agent agnostic. All agent-specific runtime, dependencies, storage, native-history parsing, and translation code must stay behind `@garcon/server-agent-interface` in `server-agents/<id>/`; `server/runtime/agents/default-agent-integrations.ts` is the only core provider import point. The authoritative provider-neutral transcript ledger lives in `server/controller/ledger/` as one SQLite database per chat. Provider-neutral transcript search, its separate derived workspace database, and its fixed Worker pair live in `server-agents/common`.
 - `chats.json` owns chat existence, enumeration-required configuration and current bindings, and fixed-size cross-chat relations. Each per-chat ledger owns only that chat's ordered transcript. `chat-metadata.json` is derived preview/list cache; cold or growing per-chat detail may use separate metadata only when workspace enumeration does not require it.
 - New provider capabilities are expressed as nullable facets on `AgentIntegration` (like `forking`), not as optional methods on an existing facet; optional methods force per-call guards in core and hide capability differences from the conformance kit.
 - cursor is a best-effort provider: unit coverage only, no scripted-model tier. Do not assume scripted or live parity when changing it; Claude and Codex are the reference integrations.
 - opencode has pinned real-binary scripted-model coverage (the exact `opencode-ai` binary behind the shared fake Chat Completions model, fully isolated from user config, auth, and sessions; Linux-only) plus a credential-backed DeepSeek restart smoke. Its transport is one spawned `opencode serve` with a process-wide `/global/event` stream; readiness, retry ownership, and prompt-part correlation are locked by the scripted event-stream suite. The runtime watches the spawned process for its whole lifetime (`OpenCodeInstance.server.termination`): a post-readiness death retires the cached instance immediately, fails active turns exactly once, disarms the unavailability cooldown, and respawns lazily on the next demand. In-flight start/resume admissions are fenced by instance identity (`#assertInstanceCurrent`) so a retired instance can never register sessions, publish activation, or receive prompts.
 - Pi is a first-class provider with a scripted-model integration tier (deterministic fake-model coverage through the real pinned Pi CLI), same class as Claude and Codex. Its transport is the long-lived Pi RPC process; steering lands at the tool-call boundary.
-- Keep execution state ephemeral. Queue entries, pending user inputs, and the command ledger live only for the server process lifetime; restart intentionally starts them empty and must not replay or recover them from disk. `server/chats/agent-ownership-journal.ts` is the durable exception for cross-provider ownership transfers/deletions, not queue recovery. The per-chat SQLite transcript ledger is durable conversation state; the workspace-wide SQLite search index in `server-agents/common` is separate, derived, and rebuildable.
-- Chat busy-ness has exactly two public questions: `ownsExecution` for exclusive access to a chat's transcript or view, and the processing projection for whether the user should see a turn running. Consume one of them. Do not compose `ExecutionOwnership` fields, provider running state, and reservation state into a new predicate: four features once did exactly that with four different non-nested subsets, and the fork and reload guards ended up contradicting each other. Adding or widening a predicate means updating the `ExecutionOwnership` module documentation and `server/chat-execution/__tests__/execution-api-contract.test.js` in the same change. In review, treat a new boolean on `ExecutionOwnership`, a new predicate on the coordinator's public facets, or an `isChatRunning || ...` composition outside the coordinator as recreating this debt.
+- Keep execution state ephemeral. Queue entries, pending user inputs, and the command ledger live only for the server process lifetime; restart intentionally starts them empty and must not replay or recover them from disk. `server/controller/chats/agent-ownership-journal.ts` is the durable exception for cross-provider ownership transfers/deletions, not queue recovery. The per-chat SQLite transcript ledger is durable conversation state; the workspace-wide SQLite search index in `server-agents/common` is separate, derived, and rebuildable.
+- Chat busy-ness has exactly two public questions: `ownsExecution` for exclusive access to a chat's transcript or view, and the processing projection for whether the user should see a turn running. Consume one of them. Do not compose `ExecutionOwnership` fields, provider running state, and reservation state into a new predicate: four features once did exactly that with four different non-nested subsets, and the fork and reload guards ended up contradicting each other. Adding or widening a predicate means updating the `ExecutionOwnership` module documentation and `server/controller/chat-execution/__tests__/execution-api-contract.test.js` in the same change. In review, treat a new boolean on `ExecutionOwnership`, a new predicate on the coordinator's public facets, or an `isChatRunning || ...` composition outside the coordinator as recreating this debt.
 - Use the official Claude Agent SDK as the primary reference when changing the Claude integration. It is not a complete source of truth because Garcon adds lifecycle requirements such as provider-neutral queue ownership, but its protocol, process, control, and cleanup behavior should guide the implementation.
 - When a provider's stream behavior is ambiguous, check whether the reference implementation already fought the same battle before inventing local semantics. The Python Agent SDK's inline comments and issue references document CLI protocol rationale (turn versus run boundaries, task lifecycle frames versus `background_tasks_changed` snapshots), and its CHANGELOG maps each release to the bundled CLI version whose behavior it describes - compare that against the CLI version Garcon runs.
 - Clone references into /tmp pinned to a commit, and cite file plus line as permalinks at that commit in comments and design docs, so the citation survives upstream drift:
@@ -82,6 +84,45 @@ Required for every known tool-use addition or change:
 - Remove any client-side aliasing or raw-name rule that the new explicit type replaces.
 
 ## Clean Code Rules (Practical)
+
+### Server Ownership
+
+See `docs/file-structure.md` for the full layout. Former top-level server application domains now live under `server/controller/`. Former `server/lib/` helpers are split between shared primitives in `server/common/` and controller-only helpers in `server/controller/lib/`; do not recreate the retired paths.
+
+- `server/controller/` owns application policy, durable controller state, HTTP APIs, and browser WebSocket delivery.
+- `server/runtime/` owns machine services and provider hosting. Local and remote workers instantiate the same `ExecutionRuntime`.
+- `server/controller/agents/` owns chat-facing orchestration; `server/runtime/agents/` hosts integrations. Provider implementations remain in `server-agents/<id>/`, not either core `agents/` directory.
+- `server/remote/client/` implements `ExecutionRuntimeApi` over RPC; `server/remote/server/` dispatches onto an injected runtime. `server/remote/transport/` owns the shared encrypted channel and wire protocol.
+- `server/common/` contains backend primitives. Runtime and remoting must not import controller modules; common must not import any of those owners. Only `server/remote/worker.ts` composes concrete runtime services into remoting.
+- Keep browser/server DTOs in top-level `common/` and provider-specific code behind `@garcon/server-agent-interface` in `server-agents/`.
+- Use executor terminology for execution targets and `executorId` for their identities. Graph nodes, DOM nodes, and linked carryover nodes are unrelated concepts.
+
+### Remote Executor Contract
+
+Every execution, machine-service, and related UI change must account for Local and remote executors, not just the controller's machine.
+
+- Route machine operations through the selected `ExecutionRuntimeApi`, including Local. Paths, symlinks, native sessions, executables, environment, and `localhost` belong to that executor. Repository and model-generation targets can differ.
+- Qualify executor-owned resources and their caches, recents, and recovery drafts with `executorId`; scope ephemeral handles to their declared runtime/session/binding. Capture the owning panel or operation's target, not global chat selection. Fence dispatch and publication across awaits; never retarget stale work or fall back from an explicit remote to Local.
+- Treat readiness and capabilities per executor, independently of browser WebSocket connectivity. An unavailable executor must not block controller startup or healthy hosts. Preserve unavailable selections and drafts; invalidate affected catalogs and revalidate execution admission on every submit path without gating controller-only actions. Empty success is not an offline result.
+- Reuse the shared Noise WebSocket in both dial directions; a worker may have no reachable inbound HTTP endpoint. Bound encoded payloads, queues, and in-flight work. Liveness must observe authenticated transfer progress. Do not add channels, schedulers, or replay as incidental feature work.
+- Each disconnected socket retires its session; there is no transport replay or automatic resend. Timeout, cancellation, and lost replies are not rollback or proof of non-execution. Preserve definite versus unknown outcomes; retries require the operation's existing idempotency and generation guarantees. Start/resume/compaction have no implicit RPC deadline.
+- Worker processes outlive connection authority. Disconnected native turns may continue; fence old publication and permissions, preserve native busy guards, report uncertainty, and retain explicit native Reload recovery. Remote PTYs survive browser/controller disconnects and restarts while the worker survives; preserve bounded terminal replay, not transport replay. Local shares the controller's process lifetime.
+- Handle late success and failure against the captured operation. Clean up late remote resources only through their originating session, never a replacement. Cancellation must not release process-owned mutation locks or admission while the underlying work remains unsettled.
+- Provider profiles remain controller-owned; assignments and revisions gate execution and credential release on Local and remote executors. Derive reverse-RPC origin from the authenticated connection. CLI access is a separate, default-off workspace-wide grant. Revocation cannot erase disclosed credentials or undo admitted work.
+- Reuse executor reference-publication guards when changing durable references or deletion. Retain protection through failed or uncertain writes; do not equate an in-memory change with durable removal or publish configuration grants before durability.
+
+### CLI Forwarding Contract
+
+Every CLI command and CLI-facing API change must account for both direct controller HTTP and the executor's loopback gateway. Working only against the controller is incomplete.
+
+- Keep `cli/garcon-client.ts` HTTP-only and command logic transport-agnostic. `server/remote/server/cli-gateway.ts` forwards allowlisted requests over the existing Noise connection via `controllerCli.*`; `server/controller/executors/cli-dispatcher.ts` invokes the same controller handlers with delegated authority. Do not require worker access to the controller's HTTP listener, add a generic proxy, or duplicate command implementations on the worker.
+- When adding or changing a client HTTP operation, review `CLI_OPERATIONS` and envelope validation in `server/remote/transport/cli-protocol.ts`, gateway adaptation, and controller dispatch together. Keep exact method/path allowlisting, typed payloads, executor-target validation, mutation classification, deadlines, admission pools, and encoded request/reply bounds aligned. A new controller route is not automatically available through the gateway; never widen forwarding to arbitrary routes or settings payloads.
+- Derive CLI origin from the authenticated executor link and enforce the current default-off `allowControllerCli` grant. Preserve delegated-executor principals, session/authorization checks, and reply-publication guards. Never substitute Local authority, trust caller-supplied origin, forward the gateway bearer as controller authentication, or copy controller credentials to workers.
+- Keep origin separate from execution target. New starts, standalone catalogs, and native-session lookup use authenticated `defaultExecutorId`; existing-chat operations use the chat's owning/target executor and ownership fences. Resolve cwd and read stdin/write output files on the CLI machine. Do not interpret worker paths on the controller or silently replace an omitted executor with Local.
+- Preserve endpoint identity, captured controller `serverInstanceId`, and RPC-session fencing through dispatch, polling, and operation-specific recovery. Forward application status, JSON errors, and supported retry metadata without gateway-specific success envelopes. Disconnects, cancellation, or undeliverable mutation replies may mean unknown outcome; never add gateway replay, automatic retargeting, or retries outside the operation's existing identity guarantees.
+- Discovery/configuration changes must preserve inherited config-root/role selection for controller and worker provider/PTY children, including gateway startup failure without fallback. Generated follow-up commands and explicit ticket retries must carry the resolved selector; switching from executor to controller changes authority and ticket retry identity. Update `docs/cli.md`, the executor CLI contract, and linked agent skill instructions when syntax or behavior changes.
+
+### General
 
 - Name by domain intent, not implementation detail.
 - Keep functions small and single-purpose.
@@ -245,8 +286,8 @@ Rules:
 - `web/src/lib/terminal/` owns Terminal runtimes, input controls, theme, and sessions.
 - `web/src/lib/sidebar/` owns reusable Sidebar search parsing/state and the project-collapse store.
 - `web/src/lib/chat-map/` owns chat-lineage normalization and retained Chat Map surface state.
-- `web/src/lib/chat-canvas/` owns canvas documents, layout/membership rules, undo history, save coordination, and draft recovery. `server/chat-canvas/` persists provider-neutral canvas documents independently of chats and transcript ledgers; renderers and graph-engine adapters live in `components/chat-canvas`.
-- `web/src/lib/tickets/` owns the global ticket catalog, detail projections, mutation drafts, and tab-scoped recovery. `server/tickets/` is the synchronous SQLite authority for workspace tickets, comments, relationships, attributed history, and durable operation results. Operation results support explicit retries only; they are never an execution queue or replayed at startup. Ticket renderers and DOM interaction state live in `components/tickets`; HTTP and WebSocket adaptation stay in the integration layer.
+- `web/src/lib/chat-canvas/` owns canvas documents, layout/membership rules, undo history, save coordination, and draft recovery. `server/controller/chat-canvas/` persists provider-neutral canvas documents independently of chats and transcript ledgers; renderers and graph-engine adapters live in `components/chat-canvas`.
+- `web/src/lib/tickets/` owns the global ticket catalog, detail projections, mutation drafts, and tab-scoped recovery. `server/controller/tickets/` is the synchronous SQLite authority for workspace tickets, comments, relationships, attributed history, and durable operation results. Operation results support explicit retries only; they are never an execution queue or replayed at startup. Ticket renderers and DOM interaction state live in `components/tickets`; HTTP and WebSocket adaptation stay in the integration layer.
 - Their Svelte renderers remain in the corresponding `components` directories.
 
 ### Utilities Layer
@@ -408,6 +449,14 @@ A bug or flake first observed in a live suite or in production may only be close
 - Keep credential-backed agent suites under `test:live:*`, outside routine test commands.
 - Never run live-agent tests locally unless actively changing those tests; rely on the PR CI live-provider gate otherwise.
 
+### Remote Executor Coverage
+
+- Exercise changed cross-boundary workflows through public controller/worker startup on Local and both remote dial directions. Protocol doubles alone do not establish integration correctness. Use each provider's documented test tier; reference-provider behavior requires pinned scripted coverage.
+- CLI command/API changes require direct-controller and forwarded-path coverage. Keep `server/remote/transport/__tests__/cli-allowlist.test.ts` accounting for every `GarconClient` HTTP operation; extend gateway and dispatcher contract tests for validation, authority, response parity, and bounds. Exercise affected commands with real CLI processes in `integration-tests/tests/server/garcon-cli*.test.ts` and `executor-cli*.test.ts`, including both dial directions. Changes to discovery, grants, targeting, or recovery also need relevant provider/PTY inheritance, denial/revocation, restart, and uncertain-outcome regressions.
+- Use deterministic barriers for disconnect before dispatch, side effects before reply, late settlement, session replacement, and separate controller/worker restarts. Assert no duplicate execution, false success, stale publication, or premature resource release.
+- Test identical paths/IDs on different executors, partial outages, and unavailable-to-ready transitions. Browser workflows must preserve drafts and owning-panel identity across switches, reconnects, and provider revocation; click and keyboard admission must agree.
+- Transport/bounds changes need slow progressing links, silent half-open connections, and mixed chat/Files/Git/PTY pressure. Assert bounded resources and process survival without claiming latency isolation.
+
 ### Regression Focus Areas
 
 - Chat lifecycle transitions.
@@ -454,6 +503,8 @@ Reviewers should explicitly check:
 - duplicated logic and boundary leaks
 - accessibility regressions
 - missing tests for stateful behavior
+- executor-qualified routing, authority/lifetime fences, uncertain outcomes, and Local/remote coverage
+- CLI direct/gateway parity, allowlist and policy updates, executor origin versus target, and real forwarded-command coverage
 
 ## Practical Do/Don't Examples
 

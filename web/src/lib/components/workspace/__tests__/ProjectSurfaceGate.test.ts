@@ -14,7 +14,11 @@ describe('ProjectSurfaceGate', () => {
 			...retained,
 			projectState: {
 				kind: 'resolving',
-				context: { chatId: 'draft', projectPath: '/project' },
+				context: {
+					target: { kind: 'chat' as const, chatId: 'draft', projectPath: '/project' },
+					chatId: 'draft',
+					projectPath: '/project',
+				},
 			},
 		});
 
@@ -30,7 +34,11 @@ describe('ProjectSurfaceGate', () => {
 			...retained,
 			projectState: {
 				kind: 'resolving',
-				context: { chatId: 'draft', projectPath: '/other' },
+				context: {
+					target: { kind: 'chat' as const, chatId: 'draft', projectPath: '/other' },
+					chatId: 'draft',
+					projectPath: '/other',
+				},
 			},
 		});
 
@@ -45,6 +53,7 @@ describe('ProjectSurfaceGate', () => {
 		const projectState = {
 			kind: 'available' as const,
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat2', projectPath: '/project' },
 				chatId: 'chat2',
 				projectPath: '/project',
 				effectiveProjectKey: '/canonical/project',
@@ -58,6 +67,36 @@ describe('ProjectSurfaceGate', () => {
 		const action = screen.getByRole('button', { name: 'Project action' });
 		expect(action.parentElement?.hasAttribute('inert')).toBe(false);
 		expect(container.firstElementChild?.getAttribute('aria-busy')).toBe('false');
+	});
+
+	it('reports an executor outage instead of folder recovery actions', () => {
+		const onChooseFolder = vi.fn();
+		render(ProjectSurfaceGateTestHost, {
+			...retained,
+			onChooseFolder,
+			serviceNotice: { kind: 'executor-unavailable', executorLabel: 'Worker' },
+			projectState: {
+				kind: 'request-failed',
+				context: {
+					target: {
+						kind: 'chat' as const,
+						chatId: 'chat',
+						projectPath: '/project',
+						executorId: 'worker',
+					},
+					chatId: 'chat',
+					executorId: 'worker',
+					projectPath: '/project',
+				},
+				message: 'Files are unavailable on this executor.',
+			},
+		});
+
+		expect(screen.getByText('Executor unavailable')).toBeTruthy();
+		expect(screen.getByText('Worker is unavailable.')).toBeTruthy();
+		expect(screen.queryByText('Project folder unavailable')).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Choose folder' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
 	});
 
 	it('shows actionable unavailable feedback and retries the explicit target', async () => {
@@ -75,7 +114,11 @@ describe('ProjectSurfaceGate', () => {
 				fetchResolution,
 				projectState: {
 					kind: 'unavailable',
-					context: { chatId: 'draft', projectPath: target.projectPath },
+					context: {
+						target: { kind: 'chat' as const, chatId: 'draft', projectPath: target.projectPath },
+						chatId: 'draft',
+						projectPath: target.projectPath,
+					},
 					reason: 'not-found',
 				},
 			},

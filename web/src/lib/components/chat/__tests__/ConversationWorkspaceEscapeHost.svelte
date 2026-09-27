@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { onDestroy, tick } from 'svelte';
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
+	import { onDestroy, tick, untrack } from 'svelte';
 	import { SubagentToolbarState } from '$lib/chat/transcript/subagent-toolbar-state.svelte.js';
 	import ConversationWorkspace from '../ConversationWorkspace.svelte';
 	import ConversationPanel from '../ConversationPanel.svelte';
@@ -23,7 +25,12 @@
 		setConversationLifecycles,
 		setConversationPanels,
 		setProjectResolution,
+		setSingletonSurfaces,
 	} from '$lib/context';
+	import { SingletonSurfaceRegistry } from '$lib/workspace/singleton-surfaces.svelte.js';
+	import { createGitSurfaceTestDeps } from '$lib/git/__tests__/git-surface-test-deps.js';
+	import { CommitController } from '$lib/git/commit/commit-controller.svelte.js';
+	import { PullRequestsStore } from '$lib/git/pull-requests/pull-requests-store.svelte.js';
 	import { ChatDraftStore } from '$lib/chat/composer/chat-draft-store.svelte.js';
 	import { createNotificationsStore } from '$lib/stores/notifications.svelte.js';
 	import type { ChatSessionRecord } from '$lib/types/chat-session';
@@ -54,9 +61,20 @@
 	interface ConversationWorkspaceEscapeHostProps {
 		onPatchActivity?: (chatId: string, timestamp: string) => void;
 		fetchProjectResolution?: ConstructorParameters<typeof ProjectResolutionStore>[0];
+		commit?: CommitController;
+		quickSummary?: GitQuickSummaryStore;
+		onOpenCommit?: WorkspaceCoordinator['openSingletonAsTab'];
+		notifications?: ReturnType<typeof createNotificationsStore>;
 	}
 
-	let { onPatchActivity, fetchProjectResolution }: ConversationWorkspaceEscapeHostProps = $props();
+	let {
+		onPatchActivity,
+		fetchProjectResolution,
+		commit,
+		quickSummary,
+		onOpenCommit,
+		notifications,
+	}: ConversationWorkspaceEscapeHostProps = $props();
 
 	let selectedChat = $state<ChatSessionRecord>({
 		id: 'chat-1',
@@ -83,6 +101,14 @@
 		tags: [],
 	});
 	setChatDrafts(new ChatDraftStore());
+	const gitDeps = createGitSurfaceTestDeps();
+	const singletonSurfaces = new SingletonSurfaceRegistry({
+		...gitDeps,
+		createCommit: () => commit ?? new CommitController(gitDeps),
+		createPullRequests: () => new PullRequestsStore(),
+	});
+	setSingletonSurfaces(singletonSurfaces);
+	onDestroy(() => singletonSurfaces.destroy());
 	function getInitialProjectResolver() {
 		return (
 			fetchProjectResolution ??
@@ -139,7 +165,7 @@
 		showQuickCommitTray: false,
 		chatMaxWidth: 'default',
 	} as never);
-	setNotifications(createNotificationsStore());
+	setNotifications(untrack(() => notifications ?? createNotificationsStore()));
 	setAppShell({
 		isMobile: false,
 		requestComposerFocus: () => {},
@@ -162,6 +188,9 @@
 	} as never);
 	setRemoteSettings({} as never);
 	setModelCatalog({
+		forExecutor() {
+			return this;
+		},
 		selectionValueFor: (_agentId: string, model: string) => model,
 		selectionFor: (_agentId: string, model: string) => ({
 			model,
@@ -181,7 +210,6 @@
 		supportsFork: () => true,
 		supportsForkWhileRunning: () => true,
 		supportsSteering: (agentId: string) => agentId === 'claude' || agentId === 'codex',
-		supportsGoals: (agentId: string) => agentId === 'codex',
 	} as never);
 
 	const workspaceInteractionGate = new WorkspaceInteractionGate();
@@ -195,6 +223,7 @@
 			| 'focusChat'
 			| 'focusMobileSingleton'
 			| 'openSingletonAsTab'
+			| 'windowOf'
 			| 'focusOwnerRevision'
 		>;
 	let workspaceFocusOwner = $state<FocusOwner>({
@@ -235,7 +264,8 @@
 		},
 		focusChat: () => Promise.resolve(),
 		focusMobileSingleton: () => Promise.resolve(),
-		openSingletonAsTab: () => Promise.resolve(),
+		openSingletonAsTab: (...args) => onOpenCommit?.(...args) ?? Promise.resolve(),
+		windowOf: () => 'window-main',
 	};
 	const workspaceShortcuts = new WorkspaceShortcutDispatcher({
 		workspace,
@@ -248,7 +278,10 @@
 	setWorkspaceCoordinator(workspace as WorkspaceCoordinator);
 	setWorkspaceShortcuts(workspaceShortcuts);
 	setTransientLayers(transientLayers);
-	setGitQuickSummary(new GitQuickSummaryStore());
+	function getQuickSummary(): GitQuickSummaryStore {
+		return quickSummary ?? new GitQuickSummaryStore();
+	}
+	setGitQuickSummary(getQuickSummary());
 	const quickGitBranches = new GitBranchSelectorState();
 	setGitBranchActions(quickGitBranches);
 	const conversationLifecycles = new ConversationLifecycleRegistry({
@@ -338,6 +371,11 @@
 >
 <button type="button" onclick={() => (selectedChat.status = 'draft')}>Set draft status</button>
 <button type="button" onclick={startBranchToggle}>Open branch dropdown</button>
+<button
+	type="button"
+	onclick={() => panelActions?.openCommit(CANONICAL_CHAT_SURFACE_ID, selectedChat.id)}
+	>Open quick commit</button
+>
 <button type="button" onclick={() => (workspace.focusOwner = { kind: 'chat-list' })}
 	>Move command ownership</button
 >

@@ -8,10 +8,30 @@ import {
 import { type FileOpenRequest } from '$lib/files/sessions/file-session-registry.svelte.js';
 import * as m from '$lib/paraglide/messages.js';
 import FileSurfaceTestHost from './FileSurfaceTestHost.svelte';
+import { remoteExecutor } from '$lib/executors/__tests__/fixtures';
+
+const { copyToClipboard } = vi.hoisted(() => ({ copyToClipboard: vi.fn(async () => true) }));
+vi.mock('$lib/utils/clipboard', () => ({ copyToClipboard }));
 
 afterEach(cleanup);
 
 describe('FileSurface', () => {
+	it.each(['local', remoteExecutor.id])(
+		'copies only the filesystem path for executor %s',
+		async (executorId) => {
+			render(FileSurfaceTestHost, { presentation: 'dialog', executorId });
+			const prefix = executorId === 'local' ? '' : 'Worker: ';
+			expect(screen.getByRole('heading', { level: 2 }).textContent?.trim()).toBe(
+				`${prefix}image.png`,
+			);
+			expect(screen.getByRole('heading', { level: 2 }).title).toBe(
+				`${prefix}/workspace/assets/image.png`,
+			);
+			await fireEvent.click(screen.getByRole('button', { name: 'Copy file path' }));
+			expect(copyToClipboard).toHaveBeenLastCalledWith('/workspace/assets/image.png', undefined);
+		},
+	);
+
 	const portablePresentations = ['dialog', 'mobile'] as const;
 	const rendererModes = ['code', 'markdown', 'image'] as const;
 	const closeCases = portablePresentations.flatMap((presentation) =>

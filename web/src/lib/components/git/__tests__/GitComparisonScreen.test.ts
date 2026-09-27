@@ -249,6 +249,7 @@ describe('GitComparisonScreen', () => {
 
 function readySnapshot(): GitComparisonSnapshotReady {
 	return {
+		document: { executorId: 'local', instanceId: 'test-instance', documentId: 'comparison-document' },
 		status: 'ready',
 		project: '/project',
 		repoRoot: '/project',

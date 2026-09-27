@@ -19,7 +19,7 @@
 	import {
 		RemoteGenerationSettingsCardState,
 		type GenerationSettingsKey,
-	} from './remote-generation-settings-card-state.svelte';
+	} from './remote-generation-settings-card-state.svelte.ts';
 
 	interface Props {
 		settingsKey: GenerationSettingsKey;
@@ -43,14 +43,17 @@
 	const remoteSettings = getRemoteSettings();
 	const modelCatalog = getModelCatalog();
 	const selectorMode: ModelSelectorMode = {
+		executor: 'select',
 		agent: 'select',
 		source: 'select',
 		surface: 'settings',
 		effort: 'select',
 	};
-	const cardState = new RemoteGenerationSettingsCardState({
+	const cardState: RemoteGenerationSettingsCardState = new RemoteGenerationSettingsCardState({
 		remoteSettings,
-		modelCatalog,
+		get modelCatalog() {
+			return modelCatalog.forExecutor(cardState.executorId);
+		},
 		get settingsKey() {
 			return settingsKey;
 		},
@@ -91,7 +94,7 @@
 	{/if}
 
 	{#if cardState.hasEnabledSwitch && enabledLabel}
-		<div class="flex items-center justify-between py-2">
+		<div class="flex items-center justify-between gap-3 py-2">
 			<div class="text-sm font-medium text-foreground">{enabledLabel}</div>
 			<Switch
 				checked={cardState.enabled}
@@ -103,13 +106,10 @@
 		</div>
 	{/if}
 
-	{#if cardState.enabled}
-		{#if settingsKey === 'agentSwitchCompaction'}
-			<div class="flex items-center justify-between gap-3 py-2">
-				<label
-					for="agent-switch-context-window"
-					class="text-sm font-medium text-foreground"
-				>
+	{#if cardState.enabled || cardState.selectionUnavailable}
+		{#if cardState.enabled && settingsKey === 'agentSwitchCompaction'}
+			<div class="flex flex-wrap items-center justify-between gap-3 py-2">
+				<label for="agent-switch-context-window" class="text-sm font-medium text-foreground">
 					{m.settings_agent_switch_compaction_context_window()}
 				</label>
 				<select
@@ -126,9 +126,16 @@
 			</div>
 		{/if}
 
-		<div class="flex items-start justify-between gap-3 pb-1 pt-2">
+		<div class="flex flex-col items-start justify-between gap-3 pb-1 pt-2 sm:flex-row">
 			<div class="pt-1.5 text-sm font-medium text-foreground">{modelLabel}</div>
-			<div class="flex min-w-0 flex-col items-end">
+			<div class="flex min-w-0 max-w-full flex-col items-start sm:items-end">
+				<Button
+					variant={cardState.isAuto ? 'secondary' : 'ghost'}
+					size="sm"
+					aria-pressed={cardState.isAuto}
+					disabled={cardState.isSaving}
+					onclick={() => cardState.persistAuto()}>Auto (Local)</Button
+				>
 				<SettingsModelSelector
 					value={cardState.selectorValue}
 					mode={selectorMode}
@@ -155,7 +162,7 @@
 					{/if}
 				</Button>
 				<div
-					class="mt-1 min-h-4 max-w-sm text-right text-xs leading-4"
+					class="mt-1 min-h-4 max-w-full break-words text-xs leading-4 sm:max-w-sm sm:text-right"
 					role="status"
 					aria-live="polite"
 				>
@@ -193,7 +200,7 @@
 		{/if}
 
 		{#if showDirectoryPrefix}
-			<div class="flex items-center justify-between py-2">
+			<div class="flex items-center justify-between gap-3 py-2">
 				<div class="text-sm font-medium text-foreground">
 					{m.settings_commit_add_common_directory_prefix()}
 				</div>

@@ -1,4 +1,10 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
+	setExecutorsTestContext([
+		localExecutor,
+		{ ...remoteExecutor, machineServices: { files: true, git: false, gh: false, terminals: false } },
+	]);
 	import { onDestroy, onMount, untrack } from 'svelte';
 	import {
 		setFileSessions,
@@ -23,6 +29,7 @@
 
 	let {
 		presentation,
+		executorId = 'local',
 		rendererMode = 'image',
 		loading = true,
 		stale = false,
@@ -37,6 +44,7 @@
 		closeDisabled = false,
 	}: {
 		presentation: PresentationHostId;
+		executorId?: string;
 		rendererMode?: 'code' | 'markdown' | 'image';
 		loading?: boolean;
 		stale?: boolean;
@@ -51,6 +59,7 @@
 		closeDisabled?: boolean;
 	} = $props();
 	const initial = untrack(() => ({
+		executorId,
 		rendererMode,
 		loading,
 		stale,
@@ -82,6 +91,7 @@
 		resolveFileIdentity: async ({ relativePath }) => ({
 			success: true,
 			identity: {
+				executorId: initial.executorId,
 				canonicalFileRootPath: '/workspace',
 				normalizedRelativePath: relativePath,
 			},
@@ -123,6 +133,7 @@
 	}
 	const session = new FileSession(
 		{
+			executorId: initial.executorId,
 			canonicalFileRootPath: '/workspace',
 			normalizedRelativePath: relativePath,
 		},

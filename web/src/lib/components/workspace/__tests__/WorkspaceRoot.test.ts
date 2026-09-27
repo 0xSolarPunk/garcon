@@ -32,6 +32,10 @@ import type { ProjectTarget } from '$shared/project-resolution';
 import * as m from '$lib/paraglide/messages.js';
 import { resolveUnmeasuredWorkspaceSplit } from '$lib/workspace/__tests__/workspace-geometry-test-fixtures.js';
 import { findWorkspaceChatPlacement } from '$lib/workspace/workspace-chat-placement.js';
+import { terminalDisplayName } from '$lib/terminal/sessions/terminal-display-name.js';
+import { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
+import type { GhCapabilityStore } from '$lib/git/pull-requests/gh-capability.svelte.js';
+import type { WorkspaceContextStore } from '$lib/workspace/workspace-context.svelte.js';
 
 const testContext = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
 const chatApiMocks = vi.hoisted(() => ({ getChatMessages: vi.fn() }));
@@ -44,6 +48,9 @@ vi.mock('$lib/context', () => ({
 	getChatSessions: () => testContext.current?.sessions,
 	getFileSessions: () => testContext.current?.fileSessions,
 	getGhCapability: () => testContext.current?.ghCapability,
+	getExecutors: () => testContext.current?.executors,
+	getWorkspaceContext: () =>
+		({ currentTarget: null }) satisfies Pick<WorkspaceContextStore, 'currentTarget'>,
 	getGitBranchActions: () => testContext.current?.gitBranchActions,
 	getLocalSettings: () => testContext.current?.localSettings,
 	getGitQuickSummary: () => testContext.current?.gitQuickSummary,
@@ -373,6 +380,7 @@ function installContext({ showQuickCommitTray = false }: { showQuickCommitTray?:
 			);
 		}),
 		createTerminal: vi.fn(async () => 'terminal-created'),
+		terminalCreationExecutorIdFor: () => 'local',
 		terminateTerminalSession: vi.fn(async () => true),
 		openTerminalSession: vi.fn(async () => undefined),
 		retryPresentation: vi.fn(async () => undefined),
@@ -380,6 +388,13 @@ function installContext({ showQuickCommitTray = false }: { showQuickCommitTray?:
 		focusChat: vi.fn(async () => undefined),
 	};
 	const terminals = {
+		hasRemoteHosts: false,
+		hosts: [{ id: 'local', label: 'Local', available: true, full: false }],
+		canCreate: (executorId: string) => executorId === 'local',
+		executorIdFor: () => 'local',
+		executorLabel: () => 'Local',
+		displayName: (metadata: { title: string | null; displaySequence: number }) =>
+			terminalDisplayName(metadata, 'Local'),
 		orderedSessions: [] as TerminalClientSession[],
 		sessions: {} as Record<string, TerminalClientSession>,
 		listStatus: 'ready' as const,
@@ -430,6 +445,7 @@ function installContext({ showQuickCommitTray = false }: { showQuickCommitTray?:
 		},
 		processingReconciler: { addPresentation: () => () => {} },
 		modelCatalog: {
+			forExecutor() { return this; },
 			supportsFork: () => false,
 			supportsForkWhileRunning: () => false,
 			supportsUpdateProjectPath: () => false,
@@ -440,7 +456,14 @@ function installContext({ showQuickCommitTray = false }: { showQuickCommitTray?:
 			setVisibleProjects: vi.fn(),
 			reconcilePolling: vi.fn(),
 		},
-		ghCapability: { hasChecked: true, available: true },
+		executors: new ExecutorsStore(),
+		ghCapability: {
+			forExecutor: (_executorId: string) =>
+				({ hasChecked: true, available: true }) satisfies Pick<
+					ReturnType<GhCapabilityStore['forExecutor']>,
+					'hasChecked' | 'available'
+				>,
+		},
 		notifications: { error: vi.fn() },
 		projectResolution,
 	};

@@ -41,7 +41,6 @@
 		getAuth,
 		getRemoteSettings,
 		getFileSessions,
-		getGhCapability,
 		getSingletonSurfaces,
 		getWorkspaceContext,
 		getWorkspaceCoordinator,
@@ -77,14 +76,13 @@
 	setSurfaceFrameBridge(() => frameBridge);
 	const workspace = getWorkspaceCoordinator();
 	const workspaceContext = getWorkspaceContext();
-	const ghCapability = getGhCapability();
 	const singletonSurfaces = getSingletonSurfaces();
 	const files = getFileSessions();
 	const sessions = getChatSessions();
 	const auth = getAuth();
 	const remoteSettings = getRemoteSettings();
 	const ticketSourceNavigation = getTicketSourceNavigation();
-	const projectState = $derived(workspaceContext.projectState);
+	const filesProjectState = $derived(workspaceContext.filesProjectState);
 </script>
 
 <svelte:boundary>
@@ -133,10 +131,11 @@
 		{#await filesRenderer()}
 			{@const controller = singletonSurfaces.files()}
 			<ProjectSurfaceGate
-				{projectState}
+				projectState={filesProjectState}
 				target={workspaceContext.currentTarget}
 				retainedProjectPath={controller.tree.projectPath}
 				retainedEffectiveProjectKey={controller.tree.effectiveProjectKey}
+				serviceNotice={controller.serviceNotice}
 				onChooseFolder={onChooseProjectFolder}
 			>
 				<div class="grid h-full place-items-center text-sm text-muted-foreground" role="status">
@@ -146,82 +145,41 @@
 		{:then FilesPanel}
 			<FilesPanel
 				{presentation}
-				{projectState}
+				projectState={filesProjectState}
 				target={workspaceContext.currentTarget}
 				{onChooseProjectFolder}
 			/>
 		{/await}
 	{:else if surface.type === 'singleton' && surface.kind === 'git'}
 		{@const controller = singletonSurfaces.gitWorkbench()}
-		<ProjectSurfaceGate
-			{projectState}
-			target={workspaceContext.currentTarget}
-			retainedProjectPath={controller.target.baseProjectPath}
-			retainedEffectiveProjectKey={controller.target.effectiveProjectKey}
-			onChooseFolder={onChooseProjectFolder}
-		>
-			{#await gitWorkbenchRenderer() then GitWorkbenchPanel}
-				<GitWorkbenchPanel {controller} {presentation} {visible} {onAppendToChatDraft} />
-			{/await}
-		</ProjectSurfaceGate>
+		{#await gitWorkbenchRenderer() then GitWorkbenchPanel}
+			<GitWorkbenchPanel {controller} {presentation} {visible} {onAppendToChatDraft} />
+		{/await}
 	{:else if surface.type === 'singleton' && surface.kind === 'git-history'}
 		{@const controller = singletonSurfaces.gitHistory()}
-		<ProjectSurfaceGate
-			{projectState}
-			target={workspaceContext.currentTarget}
-			retainedProjectPath={controller.target.baseProjectPath}
-			retainedEffectiveProjectKey={controller.target.effectiveProjectKey}
-			onChooseFolder={onChooseProjectFolder}
-		>
-			{#await gitHistoryRenderer() then GitHistoryPanel}
-				<GitHistoryPanel {controller} {presentation} {visible} {onAppendToChatDraft} />
-			{/await}
-		</ProjectSurfaceGate>
+		{#await gitHistoryRenderer() then GitHistoryPanel}
+			<GitHistoryPanel {controller} {presentation} {visible} {onAppendToChatDraft} />
+		{/await}
 	{:else if surface.type === 'singleton' && surface.kind === 'git-compare'}
 		{@const controller = singletonSurfaces.gitCompare()}
-		<ProjectSurfaceGate
-			{projectState}
-			target={workspaceContext.currentTarget}
-			retainedProjectPath={controller.target.baseProjectPath}
-			retainedEffectiveProjectKey={controller.target.effectiveProjectKey}
-			onChooseFolder={onChooseProjectFolder}
-		>
-			{#await gitCompareRenderer() then GitComparePanel}
-				<GitComparePanel {controller} {presentation} {visible} {onAppendToChatDraft} />
-			{/await}
-		</ProjectSurfaceGate>
+		{#await gitCompareRenderer() then GitComparePanel}
+			<GitComparePanel {controller} {presentation} {visible} {onAppendToChatDraft} />
+		{/await}
 	{:else if surface.type === 'singleton' && surface.kind === 'pull-requests'}
 		{@const controller = singletonSurfaces.pullRequests()}
-		<ProjectSurfaceGate
-			{projectState}
-			target={workspaceContext.currentTarget}
-			retainedProjectPath={controller.projectPath}
-			retainedEffectiveProjectKey={controller.effectiveProjectKey}
-			onChooseFolder={onChooseProjectFolder}
-		>
-			{#await pullRequestsRenderer() then PullRequestsPanel}
-				<PullRequestsPanel
-					{controller}
-					isMobile={presentation === 'mobile'}
-					{onSendToChat}
-					onNavigateToChat={() => void workspace.focusChat()}
-					onRetryCapability={() => void ghCapability.refresh()}
-				/>
-			{/await}
-		</ProjectSurfaceGate>
+		{#await pullRequestsRenderer() then PullRequestsPanel}
+			<PullRequestsPanel
+				{controller}
+				isMobile={presentation === 'mobile'}
+				{onSendToChat}
+				onNavigateToChat={() => void workspace.focusChat()}
+			/>
+		{/await}
 	{:else if surface.type === 'singleton' && surface.kind === 'commit'}
 		{@const controller = singletonSurfaces.commit()}
-		<ProjectSurfaceGate
-			{projectState}
-			target={workspaceContext.currentTarget}
-			retainedProjectPath={controller.target.baseProjectPath}
-			retainedEffectiveProjectKey={controller.target.effectiveProjectKey}
-			onChooseFolder={onChooseProjectFolder}
-		>
-			{#await commitRenderer() then CommitSurface}
-				<CommitSurface {controller} {presentation} />
-			{/await}
-		</ProjectSurfaceGate>
+		{#await commitRenderer() then CommitSurface}
+			<CommitSurface {controller} {presentation} />
+		{/await}
 	{:else if surface.type === 'singleton' && surface.kind === 'chat-map'}
 		{@const controller = singletonSurfaces.chatMap()}
 		{#await chatMapRenderer() then ChatMapPanel}
@@ -254,6 +212,7 @@
 				username={auth.user?.username ?? 'local'}
 				pinnedProjectPaths={remoteSettings.snapshot?.paths.pinnedProjectPaths ?? []}
 				directory={workspaceContext.current?.projectPath ?? null}
+				executorId={workspaceContext.current?.executorId}
 				onOpenChat={(chatId) => {
 					if (presentation === 'mobile') void workspace.showChatInCurrentWindow(chatId);
 					else void workspace.showChatInWindow(chatId, presentation);

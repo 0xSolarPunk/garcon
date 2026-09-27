@@ -10,6 +10,7 @@
 		getChatSessions,
 		getLocalSettings,
 		getModelCatalog,
+		getExecutors,
 		getRemoteSettings,
 	} from '$lib/context';
 	import { nonDirectAgentIds } from '$lib/agents/direct-agents.js';
@@ -30,20 +31,18 @@
 	}
 
 	let { open, scheduledPrompt, onSave, onClose }: Props = $props();
-	const modelCatalog = getModelCatalog();
+	const rootModelCatalog = getModelCatalog();
+	const executors = getExecutors();
 	const localSettings = getLocalSettings();
 	const remoteSettings = getRemoteSettings();
 	const sessions = getChatSessions();
-	const selectableAgentIds = $derived.by(() => {
-		const allAgentIds = modelCatalog.getSelectableAgents();
-		return localSettings.allowDirectChats ? allAgentIds : nonDirectAgentIds(allAgentIds);
-	});
 	const knownTags = $derived(
 		Array.from(new Set(sessions.orderedChats.flatMap((chat) => chat.tags))).sort(),
 	);
 
 	function createForm(): ScheduledPromptFormState {
-		return new ScheduledPromptFormState(modelCatalog, remoteSettings, sessions, {
+		return new ScheduledPromptFormState(rootModelCatalog, remoteSettings, sessions, {
+			executors,
 			get selectableAgentIds() {
 				return selectableAgentIds;
 			},
@@ -51,6 +50,13 @@
 	}
 
 	let form = $state(createForm());
+	const modelCatalog = $derived(rootModelCatalog.forExecutor(form.startup.executorId));
+	const pathContextKey = $derived(form.startup.pathContextKey);
+	function selectableAgentsForExecutor(executorId: string) {
+		const allAgentIds = rootModelCatalog.forExecutor(executorId).getSelectableAgents();
+		return localSettings.allowDirectChats ? allAgentIds : nonDirectAgentIds(allAgentIds);
+	}
+	const selectableAgentIds = $derived(selectableAgentsForExecutor(form.startup.executorId));
 	let pickerOpen = $state(false);
 	let isMobile = $state(false);
 	let initialization = 0;
@@ -82,7 +88,15 @@
 		const activeForm = form;
 		if (!open || activeForm.targetType !== 'new-chat') return;
 		void activeForm.startup.trimmedPath;
+		void pathContextKey;
 		untrack(() => activeForm.startup.validatePath());
+	});
+
+	$effect(() => {
+		if (!open || form.targetType !== 'new-chat' || !form.startup.executorReady) return;
+		const catalog = modelCatalog;
+		void catalog.version;
+		untrack(() => void catalog.refreshIfStale());
 	});
 
 	$effect(() => {
@@ -133,7 +147,6 @@
 
 	function handlePromptKeydown(event: KeyboardEvent): void {
 		if (event.key !== 'Enter' || (!event.ctrlKey && !event.metaKey)) return;
-		if (!form.canSave) return;
 		event.preventDefault();
 		void save();
 	}
@@ -325,7 +338,7 @@
 						startup={form.startup}
 						{modelCatalog}
 						{remoteSettings}
-						{selectableAgentIds}
+						getSelectableAgentIds={selectableAgentsForExecutor}
 						prompt={form.prompt}
 						promptError={form.promptError}
 						{knownTags}

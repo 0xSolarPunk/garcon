@@ -1,14 +1,20 @@
 export interface GitMutationRequest<T> {
+	executorId: string;
 	surfaceId: string;
 	effectiveProjectKey: string;
 	projectPath: string;
 	execute(): Promise<T>;
-	didMutate?: (result: T) => boolean;
 }
 
 export interface GitMutationCoordinatorOptions {
-	onChanged(effectiveProjectKey: string, projectPath: string): void | Promise<void>;
-	onInvalidationError?(error: unknown, effectiveProjectKey: string, projectPath: string): void;
+	onChanged(executorId: string, effectiveProjectKey: string, projectPath: string): void | Promise<void>;
+	onMutationError?(error: unknown, executorId: string, projectPath: string): void;
+	onInvalidationError?(
+		error: unknown,
+		executorId: string,
+		effectiveProjectKey: string,
+		projectPath: string,
+	): void;
 }
 
 export class GitMutationCoordinator {
@@ -22,23 +28,39 @@ export class GitMutationCoordinator {
 
 	async run<T>(request: GitMutationRequest<T>): Promise<T> {
 		this.#changePending(request.surfaceId, 1);
+		let succeeded = false;
 		try {
 			const result = await request.execute();
-			const didMutate = request.didMutate?.(result) ?? result !== false;
-			if (didMutate) {
-				try {
-					await this.options.onChanged(request.effectiveProjectKey, request.projectPath);
-				} catch (error) {
-					this.options.onInvalidationError?.(
-						error,
-						request.effectiveProjectKey,
-						request.projectPath,
-					);
-				}
-			}
+			succeeded = true;
 			return result;
+		} catch (error) {
+			this.options.onMutationError?.(error, request.executorId, request.projectPath);
+			throw error;
 		} finally {
-			this.#changePending(request.surfaceId, -1);
+			// Failed multi-command operations can still change refs or the index.
+			try {
+				const invalidation = this.#invalidate(request);
+				if (succeeded) await invalidation;
+			} finally {
+				this.#changePending(request.surfaceId, -1);
+			}
+		}
+	}
+
+	async #invalidate(request: GitMutationRequest<unknown>): Promise<void> {
+		try {
+			await this.options.onChanged(
+				request.executorId,
+				request.effectiveProjectKey,
+				request.projectPath,
+			);
+		} catch (error) {
+			this.options.onInvalidationError?.(
+				error,
+				request.executorId,
+				request.effectiveProjectKey,
+				request.projectPath,
+			);
 		}
 	}
 

@@ -3,12 +3,15 @@ import { describe, expect, it, vi } from 'vitest';
 
 import SidebarSaveFolderDialog from '../SidebarSaveFolderDialog.svelte';
 import SidebarTagDialog from '../SidebarTagDialog.svelte';
-import SidebarProjectPathDialog from '../SidebarProjectPathDialog.svelte';
+import SidebarProjectPathDialog from './SidebarProjectPathDialogTestHost.svelte';
 import { ApiError } from '$lib/api/client';
 import * as chatsApi from '$lib/api/chats';
 import * as gitApi from '$lib/api/git';
 import type { GitWorktreeItem } from '$lib/api/git';
 import { ProjectPathDialogState } from '../project-path-dialog-state.svelte.js';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
+import { ExecutorsStore } from '$lib/executors/executors-store.svelte';
+import { tick } from 'svelte';
 
 vi.mock('$lib/api/chats', async (importOriginal) => {
 	const actual = await importOriginal<typeof import('$lib/api/chats')>();
@@ -58,6 +61,140 @@ function makeWorktree(path: string, branch: string, isCurrent = false): GitWorkt
 }
 
 describe('Sidebar dialogs', () => {
+	it('fences remote worktree list and creation across executor replacement and dialog retargeting', async () => {
+		const executors = new ExecutorsStore();
+		const remote = {
+			...remoteExecutor,
+			machineServices: { ...remoteExecutor.machineServices, git: true },
+		};
+		executors.applySnapshot([localExecutor, remote]);
+		const dialog = new ProjectPathDialogState(executors);
+		vi.mocked(chatsApi.validateStart).mockResolvedValue({ valid: true, isGitRepo: true });
+		dialog.open('/worker/project', remote.id);
+		const listing = deferred<{ worktrees: GitWorktreeItem[] }>();
+		vi.mocked(gitApi.getGitWorktrees).mockReturnValueOnce(listing.promise);
+		const loading = dialog.loadWorktrees();
+		expect(gitApi.getGitWorktrees).toHaveBeenLastCalledWith(
+			{ executorId: remote.id, projectPath: '/worker/project' },
+			expect.any(Object),
+		);
+		executors.applySnapshot([localExecutor, { ...remote, instanceId: 'replacement' }]);
+		listing.resolve({ worktrees: [makeWorktree('/worker/old', 'old')] });
+		await loading;
+		expect(dialog.worktrees).toEqual([]);
+
+		const creation = deferred<Awaited<ReturnType<typeof gitApi.gitCreateWorktree>>>();
+		vi.mocked(gitApi.gitCreateWorktree).mockReturnValueOnce(creation.promise);
+		const creating = dialog.createWorktree('/worker/feature', 'feature');
+		dialog.open('/local/project', 'local');
+		creation.resolve({ success: true, worktreePath: '/worker/feature' });
+		await creating;
+		expect(dialog.candidatePath).toBe('/local/project');
+		expect(gitApi.gitCreateWorktree).toHaveBeenLastCalledWith(
+			{ executorId: remote.id, projectPath: '/worker/project' },
+			'/worker/feature',
+			{ branch: 'feature', baseRef: undefined },
+		);
+		dialog.close();
+	});
+	it('revalidates the unchanged chat path after replacement and dialog reopening', async () => {
+		vi.useFakeTimers();
+		vi.mocked(chatsApi.validateStart)
+			.mockReset()
+			.mockResolvedValueOnce({ valid: true, isGitRepo: false })
+			.mockResolvedValue({ valid: false, errorCode: 'outside_base_dir' });
+		const executors = [localExecutor, remoteExecutor];
+		const projectPathDialog = {
+			chatId: 'chat-1',
+			chatTitle: 'Synthetic project',
+			executorId: remoteExecutor.id,
+			status: 'running' as const,
+			agentOwnershipEpoch: 'epoch-1',
+			currentProjectPath: '/worker/project',
+		};
+		const rendered = render(SidebarProjectPathDialog, {
+			executors,
+			projectPathDialog,
+			projectBasePath: '/local',
+			isMobile: false,
+			onClose: vi.fn(),
+			onConfirm: vi.fn(),
+		});
+		try {
+			await tick();
+			await vi.advanceTimersByTimeAsync(250);
+			expect(chatsApi.validateStart).toHaveBeenCalledTimes(1);
+			await rendered.rerender({
+				executors: [
+					localExecutor,
+					{
+						...remoteExecutor,
+						instanceId: 'narrower',
+						projectBasePath: '/worker/project/narrow',
+					},
+				],
+			});
+			await vi.advanceTimersByTimeAsync(250);
+			await tick();
+			expect(screen.getByText('Path is outside the allowed base directory.')).toBeTruthy();
+			expect(screen.getByRole('textbox', { name: /new path/i })).toHaveProperty(
+				'value',
+				'/worker/project',
+			);
+			await rendered.rerender({
+				executors: [
+					{ ...localExecutor, instanceId: 'unrelated' },
+					{
+						...remoteExecutor,
+						instanceId: 'narrower',
+						projectBasePath: '/worker/project/narrow',
+					},
+				],
+			});
+			await vi.advanceTimersByTimeAsync(250);
+			expect(screen.getByText('Path is outside the allowed base directory.')).toBeTruthy();
+			expect(chatsApi.validateStart).toHaveBeenCalledTimes(2);
+			await rendered.rerender({ projectPathDialog: null });
+			await vi.advanceTimersByTimeAsync(250);
+			expect(chatsApi.validateStart).toHaveBeenCalledTimes(2);
+			await rendered.rerender({ projectPathDialog });
+			await vi.advanceTimersByTimeAsync(250);
+			await tick();
+			expect(screen.getByText('Path is outside the allowed base directory.')).toBeTruthy();
+			expect(chatsApi.validateStart).toHaveBeenCalledTimes(3);
+		} finally {
+			await unmountDialog(rendered);
+		}
+	});
+
+	it('revalidates an unchanged path against a new serving context without losing the candidate', async () => {
+		vi.useFakeTimers();
+		const dialog = new ProjectPathDialogState();
+		const old = deferred<Awaited<ReturnType<typeof chatsApi.validateStart>>>();
+		vi.mocked(chatsApi.validateStart)
+			.mockReset()
+			.mockResolvedValueOnce({ valid: true, isGitRepo: false })
+			.mockReturnValueOnce(old.promise)
+			.mockResolvedValueOnce({ valid: false, errorCode: 'outside_base_dir' });
+		try {
+			dialog.open('/worker/project', '22222222-2222-4222-8222-222222222222');
+			dialog.scheduleValidation('first');
+			await vi.advanceTimersByTimeAsync(250);
+			expect(dialog.validationStatus).toBe('valid');
+			dialog.scheduleValidation('second');
+			expect(dialog.validationStatus).toBe('checking');
+			vi.advanceTimersByTime(250);
+			dialog.scheduleValidation('third');
+			old.resolve({ valid: true });
+			await vi.advanceTimersByTimeAsync(250);
+			expect(dialog.validationStatus).toBe('invalid');
+			expect(dialog.candidatePath).toBe('/worker/project');
+		} finally {
+			dialog.dispose();
+			vi.useRealTimers();
+		}
+	});
+
 	it('explains rejected and unconfirmed project path updates', () => {
 		const dialog = new ProjectPathDialogState();
 
@@ -71,7 +208,9 @@ describe('Sidebar dialogs', () => {
 		);
 		expect(dialog.submitError).toMatch(/retry the same destination/i);
 
-		dialog.setSubmitFailure(new ApiError(503, 'raw provider failure', 'PROJECT_PATH_UPDATE_FAILED'));
+		dialog.setSubmitFailure(
+			new ApiError(503, 'raw provider failure', 'PROJECT_PATH_UPDATE_FAILED'),
+		);
 		expect(dialog.submitError).toBe('Failed to update project path.');
 	});
 
@@ -81,6 +220,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: longTitle,
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -118,6 +259,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -143,7 +286,10 @@ describe('Sidebar dialogs', () => {
 
 			await screen.findByText(/wait for the active turn/i);
 			expect(onClose).not.toHaveBeenCalled();
-			expect(onConfirm).toHaveBeenCalledWith('chat-1', '/workspace/repo-worktree');
+			expect(onConfirm).toHaveBeenCalledWith(
+				expect.objectContaining({ chatId: 'chat-1', agentOwnershipEpoch: 'epoch-1' }),
+				'/workspace/repo-worktree',
+			);
 
 			await fireEvent.click(updateButton);
 			await waitFor(() => {
@@ -165,6 +311,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -211,6 +359,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -229,7 +379,7 @@ describe('Sidebar dialogs', () => {
 			const worktreeDialog = await screen.findByRole('dialog', { name: 'Select worktree' });
 			expect(worktreeDialog).toBeTruthy();
 			expect(gitApi.getGitWorktrees).toHaveBeenCalledWith(
-				'/workspace/repo',
+				{ executorId: 'local', projectPath: '/workspace/repo' },
 				expect.objectContaining({ signal: expect.any(AbortSignal) }),
 			);
 			await fireEvent.click(await screen.findByRole('option', { name: /feature/ }));
@@ -247,7 +397,10 @@ describe('Sidebar dialogs', () => {
 			await fireEvent.click(updateButton);
 
 			await waitFor(() => {
-				expect(onConfirm).toHaveBeenCalledWith('chat-1', selectedPath);
+				expect(onConfirm).toHaveBeenCalledWith(
+					expect.objectContaining({ chatId: 'chat-1', agentOwnershipEpoch: 'epoch-1' }),
+					selectedPath,
+				);
 			});
 		} finally {
 			rendered.unmount();
@@ -265,6 +418,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -301,6 +456,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/plain-folder',
 			},
 			projectBasePath: '/workspace',
@@ -333,6 +490,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -366,6 +525,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -418,6 +579,8 @@ describe('Sidebar dialogs', () => {
 			projectPathDialog: {
 				chatId: 'chat-1',
 				chatTitle: 'Feature chat',
+				status: 'running' as const,
+				agentOwnershipEpoch: 'epoch-1',
 				currentProjectPath: '/workspace/repo',
 			},
 			projectBasePath: '/workspace',
@@ -460,11 +623,7 @@ describe('Sidebar dialogs', () => {
 			await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
 			await waitFor(() => {
-				expect(onSave).toHaveBeenCalledWith(
-					'chat-1',
-					['existing'],
-					['existing', 'pending-tag'],
-				);
+				expect(onSave).toHaveBeenCalledWith('chat-1', ['existing'], ['existing', 'pending-tag']);
 			});
 		} finally {
 			await unmountDialog(rendered);
@@ -472,7 +631,8 @@ describe('Sidebar dialogs', () => {
 	});
 
 	it('retries tag confirmation without discarding the staged edit', async () => {
-		const onRetryReconciliation = vi.fn()
+		const onRetryReconciliation = vi
+			.fn()
 			.mockRejectedValueOnce(new TypeError('Offline'))
 			.mockResolvedValueOnce(undefined);
 		const onSave = vi.fn().mockResolvedValue(undefined);
@@ -496,7 +656,11 @@ describe('Sidebar dialogs', () => {
 			const input = screen.getByRole('textbox', { name: 'Type a tag and press Enter' });
 			expect(input.hasAttribute('disabled')).toBe(true);
 			await fireEvent.click(screen.getByRole('button', { name: 'Try confirmation again' }));
-			expect(await screen.findByText('Saved tags still could not be confirmed. Check your connection and try again.')).toBeTruthy();
+			expect(
+				await screen.findByText(
+					'Saved tags still could not be confirmed. Check your connection and try again.',
+				),
+			).toBeTruthy();
 
 			await fireEvent.click(screen.getByRole('button', { name: 'Try confirmation again' }));
 			await waitFor(() => expect(onRetryReconciliation).toHaveBeenCalledTimes(2));
@@ -506,7 +670,11 @@ describe('Sidebar dialogs', () => {
 				reconciliationKind: null,
 			});
 			expect(screen.getByRole('button', { name: 'Remove tag staged' })).toBeTruthy();
-			expect(screen.getByText('Tags changed since this editor opened. Review the latest saved tags before saving.')).toBeTruthy();
+			expect(
+				screen.getByText(
+					'Tags changed since this editor opened. Review the latest saved tags before saving.',
+				),
+			).toBeTruthy();
 
 			await fireEvent.click(screen.getByRole('button', { name: 'Review latest tags' }));
 			expect(screen.getByRole('button', { name: 'Remove tag saved' })).toBeTruthy();

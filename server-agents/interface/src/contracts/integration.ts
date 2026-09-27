@@ -7,7 +7,6 @@ import type {
   AgentCommands,
   AgentEndpoints,
   AgentCompaction,
-  AgentGoals,
   AgentLifecycle,
   AgentMigration,
   AgentSettings,
@@ -21,6 +20,7 @@ import type {
   AgentSessionConfigurationUpdates,
 } from './execution.js';
 import type { AgentExecutionV5 } from './execution-v5.js';
+import type { AgentPermissions, AgentProducers } from './producer.js';
 import type {
   AgentHistoryImport,
   AgentNativeActivityProbe,
@@ -31,6 +31,8 @@ export interface AgentIntegration {
   readonly descriptor: AgentDescriptor;
   readonly attachments: AgentAttachments | null;
   readonly execution: AgentExecutionV5;
+  readonly producers: AgentProducers;
+  readonly permissions: AgentPermissions;
   readonly catalog: AgentCatalog;
   readonly settings: AgentSettings;
   readonly lifecycle: AgentLifecycle;
@@ -40,7 +42,6 @@ export interface AgentIntegration {
   readonly compaction: AgentCompaction | null;
   readonly forking: AgentNativeFork | null;
   readonly steering: AgentSteering | null;
-  readonly goals: AgentGoals | null;
   readonly endpoints: AgentEndpoints | null;
   readonly singleQuery: AgentSingleQuery | null;
   readonly legacyHistoryImport: AgentHistoryImport | null;

@@ -6,6 +6,7 @@
 	import PromptComposer from './PromptComposer.svelte';
 	import QueuedInputsDialog from './QueuedInputsDialog.svelte';
 	import HandoffForkDialog from './HandoffForkDialog.svelte';
+	import ExecutorHandoffDialog from './ExecutorHandoffDialog.svelte';
 	import ReloadChatDialog from './ReloadChatDialog.svelte';
 	import UserMessageNavigatorDialog from './UserMessageNavigatorDialog.svelte';
 	import {
@@ -13,7 +14,9 @@
 		type ConversationPanelActions,
 	} from './conversation-panel-actions.js';
 	import { INITIAL_VISIBLE_MESSAGES } from '$lib/chat/transcript/active-transcript-state.svelte.js';
+	import { sameGitProject } from '$lib/git/targets/git-target.js';
 	import type { ResendCandidate } from '$shared/chat-view';
+	import type { ProjectTarget } from '$shared/project-resolution';
 	import { ChatTranscriptCache } from '$lib/chat/transcript/chat-transcript-cache.svelte.js';
 	import { ComposerState } from '$lib/chat/composer/composer.svelte.js';
 	import type { ChatDraftAppend } from '$lib/chat/composer/chat-draft-append.js';
@@ -50,9 +53,11 @@
 		setAgentState,
 		getReadReceiptOutbox,
 		getModelCatalog,
+		getExecutors,
 		getRemoteSettings,
 		getNotifications,
 		getWorkspaceCoordinator,
+		getSingletonSurfaces,
 		getWorkspaceShortcuts,
 		getGitQuickSummary,
 		getProjectResolution,
@@ -78,6 +83,7 @@
 		onRegisterPrepareHide?: (prepare: (() => void) | null) => void;
 		onRegisterPanelActions?: (actions: ConversationPanelActions | null) => void;
 		onComposerHeightChange?: (height: number) => void;
+		onComposerNoticeChange?: (shown: boolean) => void;
 		onChooseProjectFolder?: (chatId: string) => void;
 		subagentToolbar: SubagentToolbarState;
 		transcriptCache?: ChatTranscriptCache;
@@ -103,6 +109,7 @@
 		onRegisterPrepareHide,
 		onRegisterPanelActions,
 		onComposerHeightChange,
+		onComposerNoticeChange,
 		onChooseProjectFolder,
 		subagentToolbar,
 		transcriptCache: providedTranscriptCache,
@@ -121,10 +128,12 @@
 	const appShell = getAppShell();
 	const ws = getWs();
 	const readReceiptOutbox = getReadReceiptOutbox();
-	const modelCatalog = getModelCatalog();
+	const rootModelCatalog = getModelCatalog();
+	const executors = getExecutors();
 	const remoteSettings = getRemoteSettings();
 	const notifications = getNotifications();
 	const workspace = getWorkspaceCoordinator();
+	const singletonSurfaces = getSingletonSurfaces();
 	const composerAnchorSurfaceId = $derived(workspace.composerAnchorSurfaceId);
 	const workspaceShortcuts = getWorkspaceShortcuts();
 	const chatDrafts = getChatDrafts();
@@ -142,6 +151,7 @@
 		},
 	});
 	const agentState = new AgentState();
+	const modelCatalog = $derived(rootModelCatalog.forExecutor(agentState.executorId));
 	const lifecycle = new CurrentConversationLifecycle({
 		lifecycles: conversationLifecycles,
 		getSelectedChatId: () => sessions.selectedChatId,
@@ -212,6 +222,7 @@
 	);
 	const drainHandle = createDrainCursor(ws);
 	onDestroy(() => {
+		controller.executorHandoff.cancel();
 		reloadRequest?.complete();
 		reloadRequest = null;
 		drainHandle.cleanup();
@@ -271,8 +282,14 @@
 		lifecycleForChat: (chatId) => conversationLifecycles.forChat(chatId),
 		conversationUi,
 		startupCoordinator,
-		modelCatalog,
-		getExecutionDefaults: (agentId) => {
+		get modelCatalog() {
+			return modelCatalog;
+		},
+		modelCatalogForExecutor: (executorId) => rootModelCatalog.forExecutor(executorId),
+		canSubmitToExecutor: (executorId) =>
+			executors.isReady(executorId) && rootModelCatalog.forExecutor(executorId).isValidated,
+		getExecutionDefaults: (agentId, executorId) => {
+			const modelCatalog = rootModelCatalog.forExecutor(executorId ?? agentState.executorId);
 			const defaults = executionDefaultsForAgent(
 				remoteSettings.snapshot?.executionDefaults,
 				agentId,
@@ -302,7 +319,8 @@
 		onProjectUnavailable: async (target) => {
 			if (
 				target.kind === 'chat' &&
-				sessions.byId[target.chatId]?.projectPath !== target.projectPath
+				(sessions.byId[target.chatId]?.projectPath !== target.projectPath ||
+					(sessions.byId[target.chatId]?.executorId ?? 'local') !== (target.executorId ?? 'local'))
 			)
 				return;
 			const lease = projectResolution.retain(target);
@@ -311,6 +329,16 @@
 			} finally {
 				lease.release();
 			}
+		},
+		isProjectUnavailable: (chatId) => {
+			const chat = sessions.byId[chatId];
+			if (!chat?.projectPath) return false;
+			const executorId = chat.executorId ?? 'local';
+			const target: ProjectTarget =
+				chat.status === 'draft'
+					? { kind: 'path', executorId, projectPath: chat.projectPath }
+					: { kind: 'chat', executorId, chatId, projectPath: chat.projectPath };
+			return projectResolution.snapshotFor(target).kind === 'unavailable';
 		},
 		setIsViewportPinnedToBottom: (v) => {
 			currentPanel()?.scroll.setPinnedToBottom(v);
@@ -619,8 +647,15 @@
 	}
 
 	function openCommitForPanel(surfaceId: ChatViewSurfaceId, chatId: string): void {
+		const executorId = sessions.byId[chatId]?.executorId ?? 'local';
+		if (!executors.gitAvailable(executorId)) return;
 		const projectPath = sessions.byId[chatId]?.projectPath;
-		if (!projectPath || !quickGit.summaryFor(projectPath)) return;
+		if (!projectPath || !quickGit.summaryFor({ executorId, projectPath })) return;
+		const target = { executorId, projectPath };
+		const commit = singletonSurfaces.commit();
+		if (!commit.target.selectProject(target) && !sameGitProject(commit.target.requestTarget, target)) {
+			notifications.info(m.commit_surface_busy_target_retained(), { key: 'commit-busy-target' });
+		}
 		const targetWindowId = workspace.windowOf(surfaceId);
 		let opening: Promise<void> | null = null;
 		if (appShell.isMobile) {
@@ -643,6 +678,7 @@
 		const projectPath = sessions.byId[chatId]?.projectPath;
 		if (!projectPath) return;
 		if (
+			quickGitBranches.executorId === command.executorId &&
 			quickGitBranches.currentProjectPath === projectPath &&
 			quickGitBranches.showBranchDropdown
 		) {
@@ -653,8 +689,9 @@
 		if (!project || !ownsBranchCommand(command)) return;
 		quickGitBranches.setProject(
 			project.projectPath,
-			quickGit.summaryFor(project.projectPath)?.branch,
+			quickGit.summaryFor(project)?.branch,
 			project.effectiveProjectKey,
+			project.executorId,
 		);
 		await quickGitBranches.openBranchDropdown(project.projectPath, project.effectiveProjectKey);
 		if (command.generation === branchCommandGeneration && !ownsBranchCommand(command)) {
@@ -663,6 +700,8 @@
 	}
 
 	type BranchCommand = {
+		readonly executorId: string;
+		readonly projectPath: string;
 		readonly generation: number;
 		readonly surfaceId: ChatViewSurfaceId;
 		readonly chatId: string;
@@ -675,6 +714,9 @@
 		chatId: string,
 		opensDropdown = false,
 	): BranchCommand | null {
+		const chat = sessions.byId[chatId];
+		const executorId = chat?.executorId ?? 'local';
+		if (!chat?.projectPath || !executors.gitAvailable(executorId)) return null;
 		const panel = conversationPanels.panel(surfaceId);
 		const owner = workspace.focusOwner;
 		if (
@@ -688,6 +730,8 @@
 		const generation = ++branchCommandGeneration;
 		if (opensDropdown) branchDropdownGeneration = generation;
 		return {
+			executorId,
+			projectPath: chat.projectPath,
 			generation,
 			surfaceId,
 			chatId,
@@ -698,6 +742,9 @@
 
 	function ownsBranchCommand(command: BranchCommand): boolean {
 		return (
+			(sessions.byId[command.chatId]?.executorId ?? 'local') === command.executorId &&
+			sessions.byId[command.chatId]?.projectPath === command.projectPath &&
+			executors.gitAvailable(command.executorId) &&
 			command.generation === branchCommandGeneration &&
 			workspace.focusOwnerRevision === command.focusOwnerRevision &&
 			workspace.focusOwner.kind !== 'chat-list' &&
@@ -718,6 +765,12 @@
 		if (!command) return;
 		const project = await resolveChatProject(chatId);
 		if (!project || !ownsBranchCommand(command)) return;
+		quickGitBranches.setProject(
+			project.projectPath,
+			quickGit.summaryFor(project)?.branch,
+			project.effectiveProjectKey,
+			project.executorId,
+		);
 		quickGitBranches.openNewBranchDialog(
 			project.projectPath,
 			surfaceId,
@@ -734,6 +787,12 @@
 		if (!command) return;
 		const project = await resolveChatProject(chatId);
 		if (!project || !ownsBranchCommand(command)) return;
+		quickGitBranches.setProject(
+			project.projectPath,
+			quickGit.summaryFor(project)?.branch,
+			project.effectiveProjectKey,
+			project.executorId,
+		);
 		await quickGitBranches.switchBranch(
 			project.projectPath,
 			branch,
@@ -744,21 +803,31 @@
 	}
 
 	async function resolveChatProject(chatId: string): Promise<{
+		executorId: string;
 		projectPath: string;
 		effectiveProjectKey: string;
 	} | null> {
 		const chat = sessions.byId[chatId];
-		if (!chat?.projectPath) return null;
+		const executorId = chat?.executorId ?? 'local';
+		const executorContextKey = executors.gitContextKey(executorId);
+		if (!chat?.projectPath || !executors.gitAvailable(executorId)) return null;
 		const target =
 			chat.status === 'draft'
-				? { kind: 'path' as const, projectPath: chat.projectPath }
-				: { kind: 'chat' as const, chatId, projectPath: chat.projectPath };
+				? { kind: 'path' as const, executorId, projectPath: chat.projectPath }
+				: { kind: 'chat' as const, executorId, chatId, projectPath: chat.projectPath };
 		const lease = projectResolution.retain(target);
 		try {
 			await lease.resolve();
-			if (sessions.byId[chatId]?.projectPath !== target.projectPath) return null;
+			if (
+				sessions.byId[chatId]?.projectPath !== target.projectPath ||
+				(sessions.byId[chatId]?.executorId ?? 'local') !== executorId ||
+				executorContextKey !== executors.gitContextKey(executorId) ||
+				!executors.gitAvailable(executorId)
+			)
+				return null;
 			return lease.snapshot.kind === 'available'
 				? {
+						executorId,
 						projectPath: target.projectPath,
 						effectiveProjectKey: lease.snapshot.effectiveProjectKey,
 					}
@@ -805,7 +874,14 @@
 			onsubmit={onSubmit}
 			{onSteerPreferredSubmit}
 			{onChooseProjectFolder}
+			onAvailabilityNoticeChange={onComposerNoticeChange}
 			onModelChange={(next) => controller.handleModelSelectionChange(next)}
+			onExecutorChange={(executorId) =>
+				controller.handleModelSelectionChange({
+					executorId,
+					agentId: agentState.agentId,
+					modelValue: agentState.model,
+				})}
 			onPermissionModeChange={(m) => controller.handlePermissionModeChange(m)}
 			onThinkingModeChange={(m) => controller.handleThinkingModeChange(m)}
 			onAgentSettingChange={(descriptor, value) =>
@@ -865,6 +941,7 @@
 		onCancel={cancelReload}
 		onConfirm={() => void confirmReload()}
 	/>
+	<ExecutorHandoffDialog handoff={controller.executorHandoff} />
 	<HandoffForkDialog
 		open={controller.handoffForkConfirmation.isOpen}
 		onCancel={() => controller.handoffForkConfirmation.cancel()}

@@ -40,6 +40,7 @@
 		getLocalSettings,
 		getAppShell,
 		getModelCatalog,
+		getExecutors,
 		getRemoteSettings,
 		getChatSessions,
 		getNotifications,
@@ -60,6 +61,7 @@
 	import { CHAT_FILE_ATTACHMENT_MIME_TYPES } from '@garcon/common/attachments';
 	import X from '@lucide/svelte/icons/x';
 	import ComposerModelSelector from '$lib/components/model-selector/ComposerModelSelector.svelte';
+	import ExecutorSelector from '$lib/components/shared/ExecutorSelector.svelte';
 	import type {
 		ModelSelectorChange,
 		ModelSelectorMode,
@@ -72,7 +74,10 @@
 	import { SnippetExpansionController } from '$lib/snippets/snippet-expansion-controller.svelte.js';
 	import { ApiError } from '$lib/api/client.js';
 	import { snippetTemplateUsesArguments } from '$shared/snippets';
-	import { matchesSelectableSnippetExpansion, type SelectableSnippet } from '$lib/snippets/selectable-snippet.js';
+	import {
+		matchesSelectableSnippetExpansion,
+		type SelectableSnippet,
+	} from '$lib/snippets/selectable-snippet.js';
 	import { createClientChatId } from '$shared/client-chat-id';
 	import type { ChatId } from '$shared/chat-id';
 	import { transientLayerAttachment } from '$lib/workspace/transient-layer-action.js';
@@ -91,7 +96,8 @@
 
 	const localSettings = getLocalSettings();
 	const appShell = getAppShell();
-	const modelCatalog = getModelCatalog();
+	const rootModelCatalog = getModelCatalog();
+	const executors = getExecutors();
 	const remoteSettings = getRemoteSettings();
 	const sessions = getChatSessions();
 	const notifications = getNotifications();
@@ -100,17 +106,20 @@
 	const transientLayers = getTransientLayers();
 	const workspaceLayout = getWorkspaceLayout();
 	const newChatSurfaceId = $derived(chatViewSurfaceId(workspaceLayout.defaultWindowId));
-	const newChatAgentIds = $derived.by(() => {
-		const allAgentIds = modelCatalog.getSelectableAgents();
-		return localSettings.allowDirectChats ? allAgentIds : nonDirectAgentIds(allAgentIds);
-	});
-	const form = new NewChatFormState({
-		modelCatalog,
+	const form: NewChatFormState = new NewChatFormState({
+		modelCatalog: rootModelCatalog,
+		executors,
 		remoteSettings,
 		get selectableAgentIds() {
 			return newChatAgentIds;
 		},
 	});
+	const modelCatalog = $derived(rootModelCatalog.forExecutor(form.executorId));
+	function selectableAgentsForExecutor(executorId: string) {
+		const allAgentIds = rootModelCatalog.forExecutor(executorId).getSelectableAgents();
+		return localSettings.allowDirectChats ? allAgentIds : nonDirectAgentIds(allAgentIds);
+	}
+	const newChatAgentIds = $derived(selectableAgentsForExecutor(form.executorId));
 	const canAttachImages = $derived(modelCatalog.supportsImages(form.agentId, form.modelValue));
 	const fileAttachmentMimeTypes = $derived(
 		modelCatalog.fileAttachmentMimeTypes?.(form.agentId) ?? CHAT_FILE_ATTACHMENT_MIME_TYPES,
@@ -148,7 +157,7 @@
 	let expansionProjectPath = '';
 	let snippetInteractionGeneration = $state(0);
 	const snippetInteractionKey = $derived(
-		`${snippetInteractionGeneration}\u0000${form.trimmedPath}`,
+		`${snippetInteractionGeneration}\u0000${form.executorId}\u0000${form.trimmedPath}`,
 	);
 
 	const snippetPalette = new SnippetPaletteTriggerState();
@@ -218,6 +227,13 @@
 		};
 	});
 
+	$effect(() => {
+		if (!form.executorReady) return;
+		const catalog = modelCatalog;
+		void catalog.version;
+		untrack(() => void catalog.refreshIfStale());
+	});
+
 	// Revalidates selected models whenever the shared model catalog updates.
 	$effect(() => {
 		void modelCatalog.version;
@@ -262,8 +278,9 @@
 	});
 
 	// Debounced path validation reacts to path changes.
+	const validationTargetKey = $derived(`${form.pathContextKey}\u0000${form.trimmedPath}`);
 	$effect(() => {
-		const projectPath = form.trimmedPath;
+		const projectPath = validationTargetKey;
 		if (projectPath !== expansionProjectPath) {
 			expansionProjectPath = projectPath;
 			snippetExpansion.cancel();
@@ -383,7 +400,12 @@
 	function expansionContext() {
 		const projectPath = form.trimmedPath;
 		if (projectPath) {
-			return { type: 'new-chat' as const, chatId: ensureProspectiveChatId(), projectPath };
+			return {
+				type: 'new-chat' as const,
+				chatId: ensureProspectiveChatId(),
+				projectPath,
+				executorId: form.executorId,
+			};
 		}
 		notifications.error(m.chat_new_chat_errors_project_path_required());
 		return null;
@@ -421,6 +443,7 @@
 			if (
 				form.trimmedPath !== projectPath ||
 				result.response.contextProjectPath !== projectPath ||
+				result.response.contextExecutorId !== form.executorId ||
 				form.firstMessage !== sourceText
 			)
 				return 'cancelled';
@@ -462,6 +485,7 @@
 			if (
 				form.trimmedPath !== projectPath ||
 				result.response.contextProjectPath !== projectPath ||
+				result.response.contextExecutorId !== form.executorId ||
 				form.firstMessage !== sourceText
 			)
 				return;
@@ -524,7 +548,6 @@
 			return;
 		}
 		if (submitOnEnter) {
-			if (!form.canSubmit) return;
 			e.preventDefault();
 			handleSubmit();
 		}
@@ -550,19 +573,24 @@
 		surface: 'composer',
 	};
 	const modelSelectorValue = $derived({
+		executorId: form.executorId,
 		agentId: form.agentId,
 		model: form.modelValue,
 		...(form.modelSelectionTarget ?? {}),
 	});
-	const recentSelectorOptions = $derived.by(() =>
-		buildModelSelectorRecents(modelCatalog, remoteSettings.snapshot?.recentAgentSettings ?? []),
-	);
-	const preferRecentsOnOpen = $derived(recentSelectorOptions.length > 1);
+	function getRecents(executorId: string) {
+		return buildModelSelectorRecents(
+			rootModelCatalog.forExecutor(executorId),
+			remoteSettings.snapshot?.recentAgentSettings ?? [],
+		);
+	}
 	const displayedFormError = $derived(form.modelSelectionError ?? form.error);
 	const sendButtonClass =
 		'bg-primary text-primary-foreground border-primary/30 hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:border-border disabled:cursor-not-allowed';
 
 	function handleModelSelectorChange(next: ModelSelectorChange): void {
+		if (!localSettings.allowDirectChats && nonDirectAgentIds([next.agentId]).length === 0) return;
+		if (next.executorId !== form.executorId) return;
 		if (!newChatAgentIds.includes(next.agentId)) return;
 		form.selectAgent(next.agentId);
 		form.selectModel(next.modelValue, next);
@@ -584,7 +612,10 @@
 		>
 			<div class="space-y-2">
 				<div class="relative">
-					<div class="flex gap-2">
+					<div class="flex flex-wrap gap-2 @container/project-target">
+						<ExecutorSelector executors={executors} executorId={form.executorId} service="agents" presentation="field"
+							class="h-[42px] w-full sm:h-[38px] @min-[32rem]/project-target:w-auto @min-[32rem]/project-target:max-w-44"
+							onSelect={(executorId) => form.selectExecutor(executorId)} />
 						<div class="relative min-w-0 flex-1">
 							<input
 								id="project-path-input"
@@ -593,7 +624,7 @@
 								bind:value={form.projectPath}
 								readonly={form.isUpdatingPinnedPath}
 								onfocus={(e: FocusEvent & { currentTarget: HTMLInputElement }) => {
-									if (isMobile) {
+									if (isMobile && form.filesAvailable) {
 										e.currentTarget.blur();
 									}
 									if (form.isUpdatingPinnedPath) return;
@@ -604,7 +635,7 @@
 									form.resetTabCompletions();
 								}}
 								onkeydown={(e: KeyboardEvent) => {
-									if (e.key === 'Tab') {
+									if (e.key === 'Tab' && form.filesAvailable) {
 										e.preventDefault();
 										if (form.isUpdatingPinnedPath) return;
 										form.handleTabCompletion();
@@ -658,8 +689,10 @@
 						{/if}
 					</div>
 
-					{#if form.showBrowser && !form.isUpdatingPinnedPath}
+					{#if form.filesAvailable && form.showBrowser && !form.isUpdatingPinnedPath}
 						<DirectoryBrowser
+							executorContextKey={form.pathContextKey}
+							executorId={form.executorId}
 							currentPath={form.trimmedPath || form.browseStartPath || form.projectBasePath}
 							basePath={form.projectBasePath}
 							onSelect={(selPath) => {
@@ -678,7 +711,7 @@
 						<p class="text-xs text-destructive transition-colors">
 							{form.validationError}
 						</p>
-					{:else if form.gitRepoStatus === 'git'}
+					{:else if form.gitAvailable && form.gitRepoStatus === 'git'}
 						<button
 							type="button"
 							disabled={form.isUpdatingPinnedPath}
@@ -720,7 +753,18 @@
 				/>
 
 				{#if displayedFormError}
-					<p class="text-sm text-destructive">{displayedFormError}</p>
+					<div role="status" class="flex items-center gap-2 text-sm text-destructive">
+						<span>{displayedFormError}</span>
+						{#if form.executorReady && modelCatalog.error}
+							<button
+								type="button"
+								class="text-foreground underline focus-visible:ring-2 focus-visible:ring-ring"
+								onclick={() => void modelCatalog.forceRefresh()}>{m.common_retry()}</button
+							>
+						{/if}
+					</div>
+				{:else if form.modelSelectionPending}
+					<p role="status" class="text-sm text-muted-foreground">Loading models...</p>
 				{/if}
 			</div>
 
@@ -788,9 +832,9 @@
 							value={modelSelectorValue}
 							mode={modelSelectorMode}
 							onChange={handleModelSelectorChange}
-							recents={recentSelectorOptions}
-							{preferRecentsOnOpen}
-							selectableAgentIds={newChatAgentIds}
+							{getRecents}
+							preferRecentsOnOpen
+							getSelectableAgentIds={selectableAgentsForExecutor}
 							align="end"
 							side="bottom"
 						/>

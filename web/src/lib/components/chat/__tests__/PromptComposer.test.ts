@@ -10,8 +10,11 @@ import type { GitQuickSummaryReady } from '$lib/api/git.js';
 import { ImageAttachmentState } from '$lib/chat/composer/image-attachment.svelte.js';
 import { chatDraftStorageKey, LOCAL_STORAGE_KEYS } from '$lib/utils/local-persistence.js';
 import * as snippetsApi from '$lib/api/snippets';
+import * as commandsApi from '$lib/api/commands.js';
 import { PromptComposerHeightState } from '../prompt-composer-height-state.svelte.js';
 import type { ProjectResolutionResponse, ProjectTarget } from '$shared/project-resolution';
+import { ModelCatalogStore } from '$lib/agents/model-catalog-store.svelte';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
 
 const appCss = readFileSync('src/app.css', 'utf8');
 
@@ -78,11 +81,239 @@ describe('PromptComposer focus', () => {
 		localStorage.removeItem(LOCAL_STORAGE_KEYS.composerHeight);
 	});
 
+	it('loads a cold remote catalog and blocks click and Enter until it is validated, including reconnect', async () => {
+		const catalog = new ModelCatalogStore();
+		const remote = catalog.forExecutor(remoteExecutor.id);
+		remote.invalidate();
+		const coldLoad = Promise.withResolvers<void>();
+		const reconnectLoad = Promise.withResolvers<void>();
+		const load = vi
+			.fn()
+			.mockReturnValueOnce(coldLoad.promise)
+			.mockReturnValueOnce(reconnectLoad.promise);
+		vi.spyOn(remote, 'refreshIfStale').mockImplementation(async () => {
+			if (!remote.isValidated) {
+				await load();
+				remote.lastValidatedAt = Date.now();
+			}
+		});
+		vi.spyOn(catalog, 'refreshIfStale').mockResolvedValue();
+		const onsubmit = vi.fn();
+		render(PromptComposerTestHost, {
+			selectedExecutorId: remoteExecutor.id,
+			executors: [localExecutor, remoteExecutor],
+			catalog,
+			onsubmit,
+		});
+		const textarea = screen.getByRole('textbox');
+		await fireEvent.input(textarea, { target: { value: 'Synthetic remote input' } });
+		const send = screen.getByRole<HTMLButtonElement>('button', { name: 'Loading models...' });
+		expect(send.title).toBe('Loading models...');
+		expect(screen.queryByText('Loading models...')).toBeNull();
+		await waitFor(() => expect(load).toHaveBeenCalledTimes(1));
+		expect(send.disabled).toBe(true);
+		await fireEvent.click(send);
+		await fireEvent.keyDown(textarea, { key: 'Enter' });
+		expect(onsubmit).not.toHaveBeenCalled();
+		coldLoad.resolve();
+		await waitFor(() => expect(send.disabled).toBe(false));
+		expect(send.getAttribute('aria-label')).toBe('Send message');
+		await fireEvent.keyDown(textarea, { key: 'Enter' });
+		expect(onsubmit).toHaveBeenCalledTimes(1);
+
+		remote.invalidate();
+		await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+		expect(send.disabled).toBe(true);
+		expect(send.getAttribute('aria-label')).toBe('Loading models...');
+		await fireEvent.keyDown(textarea, { key: 'Enter' });
+		expect(onsubmit).toHaveBeenCalledTimes(1);
+		reconnectLoad.resolve();
+		await waitFor(() => expect(send.disabled).toBe(false));
+		await fireEvent.click(send);
+		expect(onsubmit).toHaveBeenCalledTimes(2);
+	});
+
+	it.each(['offline', 'cold-catalog'])(
+		'allows controller commands through click, Enter and steer shortcut with %s',
+		async (availability) => {
+			const catalog = new ModelCatalogStore();
+			const remote = catalog.forExecutor(remoteExecutor.id);
+			remote.invalidate();
+			vi.spyOn(catalog, 'refreshIfStale').mockResolvedValue();
+			vi.spyOn(remote, 'refreshIfStale').mockResolvedValue();
+			const onsubmit = vi.fn();
+			const onSteerPreferredSubmit = vi.fn();
+			render(PromptComposerTestHost, {
+				selectedExecutorId: remoteExecutor.id,
+				executors: [
+					localExecutor,
+					{
+						...remoteExecutor,
+						availability: availability === 'offline' ? 'offline' : 'ready',
+					},
+				],
+				catalog,
+				onsubmit,
+				onSteerPreferredSubmit,
+			});
+			const textarea = screen.getByRole('textbox');
+			for (const text of [
+				'/rename Synthetic title',
+				'/move top',
+				'/tag add urgent',
+				'/in 1h Synthetic follow-up',
+			]) {
+				onsubmit.mockClear();
+				onSteerPreferredSubmit.mockClear();
+				await fireEvent.input(textarea, { target: { value: text } });
+				const send = screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' });
+				expect(send.disabled).toBe(false);
+				await fireEvent.click(send);
+				await fireEvent.keyDown(textarea, { key: 'Enter' });
+				await fireEvent.keyDown(textarea, { key: 'Enter', ctrlKey: true });
+				expect(onsubmit).toHaveBeenCalledTimes(2);
+				expect(onSteerPreferredSubmit).toHaveBeenCalledOnce();
+			}
+			onsubmit.mockClear();
+			onSteerPreferredSubmit.mockClear();
+			await fireEvent.input(textarea, { target: { value: '/compact' } });
+			await fireEvent.keyDown(textarea, { key: 'Enter' });
+			await fireEvent.keyDown(textarea, { key: 'Enter', ctrlKey: true });
+			expect(onsubmit).not.toHaveBeenCalled();
+			expect(onSteerPreferredSubmit).not.toHaveBeenCalled();
+		},
+	);
+
+	it('keeps offline draft commands gated across click, Enter and the steer shortcut', async () => {
+		const onsubmit = vi.fn();
+		const onSteerPreferredSubmit = vi.fn();
+		render(PromptComposerTestHost, {
+			selectedStatus: 'draft',
+			selectedExecutorId: remoteExecutor.id,
+			executors: [localExecutor, { ...remoteExecutor, availability: 'offline' }],
+			onsubmit,
+			onSteerPreferredSubmit,
+		});
+		const textarea = screen.getByRole('textbox');
+		for (const text of [
+			'/rename Synthetic title',
+			'/move top',
+			'/tag add urgent',
+			'/in 1h Synthetic follow-up',
+		]) {
+			await fireEvent.input(textarea, { target: { value: text } });
+			const send = screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' });
+			expect(send.disabled).toBe(true);
+			await fireEvent.click(send);
+			await fireEvent.keyDown(textarea, { key: 'Enter' });
+			await fireEvent.keyDown(textarea, { key: 'Enter', ctrlKey: true });
+		}
+		expect(onsubmit).not.toHaveBeenCalled();
+		expect(onSteerPreferredSubmit).not.toHaveBeenCalled();
+	});
+
+	it('keeps remote submission blocked after catalog failure and offers an explicit retry', async () => {
+		const catalog = new ModelCatalogStore();
+		const remote = catalog.forExecutor(remoteExecutor.id);
+		remote.invalidate();
+		vi.spyOn(catalog, 'refreshIfStale').mockResolvedValue();
+		vi.spyOn(remote, 'refreshIfStale').mockImplementation(async () => {
+			if (remote.lastValidatedAt === null) remote.error = 'Catalog unavailable';
+		});
+		const retry = vi.spyOn(remote, 'forceRefresh').mockImplementation(async () => {
+			remote.error = null;
+			remote.lastValidatedAt = Date.now();
+		});
+		const onsubmit = vi.fn();
+		const onAvailabilityNoticeChange = vi.fn();
+		const { container } = render(PromptComposerTestHost, {
+			selectedExecutorId: remoteExecutor.id,
+			executors: [localExecutor, remoteExecutor],
+			catalog,
+			onsubmit,
+			onAvailabilityNoticeChange,
+		});
+		const textarea = screen.getByRole('textbox');
+		const surface = container.querySelector<HTMLElement>('[data-composer]')!;
+		const surfaceMarkup = surface.className;
+		await fireEvent.input(textarea, { target: { value: 'Synthetic retry input' } });
+		await screen.findByText('Catalog unavailable');
+		const notice = container.querySelector('[data-composer-availability-notice="catalog-failed"]');
+		expect(notice?.textContent).toContain('Failed to load model catalog');
+		expect(notice?.contains(surface)).toBe(false);
+		expect(surface.contains(notice)).toBe(false);
+		expect(notice?.parentElement?.contains(surface)).toBe(true);
+		expect(surface.querySelector('[role="status"]')).toBeNull();
+		expect(surface.className).toBe(surfaceMarkup);
+		expect(onAvailabilityNoticeChange).toHaveBeenLastCalledWith(true);
+		expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(
+			true,
+		);
+		await fireEvent.keyDown(textarea, { key: 'Enter' });
+		expect(onsubmit).not.toHaveBeenCalled();
+		await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+		expect(retry).toHaveBeenCalledOnce();
+		expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' }).disabled).toBe(
+			false,
+		);
+		expect(container.querySelector('[data-composer-availability-notice]')).toBeNull();
+		expect(onAvailabilityNoticeChange).toHaveBeenLastCalledWith(false);
+		expect(screen.getByRole('textbox')).toBe(textarea);
+		expect(surface.className).toBe(surfaceMarkup);
+	});
+
+	it('submits file mentions with click and Enter when the ready executor has no Files capability', async () => {
+		const catalog = new ModelCatalogStore();
+		catalog.forExecutor(remoteExecutor.id).lastValidatedAt = Date.now();
+		vi.spyOn(catalog, 'refreshIfStale').mockResolvedValue();
+		vi.spyOn(catalog.forExecutor(remoteExecutor.id), 'refreshIfStale').mockResolvedValue();
+		const onsubmit = vi.fn();
+		render(PromptComposerTestHost, {
+			selectedExecutorId: remoteExecutor.id,
+			executors: [localExecutor, remoteExecutor],
+			catalog,
+			onsubmit,
+		});
+		const textarea = screen.getByRole<HTMLTextAreaElement>('textbox');
+		const text = 'Read @README.md';
+		await inputAtCaret(textarea, text, text.length);
+		const send = screen.getByRole<HTMLButtonElement>('button', { name: 'Send message' });
+		expect(send.disabled).toBe(false);
+		await fireEvent.click(send);
+		expect(onsubmit).toHaveBeenCalledTimes(1);
+		await fireEvent.keyDown(textarea, { key: 'Enter' });
+		expect(onsubmit).toHaveBeenCalledTimes(2);
+	});
+
+	it('refreshes again when an unvalidated catalog is invalidated during its first load', async () => {
+		const catalog = new ModelCatalogStore();
+		const remote = catalog.forExecutor(remoteExecutor.id);
+		remote.invalidate();
+		const pending = Promise.withResolvers<void>();
+		const refresh = vi.spyOn(remote, 'refreshIfStale').mockReturnValue(pending.promise);
+		vi.spyOn(catalog, 'refreshIfStale').mockResolvedValue();
+		render(PromptComposerTestHost, {
+			selectedExecutorId: remoteExecutor.id,
+			executors: [localExecutor, remoteExecutor],
+			catalog,
+		});
+		try {
+			await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+			expect(remote.lastValidatedAt).toBeNull();
+			remote.invalidate();
+			await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+			expect(
+				screen.getByRole<HTMLButtonElement>('button', { name: 'Loading models...' }).disabled,
+			).toBe(true);
+		} finally {
+			pending.resolve();
+		}
+	});
+
 	it('renders without a surface shadow', () => {
 		const { container } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 		});
 		const composer = container.querySelector('[data-composer]');
 
@@ -111,7 +342,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: true,
-			isSubmitting: false,
 		});
 		const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
 		const slider = screen.getByRole('slider', { name: 'Resize message composer' });
@@ -137,7 +367,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: true,
-			isSubmitting: false,
 			quickCommitRefreshing: true,
 		});
 		expect(textarea.style.height).toBe('160px');
@@ -405,6 +634,33 @@ describe('PromptComposer focus', () => {
 		expect(onsubmit).not.toHaveBeenCalled();
 	});
 
+	it.each([false, true])(
+		'uses the shared submission gate for bare /goal with admission pending=%s',
+		async (directAdmissionPending) => {
+			const commands = vi.spyOn(commandsApi, 'getSlashCommands').mockResolvedValue([]);
+			try {
+				const onsubmit = vi.fn();
+				render(PromptComposerTestHost, {
+					selectedAgentId: 'codex',
+					directAdmissionPending,
+					onsubmit,
+				});
+				const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+				await inputAtCaret(textarea, '/goal', 5);
+				await screen.findByText('No matching commands');
+
+				await fireEvent.keyDown(textarea, { key: 'Enter' });
+				expect(onsubmit).toHaveBeenCalledTimes(directAdmissionPending ? 0 : 1);
+				expect(textarea.value).toBe('/goal');
+
+				await fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+				expect(onsubmit).toHaveBeenCalledTimes(directAdmissionPending ? 0 : 2);
+			} finally {
+				commands.mockRestore();
+			}
+		},
+	);
+
 	it('resizes and reveals a draft block appended from another surface', async () => {
 		const { rerender } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-append',
@@ -446,7 +702,6 @@ describe('PromptComposer focus', () => {
 		const { rerender } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 		});
 		const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
 
@@ -458,7 +713,6 @@ describe('PromptComposer focus', () => {
 		await rerender({
 			selectedChatId: 'chat-2',
 			selectedStatus: 'running',
-			isSubmitting: false,
 		});
 		await nextAnimationFrame();
 		expect(document.activeElement).toBe(outsideButton);
@@ -603,7 +857,7 @@ describe('PromptComposer focus', () => {
 		const { rerender } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'draft',
-			isSubmitting: true,
+			directAdmissionPending: true,
 			focusRequestToken: 0,
 		});
 		const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
@@ -614,7 +868,7 @@ describe('PromptComposer focus', () => {
 		await rerender({
 			selectedChatId: 'chat-1',
 			selectedStatus: 'draft',
-			isSubmitting: true,
+			directAdmissionPending: true,
 			focusRequestToken: 1,
 		});
 		await nextAnimationFrame();
@@ -625,7 +879,7 @@ describe('PromptComposer focus', () => {
 		await rerender({
 			selectedChatId: 'chat-1',
 			selectedStatus: 'draft',
-			isSubmitting: false,
+			directAdmissionPending: false,
 			focusRequestToken: 1,
 		});
 		await expectComposerFocus(textarea);
@@ -690,7 +944,6 @@ describe('PromptComposer focus', () => {
 		const { rerender } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 			quickCommitTrayVisible: true,
 			quickCommitSummary: quickSummary(),
 			quickCommitRefreshing: false,
@@ -704,7 +957,6 @@ describe('PromptComposer focus', () => {
 		await rerender({
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 			quickCommitTrayVisible: true,
 			quickCommitSummary: quickSummary({ fingerprint: 'v1:refreshing' }),
 			quickCommitRefreshing: true,
@@ -720,7 +972,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: true,
-			isSubmitting: false,
 			quickCommitTrayVisible: false,
 		});
 		const composer = container.querySelector('[data-composer]');
@@ -745,7 +996,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: false,
-			isSubmitting: false,
 			quickCommitTrayVisible: true,
 			quickCommitSummary: quickSummary(),
 		});
@@ -767,7 +1017,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: false,
-			isSubmitting: false,
 			reduceMotion: false,
 		});
 		const frame = container.querySelector('[data-composer]')?.parentElement;
@@ -782,7 +1031,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: true,
-			isSubmitting: false,
 			reduceMotion: false,
 		});
 		expect(frame?.className).toContain('composer-thinking-active');
@@ -794,7 +1042,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: true,
-			isSubmitting: false,
 			reduceMotion: true,
 		});
 		expect(frame?.className).toContain('composer-thinking-active');
@@ -840,7 +1087,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: true,
-			isSubmitting: false,
 			quickCommitTrayVisible: false,
 			quickCommitSummary: quickSummary({ additions: 3, deletions: 1 }),
 			onAbort,
@@ -871,7 +1117,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
 			selectedIsProcessing: true,
-			isSubmitting: false,
 			quickCommitTrayVisible: false,
 			quickCommitSummary: quickSummary({
 				changedFiles: 0,
@@ -898,7 +1143,6 @@ describe('PromptComposer focus', () => {
 		const { rerender } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 			isVisible: false,
 			focusRequestToken: 1,
 		});
@@ -915,7 +1159,6 @@ describe('PromptComposer focus', () => {
 		await rerender({
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 			isVisible: true,
 			focusRequestToken: 1,
 		});
@@ -926,7 +1169,6 @@ describe('PromptComposer focus', () => {
 		const { rerender } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 			focusRequestToken: 0,
 		});
 		const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
@@ -937,7 +1179,6 @@ describe('PromptComposer focus', () => {
 		await rerender({
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 			focusRequestToken: 1,
 		});
 		await expectComposerFocus(textarea);
@@ -950,7 +1191,6 @@ describe('PromptComposer focus', () => {
 		render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 			selectableAgents: ['claude', 'codex'],
 			recentAgentSettings: [
 				{
@@ -1093,7 +1333,6 @@ describe('PromptComposer focus', () => {
 			selectedChatId: 'chat-1',
 			selectedAgentId: 'amp',
 			selectedStatus: 'running',
-			isSubmitting: false,
 		});
 		const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
 
@@ -1123,7 +1362,6 @@ describe('PromptComposer focus', () => {
 		const { unmount } = render(PromptComposerTestHost, {
 			selectedChatId: 'chat-1',
 			selectedStatus: 'running',
-			isSubmitting: false,
 		});
 		let textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
 		await fireEvent.input(textarea, { target: { value: '/in' } });
@@ -1133,7 +1371,6 @@ describe('PromptComposer focus', () => {
 		render(PromptComposerTestHost, {
 			selectedChatId: 'chat-draft',
 			selectedStatus: 'draft',
-			isSubmitting: false,
 		});
 		textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
 		await fireEvent.input(textarea, { target: { value: '/in' } });
@@ -1147,6 +1384,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'Review the API in /workspace/project',
 		});
@@ -1189,6 +1427,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'draft expansion',
 		});
@@ -1208,6 +1447,7 @@ describe('PromptComposer focus', () => {
 				arguments: { type: 'default' },
 				context: {
 					type: 'new-chat',
+					executorId: 'local',
 					chatId: '1787471053739199',
 					projectPath: '/workspace/project',
 				},
@@ -1223,6 +1463,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'expanded',
 		});
@@ -1300,6 +1541,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1335,9 +1577,7 @@ describe('PromptComposer focus', () => {
 			resolution: { kind: 'available', effectiveProjectKey: requestedTarget.projectPath },
 		});
 		await pending.promise;
-		await waitFor(() =>
-			expect(screen.getByRole('button', { name: 'Send message' })).toBeTruthy(),
-		);
+		await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeTruthy());
 
 		expect(snippetsApi.expandSnippet).not.toHaveBeenCalled();
 		expect(textarea.value).toBe('/snippet review cancellable');
@@ -1372,6 +1612,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1388,6 +1629,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'EXPANDED',
 		});
@@ -1450,6 +1692,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1489,6 +1732,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1505,6 +1749,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'EXPANDED',
 		});
@@ -1543,6 +1788,7 @@ describe('PromptComposer focus', () => {
 			sourceId: '00000000-0000-4000-8000-000000000001',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'manual',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'PREAMBLE',
 		});
@@ -1686,6 +1932,7 @@ describe('PromptComposer focus', () => {
 				sourceId: 'snippet-review',
 				sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 				shortName: 'review',
+				contextExecutorId: 'local',
 				contextProjectPath: '/workspace/project',
 				expandedText: 'EXPANDED',
 			});
@@ -1738,6 +1985,7 @@ describe('PromptComposer focus', () => {
 			...identity,
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1766,6 +2014,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-02T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not apply',
 		});
@@ -1859,6 +2108,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/two',
 			expandedText: 'must not apply',
 		});
@@ -1887,6 +2137,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/two',
 			expandedText: 'must not apply',
 		});
@@ -1899,42 +2150,98 @@ describe('PromptComposer focus', () => {
 		await fireEvent.input(textarea, { target: { value: '/snippet review keep this' } });
 		await fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 
-		await waitFor(() =>
-			expect(screen.getByRole('button', { name: 'Send message' })).toBeTruthy(),
-		);
+		await waitFor(() => expect(screen.getByRole('button', { name: 'Send message' })).toBeTruthy());
 		expect(textarea.value).toBe('/snippet review keep this');
 	});
 
-	it('presents unavailable project recovery actions for completion demand', async () => {
-		const fetchProjectResolution = vi.fn(async (target: ProjectTarget) => ({
-			target,
-			resolution: { kind: 'unavailable' as const, reason: 'not-found' as const },
-		}));
-		const onChooseProjectFolder = vi.fn();
-		const { container } = render(PromptComposerTestHost, {
-			selectedChatId: 'chat-project-unavailable',
-			selectedStatus: 'running',
-			chatMaxWidth: 'small',
-			fetchProjectResolution,
-			onChooseProjectFolder,
-		});
-		const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
-		await fireEvent.input(textarea, { target: { value: '/' } });
+	it.each(['missing', 'request-failed'])(
+		'prioritizes executor, project (%s), then catalog notices across disconnect and recovery without losing the draft',
+		async (failure) => {
+			const catalog = new ModelCatalogStore();
+			const remote = catalog.forExecutor(remoteExecutor.id);
+			remote.invalidate();
+			remote.error = 'Synthetic catalog failure';
+			vi.spyOn(remote, 'refreshIfStale').mockResolvedValue();
+			vi.spyOn(catalog, 'refreshIfStale').mockResolvedValue();
+			let pathAvailable = false;
+			const fetchProjectResolution = vi.fn(
+				async (target: ProjectTarget): Promise<ProjectResolutionResponse> => {
+					if (!pathAvailable && failure === 'request-failed')
+						throw new Error('Synthetic project check failure');
+					return {
+						target,
+						resolution: pathAvailable
+							? { kind: 'available', effectiveProjectKey: target.projectPath }
+							: { kind: 'unavailable', reason: 'not-found' },
+					};
+				},
+			);
+			const { component, container } = render(PromptComposerTestHost, {
+				selectedExecutorId: remoteExecutor.id,
+				executors: [localExecutor, remoteExecutor],
+				catalog,
+				fetchProjectResolution,
+			});
+			const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+			await fireEvent.input(textarea, { target: { value: '/synthetic-preserved-draft' } });
+			await screen.findByText('Project folder unavailable');
+			expect(screen.queryByText('Synthetic catalog failure')).toBeNull();
+			expect(screen.queryByRole('listbox')).toBeNull();
+			component.applyExecutors([localExecutor, { ...remoteExecutor, availability: 'offline' }]);
+			await screen.findByText('Worker is unavailable.');
+			expect(container.querySelector('[data-project-availability-notice]')).toBeNull();
+			expect(screen.queryByText('Synthetic catalog failure')).toBeNull();
+			expect(screen.queryByRole('listbox')).toBeNull();
+			component.applyExecutors([localExecutor]);
+			await screen.findByText("This chat's executor is no longer configured.");
+			expect(screen.queryByText('Project folder unavailable')).toBeNull();
+			pathAvailable = true;
+			component.applyExecutors([localExecutor, remoteExecutor]);
+			await waitFor(() => expect(fetchProjectResolution).toHaveBeenCalledTimes(2));
+			await screen.findByText('Synthetic catalog failure');
+			expect(screen.queryByText('Project folder unavailable')).toBeNull();
+			remote.error = null;
+			remote.lastValidatedAt = Date.now();
+			await waitFor(() => expect(screen.queryByText('Synthetic catalog failure')).toBeNull());
+			expect(screen.getByRole('textbox')).toBe(textarea);
+			expect(textarea.value).toBe('/synthetic-preserved-draft');
+		},
+	);
 
-		await screen.findByText('Project folder unavailable');
-		const notice = container.querySelector('[data-project-availability-notice]');
-		const noticeContent = notice?.querySelector<HTMLElement>('[role="status"]');
-		const noticeFrame = notice?.parentElement;
-		expect(noticeContent?.className).toContain('mx-auto');
-		expect(noticeFrame?.querySelector('[data-composer]')).toBeTruthy();
-		expect(noticeFrame?.className).toContain('w-full');
-		expect(noticeFrame?.className).toContain('lg:mx-auto');
-		expect(noticeFrame?.className).toContain('lg:max-w-3xl');
-		await fireEvent.click(screen.getByRole('button', { name: 'Choose folder' }));
-		expect(onChooseProjectFolder).toHaveBeenCalledWith('chat-project-unavailable');
-		await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-		await waitFor(() => expect(fetchProjectResolution).toHaveBeenCalledTimes(2));
-	});
+	it.each(['/', '@'])(
+		'presents unavailable project recovery actions instead of the %s completion menu',
+		async (trigger) => {
+			const fetchProjectResolution = vi.fn(async (target: ProjectTarget) => ({
+				target,
+				resolution: { kind: 'unavailable' as const, reason: 'not-found' as const },
+			}));
+			const onChooseProjectFolder = vi.fn();
+			const { container } = render(PromptComposerTestHost, {
+				selectedChatId: 'chat-project-unavailable',
+				selectedStatus: 'running',
+				chatMaxWidth: 'small',
+				fetchProjectResolution,
+				onChooseProjectFolder,
+			});
+			const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+			await fireEvent.input(textarea, { target: { value: trigger } });
+
+			await screen.findByText('Project folder unavailable');
+			expect(screen.queryByRole('listbox')).toBeNull();
+			const notice = container.querySelector('[data-project-availability-notice]');
+			const noticeContent = notice?.querySelector<HTMLElement>('[role="status"]');
+			const noticeFrame = notice?.parentElement;
+			expect(noticeContent?.className).toContain('mx-auto');
+			expect(noticeFrame?.querySelector('[data-composer]')).toBeTruthy();
+			expect(noticeFrame?.className).toContain('w-full');
+			expect(noticeFrame?.className).toContain('lg:mx-auto');
+			expect(noticeFrame?.className).toContain('lg:max-w-3xl');
+			await fireEvent.click(screen.getByRole('button', { name: 'Choose folder' }));
+			expect(onChooseProjectFolder).toHaveBeenCalledWith('chat-project-unavailable');
+			await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+			await waitFor(() => expect(fetchProjectResolution).toHaveBeenCalledTimes(2));
+		},
+	);
 
 	it('reports a missing project path instead of swallowing a snippet command', async () => {
 		render(PromptComposerTestHost, {
@@ -1974,6 +2281,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/project',
 			expandedText: 'must not cross chats',
 		});
@@ -2008,6 +2316,7 @@ describe('PromptComposer focus', () => {
 			sourceId: 'snippet-review',
 			sourceUpdatedAt: '2026-01-01T00:00:00.000Z',
 			shortName: 'review',
+			contextExecutorId: 'local',
 			contextProjectPath: '/workspace/one',
 			expandedText: 'must not cross project paths',
 		});

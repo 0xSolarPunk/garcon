@@ -1,5 +1,6 @@
 import * as m from '$lib/paraglide/messages.js';
 import type { PermissionMode } from '$lib/types/chat';
+import { isCustomProviderSelectionAvailable } from '$lib/agents/provider-selection.js';
 import type { PermissionDecisionPayload } from '$shared/chat-command-contracts';
 import { sendPermissionDecision } from '$lib/api/chats.js';
 import { createClientCommandId } from '$lib/chat/conversation/client-command-id.js';
@@ -9,12 +10,19 @@ import { isExecutionControlAdmissionConflict } from './execution-control-conflic
 import type { AcceptedInputSubmissionService } from './accepted-input-submission-service.js';
 import type { ConversationQueueController } from './conversation-queue-controller.svelte.js';
 import type { SessionControllerDeps } from './conversation-session-controller.svelte.js';
-import type { ConversationExecutionSelection } from './conversation-execution-draft-state.svelte.js';
+import type { ConversationExecutionSelection } from './conversation-execution-selection.js';
 
 export interface ConversationPermissionServiceOptions {
 	readonly deps: Pick<
 		SessionControllerDeps,
-		'sessions' | 'chatState' | 'agentState' | 'lifecycleForChat' | 'conversationUi' | 'appShell'
+		| 'sessions'
+		| 'chatState'
+		| 'agentState'
+		| 'lifecycleForChat'
+		| 'conversationUi'
+		| 'appShell'
+		| 'canSubmitToExecutor'
+		| 'modelCatalogForExecutor'
 	>;
 	readonly acceptedInputs: AcceptedInputSubmissionService;
 	readonly queue: ConversationQueueController;
@@ -81,6 +89,21 @@ export class ConversationPermissionService {
 		const { deps } = this.options;
 		const chat = deps.sessions.byId[chatId];
 		if (!chat) return;
+		if (
+			(choice === 'bypass' || choice === 'approve-edits') &&
+			(!deps.canSubmitToExecutor(chat.executorId ?? 'local') ||
+				!isCustomProviderSelectionAvailable(
+					deps.modelCatalogForExecutor(chat.executorId ?? 'local'),
+					chat,
+				))
+		) {
+			deps.chatState.appendLocalNoticeForChat(
+				chatId,
+				'error',
+				m.chat_notice_failed_resume_plan({ detail: 'Executor or model catalog is unavailable' }),
+			);
+			return;
+		}
 		const permissionControl = deps.conversationUi
 			.pendingPermissionsFor(chatId)
 			.find((request) => request.permissionOccurrenceId === permissionOccurrenceId)?.control;

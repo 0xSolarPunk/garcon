@@ -13,8 +13,8 @@ import {
   UserMessage,
   type ChatMessage,
 } from '../../../common/chat-types.js';
-import type { LedgerRowDraft } from '../../../server/ledger/contracts.js';
-import { TranscriptLedgerStore } from '../../../server/ledger/store.js';
+import type { LedgerRowDraft } from '../../../server/controller/ledger/contracts.js';
+import { TranscriptLedgerStore } from '../../../server/controller/ledger/store.js';
 import {
   assistantContents,
   countUserContent,
@@ -641,7 +641,7 @@ describe('reconnect and transcript stability', () => {
         beforeOrdinal: String(latest.nextBeforeOrdinal),
       });
 
-      const response = await fetch(`${fixture.client.baseUrl}/api/v1/chats/messages?${query}`);
+      const response = await fixture.client.fetch(`/api/v1/chats/messages?${query}`);
       const body = await response.json() as { errorCode?: unknown };
 
       expect(response.status).toBe(409);

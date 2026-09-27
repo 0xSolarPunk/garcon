@@ -1,0 +1,201 @@
+import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  cleanupLegacyQueueState,
+  CURRENT_WORKSPACE_VERSION,
+  WorkspaceMigrationRunner,
+} from '../index.ts';
+
+let workspaceDir;
+
+beforeEach(async () => {
+  workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-workspace-migrations-'));
+});
+
+afterEach(async () => {
+  await fs.rm(workspaceDir, { recursive: true, force: true });
+});
+
+async function readVersion() {
+  return JSON.parse(await fs.readFile(path.join(workspaceDir, 'workspace-version.json'), 'utf8'));
+}
+
+describe('WorkspaceMigrationRunner', () => {
+  it('stamps a fresh workspace without running historical migrations', async () => {
+    const migrate = mock(async () => undefined);
+    const runner = await WorkspaceMigrationRunner.open(workspaceDir);
+
+    expect(runner.initialVersion).toBe(0);
+
+    await runner.run('chat-id-migration', migrate);
+    await runner.run('core-record-migration', migrate);
+    await runner.run('ephemeral-queue-state-cleanup', migrate);
+    await runner.run('carryover-node-migration', migrate);
+    await runner.run('carryover-segment-migration', migrate);
+    await runner.run('agent-integration-settings-refresh', migrate);
+    await runner.run('agent-execution-mode-refresh', migrate);
+    await runner.run('fork-ordinal-cleanup', migrate);
+    await runner.run('provider-assignments', migrate);
+    await runner.finish();
+
+    expect(migrate).not.toHaveBeenCalled();
+    expect(await readVersion()).toEqual({ version: CURRENT_WORKSPACE_VERSION });
+  });
+
+  it('runs old-workspace migrations in order before deleting ephemeral state', async () => {
+    const queuesDir = path.join(workspaceDir, 'queues');
+    await fs.mkdir(queuesDir);
+    await Promise.all([
+      fs.writeFile(path.join(workspaceDir, 'chats.json'), '{}', 'utf8'),
+      fs.writeFile(path.join(queuesDir, 'chat-1.queue.json'), '{}', 'utf8'),
+      fs.writeFile(path.join(workspaceDir, 'pending-user-inputs.json'), '{}', 'utf8'),
+      fs.writeFile(path.join(workspaceDir, 'command-ledger.json'), '{}', 'utf8'),
+    ]);
+    const events = [];
+    const runner = await WorkspaceMigrationRunner.open(workspaceDir);
+
+    expect(runner.initialVersion).toBe(0);
+
+    await runner.run('chat-id-migration', async () => { events.push('chat-id'); });
+    await runner.run('core-record-migration', async () => { events.push('core-record'); });
+    await runner.run('ephemeral-queue-state-cleanup', () => cleanupLegacyQueueState({
+      workspaceDir,
+      async settleOwnershipIntents() {
+        expect(await fs.readFile(path.join(queuesDir, 'chat-1.queue.json'), 'utf8')).toBe('{}');
+        events.push('ownership');
+      },
+    }));
+    await runner.run('carryover-node-migration', async () => { events.push('carryover-node'); });
+    await runner.run('carryover-segment-migration', async () => { events.push('carryover-segment'); });
+    await runner.run('agent-integration-settings-refresh', async () => { events.push('settings-refresh'); });
+    await runner.run('agent-execution-mode-refresh', async () => { events.push('execution-mode-refresh'); });
+    await runner.run('fork-ordinal-cleanup', async () => { events.push('fork-ordinal-cleanup'); });
+    await runner.run('provider-assignments', async () => { events.push('provider-assignments'); });
+    await runner.finish();
+
+    expect(events).toEqual([
+      'chat-id',
+      'core-record',
+      'ownership',
+      'carryover-node',
+      'carryover-segment',
+      'settings-refresh',
+      'execution-mode-refresh',
+      'fork-ordinal-cleanup',
+      'provider-assignments',
+    ]);
+    await expect(fs.stat(queuesDir)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.stat(path.join(workspaceDir, 'pending-user-inputs.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.stat(path.join(workspaceDir, 'command-ledger.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(await readVersion()).toEqual({ version: CURRENT_WORKSPACE_VERSION });
+  });
+
+  it('runs only entries newer than the recorded version', async () => {
+    await fs.writeFile(
+      path.join(workspaceDir, 'workspace-version.json'),
+      JSON.stringify({ version: 2 }),
+      'utf8',
+    );
+    const early = mock(async () => undefined);
+    const cleanup = mock(async () => undefined);
+    const runner = await WorkspaceMigrationRunner.open(workspaceDir);
+
+    expect(runner.initialVersion).toBe(2);
+
+    await runner.run('chat-id-migration', early);
+    await runner.run('core-record-migration', early);
+    await runner.run('ephemeral-queue-state-cleanup', cleanup);
+    await runner.run('carryover-node-migration', cleanup);
+    await runner.run('carryover-segment-migration', cleanup);
+    await runner.run('agent-integration-settings-refresh', cleanup);
+    await runner.run('agent-execution-mode-refresh', cleanup);
+    await runner.run('fork-ordinal-cleanup', cleanup);
+    await runner.run('provider-assignments', cleanup);
+    await runner.finish();
+
+    expect(early).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledTimes(7);
+    expect(await readVersion()).toEqual({ version: CURRENT_WORKSPACE_VERSION });
+  });
+
+  it('runs the execution-mode refresh for an existing version 6 workspace', async () => {
+    await fs.writeFile(
+      path.join(workspaceDir, 'workspace-version.json'),
+      JSON.stringify({ version: 6 }),
+      'utf8',
+    );
+    const previous = mock(async () => undefined);
+    const executionModeRefresh = mock(async () => undefined);
+    const runner = await WorkspaceMigrationRunner.open(workspaceDir);
+
+    await runner.run('chat-id-migration', previous);
+    await runner.run('core-record-migration', previous);
+    await runner.run('ephemeral-queue-state-cleanup', previous);
+    await runner.run('carryover-node-migration', previous);
+    await runner.run('carryover-segment-migration', previous);
+    await runner.run('agent-integration-settings-refresh', previous);
+    await runner.run('agent-execution-mode-refresh', executionModeRefresh);
+    await runner.run('fork-ordinal-cleanup', async () => undefined);
+    await runner.run('provider-assignments', async () => undefined);
+    await runner.finish();
+
+    expect(previous).not.toHaveBeenCalled();
+    expect(executionModeRefresh).toHaveBeenCalledOnce();
+    expect(await readVersion()).toEqual({ version: CURRENT_WORKSPACE_VERSION });
+  });
+
+  it('runs only fork ordinal cleanup for version 7 and stamps only after success', async () => {
+    await fs.writeFile(path.join(workspaceDir, 'workspace-version.json'), JSON.stringify({ version: 7 }));
+    const previous = mock(async () => undefined);
+    const cleanup = mock(async () => { throw new Error('cleanup failed'); });
+
+    for (const attempt of [1, 2]) {
+      const runner = await WorkspaceMigrationRunner.open(workspaceDir);
+      await runner.run('chat-id-migration', previous);
+      await runner.run('core-record-migration', previous);
+      await runner.run('ephemeral-queue-state-cleanup', previous);
+      await runner.run('carryover-node-migration', previous);
+      await runner.run('carryover-segment-migration', previous);
+      await runner.run('agent-integration-settings-refresh', previous);
+      await runner.run('agent-execution-mode-refresh', previous);
+      if (attempt === 1) {
+        await expect(runner.run('fork-ordinal-cleanup', cleanup)).rejects.toThrow('cleanup failed');
+        expect(await readVersion()).toEqual({ version: 7 });
+        cleanup.mockImplementation(async () => undefined);
+      } else {
+        await runner.run('fork-ordinal-cleanup', cleanup);
+        await runner.run('provider-assignments', async () => undefined);
+        await runner.finish();
+      }
+    }
+
+    expect(previous).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(await readVersion()).toEqual({ version: CURRENT_WORKSPACE_VERSION });
+  });
+
+  it('rejects invalid, future, and out-of-order workspace versions', async () => {
+    await fs.writeFile(
+      path.join(workspaceDir, 'workspace-version.json'),
+      JSON.stringify({ version: CURRENT_WORKSPACE_VERSION + 1 }),
+      'utf8',
+    );
+    await expect(WorkspaceMigrationRunner.open(workspaceDir)).rejects.toThrow('newer than supported');
+
+    await fs.writeFile(
+      path.join(workspaceDir, 'workspace-version.json'),
+      JSON.stringify({ version: 0 }),
+      'utf8',
+    );
+    const runner = await WorkspaceMigrationRunner.open(workspaceDir);
+    await expect(runner.run('core-record-migration', async () => undefined)).rejects.toThrow(
+      'expected chat-id-migration',
+    );
+  });
+});

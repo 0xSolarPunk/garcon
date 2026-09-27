@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
 	import { untrack } from 'svelte';
 	import Sidebar from '../Sidebar.svelte';
 	import SidebarSearchDialogs from '../SidebarSearchDialogs.svelte';
@@ -174,6 +176,7 @@
 	setSidebarSearch(sidebarSearchContext);
 
 	setModelCatalog({
+		forExecutor() { return this; },
 		supportsFork() {
 			return true;
 		},
@@ -227,6 +230,7 @@
 		onShowPreambles={() => {}}
 		onShowSnippets={() => {}}
 		onShowSettings={() => {}}
+		onShowAppSettings={() => {}}
 		newWindowEdges={workspaceSplitAdmissions()}
 	/>
 {/if}

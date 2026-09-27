@@ -7,6 +7,7 @@ import {
 	PermissionRequestMessage,
 } from '$shared/chat-types';
 import PermissionRequestRowTestHost from './PermissionRequestRowTestHost.svelte';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
 
 const TS = '2026-07-02T00:00:00.000Z';
 
@@ -186,5 +187,54 @@ describe('PermissionRequestRow', () => {
 
 		expect(screen.getByRole('link', { name: 'Open target' })).toBeTruthy();
 		expect(container.querySelectorAll('[data-chat-reference-id]')).toHaveLength(1);
+	});
+
+	it('reports unavailable remote plan files without opening Local', async () => {
+		const onFileOpen = vi.fn();
+		const request = new PermissionRequestMessage(
+			TS, 'permission-plan',
+			new ExitPlanModeToolUseMessage(TS, 'tool-plan', '[Plan file](plan.md)'),
+		);
+		render(PermissionRequestRowTestHost, {
+			request, onDecision: vi.fn(), onFileOpen,
+			chatContext: {
+				chatId: 'remote-chat', executorId: remoteExecutor.id, projectPath: '/worker/project',
+			},
+			executors: [localExecutor, { ...remoteExecutor, availability: 'offline' }],
+		});
+		await fireEvent.click(screen.getByRole('link', { name: 'Plan file' }));
+		expect(onFileOpen).not.toHaveBeenCalled();
+		expect(screen.getByText('Files are unavailable on this executor.')).toBeTruthy();
+	});
+
+	it('resolves plan file links on the panel executor rather than the selected Local chat', async () => {
+		const onFileOpen = vi.fn();
+		const request = new PermissionRequestMessage(
+			TS,
+			'permission-plan',
+			new ExitPlanModeToolUseMessage(TS, 'tool-plan', '[Plan file](plan.md)'),
+		);
+		render(PermissionRequestRowTestHost, {
+			request,
+			onDecision: vi.fn(),
+			onFileOpen,
+			chatContext: {
+				chatId: 'remote-chat',
+				executorId: remoteExecutor.id,
+				projectPath: '/worker/project',
+			},
+			executors: [
+				localExecutor,
+				{ ...remoteExecutor, machineServices: { files: true, git: false, gh: false, terminals: false } },
+			],
+		});
+		await fireEvent.click(screen.getByRole('link', { name: 'Plan file' }));
+		expect(onFileOpen).toHaveBeenCalledWith(
+			expect.objectContaining({
+				executorId: remoteExecutor.id,
+				fileRootPath: '/worker',
+				relativePath: 'project/plan.md',
+			}),
+		);
 	});
 });

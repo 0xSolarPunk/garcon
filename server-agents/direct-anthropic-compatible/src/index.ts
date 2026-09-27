@@ -27,6 +27,7 @@ import { createVersion1RecordMigration } from '@garcon/server-agent-common/migra
 import { createVersionedSettings } from '@garcon/server-agent-common/settings/versioned-settings';
 import { singleQueryRuntimeOptions } from '@garcon/server-agent-common/shared/single-query-control';
 import { createAgentProducerAdapter } from '@garcon/server-agent-common/execution/producer-adapter';
+import { createAgentProjectPathUpdates } from '@garcon/server-agent-common/execution/project-path-adapter';
 
 const DESCRIPTOR = {
   id: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
@@ -53,6 +54,8 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
     ],
   } as const;
   readonly execution;
+  readonly producers;
+  readonly permissions;
   readonly legacyHistoryImport = null;
   readonly nativeHistoryImport;
   readonly nativeActivity = null;
@@ -68,7 +71,6 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
   readonly compaction = null;
   readonly forking = null;
   readonly steering = null;
-  readonly goals = null;
   readonly endpoints: NonNullable<AgentIntegration['endpoints']>;
   readonly singleQuery: NonNullable<AgentIntegration['singleQuery']>;
 
@@ -88,10 +90,12 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
       descriptors: [],
     });
     const providerExecution = new DirectExecution(host, runtime);
-    this.projectPathUpdates = {
-      prepare: (request) => providerExecution.prepareProjectPathUpdate(request),
-    };
-    this.execution = createAgentProducerAdapter(providerExecution, host.logger).execution;
+    this.projectPathUpdates = createAgentProjectPathUpdates(host.scope,
+      (request) => providerExecution.prepareProjectPathUpdate(request));
+    const producer = createAgentProducerAdapter(providerExecution, host);
+    this.execution = producer.execution;
+    this.producers = producer.producers;
+    this.permissions = producer.permissions;
     this.catalog = createModelCatalog({
       logger: host.logger,
       defaultModel: '',
@@ -129,7 +133,6 @@ export default class DirectAnthropicCompatibleIntegration implements AgentIntegr
         }
         try {
           return await runtime.runSingleQuery(request.prompt, endpoint, {
-            projectPath: request.projectPath,
             model: request.model,
             ...singleQueryRuntimeOptions(request),
           });

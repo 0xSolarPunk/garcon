@@ -1,7 +1,7 @@
 import type { GitTargetCandidate } from '$lib/api/git.js';
+import type { GitProjectTarget } from '$shared/git-execution';
 
-export interface GitTarget {
-	projectPath: string;
+export interface GitTarget extends GitProjectTarget {
 	repoRoot: string;
 	worktreePath: string;
 	label: string;
@@ -9,8 +9,20 @@ export interface GitTarget {
 	source: GitTargetCandidate['source'];
 }
 
-export function gitTargetFromCandidate(candidate: GitTargetCandidate): GitTarget {
+export function sameGitProject(
+	left: GitProjectTarget | null,
+	right: GitProjectTarget | null,
+): boolean {
+	return left?.executorId === right?.executorId && left?.projectPath === right?.projectPath;
+}
+
+export function gitProjectKey(project: GitProjectTarget): string {
+	return JSON.stringify([project.executorId, project.projectPath]);
+}
+
+export function gitTargetFromCandidate(candidate: GitTargetCandidate, executorId: string): GitTarget {
 	return {
+		executorId,
 		projectPath: candidate.projectPath,
 		repoRoot: candidate.repoRoot,
 		worktreePath: candidate.worktreePath,
@@ -21,7 +33,7 @@ export function gitTargetFromCandidate(candidate: GitTargetCandidate): GitTarget
 }
 
 export function gitTargetIdentity(effectiveProjectKey: string, target: GitTarget): string {
-	return JSON.stringify([effectiveProjectKey, target.repoRoot, target.worktreePath]);
+	return JSON.stringify([target.executorId, effectiveProjectKey, target.repoRoot, target.worktreePath]);
 }
 
 export function gitTargetCandidateFromTarget(target: GitTarget): GitTargetCandidate {

@@ -1,12 +1,10 @@
 import {
   normalizePermissionMode,
   normalizeThinkingMode,
-  isPermissionMode,
-  isThinkingMode,
   type PermissionMode,
   type ThinkingMode,
 } from './chat-modes.js';
-import { parseAgentSettingsEnvelope, type AgentSettingsEnvelope } from './agent-integration.js';
+import type { AgentSettingsEnvelope } from './agent-integration.js';
 import type { JsonObject } from './json.js';
 import type { AgentCommandImage } from './ws-requests.js';
 import type { ApiProtocol } from './api-providers.js';
@@ -18,6 +16,16 @@ import type { ParentChatRef } from './chat-parentage.js';
 import type { CommandTagMutationOutcome } from './chat-tag-mutations.js';
 import type { ErrorCode } from './error-codes.js';
 import { normalizeTags } from './tags.js';
+import { isExecutorId } from './executors.js';
+import {
+  optionalAgentHandoffRequest,
+  optionalPermissionMode,
+  optionalThinkingMode,
+  optionalApiProtocol,
+  requiredAgentSettings,
+  optionalAgentSettings,
+} from './chat-execution-command-parsing.js';
+export { parseAgentHandoffCommandRequest } from './chat-execution-command-parsing.js';
 import { parseHandoffForkConsent } from './chat-fork-command-parsing.js';
 import { normalizeAskUserQuestionDecisionResponse } from './ask-user-question-response.js';
 
@@ -89,8 +97,6 @@ export type CommandErrorCode = Extract<
   | 'STEER_CAPACITY_EXHAUSTED'
   | 'QUEUE_STEER_FINALIZATION_FAILED'
   | 'QUEUE_STEER_RECOVERY_FAILED'
-  | 'GOAL_CONTROL_NOT_DELIVERED'
-  | 'GOAL_CONTROL_OUTCOME_UNKNOWN'
   | 'PERMISSION_NOT_ACTIONABLE'
   | 'PERMISSION_DECISION_OUTCOME_UNKNOWN'
   | 'UNSUPPORTED_AGENT'
@@ -196,6 +202,7 @@ export interface CommandErrorResponse extends HttpErrorResponse {
 }
 
 export interface StartChatCommandRequest {
+  executorId?: string | null;
   origin: ClientChatStartOrigin;
   clientRequestId: string;
   clientMessageId: string;
@@ -235,6 +242,7 @@ export interface AgentRunCommandRequest {
   modelEndpointId?: string | null;
   modelProtocol?: ApiProtocol | null;
   expectedAgentId?: string;
+  expectedAgentOwnershipEpoch?: string;
   tagsToAdd?: string[];
   permissionFallbackPolicy?: 'require-explicit-bypass';
   handoff?: AgentHandoffRequest;
@@ -242,6 +250,8 @@ export interface AgentRunCommandRequest {
 }
 
 export interface AgentHandoffTarget {
+  executorId?: string | null;
+  projectPath?: string;
   agentId: string;
   model: string;
   apiProviderId?: string | null;
@@ -255,6 +265,18 @@ export interface AgentHandoffTarget {
 export interface AgentHandoffRequest {
   target: AgentHandoffTarget;
   expectedAgentOwnershipEpoch: string;
+}
+
+export interface AgentHandoffCommandRequest {
+  chatId: string;
+  clientRequestId: string;
+  handoff: AgentHandoffRequest;
+}
+
+export interface AgentHandoffCommandResponse {
+  success: true;
+  chatId: string;
+  chat: ChatListEntry;
 }
 
 export interface ForkRunCommandRequest {
@@ -359,21 +381,6 @@ export interface QueueEntrySteerErrorResponse extends HttpErrorResponse {
   control?: ChatExecutionControlState;
 }
 
-export interface GoalControlCommandRequest {
-  clientRequestId: string;
-  clientMessageId: string;
-  chatId: string;
-  transcriptViewId: string;
-  content: string;
-}
-
-export interface GoalControlCommandResponse extends CommandAcceptedResponse {
-  commandType: 'goal-control';
-  delivery: 'active' | 'queued';
-  entryId?: string;
-  control: ChatExecutionControlState;
-}
-
 export interface QueueCommandErrorResponse extends HttpErrorResponse {
   control?: ChatExecutionControlState;
 }
@@ -439,6 +446,7 @@ export interface CompactCommandRequest {
 
 export interface ExecutionSettingsPatchRequest {
   chatId: string;
+  expectedAgentOwnershipEpoch?: string;
   permissionMode?: PermissionMode;
   thinkingMode?: ThinkingMode;
   agentSettingsPatch?: JsonObject;
@@ -454,6 +462,7 @@ export interface ExecutionSettingsPatchResponse {
 
 export interface ModelPatchRequest {
   chatId: string;
+  expectedAgentOwnershipEpoch?: string;
   model: string;
   apiProviderId?: string | null;
   modelEndpointId?: string | null;
@@ -472,6 +481,9 @@ export interface ModelPatchResponse {
 export interface ProjectPathPatchRequest {
   chatId: string;
   projectPath: string;
+  expectedExecutorId: string;
+  expectedAgentOwnershipEpoch: string;
+  expectedProjectPath: string;
 }
 
 export interface ProjectPathPatchResponse {
@@ -488,6 +500,8 @@ export interface RunningChatsResponse {
 
 export function parseStartChatCommandRequest(value: unknown): StartChatCommandRequest {
   const body = requestRecord(value);
+  const executorId = body.executorId;
+  if (executorId != null && !isExecutorId(executorId)) throw new CommandRequestValidationError('executorId is invalid');
   if ('options' in body) throw new CommandRequestValidationError('options is not supported');
   if ('parentChat' in body) {
     throw new CommandRequestValidationError('parentChat is not supported; use parentChatId');
@@ -514,6 +528,7 @@ export function parseStartChatCommandRequest(value: unknown): StartChatCommandRe
     ...(parentChatId === undefined ? {} : { parentChatId }),
     agentId,
     projectPath: requiredString(body, 'projectPath'),
+    ...(executorId === undefined ? {} : { executorId }),
     model: requiredString(body, 'model'),
     apiProviderId: optionalNullableString(body, 'apiProviderId'),
     modelEndpointId: optionalNullableString(body, 'modelEndpointId'),
@@ -591,6 +606,7 @@ export function parseAgentRunCommandRequest(value: unknown): AgentRunCommandRequ
     );
   }
   const expectedAgentId = optionalNonEmptyString(body, 'expectedAgentId');
+  const expectedAgentOwnershipEpoch = optionalNonEmptyString(body, 'expectedAgentOwnershipEpoch');
   const permissionFallbackPolicy = body.permissionFallbackPolicy;
   if (
     permissionFallbackPolicy !== undefined
@@ -622,52 +638,13 @@ export function parseAgentRunCommandRequest(value: unknown): AgentRunCommandRequ
     ...(modelEndpointId === undefined ? {} : { modelEndpointId }),
     ...(modelProtocol === undefined ? {} : { modelProtocol }),
     ...(expectedAgentId === undefined ? {} : { expectedAgentId }),
+    ...(expectedAgentOwnershipEpoch === undefined ? {} : { expectedAgentOwnershipEpoch }),
     ...(tagsToAdd === undefined ? {} : { tagsToAdd }),
     ...(permissionFallbackPolicy === 'require-explicit-bypass'
       ? { permissionFallbackPolicy }
       : {}),
     ...(handoff === undefined ? {} : { handoff }),
     ...(userMessagePresentation === undefined ? {} : { userMessagePresentation }),
-  };
-}
-
-function optionalAgentHandoffRequest(value: unknown): AgentHandoffRequest | undefined {
-  if (value === undefined) return undefined;
-  const handoff = requestRecord(value);
-  const target = requestRecord(handoff.target);
-  const agentId = requiredString(target, 'agentId');
-  const model = requiredString(target, 'model');
-  const apiProviderId = optionalNullableString(target, 'apiProviderId');
-  const modelEndpointId = optionalNullableString(target, 'modelEndpointId');
-  const modelProtocol = optionalApiProtocol(target.modelProtocol);
-  if (modelEndpointId !== undefined && modelEndpointId !== null && apiProviderId == null) {
-    throw new CommandRequestValidationError(
-      'handoff.target.apiProviderId is required with modelEndpointId',
-    );
-  }
-  const permissionMode = optionalPermissionMode(target.permissionMode);
-  const thinkingMode = optionalThinkingMode(target.thinkingMode);
-  const agentSettings = optionalAgentSettings(target.agentSettings, 'handoff.target.agentSettings');
-  if (agentSettings && agentSettings.ownerId !== agentId) {
-    throw new CommandRequestValidationError(
-      'handoff.target.agentSettings must be owned by handoff.target.agentId',
-    );
-  }
-  return {
-    target: {
-      agentId,
-      model,
-      ...(apiProviderId === undefined ? {} : { apiProviderId }),
-      ...(modelEndpointId === undefined ? {} : { modelEndpointId }),
-      ...(modelProtocol === undefined ? {} : { modelProtocol }),
-      ...(permissionMode === undefined ? {} : { permissionMode }),
-      ...(thinkingMode === undefined ? {} : { thinkingMode }),
-      ...(agentSettings === undefined ? {} : { agentSettings }),
-    },
-    expectedAgentOwnershipEpoch: requiredString(
-      handoff,
-      'expectedAgentOwnershipEpoch',
-    ),
   };
 }
 
@@ -698,9 +675,6 @@ export function parseForkRunCommandRequest(value: unknown): ForkRunCommandReques
     modelProtocol: optionalApiProtocol(body.modelProtocol),
   };
 }
-
-
-
 
 export function parseQueueEntryCreateCommandRequest(value: unknown): QueueEntryCreateCommandRequest {
   const body = requestRecord(value);
@@ -839,17 +813,6 @@ export function parseQueueEntrySteerCommandRequest(value: unknown): QueueEntrySt
   };
 }
 
-export function parseGoalControlCommandRequest(value: unknown): GoalControlCommandRequest {
-  const body = requestRecord(value);
-  return {
-    clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
-    clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
-    chatId: requiredChatId(body, 'chatId'),
-    transcriptViewId: requiredString(body, 'transcriptViewId'),
-    content: requiredContent(body, 'content'),
-  };
-}
-
 export function parseQueueMutationRequest(value: unknown): QueueMutationRequest {
   return { chatId: requiredChatId(requestRecord(value), 'chatId') };
 }
@@ -921,9 +884,14 @@ export function parseCompactCommandRequest(value: unknown): CompactCommandReques
 
 export function parseProjectPathPatchRequest(value: unknown): ProjectPathPatchRequest {
   const body = requestRecord(value);
+  const expectedExecutorId = requiredString(body, 'expectedExecutorId');
+  if (!isExecutorId(expectedExecutorId)) throw new CommandRequestValidationError('expectedExecutorId is invalid');
   return {
     chatId: requiredChatId(body, 'chatId'),
     projectPath: requiredString(body, 'projectPath'),
+    expectedExecutorId,
+    expectedAgentOwnershipEpoch: requiredString(body, 'expectedAgentOwnershipEpoch'),
+    expectedProjectPath: requiredString(body, 'expectedProjectPath'),
   };
 }
 
@@ -937,39 +905,6 @@ function contentOrImages(
     throw new CommandRequestValidationError(`${field} or images are required`);
   }
   return value;
-}
-
-function optionalPermissionMode(value: unknown): PermissionMode | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (!isPermissionMode(value)) {
-    throw new CommandRequestValidationError('permissionMode is invalid');
-  }
-  return value;
-}
-
-function optionalThinkingMode(value: unknown): ThinkingMode | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (!isThinkingMode(value)) {
-    throw new CommandRequestValidationError('thinkingMode is invalid');
-  }
-  return value;
-}
-
-function optionalApiProtocol(value: unknown): ApiProtocol | null | undefined {
-  if (value === undefined || value === null) return value;
-  if (value === 'anthropic-messages' || value === 'openai-compatible') return value;
-  throw new CommandRequestValidationError('modelProtocol is invalid');
-}
-
-function requiredAgentSettings(value: unknown, field: string): AgentSettingsEnvelope {
-  const parsed = parseAgentSettingsEnvelope(value);
-  if (!parsed) throw new CommandRequestValidationError(`${field} is invalid`);
-  return parsed;
-}
-
-function optionalAgentSettings(value: unknown, field: string): AgentSettingsEnvelope | undefined {
-  if (value === undefined || value === null) return undefined;
-  return requiredAgentSettings(value, field);
 }
 
 function optionalImages(value: unknown): AgentCommandImage[] | undefined {

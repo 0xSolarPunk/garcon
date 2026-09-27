@@ -17,6 +17,7 @@ describe('CodeEditor lifecycle', () => {
 		async (waitForProvider) => {
 			const documentState = new FileDocumentState(
 				{
+					executorId: 'local',
 					canonicalFileRootPath: '/workspace',
 					normalizedRelativePath: 'file.txt',
 				},

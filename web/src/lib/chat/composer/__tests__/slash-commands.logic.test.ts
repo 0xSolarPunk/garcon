@@ -3,6 +3,7 @@ import {
 	applySlashCommand,
 	BUILTIN_SLASH_COMMANDS,
 	findSlashCommandTrigger,
+	isControllerSlashCommand,
 	parseCompactCommand,
 	parseMoveChatBoundaryCommand,
 	parseRenameCommand,
@@ -13,6 +14,17 @@ import {
 } from '$lib/chat/composer/slash-commands.js';
 
 describe('slash command helpers', () => {
+	it.each(['/rename Title', '/move top', '/tag add urgent', '/in 1h Follow up', '/rename', '/move invalid', '/in invalid', ' /TAG '])(
+		'classifies %s as controller-owned, including invalid arguments', (text) => {
+			expect(isControllerSlashCommand(text)).toBe(true);
+		},
+	);
+	it.each(['ordinary input', '/compact', '/fork', '/handoff', '/steer hello', '/snippet name', '/rename-agent', 'text /tag add urgent']) (
+		'keeps %s behind executor admission', (text) => {
+			expect(isControllerSlashCommand(text)).toBe(false);
+		},
+	);
+
 	it('detects a "/" trigger at the start of the input', () => {
 		expect(findSlashCommandTrigger('/dogf', '/dogf'.length)).toEqual({
 			start: 0,
@@ -75,8 +87,7 @@ describe('BUILTIN_SLASH_COMMANDS', () => {
 		expect(compact?.description).toBeTruthy();
 		expect(fork?.source).toBe('command');
 		expect(fork?.description).toBeTruthy();
-		expect(goal?.source).toBe('command');
-		expect(goal?.description).toBeTruthy();
+		expect(goal).toBeUndefined();
 		expect(scheduleIn?.source).toBe('command');
 		expect(scheduleIn?.description).toBeTruthy();
 		expect(steer?.source).toBe('command');

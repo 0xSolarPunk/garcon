@@ -1,3 +1,4 @@
+import type { GarconTestClient } from "../../support/garcon-client.js";
 import { describe, expect, test } from "bun:test";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -19,8 +20,8 @@ async function runGit(projectPath: string, args: string[]): Promise<void> {
   }
 }
 
-async function getJson<T>(baseUrl: string, endpoint: string): Promise<T> {
-  const response = await fetch(`${baseUrl}${endpoint}`);
+async function getJson<T>(client: GarconTestClient, endpoint: string): Promise<T> {
+  const response = await client.fetch(endpoint);
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(
@@ -33,9 +34,10 @@ async function getJson<T>(baseUrl: string, endpoint: string): Promise<T> {
 describe("Git worktree HTTP API", () => {
   test("lists linked and missing worktrees and builds target candidates", async () => {
     await withIntegrationFixture("git-worktrees", async (fixture) => {
-      const projectPath = fixture.dirs.project;
-      const linkedPath = join(fixture.dirs.root, "linked");
-      const missingPath = join(fixture.dirs.root, "missing");
+      const projectPath = fixture.executionDirs.project;
+      const linkedPath = join(projectPath, "linked");
+      const missingPath = join(projectPath, "missing");
+      const outsidePath = join(fixture.dirs.root, "outside");
       await runGit(projectPath, ["init", "-b", "main"]);
       await runGit(projectPath, ["config", "user.email", "test@example.com"]);
       await runGit(projectPath, ["config", "user.name", "Integration Test"]);
@@ -57,8 +59,9 @@ describe("Git worktree HTTP API", () => {
         missingPath,
       ]);
       await rm(missingPath, { recursive: true, force: true });
+      await runGit(projectPath, ['worktree', 'add', '-b', 'outside', outsidePath]);
 
-      const query = new URLSearchParams({ project: projectPath });
+      const query = new URLSearchParams({ executorId: fixture.client.executorId, project: projectPath });
       const { worktrees } = await getJson<{
         worktrees: Array<{
           path: string;
@@ -67,7 +70,7 @@ describe("Git worktree HTTP API", () => {
           isCurrent: boolean;
           isPathMissing: boolean;
         }>;
-      }>(fixture.garcon.baseUrl, `/api/v1/git/worktrees?${query}`);
+      }>(fixture.client, `/api/v1/git/worktrees?${query}`);
       expect(worktrees).toMatchObject([
         {
           path: projectPath,
@@ -91,6 +94,7 @@ describe("Git worktree HTTP API", () => {
           isPathMissing: true,
         },
       ]);
+      expect(worktrees.some(worktree => worktree.path === outsidePath)).toBe(false);
 
       const { targets } = await getJson<{
         targets: Array<{
@@ -99,7 +103,7 @@ describe("Git worktree HTTP API", () => {
           source: "chat-project" | "worktree";
           isMissing: boolean;
         }>;
-      }>(fixture.garcon.baseUrl, `/api/v1/git/targets?${query}`);
+      }>(fixture.client, `/api/v1/git/targets?${query}`);
       expect(targets[0]).toMatchObject({
         worktreePath: projectPath,
         branch: "main",
@@ -111,6 +115,6 @@ describe("Git worktree HTTP API", () => {
         source: "worktree",
         isMissing: true,
       });
-    });
+    }, { projectRoots: 'separate' });
   });
 });

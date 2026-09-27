@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
 	import PreamblesSection from '../PreamblesSection.svelte';
 	import {
 		setAppShell,
@@ -34,7 +36,6 @@
 			supportsForkWhileRunning: false,
 			supportsUpdateProjectPath: false,
 			supportsSteering: false,
-			supportsGoals: false,
 			supportsImages: false,
 			fileAttachmentMimeTypes: [],
 			acceptsApiProviderEndpoints: false,

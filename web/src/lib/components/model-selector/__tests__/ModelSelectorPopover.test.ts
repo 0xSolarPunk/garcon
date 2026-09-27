@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ModelSelectorPopoverHost from './ModelSelectorPopoverHost.svelte';
 import type { ModelSelectorRecentOption } from '../model-selector-types';
 import { DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID } from '$shared/agents';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
 
 let originalMatchMedia: typeof window.matchMedia | undefined;
 
@@ -19,8 +20,7 @@ function installMatchMedia(matchesCompact: boolean): void {
 		configurable: true,
 		writable: true,
 		value: vi.fn((query: string) => ({
-			matches:
-				query === '(max-width: 639px)' || query === '(max-width: 899px)' ? matchesCompact : false,
+			matches: query.startsWith('(max-width:') ? matchesCompact : false,
 			media: query,
 			onchange: null,
 			addEventListener: vi.fn(),
@@ -30,6 +30,19 @@ function installMatchMedia(matchesCompact: boolean): void {
 			dispatchEvent: vi.fn(),
 		})),
 	});
+}
+
+function installViewport(width: number): void {
+	vi.mocked(window.matchMedia).mockImplementation((query) => ({
+		matches: width <= Number(/max-width:\s*(\d+)px/.exec(query)?.[1]),
+		media: query,
+		onchange: null,
+		addEventListener: vi.fn(),
+		removeEventListener: vi.fn(),
+		addListener: vi.fn(),
+		removeListener: vi.fn(),
+		dispatchEvent: vi.fn(),
+	}));
 }
 
 async function closePopoverByOutsideClick(): Promise<void> {
@@ -162,6 +175,45 @@ describe('ModelSelectorPopover', () => {
 		}
 	});
 
+	for (const committedExecutor of [localExecutor, remoteExecutor]) {
+		it(`keeps the ${committedExecutor.label} trigger unchanged while browsing another executor`, async () => {
+			const onChange = vi.fn();
+			render(ModelSelectorPopoverHost, {
+				value: { executorId: committedExecutor.id, agentId: 'claude', model: 'model-0' },
+				mode: { executor: 'select', agent: 'select', source: 'select', surface: 'composer' },
+				onChange,
+				executors: [localExecutor, remoteExecutor],
+			});
+			const trigger = screen.getByRole('button', { name: /Claude .* Model 0/ });
+			const label = trigger.textContent;
+			await fireEvent.click(trigger);
+			const destination = committedExecutor.id === 'local' ? remoteExecutor : localExecutor;
+			await fireEvent.click(await screen.findByRole('button', { name: destination.label }));
+			await waitFor(() => {
+				expect(screen.getByRole('button', { name: destination.label }).getAttribute('aria-pressed')).toBe('true');
+			});
+			expect(document.querySelector('[data-slot="model-selector-columns"]')?.firstElementChild?.querySelector('[data-slot="model-selector-executors"]')).toBeTruthy();
+			expect(trigger.textContent).toBe(label);
+			expect(onChange).not.toHaveBeenCalled();
+		});
+	}
+
+	it('offers Retry beside a model catalog failure', async () => {
+		const onRetryCatalog = vi.fn();
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { agent: 'fixed', source: 'hidden', surface: 'composer' },
+			onChange: vi.fn(),
+			catalogError: 'Failed to fetch model catalog: 502',
+			onRetryCatalog,
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+		const alert = await screen.findByRole('alert');
+		expect(alert.textContent).toContain('Failed to fetch model catalog: 502');
+		await fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+		expect(onRetryCatalog).toHaveBeenCalledOnce();
+	});
+
 	it('commits normal model selection immediately and closes', async () => {
 		const onChange = vi.fn();
 
@@ -178,6 +230,7 @@ describe('ModelSelectorPopover', () => {
 
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledWith({
+				executorId: 'local',
 				agentId: 'claude',
 				modelValue: 'model-119',
 				model: 'model-119',
@@ -189,6 +242,20 @@ describe('ModelSelectorPopover', () => {
 		await waitFor(() => {
 			expect(screen.queryByRole('listbox', { name: 'Model' })).toBeNull();
 		});
+	});
+
+	it('closes an open fixed-executor picker when its enclosing target changes', async () => {
+		const onChange = vi.fn();
+		const view = render(ModelSelectorPopoverHost, {
+			value: { executorId: 'local', agentId: 'claude', model: 'model-0' },
+			mode: { executor: 'fixed', agent: 'select', source: 'select', surface: 'composer' },
+			onChange, executors: [localExecutor, remoteExecutor],
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+		expect(document.querySelector('[data-slot="model-selector-executors"]')).toBeNull();
+		await view.rerender({ value: { executorId: remoteExecutor.id, agentId: 'claude', model: 'model-0' } });
+		await waitFor(() => expect(screen.queryByRole('listbox', { name: 'Model' })).toBeNull());
+		expect(onChange).not.toHaveBeenCalled();
 	});
 
 	it('does not submit a surrounding form when the compact provider selector opens', async () => {
@@ -233,6 +300,7 @@ describe('ModelSelectorPopover', () => {
 
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledWith({
+				executorId: 'local',
 				agentId: 'claude',
 				modelValue: 'model-119',
 				model: 'model-119',
@@ -282,6 +350,7 @@ describe('ModelSelectorPopover', () => {
 
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledWith({
+				executorId: 'local',
 				agentId: 'claude',
 				modelValue: 'endpoint-model',
 				model: 'endpoint-model',
@@ -317,6 +386,7 @@ describe('ModelSelectorPopover', () => {
 
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledWith({
+				executorId: 'local',
 				agentId: 'claude',
 				modelValue: 'endpoint-model',
 				model: 'endpoint-model',
@@ -326,6 +396,22 @@ describe('ModelSelectorPopover', () => {
 				thinkingMode: 'high',
 			});
 		});
+	});
+
+	it.each([false, true])('allows explicit native replacement of an unavailable same-named endpoint (compact %s)', async (compact) => {
+		installMatchMedia(compact);
+		const onChange = vi.fn();
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0', modelEndpointId: 'unavailable', apiProviderId: 'provider', modelProtocol: 'anthropic-messages' },
+			mode: { executor: 'fixed', agent: 'select', source: 'select', surface: 'composer' },
+			onChange,
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .*model-0/ }));
+		const listbox = await screen.findByRole('listbox', { name: 'Model' });
+		await fireEvent.click(within(listbox).getByText('Model 0'));
+		await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+			agentId: 'claude', model: 'model-0', modelEndpointId: null, apiProviderId: null, modelProtocol: null,
+		})));
 	});
 
 	it('allows explicitly selecting the live endpoint for a stale model name', async () => {
@@ -355,6 +441,7 @@ describe('ModelSelectorPopover', () => {
 
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledWith({
+				executorId: 'local',
 				agentId: 'claude',
 				modelValue: 'acme-claude:endpoint-model',
 				model: 'endpoint-model',
@@ -391,6 +478,7 @@ describe('ModelSelectorPopover', () => {
 
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledWith({
+				executorId: 'local',
 				agentId: DIRECT_ANTHROPIC_COMPATIBLE_AGENT_ID,
 				modelValue: 'removed-from-catalog',
 				model: 'removed-from-catalog',
@@ -400,6 +488,44 @@ describe('ModelSelectorPopover', () => {
 				thinkingMode: 'high',
 			});
 		});
+	});
+
+	it('resets the compact effort pane when changing executors', async () => {
+		installMatchMedia(true);
+		const onChange = vi.fn();
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0', thinkingMode: 'none' },
+			mode: { executor: 'select', agent: 'select', source: 'select', surface: 'settings', effort: 'select' },
+			executors: [localExecutor, remoteExecutor], onChange,
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+		await fireEvent.click(within(await screen.findByRole('listbox', { name: 'Model' })).getByText('Model 1'));
+		expect(screen.getByRole('button', { name: /Ultra Highest available reasoning effort/ })).toBeTruthy();
+		for (let i = 0; i < 3; i++) await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+		await fireEvent.click(screen.getByRole('button', { name: remoteExecutor.label }));
+		expect(screen.queryByRole('button', { name: /Ultra Highest available reasoning effort/ })).toBeNull();
+		expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Done' }).disabled).toBe(true);
+		await fireEvent.click(screen.getByRole('button', { name: 'Claude' }));
+		await fireEvent.click(within(await screen.findByRole('listbox', { name: 'Model' })).getByText('Model 2'));
+		await fireEvent.click(screen.getByRole('button', { name: /Ultra Highest available reasoning effort/ }));
+		expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ executorId: remoteExecutor.id, model: 'model-2', thinkingMode: 'ultra' }));
+	});
+
+	it('resets compact recents after selecting an executor with no recent models', async () => {
+		installMatchMedia(true);
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0' },
+			mode: { executor: 'select', agent: 'select', source: 'select', surface: 'composer' },
+			executors: [localExecutor, remoteExecutor], recents: [claudeRecent(), codexRecent()],
+			preferRecentsOnOpen: true, onChange: vi.fn(),
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+		expect(await screen.findByText('Recent models')).toBeTruthy();
+		await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+		await fireEvent.click(screen.getByRole('button', { name: remoteExecutor.label }));
+		expect(screen.queryByText('Recent models')).toBeNull();
+		expect(screen.getByRole('button', { name: 'Claude' })).toBeTruthy();
 	});
 
 	it('advances compact generation selection from model to effort', async () => {
@@ -444,6 +570,35 @@ describe('ModelSelectorPopover', () => {
 		await waitFor(() => {
 			expect(window.matchMedia).toHaveBeenCalledWith('(max-width: 899px)');
 		});
+	});
+
+	it.each([
+		{ width: 800, executors: [localExecutor] },
+		{ width: 1000, executors: [localExecutor, remoteExecutor] },
+	])('keeps the compact dialog mounted when draft effort support changes at $width px', async ({ width, executors }) => {
+		installViewport(width);
+		const onChange = vi.fn();
+		render(ModelSelectorPopoverHost, {
+			value: { agentId: 'claude', model: 'model-0', thinkingMode: 'none' },
+			mode: { executor: 'select', agent: 'select', source: 'select', surface: 'settings', effort: 'select' },
+			includeManagedAgent: true,
+			executors,
+			onChange,
+		});
+		await fireEvent.click(screen.getByRole('button', { name: /Claude .* Model 0/ }));
+		const dialog = screen.getByRole('dialog');
+		await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Amp' }));
+
+		expect(screen.getByRole('dialog')).toBe(dialog);
+		expect(document.querySelector('[data-slot="model-selector-compact"]')).toBeTruthy();
+		const input = screen.getByPlaceholderText('Filter models...');
+		await waitFor(() => expect(document.activeElement).toBe(input));
+		expect(onChange).not.toHaveBeenCalled();
+		await fireEvent.click(screen.getByText('Amp Medium'));
+		await waitFor(() => expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+			agentId: 'amp', model: 'medium', executorId: 'local',
+		})));
 	});
 
 	it('renders a bounded unfiltered model catalog slice', async () => {
@@ -572,6 +727,7 @@ describe('ModelSelectorPopover', () => {
 		await waitFor(() => {
 			expect(onChange).toHaveBeenCalledTimes(1);
 			expect(onChange).toHaveBeenCalledWith({
+				executorId: 'local',
 				agentId: 'claude',
 				modelValue: 'acme-claude:endpoint-model',
 				model: 'endpoint-model',
@@ -716,6 +872,7 @@ describe('ModelSelectorPopover', () => {
 		);
 
 		expect(onChange).toHaveBeenCalledWith({
+			executorId: 'local',
 			agentId: 'codex',
 			modelValue: 'codex-model-1',
 			model: 'codex-model-1',
@@ -849,6 +1006,7 @@ describe('ModelSelectorPopover', () => {
 		);
 
 		expect(onChange).toHaveBeenCalledWith({
+			executorId: 'local',
 			agentId: 'claude',
 			modelValue: 'acme-claude:endpoint-model',
 			model: 'endpoint-model',
@@ -894,7 +1052,7 @@ describe('ModelSelectorPopover', () => {
 		expect(contentClass).toContain('top-[var(--app-viewport-center-y)]');
 		expect(contentClass).toContain('translate-y-[-50%]');
 		expect(contentClass).toContain('safe-viewport-dialog');
-		expect(contentClass).toContain('h-[min(32rem,calc(var(--app-height)-1rem))]');
+		expect(contentClass).toContain('h-[min(36rem,calc(var(--app-height)-1rem))]');
 		expect(contentClass).toContain('overflow-hidden');
 		expect(contentClass).toContain('p-0');
 		expect(contentClass).not.toContain('top-auto');

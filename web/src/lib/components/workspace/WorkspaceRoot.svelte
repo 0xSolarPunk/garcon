@@ -25,6 +25,7 @@
 		getFileSessions,
 		getGitBranchActions,
 		getGitQuickSummary,
+		getExecutors,
 		getChatProcessingReconciler,
 		getModelCatalog,
 		getLocalSettings,
@@ -85,7 +86,6 @@
 		visiblePortablePresentations,
 	} from '$lib/workspace/visible-presentations.js';
 	import { cn } from '$lib/utils/cn';
-	import { terminalDisplayName } from '$lib/terminal/sessions/terminal-display-name.js';
 	import * as m from '$lib/paraglide/messages.js';
 	import { projectTargetKey, type ProjectTarget } from '$shared/project-resolution';
 
@@ -110,6 +110,7 @@
 	const projectResolution = getProjectResolution();
 	const gitBranchActions = getGitBranchActions();
 	const gitQuickSummary = getGitQuickSummary();
+	const executors = getExecutors();
 	const fileSessions = getFileSessions();
 	const surfaceFrames = getSurfaceFrames();
 	const processingReconciler = getChatProcessingReconciler();
@@ -175,6 +176,7 @@
 	let renamingTerminalId = $state<string | null>(null);
 	let conversationPanelActions = $state<ConversationPanelActions | null>(null);
 	let composerInsetPx = $state(0);
+	let composerNoticeShown = $state(false);
 	const PORTABLE_SURFACE_STYLE = 'inset: 0;';
 
 	const snapshot = $derived(workspace.layout.snapshot);
@@ -209,11 +211,18 @@
 		if (!localSettings.showQuickCommitTray) return [];
 		return chatPresentations.flatMap(({ chatId }) => {
 			const chat = sessions.byId[chatId];
-			if (!chat?.projectPath) return [];
+			if (!chat?.projectPath || !executors.gitAvailable(chat.executorId)) return [];
 			const target = targetForChat(chat);
 			const resolution = projectResolution.snapshotFor(target);
 			return resolution.kind === 'available'
-				? [{ projectPath: chat.projectPath, isProcessing: chat.isProcessing }]
+				? [
+						{
+							executorId: chat.executorId ?? 'local',
+							executorContextKey: executors.gitContextKey(chat.executorId),
+							projectPath: chat.projectPath,
+							isProcessing: chat.isProcessing,
+						},
+					]
 				: [];
 		});
 	});
@@ -262,10 +271,20 @@
 		];
 	}
 
-	function targetForChat(chat: { id: string; status: string; projectPath: string }): ProjectTarget {
+	function targetForChat(chat: {
+		id: string;
+		executorId?: string | null;
+		status: string;
+		projectPath: string;
+	}): ProjectTarget {
 		return chat.status === 'draft'
-			? { kind: 'path', projectPath: chat.projectPath }
-			: { kind: 'chat', chatId: chat.id, projectPath: chat.projectPath };
+			? { kind: 'path', executorId: chat.executorId ?? 'local', projectPath: chat.projectPath }
+			: {
+					kind: 'chat',
+					executorId: chat.executorId ?? 'local',
+					chatId: chat.id,
+					projectPath: chat.projectPath,
+				};
 	}
 	const rootState = new WorkspaceRootState({
 		get snapshot() {
@@ -442,7 +461,7 @@
 		}
 		if (surface.type === 'terminal') {
 			const metadata = terminals.sessions[surface.terminalId]?.metadata;
-			return metadata ? terminalDisplayName(metadata) : m.workspace_surface_terminal();
+			return metadata ? terminals.displayName(metadata) : m.workspace_surface_terminal();
 		}
 		if (surface.type === 'file') {
 			const session = fileSessions.get(surface.fileSessionId);
@@ -501,16 +520,18 @@
 	{@const chat = surface?.type === 'chat' && surface.chatId ? sessions.byId[surface.chatId] : null}
 	{@const panel = surface?.type === 'chat' ? conversationPanels.panel(surface.id) : null}
 	{#if chat}
-		{@const supportsFork = modelCatalog.supportsFork(chat.agentId)}
+		{@const chatCatalog = modelCatalog.forExecutor(chat.executorId)}
+		{@const supportsFork = chatCatalog.supportsFork(chat.agentId)}
 		<CurrentChatMenuItems
 			{menu}
 			selectedChat={chat}
 			canReload={chat.canReloadFromNativeHistory ?? false}
-			canUpdateProjectPath={modelCatalog.supportsUpdateProjectPath?.(chat.agentId) ?? false}
+			canUpdateProjectPath={executors.isReady(chat.executorId) &&
+				chatCatalog.supportsUpdateProjectPath(chat.agentId)}
 			canFork={supportsFork}
 			canForkNow={canUseForkAction({
 				supportsFork,
-				supportsForkWhileRunning: modelCatalog.supportsForkWhileRunning(chat.agentId),
+				supportsForkWhileRunning: chatCatalog.supportsForkWhileRunning(chat.agentId),
 				isProcessing: chat.isProcessing,
 			})}
 			onOpenUserMessageNavigator={sessions.selectedChatId === chat.id
@@ -551,9 +572,9 @@
 				style={PORTABLE_SURFACE_STYLE}
 				onSendToChat={sendToChat}
 				onAppendToChatDraft={appendToChatDraft}
-				onChooseProjectFolder={modelCatalog.supportsUpdateProjectPath(
-					sessions.selectedChat?.agentId ?? '',
-				) && sessions.selectedChat
+				onChooseProjectFolder={modelCatalog
+					.forExecutor(sessions.selectedChat?.executorId)
+					.supportsUpdateProjectPath(sessions.selectedChat?.agentId ?? '') && sessions.selectedChat
 					? () => chatActions.requestProjectPath(sessions.selectedChat!)
 					: undefined}
 				frameBridge={rootState.frameBridge(surface.id)}
@@ -588,6 +609,7 @@
 				labelFor={label}
 				panelActions={conversationPanelActions}
 				{composerInsetPx}
+				composerNoticeShown={composerBound && composerNoticeShown}
 				{subagentToolbar}
 				{titlebarMetrics}
 				{surfaceMenuItems}
@@ -637,6 +659,7 @@
 						isVisible={true}
 						actions={conversationPanelActions}
 						composerInsetPx={composerBound ? composerInsetPx : 0}
+						composerNoticeShown={composerBound && composerNoticeShown}
 						reserveMobileToolbar={true}
 					/>
 				{/key}
@@ -692,6 +715,7 @@
 				onRegisterAppendToDraft={(append) => (chatDraftAppend = append)}
 				onRegisterPanelActions={(actions) => (conversationPanelActions = actions)}
 				onComposerHeightChange={(height) => (composerInsetPx = height)}
+				onComposerNoticeChange={(shown) => (composerNoticeShown = shown)}
 				{subagentToolbar}
 				{chatActions}
 				transcriptCache={chatTranscriptCache}
@@ -726,6 +750,9 @@
 
 <TerminalRenameDialog
 	terminal={terminalToRename}
+	hostLabel={terminalToRename
+		? terminals.executorLabel(terminals.executorIdFor(terminalToRename.terminalId))
+		: 'Local'}
 	onClose={() => (renamingTerminalId = null)}
 	onRename={(terminalId, title) => terminals.rename(terminalId, title)}
 />

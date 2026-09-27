@@ -1,7 +1,7 @@
 import { untrack } from 'svelte';
 import type { ChatSessionRecord } from '$lib/types/chat-session';
-import type { SnippetExpansionContext } from '$shared/snippets';
-import type { ProjectTarget } from '$shared/project-resolution';
+import type { ExpandSnippetResponse, SnippetExpansionContext } from '$shared/snippets';
+import { projectTargetKey, type ProjectTarget } from '$shared/project-resolution';
 import type {
 	ProjectResolutionSnapshot,
 	ProjectResolutionStore,
@@ -10,11 +10,13 @@ import * as m from '$lib/paraglide/messages.js';
 
 interface PromptComposerProjectStateDeps {
 	readonly selectedChat: ChatSessionRecord | null;
+	readonly executionTarget?: { executorId: string; projectPath: string };
 	readonly completionDemand: boolean;
 	projectResolution: ProjectResolutionStore;
 }
 
 export interface PromptComposerSnippetContext {
+	executorId: string;
 	context: SnippetExpansionContext;
 	chatId: string;
 	projectPath: string;
@@ -46,9 +48,16 @@ export class PromptComposerProjectState {
 	get target(): ProjectTarget | null {
 		const chat = this.deps.selectedChat;
 		if (!chat?.projectPath) return null;
+		const execution = this.deps.executionTarget;
+		if (
+			execution &&
+			(execution.executorId !== (chat.executorId ?? 'local') || execution.projectPath !== chat.projectPath)
+		) {
+			return { kind: 'path', ...execution };
+		}
 		return chat.status === 'draft'
-			? { kind: 'path', projectPath: chat.projectPath }
-			: { kind: 'chat', chatId: chat.id, projectPath: chat.projectPath };
+			? { kind: 'path', executorId: chat.executorId, projectPath: chat.projectPath }
+			: { kind: 'chat', chatId: chat.id, executorId: chat.executorId, projectPath: chat.projectPath };
 	}
 
 	get snapshot(): ProjectResolutionSnapshot {
@@ -67,15 +76,21 @@ export class PromptComposerProjectState {
 		void lease.retry().finally(() => lease.release());
 	}
 
+	matchesSnippetContext(operation: PromptComposerSnippetContext, response: Pick<ExpandSnippetResponse, 'contextExecutorId' | 'contextProjectPath'>): boolean {
+		return this.deps.selectedChat?.id === operation.chatId
+			&& this.target?.projectPath.trim() === operation.projectPath
+			&& (this.target?.executorId ?? 'local') === operation.executorId
+			&& response.contextExecutorId === operation.executorId
+			&& response.contextProjectPath === operation.projectPath;
+	}
+
 	async resolveSnippetContext(signal?: AbortSignal): Promise<PromptComposerSnippetContext> {
 		const chat = this.deps.selectedChat;
-		const projectPath = chat?.projectPath.trim();
-		if (!chat || !projectPath) throw new Error(m.chat_new_chat_errors_project_path_required());
+		const target = this.target;
+		const projectPath = target?.projectPath.trim();
+		const executorId = target?.executorId ?? 'local';
+		if (!chat || !target || !projectPath) throw new Error(m.chat_new_chat_errors_project_path_required());
 		signal?.throwIfAborted();
-		const target: ProjectTarget =
-			chat.status === 'draft'
-				? { kind: 'path', projectPath }
-				: { kind: 'chat', chatId: chat.id, projectPath };
 		const lease = this.deps.projectResolution.retain(target);
 		let released = false;
 		const release = () => {
@@ -98,7 +113,7 @@ export class PromptComposerProjectState {
 			signal?.throwIfAborted();
 			if (
 				this.deps.selectedChat?.id !== chat.id ||
-				this.deps.selectedChat.projectPath.trim() !== projectPath
+				!this.target || projectTargetKey(this.target) !== projectTargetKey(target)
 			) {
 				throw new Error(m.workspace_project_changed());
 			}
@@ -114,9 +129,10 @@ export class PromptComposerProjectState {
 			release();
 		}
 		return {
+			executorId,
 			context:
-				chat.status === 'draft'
-					? { type: 'new-chat', chatId: chat.id, projectPath }
+				target.kind === 'path'
+					? { type: 'new-chat', chatId: chat.id, executorId, projectPath }
 					: { type: 'chat', chatId: chat.id },
 			chatId: chat.id,
 			projectPath,

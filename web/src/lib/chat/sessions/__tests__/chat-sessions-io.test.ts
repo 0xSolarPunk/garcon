@@ -141,6 +141,42 @@ describe('ChatSessionsStore IO', () => {
 		expect(store.lastSelectedChatId).toBe('fresh');
 	});
 
+	it.each([false, true])('preserves accepted startup across an older list response (empty: %s)', async (empty) => {
+		const store = new ChatSessionsStore();
+		const beforeSession = deferred<Awaited<ReturnType<typeof listChats>>>();
+		const afterSession = deferred<Awaited<ReturnType<typeof listChats>>>();
+		const started = makeServerSession({ canReloadFromNativeHistory: true });
+		mockListChats
+			.mockReturnValueOnce(beforeSession.promise)
+			.mockReturnValueOnce(afterSession.promise);
+
+		const refreshing = store.quietRefreshChats();
+		store.applyStartEntry(started);
+		store.setSelectedChatId(started.id);
+		beforeSession.resolve({ sessions: empty ? [] : [makeServerSession()], total: empty ? 0 : 1, lastSelectedChatId: null });
+		await flushMicrotasks();
+
+		expect(store.byId[started.id]?.canReloadFromNativeHistory).toBe(true);
+		expect(store.selectedChatId).toBe(started.id);
+		expect(mockListChats).toHaveBeenCalledTimes(2);
+		afterSession.resolve({ sessions: [started], total: 1, lastSelectedChatId: null });
+		await refreshing;
+		expect(store.selectedChat?.canReloadFromNativeHistory).toBe(true);
+	});
+
+	it('refreshes server truth when a delayed start response follows a newer list snapshot', async () => {
+		const store = new ChatSessionsStore();
+		const current = makeServerSession({ canReloadFromNativeHistory: true });
+		store.upsertFromServer([current]);
+		mockListChats.mockResolvedValueOnce({ sessions: [current], total: 1, lastSelectedChatId: null });
+
+		store.applyStartEntry(makeServerSession());
+		await flushMicrotasks();
+
+		expect(mockListChats).toHaveBeenCalledTimes(1);
+		expect(store.byId[current.id]?.canReloadFromNativeHistory).toBe(true);
+	});
+
 	it('does not let an older list response overwrite a newer project binding', async () => {
 		const store = new ChatSessionsStore();
 		store.upsertFromServer([makeServerSession({ projectPath: '/workspace/a' })]);
@@ -1328,6 +1364,29 @@ describe('ChatSessionsStore IO', () => {
 			model: 'gpt-5.5',
 		});
 		await vi.waitFor(() => expect(listChats).toHaveBeenCalledTimes(1));
+	});
+
+	it.each([
+		{ sourceExecutor: '00000000-0000-4000-8000-000000000001', executorId: undefined, projectPath: '/local' },
+		{ sourceExecutor: 'local', executorId: '00000000-0000-4000-8000-000000000001', projectPath: '/repo' },
+	])('publishes the accepted handoff project binding before list refresh: $sourceExecutor', async ({ sourceExecutor, executorId, projectPath }) => {
+		const refresh = deferred<Awaited<ReturnType<typeof listChats>>>();
+		const store = new ChatSessionsStore({ listChats: () => refresh.promise });
+		store.upsertFromServer([makeServerSession({ executorId: sourceExecutor, projectPath: '/repo' })]);
+		const bindingChanged = vi.fn();
+		const unsubscribe = store.onProjectPathChanged(bindingChanged);
+		const accepted = makeServerSession({ executorId, projectPath, agentOwnershipEpoch: 'epoch-2' });
+		try {
+			store.reconcileAcceptedHandoffProjection(accepted);
+			expect(store.byId['chat-1']).toMatchObject({
+				executorId: executorId ?? 'local', projectPath, agentOwnershipEpoch: 'epoch-2',
+			});
+			expect(bindingChanged).toHaveBeenCalledExactlyOnceWith('chat-1', projectPath, executorId ?? 'local');
+		} finally {
+			refresh.resolve({ sessions: [accepted], total: 1, lastSelectedChatId: null });
+			await store.quietRefreshChats();
+			unsubscribe();
+		}
 	});
 
 	it('generates a chat title from a message and patches local state', async () => {

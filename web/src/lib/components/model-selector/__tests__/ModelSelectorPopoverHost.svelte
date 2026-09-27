@@ -1,4 +1,7 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	import type { ExecutorSnapshot } from '$shared/executors';
+	import { untrack } from 'svelte';
 	import ModelSelectorPopover from '../ModelSelectorPopover.svelte';
 	import { setModelCatalog } from '$lib/context';
 	import type { ModelCatalogStore, ModelOption } from '$lib/agents/model-catalog-store.svelte';
@@ -36,6 +39,9 @@
 		preferRecentsOnOpen?: boolean;
 		wrapInForm?: boolean;
 		onFormSubmit?: () => void;
+		executors?: readonly ExecutorSnapshot[];
+		catalogError?: string | null;
+		onRetryCatalog?: () => void;
 	}
 
 	let {
@@ -52,7 +58,11 @@
 		preferRecentsOnOpen = false,
 		wrapInForm = false,
 		onFormSubmit = () => {},
+		executors,
+		catalogError = null,
+		onRetryCatalog = () => {},
 	}: Props = $props();
+	setExecutorsTestContext(untrack(() => executors));
 
 	let claudeModels = $derived.by<ModelOption[]>(() => {
 		const generated = Array.from({ length: modelCount }, (_, index): ModelOption => ({
@@ -120,6 +130,12 @@
 	}
 
 	setModelCatalog({
+		forExecutor() { return this; },
+		refreshIfStale: async () => {},
+		get error() {
+			return catalogError;
+		},
+		forceRefresh: async () => onRetryCatalog(),
 		getSelectableAgents: () => selectableAgents,
 		getAgent: (agentId: string) => ({
 			id: agentId,
@@ -178,9 +194,9 @@
 		{value}
 		{mode}
 		{onChange}
-		{recents}
+		getRecents={() => recents}
 		{preferRecentsOnOpen}
-		{selectableAgentIds}
+		getSelectableAgentIds={selectableAgentIds ? () => selectableAgentIds! : undefined}
 	/>
 {/snippet}
 

@@ -2,7 +2,8 @@
 	// Selects the Git folder used by the Git panel. Worktree selection updates
 	// only the pending path; the active target changes after OK.
 
-	import { onDestroy } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
+	import { getExecutors, getNotifications } from '$lib/context';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import DirectoryBrowser from '$lib/components/chat/DirectoryBrowser.svelte';
 	import ProjectPinnedPathList from '$lib/components/chat/ProjectPinnedPathList.svelte';
@@ -19,6 +20,7 @@
 	import * as m from '$lib/paraglide/messages.js';
 
 	interface GitTargetDialogProps {
+		executorId: string;
 		initialPath: string;
 		projectBasePath: string;
 		pinnedProjectPaths?: string[];
@@ -29,6 +31,7 @@
 	}
 
 	let {
+		executorId,
 		initialPath,
 		projectBasePath,
 		pinnedProjectPaths = [],
@@ -38,7 +41,23 @@
 		onClose,
 	}: GitTargetDialogProps = $props();
 
+	const executors = getExecutors();
+	const notifications = getNotifications();
+	const executorContextKey = $derived(executors.gitContextKey(executorId));
 	const dialog = new GitTargetDialogState({
+		onMutationError: (error, target) =>
+			notifications.error(
+				`${executors.label(target.executorId)}: ${target.projectPath}: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		get executorId() {
+			return executorId;
+		},
+		get executorContextKey() {
+			return executorContextKey;
+		},
+		get available() {
+			return executors.gitAvailable(executorId);
+		},
 		get initialPath() {
 			return initialPath;
 		},
@@ -54,7 +73,8 @@
 
 	$effect(() => {
 		void dialog.candidatePath;
-		dialog.scheduleValidation();
+		void executorContextKey;
+		untrack(() => dialog.scheduleValidation());
 	});
 
 	onDestroy(() => {
@@ -142,6 +162,7 @@
 										bind:value={dialog.candidatePath}
 										readonly={isUpdatingPinnedProjectPath}
 										onfocus={(event: FocusEvent & { currentTarget: HTMLInputElement }) => {
+											if (!executors.filesAvailable(executorId)) return;
 											if (isMobile) event.currentTarget.blur();
 											if (isUpdatingPinnedProjectPath) return;
 											dialog.showBrowser = true;
@@ -185,7 +206,7 @@
 								/>
 								<button
 									type="button"
-									disabled={isUpdatingPinnedProjectPath}
+									disabled={isUpdatingPinnedProjectPath || !executors.filesAvailable(executorId)}
 									onclick={() => {
 										dialog.showBrowser = true;
 									}}
@@ -197,8 +218,9 @@
 								</button>
 							</div>
 
-							{#if dialog.showBrowser && !isUpdatingPinnedProjectPath}
+							{#if dialog.showBrowser && !isUpdatingPinnedProjectPath && executors.filesAvailable(executorId)}
 								<DirectoryBrowser
+									{executorId}
 									currentPath={dialog.trimmedPath || projectBasePath}
 									basePath={projectBasePath}
 									onSelect={(path) => {

@@ -19,8 +19,8 @@ import type {
   AgentExecutionHandle,
   AgentResumeRequestV5,
 } from './execution-v5.js';
-import type { AgentMigrationStore } from './host.js';
 import type { AgentNativeSessionRef } from './transcript.js';
+import type { AgentProducerBinding, AgentResourceRef, ExecutorCallOptions } from './resources.js';
 
 export interface AgentCatalog {
   snapshot(request: { readonly strict: boolean; readonly signal: AbortSignal }): Promise<{
@@ -52,7 +52,7 @@ export interface AgentAuth {
   status(signal: AbortSignal): Promise<AgentAuthStatus>;
   launchLogin?(): Promise<AgentAuthLoginLaunchResult>;
   completeLogin?(sessionId: string, code: string): Promise<AgentAuthLoginCompleteResult>;
-  loginStatus?(expectedSessionId?: string): AgentAuthLoginStatus;
+  loginStatus?(expectedSessionId?: string): Promise<AgentAuthLoginStatus>;
 }
 
 export interface AgentCommands {
@@ -60,16 +60,18 @@ export interface AgentCommands {
 }
 
 export interface AgentSteering {
-  captureTarget(request: AgentSteerTargetRequest): AgentSteerTarget | null;
-  steer(request: AgentSteerRequest): Promise<AgentSteerResult>;
+  captureTarget(request: AgentSteerTargetRequest, options?: ExecutorCallOptions): Promise<AgentSteerTarget | null>;
+  steer(request: AgentSteerRequest, options?: ExecutorCallOptions): Promise<AgentSteerResult>;
 }
 
-export type AgentSteerTarget = object;
+export type AgentSteerTarget = AgentResourceRef<'steer-target'>;
 
 export interface AgentSteerTargetRequest {
   readonly chatId: string;
   readonly agentSessionId: string;
   readonly nativeSession: AgentNativeSessionRef | null;
+  readonly producerBinding: AgentProducerBinding;
+  readonly expectedRunId: string;
 }
 
 export interface AgentSteerRequest {
@@ -80,7 +82,6 @@ export interface AgentSteerRequest {
   readonly target: AgentSteerTarget | null;
   readonly input: string;
   readonly clientMessageId: string;
-  readonly prepareDelivery: () => Promise<void>;
 }
 
 export type AgentSteerRejectionReason =
@@ -103,32 +104,19 @@ export type AgentSteerResult =
       readonly message: string;
     };
 
-export interface AgentGoals {
-  submitControl(request: AgentGoalControlRequest): Promise<boolean>;
-}
-
-export interface AgentGoalControlRequest extends AgentResumeRequestV5 {
-  readonly beforeDelivery: (handoff: AgentGoalControlHandoff) => Promise<void>;
-}
-
-export interface AgentGoalControlHandoff {
-  validate(): void;
-  commit(): void;
-}
-
 // Native, in-place context compaction. A provider that implements this rewrites
 // its own session history and keeps everything the transcript does not capture:
 // cached reads, plan state, MCP connections, session permission grants. Absent
 // this facet the chat can still shed context through `/handoff`, which starts a
 // fresh session from a projected transcript instead.
 export interface AgentCompaction {
-  compact(request: AgentResumeRequestV5): Promise<AgentExecutionHandle>;
+  compact(request: AgentResumeRequestV5, options?: ExecutorCallOptions): Promise<AgentExecutionHandle>;
 }
 
 export interface AgentLifecycle {
   start(): Promise<void>;
   stop(): Promise<void>;
-  migrateOwnedStorage(store: AgentMigrationStore): Promise<void>;
+  migrateOwnedStorage(): Promise<void>;
 }
 
 export interface AgentMigration {
@@ -175,7 +163,6 @@ export interface AgentSingleQuery {
 
 export interface AgentSingleQueryRequest {
   readonly prompt: string;
-  readonly projectPath: string;
   readonly model: string;
   readonly thinkingMode: ThinkingMode;
   readonly timeoutMs?: number;

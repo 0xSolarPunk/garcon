@@ -6,6 +6,7 @@
 		setProjectResolution,
 		setSingletonSurfaces,
 		setWorkspaceCoordinator,
+		setExecutors,
 	} from '$lib/context';
 	import { NotificationsStore } from '$lib/stores/notifications.svelte.js';
 	import { ProjectResolutionStore } from '$lib/workspace/project-resolution-store.svelte.js';
@@ -14,6 +15,7 @@
 	import { getFilesPanelTestContext } from './files-panel-test-context.js';
 	import type { WorkspaceWindowId } from '$lib/workspace/surface-types.js';
 	import type { WorkspaceCoordinator } from '$lib/workspace/workspace-coordinator.svelte.js';
+	import { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
 
 	let {
 		presentation = 'window-main',
@@ -28,10 +30,12 @@
 		fileSessions,
 		singletonSurfaces,
 		notifications = new NotificationsStore(),
+		executors = new ExecutorsStore(),
 	} = getFilesPanelTestContext();
 	setFileSessions(fileSessions);
 	setSingletonSurfaces(singletonSurfaces);
 	setNotifications(notifications);
+	setExecutors(executors);
 	const projectResolution = new ProjectResolutionStore(async () => {
 		throw new Error('No project resolver configured');
 	});

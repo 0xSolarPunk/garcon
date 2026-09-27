@@ -10,7 +10,7 @@ import {
 import { withTimeout } from './deferred.js';
 import { requireCurrentWebBuild } from './web-build-gate.js';
 
-const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const ARTIFACT_ROOT = join(REPO_ROOT, 'integration-tests', 'artifacts', 'chromium');
 const FIXTURE_SETUP_TIMEOUT_MS = 25_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -29,6 +29,13 @@ export interface ChromiumFixture {
   assertNoBrowserErrors(): void;
 }
 
+export interface ChromiumFixtureOptions extends IntegrationFixtureOptions {
+  // Playwright request interception can miss requests from pages the app's service worker
+  // controls, and the worker claims open pages at an arbitrary point after load, so only
+  // tests that exercise the worker allow it.
+  serviceWorkers?: 'allow' | 'block';
+}
+
 const fixturesOwningBrowsers = new WeakSet<ChromiumFixture>();
 
 export async function launchChromiumBrowser(): Promise<Browser> {
@@ -43,10 +50,24 @@ export async function closeChromiumBrowser(browser: Browser): Promise<void> {
   );
 }
 
+export async function authenticateChromiumContext(
+  context: BrowserContext,
+  integration: IntegrationFixture,
+): Promise<void> {
+  const authToken = integration.garcon.authToken;
+  if (!authToken) throw new Error('Chromium fixture requires an authenticated controller.');
+  await context.addInitScript((authToken) => {
+    if (location.hostname === '127.0.0.1' && !globalThis.localStorage.getItem('bearer-token')) {
+      globalThis.localStorage.setItem('bearer-token', authToken);
+    }
+  }, authToken);
+}
+
 export async function createChromiumFixture(
-  integrationOptions: IntegrationFixtureOptions = {},
+  options: ChromiumFixtureOptions = {},
   sharedBrowser?: Browser,
 ): Promise<ChromiumFixture> {
+  const { serviceWorkers = 'block', ...integrationOptions } = options;
   await requireCurrentWebBuild();
   const integration = await createIntegrationFixture(integrationOptions);
   let browser: Browser | null = null;
@@ -56,7 +77,9 @@ export async function createChromiumFixture(
     browser = sharedBrowser ?? (await launchChromiumBrowser());
     context = await browser.newContext({
       viewport: { width: 1440, height: 900 },
+      serviceWorkers,
     });
+    await authenticateChromiumContext(context, integration);
     await context.addInitScript(() => {
       const key = 'pref_local_settings';
       try {
@@ -188,11 +211,11 @@ export async function withChromiumFixture<T>(
   testName: string,
   run: (fixture: ChromiumFixture, markPhase: MarkPhase) => Promise<T>,
   diagnostics?: (fixture: ChromiumFixture) => Promise<unknown>,
-  integrationOptions: IntegrationFixtureOptions = {},
+  options: ChromiumFixtureOptions = {},
   sharedBrowser?: Browser,
 ): Promise<T> {
   const fixture = await withTimeout(
-    createChromiumFixture(integrationOptions, sharedBrowser),
+    createChromiumFixture(options, sharedBrowser),
     FIXTURE_SETUP_TIMEOUT_MS,
     () => `Chromium fixture setup timed out for ${testName}.`,
   );

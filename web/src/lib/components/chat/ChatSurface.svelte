@@ -5,6 +5,7 @@
 		getConversationPanels,
 		getGitViewLauncher,
 		getGhCapability,
+		getExecutors,
 		getWorkspaceCoordinator,
 		getModelCatalog,
 		type WorkspaceChatActions,
@@ -45,6 +46,7 @@
 		onRegisterAppendToDraft,
 		onRegisterPanelActions,
 		onComposerHeightChange,
+		onComposerNoticeChange,
 		subagentToolbar,
 		chatActions = noopChatActions,
 		transcriptCache: providedTranscriptCache,
@@ -58,6 +60,7 @@
 		onRegisterAppendToDraft?: (fn: ChatDraftAppend) => void;
 		onRegisterPanelActions?: (actions: ConversationPanelActions | null) => void;
 		onComposerHeightChange?: (height: number) => void;
+		onComposerNoticeChange?: (shown: boolean) => void;
 		subagentToolbar: SubagentToolbarState;
 		chatActions?: WorkspaceChatActions;
 		transcriptCache?: ChatTranscriptCache;
@@ -65,9 +68,10 @@
 
 	const sessions = getChatSessions();
 	const conversationPanels = getConversationPanels();
-	const modelCatalog = getModelCatalog();
+	const rootModelCatalog = getModelCatalog();
 	const gitViews = getGitViewLauncher();
-	const ghCapability = getGhCapability();
+	const ghCapabilities = getGhCapability();
+	const executors = getExecutors();
 	const workspace = getWorkspaceCoordinator();
 	const transcriptCache =
 		untrack(() => providedTranscriptCache) ??
@@ -76,6 +80,19 @@
 	let prepareConversationHide: (() => void) | null = $state(null);
 
 	const selectedChat = $derived(sessions.selectedChat);
+	const modelCatalog = $derived(rootModelCatalog.forExecutor(selectedChat?.executorId));
+	const gitAvailable = $derived(executors.gitAvailable(selectedChat?.executorId));
+	const ghCapability = $derived(ghCapabilities.forExecutor(selectedChat?.executorId ?? 'local'));
+	$effect(() => {
+		if (
+			!isMobile ||
+			!isVisible ||
+			!executors.ghAvailable(selectedChat?.executorId) ||
+			ghCapability.hasChecked
+		)
+			return;
+		untrack(() => void ghCapability.ensureChecked());
+	});
 	const mobileToolbarChat = $derived(isVisible ? selectedChat : null);
 	const hasUsableChatContext = $derived(Boolean(selectedChat));
 	const chatSurfacePresentation = $derived(
@@ -87,8 +104,9 @@
 	const conversationWorkspaceVisible = $derived(conversationWorkspacePresented);
 	const reserveMobileToolbar = $derived(isMobile && hasUsableChatContext);
 	const canUpdateSelectedProjectPath = $derived(
-		selectedChat
-			? (modelCatalog.supportsUpdateProjectPath?.(selectedChat.agentId) ?? false)
+		selectedChat && executors.isReady(selectedChat.executorId)
+			? selectedChat.status === 'draft' ||
+					(modelCatalog.supportsUpdateProjectPath?.(selectedChat.agentId) ?? false)
 			: false,
 	);
 	const canForkSelectedChat = $derived(
@@ -145,12 +163,16 @@
 					canForkNow={canForkSelectedChatNow}
 					shadow
 					onOpenUserMessageNavigator={openUserMessageNavigator ?? undefined}
-					onOpenGitHistory={() => void gitViews.openHistory({ presentation: 'mobile' })}
-					onOpenGitCompare={() => void gitViews.openCompare({ presentation: 'mobile' })}
+					onOpenGitHistory={gitAvailable
+						? () => void gitViews.openHistory({ presentation: 'mobile' })
+						: undefined}
+					onOpenGitCompare={gitAvailable
+						? () => void gitViews.openCompare({ presentation: 'mobile' })
+						: undefined}
 					onOpenTickets={() => void workspace.focusMobileSingleton('tickets')}
 					onOpenChatMap={() => void workspace.focusMobileSingleton('chat-map')}
 					onOpenCanvas={() => void workspace.focusMobileSingleton('chat-canvas')}
-					onOpenPullRequests={ghCapability.available
+					onOpenPullRequests={gitAvailable && ghCapability.available
 						? () => void workspace.focusMobileSingleton('pull-requests')
 						: undefined}
 					onRename={() => selectedChat && chatActions.requestRename(selectedChat)}
@@ -187,6 +209,7 @@
 			{onRegisterReload}
 			{onRegisterPanelActions}
 			{onComposerHeightChange}
+			{onComposerNoticeChange}
 			{transcriptCache}
 			{reserveMobileToolbar}
 			isVisible={conversationWorkspaceVisible}

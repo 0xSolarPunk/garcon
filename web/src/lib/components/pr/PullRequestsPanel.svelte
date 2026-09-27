@@ -17,13 +17,14 @@
 		type ContainerPresentation,
 	} from '$lib/components/shared/container-presentation.js';
 	import { registerNativeWorkspaceScrollRegion } from '$lib/workspace/workspace-scroll-region.js';
+	import GitProjectSelector from '$lib/components/git/GitProjectSelector.svelte';
+	import GitProjectContent from '$lib/components/git/GitProjectContent.svelte';
 
 	interface PullRequestsPanelProps {
 		controller: PullRequestsStore;
 		isMobile?: boolean;
 		onSendToChat: (message: string) => Promise<boolean>;
 		onNavigateToChat: () => void;
-		onRetryCapability: () => void;
 	}
 
 	let {
@@ -31,7 +32,6 @@
 		isMobile = false,
 		onSendToChat,
 		onNavigateToChat,
-		onRetryCapability,
 	}: PullRequestsPanelProps = $props();
 
 	const projectPath = $derived(pullRequests.projectPath);
@@ -78,22 +78,28 @@
 		class="surface-toolbar flex h-10 shrink-0 items-center gap-2 border-b border-border px-3"
 		style="container-name: surface-toolbar; container-type: inline-size;"
 	>
-		<GitPullRequest class="h-4 w-4 shrink-0 text-muted-foreground" />
-		<span class="min-w-0 truncate text-sm font-semibold text-foreground"
-			>{m.pull_requests_title()}</span
-		>
-		{#if pullRequests.pulls.length > 0}
-			<span class="rounded-full bg-accent px-1.5 text-[10px] font-medium text-accent-foreground"
-				>{pullRequests.pulls.length}</span
-			>
-		{/if}
+		<GitProjectSelector
+			selection={pullRequests.projectSelection}
+			path={projectPath}
+			{isMobile}
+			onSelectExecutor={(executorId) => void pullRequests.projectSelection.selectExecutor(executorId)}
+			onSelectFolder={(candidate) =>
+				pullRequests.projectSelection.selectResolvedProject({
+					executorId: pullRequests.projectSelection.executorId,
+					projectPath: candidate.projectPath,
+				})}
+			onGoToChatProject={() => pullRequests.projectSelection.goToChatProject()}
+		/>
 		<ResponsiveSurfaceActions
 			actions={toolbarActions}
 			menuLabel={m.workspace_surface_actions()}
 			class="ml-auto"
 		/>
 	</div>
-	<div class="min-h-0 flex-1">
+	<GitProjectContent
+		selection={pullRequests.projectSelection}
+		ready={!pullRequests.projectIdentityPending}
+	>
 		{#if pullRequests.capabilityState === 'pending'}
 			<div class="grid h-full place-items-center px-6 text-center text-sm text-muted-foreground">
 				{m.workspace_pull_requests_checking()}
@@ -105,7 +111,7 @@
 					<button
 						type="button"
 						class="mt-3 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
-						onclick={onRetryCapability}>{m.common_retry()}</button
+						onclick={() => pullRequests.retryCapability()}>{m.common_retry()}</button
 					>
 				</div>
 			</div>
@@ -150,10 +156,7 @@
 					</ScrollArea>
 				</div>
 				<div
-					class={cn(
-						'flex h-full min-h-0 min-w-0 flex-1 flex-col',
-						detailHidden && 'hidden',
-					)}
+					class={cn('flex h-full min-h-0 min-w-0 flex-1 flex-col', detailHidden && 'hidden')}
 					aria-hidden={detailHidden}
 					inert={detailHidden}
 					data-pr-detail
@@ -188,5 +191,5 @@
 				</div>
 			</div>
 		{/if}
-	</div>
+	</GitProjectContent>
 </div>

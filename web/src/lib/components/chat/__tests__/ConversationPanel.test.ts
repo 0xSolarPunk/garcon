@@ -15,6 +15,9 @@ import type { ChatQueueState } from '$lib/types/chat.js';
 import type { GitQuickSummaryReady } from '$lib/api/git.js';
 import * as m from '$lib/paraglide/messages.js';
 import { UserMessage } from '$shared/chat-types';
+import { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
+
+const executors = new ExecutorsStore();
 
 const runtime = vi.hoisted(() => ({
 	autoScrollToBottom: false,
@@ -25,6 +28,7 @@ const runtime = vi.hoisted(() => ({
 }));
 
 vi.mock('$lib/context', () => ({
+	getExecutors: () => executors,
 	getAppShell: () => ({ isMobile: false }),
 	getChatSessions: () => ({ isChatProcessing: () => runtime.processing }),
 	getConversationUi: () => ({
@@ -51,7 +55,7 @@ vi.mock('$lib/context', () => ({
 		reduceMotion: runtime.reduceMotion,
 		showQuickCommitTray: true,
 	}),
-	getModelCatalog: () => ({ supportsSteering: () => true }),
+	getModelCatalog: () => ({ forExecutor() { return this; }, supportsSteering: () => true }),
 	getOptionalTransientLayers: () => null,
 }));
 
@@ -232,6 +236,27 @@ describe('ConversationPanel', () => {
 		expect(detach).not.toHaveBeenCalled();
 		rendered.unmount();
 		expect(detach).toHaveBeenCalledOnce();
+	});
+
+	it('passes each simultaneous panel its own executor and project context', async () => {
+		const localChat = chat();
+		const remoteChat = { ...chat(), id: 'chat-remote', executorId: '22222222-2222-4222-8222-222222222222', projectPath: '/remote/project' };
+		const panels = [localChat, remoteChat].map((entry) => render(ConversationPanel, {
+			surfaceId: `chat-view:window-${entry.id}`,
+			chat: entry,
+			panel: makePanel().panel,
+			isCommandOwner: entry === localChat,
+			ownsComposer: entry === localChat,
+			actions: makeActions(),
+		}));
+		for (const [index, entry] of [localChat, remoteChat].entries()) {
+			const feed = panels[index].container.querySelector('[data-conversation-feed-stub]');
+			expect(JSON.parse(feed?.getAttribute('data-chat-context') ?? 'null')).toEqual({
+				chatId: entry.id,
+				executorId: entry.executorId ?? 'local',
+				projectPath: entry.projectPath,
+			});
+		}
 	});
 
 	it('leaves remount scroll restoration to the panel registry', async () => {
@@ -428,5 +453,28 @@ describe('ConversationPanel', () => {
 		expect(actions.openCommit).toHaveBeenCalledWith(panel.surfaceId, 'chat-1');
 		await fireEvent.click(screen.getByRole('button', { name: /main/ }));
 		expect(actions.toggleBranch).toHaveBeenCalledWith(panel.surfaceId, 'chat-1');
+	});
+
+	it('hides the Git tray while its composer shows an availability notice', async () => {
+		runtime.processing = false;
+		runtime.summary = gitSummary();
+		const { panel } = makePanel();
+		const props = {
+			surfaceId: panel.surfaceId,
+			chat: chat(),
+			panel,
+			isCommandOwner: true,
+			ownsComposer: true,
+			actions: makeActions(),
+			composerNoticeShown: true,
+		};
+		const rendered = render(ConversationPanel, props);
+		expect(screen.queryByRole('button', { name: /Commit/ })).toBeNull();
+
+		await rendered.rerender({ ...props, ownsComposer: false });
+		expect(screen.getByRole('button', { name: /Commit/ })).toBeTruthy();
+
+		await rendered.rerender({ ...props, composerNoticeShown: false });
+		expect(screen.getByRole('button', { name: /Commit/ })).toBeTruthy();
 	});
 });

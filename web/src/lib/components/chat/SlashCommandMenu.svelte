@@ -18,6 +18,8 @@
 	const COMMAND_LIST_HEIGHT = 240;
 
 	interface Props {
+		executorContextKey?: string;
+		executorId?: string;
 		agent: string;
 		projectPath: string;
 		chatId?: string | null;
@@ -27,7 +29,6 @@
 		query: string;
 		supportsFork: boolean;
 		supportsSteering: boolean;
-		supportsGoals: boolean;
 		canScheduleIn: boolean;
 		onSelect: (name: string) => void;
 		onClose: () => void;
@@ -35,6 +36,8 @@
 	}
 
 	let {
+		executorContextKey = '',
+		executorId = 'local',
 		agent,
 		projectPath,
 		chatId = null,
@@ -44,7 +47,6 @@
 		query,
 		supportsFork,
 		supportsSteering,
-		supportsGoals,
 		canScheduleIn,
 		onSelect,
 		onClose,
@@ -61,11 +63,12 @@
 
 	let fetchedKey = '';
 	let activeLoad: AbortController | null = null;
+	const contextKey = $derived(JSON.stringify([executorId, executorContextKey, agent, chatId, projectPath]));
 
 	// Defers fetch until the menu becomes visible for the first time.
 	// Re-fetches when the agent/project identity changes.
 	$effect(() => {
-		const key = `${agent}::${chatId ?? ''}::${projectPath}`;
+		const key = contextKey;
 		if (!projectPath || !isVisible) return;
 		if (fetchedKey === key) return;
 		isLoading = true;
@@ -74,7 +77,7 @@
 		const controller = new AbortController();
 		activeLoad = controller;
 
-		getSlashCommands({ agent, chatId, projectPath }, { signal: controller.signal })
+		getSlashCommands({ executorId, agent, chatId, projectPath }, { signal: controller.signal })
 			.then((commands) => {
 				if (!controller.signal.aborted) {
 					allCommands = commands;
@@ -109,18 +112,16 @@
 			if (command.name === 'fork') return supportsFork;
 			if (command.name === 'in') return canScheduleIn;
 			if (command.name === 'steer' || command.name === 'st') return supportsSteering;
-			if (command.name === 'goal') return supportsGoals;
 			return true;
 		});
 		const builtinNames = new Set(builtins.map((command) => command.name));
-		const key = `${agent}::${chatId ?? ''}::${projectPath}`;
 		const discovered =
 			projectPath &&
 			!projectPending &&
 			!projectUnavailable &&
 			!isLoading &&
 			!loadFailed &&
-			fetchedKey === key
+			fetchedKey === contextKey
 				? allCommands.filter(
 						(command) => command.name !== 'in' && !builtinNames.has(command.name),
 					)

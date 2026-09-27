@@ -219,6 +219,7 @@ describe('SingletonSurfaceRegistry', () => {
 		registry.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat-a', projectPath: '/project-a' },
 				chatId: 'chat-a',
 				projectPath: '/project-a',
 				effectiveProjectKey: '/canonical/a',
@@ -231,6 +232,7 @@ describe('SingletonSurfaceRegistry', () => {
 		const resolving = {
 			kind: 'resolving' as const,
 			context: {
+				target: { kind: 'chat' as const, chatId: 'draft-b', projectPath: '/project-b' },
 				chatId: 'draft-b',
 				projectPath: '/project-b',
 				effectiveProjectKey: null,
@@ -261,7 +263,7 @@ describe('SingletonSurfaceRegistry', () => {
 		const chatBoard = registry.chatBoard();
 		chatMap.setQuery('retained query');
 		chatCanvas.view = 'list';
-		git.target.showTargetDialog = true;
+		git.target.projectSelection.showFolderDialog = true;
 
 		registry.setPresentationVisible('git', false);
 		registry.setPresentationVisible('files', false);
@@ -277,7 +279,7 @@ describe('SingletonSurfaceRegistry', () => {
 		expect(chatMap.query).toBe('retained query');
 		expect(chatCanvas.view).toBe('list');
 		expect(git.presentationVisible).toBe(false);
-		expect(git.target.showTargetDialog).toBe(false);
+		expect(git.target.projectSelection.showFolderDialog).toBe(false);
 		expect(files.presentationVisible).toBe(false);
 	});
 
@@ -366,6 +368,7 @@ describe('SingletonSurfaceRegistry', () => {
 		registry.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat-a', projectPath: '/project-a' },
 				chatId: 'chat-a',
 				projectPath: '/project-a',
 				effectiveProjectKey: '/canonical/a',
@@ -400,18 +403,26 @@ describe('SingletonSurfaceRegistry', () => {
 			toRevision: 'HEAD',
 			mode: 'direct' as const,
 		};
-		comparisonPreferences.rememberChat('chat-a', specification);
+		comparisonPreferences.rememberChat({ executorId: 'local', chatId: 'chat-a' }, specification);
 		registry.gitCompare();
 
 		registry.disposeSurface('git-compare');
-		expect(comparisonPreferences.recall({ chatId: 'chat-a', projectPath: '/project-a' })).toEqual(
-			specification,
-		);
+		expect(
+			comparisonPreferences.recall({
+				executorId: 'local',
+				chatId: 'chat-a',
+				projectPath: '/project-a',
+			}),
+		).toEqual(specification);
 
 		registry.destroy();
-		expect(comparisonPreferences.recall({ chatId: 'chat-a', projectPath: '/project-a' })).toEqual(
-			specification,
-		);
+		expect(
+			comparisonPreferences.recall({
+				executorId: 'local',
+				chatId: 'chat-a',
+				projectPath: '/project-a',
+			}),
+		).toEqual(specification);
 	});
 
 	it('routes visibility for every singleton through one lifecycle owner', () => {

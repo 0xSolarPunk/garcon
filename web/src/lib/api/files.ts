@@ -26,27 +26,32 @@ import {
 } from '$shared/file-contracts';
 
 export interface FilePathParams {
+	executorId?: string | null;
 	chatId?: string | null;
 	projectPath?: string | null;
 	filePath: string;
 }
 
 export interface FileIdentityParams {
+	executorId?: string | null;
 	chatId?: string | null;
 	projectPath?: string | null;
 	relativePath: string;
 }
 
 export interface FileTreeParams {
+	executorId?: string | null;
 	directoryPath?: string | null;
 }
 
 export interface ProjectParams {
+	executorId?: string | null;
 	chatId?: string | null;
 	projectPath?: string | null;
 }
 
 export interface SaveTextParams {
+	executorId?: string | null;
 	chatId?: string | null;
 	projectPath?: string | null;
 	filePath: string;
@@ -77,11 +82,13 @@ export interface UploadImagesResponse {
 
 /** Builds query string from chatId/projectPath/filePath. */
 function buildFileQuery(params: {
+	executorId?: string | null;
 	chatId?: string | null;
 	projectPath?: string | null;
 	filePath?: string;
 }): string {
 	const query = new URLSearchParams();
+	if (params.executorId) query.set('executorId', params.executorId);
 	if (params.filePath !== undefined) {
 		query.append('path', String(params.filePath || ''));
 	}
@@ -92,10 +99,12 @@ function buildFileQuery(params: {
 
 /** Builds query string from chatId/projectPath only. */
 function buildProjectQuery(params: {
+	executorId?: string | null;
 	chatId?: string | null;
 	projectPath?: string | null;
 }): string {
 	const query = new URLSearchParams();
+	if (params.executorId) query.set('executorId', params.executorId);
 	if (params.chatId) query.append('chatId', params.chatId);
 	else if (params.projectPath) query.append('projectPath', params.projectPath);
 	return query.toString();
@@ -129,6 +138,7 @@ export async function resolveFileIdentity(
 	options?: RequestInit,
 ): Promise<FileIdentityResponse> {
 	const query = buildFileQuery({
+		executorId: params.executorId,
 		chatId: params.chatId,
 		projectPath: params.projectPath,
 		filePath: params.relativePath,
@@ -166,6 +176,7 @@ export async function getTree(
 	options?: RequestInit,
 ): Promise<FileTreeResponse> {
 	const query = new URLSearchParams();
+	if (params.executorId) query.set('executorId', params.executorId);
 	if (params.directoryPath) query.set('path', params.directoryPath);
 	const qs = query.toString();
 	const url = `/api/v1/files/tree${qs ? `?${qs}` : ''}`;
@@ -227,8 +238,11 @@ export interface DirectoryEntry {
 export async function browseDirectory(
 	path: string,
 	signal?: AbortSignal,
+	executorId?: string | null,
 ): Promise<DirectoryEntry[]> {
-	const response = await apiFetch(`/api/v1/files/browse?path=${encodeURIComponent(path)}`, {
+	const query = new URLSearchParams({ path });
+	if (executorId) query.set('executorId', executorId);
+	const response = await apiFetch(`/api/v1/files/browse?${query}`, {
 		signal,
 	});
 	if (!response.ok) await parseApiResponse<never>(response);

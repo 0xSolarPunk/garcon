@@ -2,7 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	GitTargetSessionController,
 	type GitTargetChangeReason,
+	type GitTargetSessionDeps,
 } from '$lib/git/targets/git-target-session.svelte.js';
+import { GitProjectInvalidationStore } from '$lib/git/surface/git-project-invalidation.svelte.js';
 import {
 	GitBranchSelectorState,
 	type GitBranchSelectorStateOptions,
@@ -46,7 +48,7 @@ function deferred<T>() {
 function createSession(options: {
 	kind?: 'git' | 'git-history' | 'git-compare' | 'commit';
 	canChangeTarget?: () => boolean;
-	invalidationVersion?: (effectiveProjectKey: string) => number;
+	invalidationVersion?: GitTargetSessionDeps['invalidationVersion'];
 	runMutation?: GitBranchSelectorStateOptions['runMutation'];
 	afterCheckout?: (projectPath: string) => void | Promise<void>;
 }) {
@@ -85,11 +87,21 @@ function setProject(
 	session: GitTargetSessionController,
 	projectPath: string,
 	effectiveProjectKey = projectPath,
+	executorId = 'local',
+	executorContextKey = 'session-a',
 ): void {
 	session.setProjectState({
 		kind: 'available',
 		project: {
+			target: {
+				kind: 'chat' as const,
+				chatId: effectiveProjectKey,
+				projectPath: projectPath,
+				executorId: executorId,
+			},
 			chatId: effectiveProjectKey,
+			executorId,
+			executorContextKey,
 			projectPath,
 			effectiveProjectKey,
 		},
@@ -99,8 +111,52 @@ function setProject(
 describe('GitTargetSessionController', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		api.getGitTargetCandidates.mockReset();
 		api.getGitTargetCandidates.mockResolvedValue({ targets: [] });
 	});
+
+	it('fences held same-path discovery when switching executors', async () => {
+		const local = deferred<{ targets: GitTargetCandidate[] }>();
+		api.getGitTargetCandidates
+			.mockReturnValueOnce(local.promise)
+			.mockResolvedValueOnce({ targets: [candidate('/repo', { branch: 'remote' })] });
+		const { session } = createSession({});
+		setProject(session, '/repo', 'chat', 'local');
+		session.setPresentationVisible(true);
+		const localActivation = session.activate();
+		setProject(session, '/repo', 'chat', 'remote');
+		await session.activate();
+		local.resolve({ targets: [candidate('/repo', { branch: 'local' })] });
+		await localActivation;
+		expect(session.activeTarget).toMatchObject({ executorId: 'remote', branch: 'remote' });
+		expect(api.getGitTargetCandidates.mock.calls.map(([target]) => target.executorId)).toEqual([
+			'local',
+			'remote',
+		]);
+		session.dispose();
+	});
+
+	it.each([true, false])(
+		'reloads a replacement executor session without changing target (visible=%s)',
+		async (visible) => {
+			const { session, changes } = createSession({});
+			setProject(session, '/repo', 'chat', 'remote', 'instance-a');
+			session.setPresentationVisible(true);
+			await session.activate();
+			const identity = session.identity;
+			session.setPresentationVisible(visible);
+			setProject(session, '/repo', 'chat', 'remote', 'instance-b');
+			if (!visible) {
+				expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(1);
+				session.setPresentationVisible(true);
+			}
+			await session.activate();
+			expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(2);
+			expect(session.identity).toBe(identity);
+			expect(changes.at(-1)).toMatchObject({ reason: 'session', identityChanged: false });
+			session.dispose();
+		},
+	);
 
 	it('keeps discovery gated by visibility and applies the chat fallback once', async () => {
 		const { session, changes } = createSession({});
@@ -136,19 +192,20 @@ describe('GitTargetSessionController', () => {
 		setProject(session, '/old', 'chat-old');
 		session.setPresentationVisible(true);
 		const activation = session.activate();
-		session.showTargetDialog = true;
+		session.projectSelection.showFolderDialog = true;
 		session.branches.showBranchDropdown = true;
 
 		session.setProjectState({
 			kind: 'resolving',
 			context: {
+				target: { kind: 'chat' as const, chatId: 'draft', projectPath: '/new' },
 				chatId: 'draft',
 				projectPath: '/new',
 			},
 		});
-		expect(signal?.aborted).toBe(false);
-		expect(session.showTargetDialog).toBe(true);
-		expect(session.branches.showBranchDropdown).toBe(true);
+		expect(signal?.aborted).toBe(true);
+		expect(session.projectSelection.showFolderDialog).toBe(false);
+		expect(session.branches.showBranchDropdown).toBe(false);
 		load.resolve({ targets: [candidate('/old/worktree')] });
 		await activation;
 
@@ -174,17 +231,21 @@ describe('GitTargetSessionController', () => {
 		setProject(session, '/project', 'chat-project');
 		session.setPresentationVisible(true);
 		const activation = session.activate();
-		session.showTargetDialog = true;
+		session.projectSelection.showFolderDialog = true;
 		session.branches.showBranchDropdown = true;
 
 		session.setProjectState({
 			kind: 'unavailable',
-			context: { chatId: 'chat-project', projectPath: '/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'chat-project', projectPath: '/project' },
+				chatId: 'chat-project',
+				projectPath: '/project',
+			},
 			reason: 'not-found',
 		});
 
 		expect(signal?.aborted).toBe(true);
-		expect(session.showTargetDialog).toBe(false);
+		expect(session.projectSelection.showFolderDialog).toBe(false);
 		expect(session.branches.showBranchDropdown).toBe(false);
 		expect(session.isLoadingTargets).toBe(false);
 		load.resolve({ targets: [candidate('/stale')] });
@@ -214,14 +275,18 @@ describe('GitTargetSessionController', () => {
 
 		session.setProjectState({
 			kind: 'request-failed',
-			context: { chatId: 'chat-project', projectPath: '/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'chat-project', projectPath: '/project' },
+				chatId: 'chat-project',
+				projectPath: '/project',
+			},
 			message: 'Project check failed',
 		});
 		setProject(session, '/project', 'chat-project');
 		await session.activate();
 
 		expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(2);
-		expect(changes.filter((change) => change.reason === 'project')).toHaveLength(1);
+		expect(changes.filter((change) => change.reason === 'session')).toHaveLength(1);
 	});
 
 	it.each(['unavailable', 'request-failed'] as const)(
@@ -248,12 +313,20 @@ describe('GitTargetSessionController', () => {
 				kind === 'unavailable'
 					? {
 							kind,
-							context: { chatId: 'chat-project', projectPath: '/project' },
+							context: {
+								target: { kind: 'chat' as const, chatId: 'chat-project', projectPath: '/project' },
+								chatId: 'chat-project',
+								projectPath: '/project',
+							},
 							reason: 'not-found',
 						}
 					: {
 							kind,
-							context: { chatId: 'chat-project', projectPath: '/project' },
+							context: {
+								target: { kind: 'chat' as const, chatId: 'chat-project', projectPath: '/project' },
+								chatId: 'chat-project',
+								projectPath: '/project',
+							},
 							message: 'Project check failed',
 						},
 			);
@@ -286,7 +359,11 @@ describe('GitTargetSessionController', () => {
 		await vi.waitFor(() => expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(2));
 		session.setProjectState({
 			kind: 'unavailable',
-			context: { chatId: 'chat-project', projectPath: '/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'chat-project', projectPath: '/project' },
+				chatId: 'chat-project',
+				projectPath: '/project',
+			},
 			reason: 'not-found',
 		});
 		setProject(session, '/project', 'chat-project');
@@ -296,11 +373,11 @@ describe('GitTargetSessionController', () => {
 		expect(changes.map((change) => change.reason)).toEqual(['project']);
 		recovery.resolve({ targets: [candidate('/recovered')] });
 		await recoveryActivation;
-		expect(changes.map((change) => change.reason)).toEqual(['project', 'project']);
+		expect(changes.map((change) => change.reason)).toEqual(['project', 'session']);
 		expect(session.activeProjectPath).toBe('/recovered');
 	});
 
-	it('restores only its own cached target when switching chat projects', async () => {
+	it('retains an explicit worktree across chat switches and returns to the actual chat project', async () => {
 		api.getGitTargetCandidates
 			.mockResolvedValueOnce({
 				targets: [
@@ -334,17 +411,22 @@ describe('GitTargetSessionController', () => {
 
 		setProject(session, '/chat-b', 'chat-b');
 		await session.activate();
-		expect(session.activeProjectPath).toBe('/chat-b');
+		expect(session.activeProjectPath).toBe('/repo/worktree-a');
 
 		setProject(session, '/chat-a', 'chat-a');
 		await session.activate();
 		expect(session.activeProjectPath).toBe('/repo/worktree-a');
+		api.getGitTargetCandidates.mockReset();
+		api.getGitTargetCandidates.mockResolvedValue({ targets: [candidate('/chat-a')] });
+		session.goToChatProject();
+		await session.activate();
+		expect(session.activeProjectPath).toBe('/chat-a');
 	});
 
 	it('keeps an explicitly selected repository as the discovery anchor', async () => {
 		const chatTarget = candidate('/chat', { repoRoot: '/chat' });
 		const selectedTarget = candidate('/selected', { repoRoot: '/selected' });
-		api.getGitTargetCandidates.mockImplementation(async (projectPath) => ({
+		api.getGitTargetCandidates.mockImplementation(async ({ projectPath }) => ({
 			targets: projectPath === '/selected' ? [selectedTarget] : [chatTarget],
 		}));
 		const { session } = createSession({});
@@ -356,15 +438,15 @@ describe('GitTargetSessionController', () => {
 		await vi.waitFor(() => expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(2));
 		await vi.waitFor(() => expect(session.isLoadingTargets).toBe(false));
 
-		expect(api.getGitTargetCandidates.mock.calls.map(([projectPath]) => projectPath)).toEqual([
+		expect(api.getGitTargetCandidates.mock.calls.map(([{ projectPath }]) => projectPath)).toEqual([
 			'/chat',
 			'/selected',
 		]);
 		expect(session.activeProjectPath).toBe('/selected');
 
-		await session.refreshForInvalidation('chat', 1);
+		await session.refreshForInvalidation('/selected', 1);
 
-		expect(api.getGitTargetCandidates.mock.calls.map(([projectPath]) => projectPath)).toEqual([
+		expect(api.getGitTargetCandidates.mock.calls.map(([{ projectPath }]) => projectPath)).toEqual([
 			'/chat',
 			'/selected',
 			'/selected',
@@ -400,6 +482,7 @@ describe('GitTargetSessionController', () => {
 		const runMutation = vi.fn(
 			async (
 				surfaceId: string,
+				_executorId: string,
 				projectPath: string,
 				effectiveProjectKey: string,
 				execute: () => Promise<{ success: boolean }>,
@@ -420,6 +503,7 @@ describe('GitTargetSessionController', () => {
 
 		expect(runMutation).toHaveBeenCalledWith(
 			'singleton:git-compare',
+			'local',
 			'/chat',
 			'chat',
 			expect.any(Function),
@@ -428,20 +512,223 @@ describe('GitTargetSessionController', () => {
 		expect(session.branches.currentBranch).toBe('feature');
 	});
 
+	it.each([
+		{ executorId: 'local', projectPath: '/other' },
+		{ executorId: 'remote', projectPath: '/repo' },
+	])('activation consumes earlier invalidations for $executorId:$projectPath', async (other) => {
+		const invalidations = new GitProjectInvalidationStore();
+		const localVersion = invalidations.markChanged('local');
+		const otherVersion =
+			other.executorId === 'local' ? localVersion : invalidations.markChanged(other.executorId);
+		const { session, changes } = createSession({
+			invalidationVersion: (executorId) => invalidations.version(executorId),
+		});
+		setProject(session, '/repo');
+		session.setPresentationVisible(true);
+		await session.activate();
+		await expect(session.refreshForInvalidation('/repo', localVersion)).resolves.toBe(false);
+		setProject(session, other.projectPath, other.projectPath, other.executorId);
+		await session.activate();
+		await expect(session.refreshForInvalidation(other.projectPath, otherVersion)).resolves.toBe(
+			false,
+		);
+
+		for (let visit = 0; visit < 3; visit++) {
+			setProject(session, '/repo');
+			await session.activate();
+			await expect(session.refreshForInvalidation('/repo', localVersion)).resolves.toBe(false);
+			setProject(session, other.projectPath, other.projectPath, other.executorId);
+			await session.activate();
+			await expect(session.refreshForInvalidation(other.projectPath, otherVersion)).resolves.toBe(
+				false,
+			);
+		}
+		expect(changes.filter((change) => change.reason === 'invalidation')).toHaveLength(0);
+		expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(8);
+		const nextVersion = invalidations.markChanged(other.executorId);
+		await expect(session.refreshForInvalidation(other.projectPath, nextVersion)).resolves.toBe(
+			true,
+		);
+		session.dispose();
+	});
+
+	it('bounds retained invalidations to the recent target cache', async () => {
+		const { session } = createSession({});
+		for (let index = 0; index < 9; index++) {
+			setProject(session, `/repo-${index}`);
+			session.setPresentationVisible(true);
+			await session.activate();
+			await expect(session.refreshForInvalidation(`/repo-${index}`, 1)).resolves.toBe(true);
+		}
+		setProject(session, '/repo-1');
+		await session.activate();
+		await expect(session.refreshForInvalidation('/repo-1', 1)).resolves.toBe(false);
+		setProject(session, '/repo-0');
+		await session.activate();
+		await expect(session.refreshForInvalidation('/repo-0', 1)).resolves.toBe(true);
+		session.dispose();
+	});
+
+	it('loads a newly activated project once despite earlier executor invalidations', async () => {
+		const invalidations = new GitProjectInvalidationStore();
+		const { session, changes } = createSession({
+			invalidationVersion: (executorId) => invalidations.version(executorId),
+		});
+		setProject(session, '/first');
+		session.setPresentationVisible(true);
+		await session.activate();
+		const version = invalidations.markChanged('local');
+		await session.refreshForInvalidation('/first', version);
+		api.getGitTargetCandidates.mockClear();
+		changes.length = 0;
+		const result = deferred<{ targets: GitTargetCandidate[] }>();
+		api.getGitTargetCandidates.mockImplementation(
+			(_target, options) =>
+				new Promise((resolve, reject) => {
+					result.promise.then(resolve, reject);
+					options?.signal?.addEventListener(
+						'abort',
+						() => reject(new DOMException('Aborted', 'AbortError')),
+						{ once: true },
+					);
+				}),
+		);
+		setProject(session, '/second');
+		const activation = session.activate();
+		const invalidation = session.refreshForInvalidation('/second', version);
+		try {
+			expect(api.getGitTargetCandidates).toHaveBeenCalledOnce();
+			expect(api.getGitTargetCandidates.mock.calls[0]?.[1]?.signal?.aborted).toBe(false);
+		} finally {
+			result.resolve({
+				targets: [candidate('/second', { repoRoot: '/actual', worktreePath: '/actual' })],
+			});
+			await activation;
+			await invalidation;
+		}
+		expect(changes).toEqual([
+			{
+				path: '/second',
+				identity: JSON.stringify(['local', '/second', '/actual', '/actual']),
+				reason: 'project',
+				identityChanged: true,
+			},
+		]);
+		const nextVersion = invalidations.markChanged('local');
+		await expect(session.refreshForInvalidation('/second', nextVersion)).resolves.toBe(true);
+		session.dispose();
+	});
+
+	it('includes invalidation after context installation in its first visible load', async () => {
+		const invalidations = new GitProjectInvalidationStore();
+		const { session, changes } = createSession({
+			invalidationVersion: (executorId) => invalidations.version(executorId),
+		});
+		setProject(session, '/repo');
+		const version = invalidations.markChanged('local');
+		session.setPresentationVisible(true);
+		const activation = session.activate();
+		await expect(session.refreshForInvalidation('/repo', version)).resolves.toBe(false);
+		await activation;
+		expect(api.getGitTargetCandidates).toHaveBeenCalledOnce();
+		expect(changes.map((change) => change.reason)).toEqual(['project']);
+		session.dispose();
+	});
+
+	it.each([true, false])(
+		'loads a reconnected project once despite offline invalidation (visible=%s)',
+		async (visible) => {
+			const invalidations = new GitProjectInvalidationStore();
+			const { session, changes } = createSession({
+				invalidationVersion: (executorId) => invalidations.version(executorId),
+			});
+			setProject(session, '/repo', '/repo', 'remote', 'instance-a');
+			session.setPresentationVisible(true);
+			await session.activate();
+			session.setPresentationVisible(visible);
+			session.setProjectState({
+				kind: 'request-failed',
+				context: {
+					target: {
+						kind: 'chat' as const,
+						chatId: '/repo',
+						projectPath: '/repo',
+						executorId: 'remote',
+					},
+					chatId: '/repo',
+					executorId: 'remote',
+					projectPath: '/repo',
+				},
+				message: 'Executor is unavailable',
+			});
+			const version = invalidations.markChanged('remote');
+			api.getGitTargetCandidates.mockClear();
+			changes.length = 0;
+			const result = deferred<{ targets: GitTargetCandidate[] }>();
+			api.getGitTargetCandidates.mockReturnValueOnce(result.promise);
+			setProject(session, '/repo', '/repo', 'remote', 'instance-b');
+			session.setPresentationVisible(true);
+			const activation = session.activate();
+			const invalidation = session.refreshForInvalidation('/repo', version);
+			try {
+				expect(api.getGitTargetCandidates).toHaveBeenCalledOnce();
+				expect(api.getGitTargetCandidates.mock.calls[0]?.[1]?.signal?.aborted).toBe(false);
+				result.resolve({ targets: [candidate('/repo', { branch: 'reconnected' })] });
+				await activation;
+				await expect(invalidation).resolves.toBe(false);
+				expect(changes.map((change) => change.reason)).toEqual(['session']);
+				expect(session.activeTarget?.branch).toBe('reconnected');
+				await expect(
+					session.refreshForInvalidation('/repo', invalidations.markChanged('remote')),
+				).resolves.toBe(true);
+			} finally {
+				result.resolve({ targets: [] });
+				await activation;
+				await invalidation;
+				session.dispose();
+			}
+		},
+	);
+
+	it('keeps same-path pending invalidations separate across executors', async () => {
+		const local = deferred<{ targets: GitTargetCandidate[] }>();
+		const remote = deferred<{ targets: GitTargetCandidate[] }>();
+		const { session, changes } = createSession({});
+		setProject(session, '/repo');
+		session.setPresentationVisible(true);
+		await session.activate();
+		api.getGitTargetCandidates.mockReturnValueOnce(local.promise);
+		const localRefresh = session.refreshForInvalidation('/repo', 1);
+		setProject(session, '/repo', '/repo', 'remote');
+		await session.activate();
+		api.getGitTargetCandidates.mockReturnValueOnce(remote.promise);
+		const remoteRefresh = session.refreshForInvalidation('/repo', 1);
+		local.resolve({ targets: [candidate('/repo')] });
+		await expect(localRefresh).resolves.toBe(false);
+		await expect(session.refreshForInvalidation('/repo', 1)).resolves.toBe(false);
+		remote.resolve({ targets: [candidate('/repo')] });
+		await expect(remoteRefresh).resolves.toBe(true);
+		expect(changes.filter((change) => change.reason === 'invalidation')).toHaveLength(1);
+		expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(4);
+		session.dispose();
+	});
+
 	it('coalesces its branch invalidation into the direct checkout reconciliation', async () => {
-		let invalidationVersion = 0;
+		const invalidations = new GitProjectInvalidationStore();
+		invalidations.markChanged('remote');
 		const context: { session?: GitTargetSessionController } = {};
 		const runMutation = vi.fn(
 			async (
 				_surfaceId: string,
+				executorId: string,
 				_projectPath: string,
 				effectiveProjectKey: string,
 				execute: () => Promise<{ success: boolean }>,
 			) => {
 				const result = await execute();
 				if (result.success) {
-					invalidationVersion += 1;
-					await context.session?.refreshForInvalidation(effectiveProjectKey, invalidationVersion);
+					const version = invalidations.markChanged(executorId);
+					await context.session?.refreshForInvalidation(effectiveProjectKey, version);
 				}
 				return result;
 			},
@@ -451,7 +738,7 @@ describe('GitTargetSessionController', () => {
 		});
 		const created = createSession({
 			runMutation,
-			invalidationVersion: () => invalidationVersion,
+			invalidationVersion: (executorId) => invalidations.version(executorId),
 		});
 		context.session = created.session;
 		setProject(created.session, '/chat', 'chat');
@@ -459,13 +746,44 @@ describe('GitTargetSessionController', () => {
 		await created.session.activate();
 
 		await expect(created.session.switchBranch('feature', 'local-branch')).resolves.toBe(true);
-		await expect(created.session.refreshForInvalidation('chat', invalidationVersion)).resolves.toBe(
-			false,
-		);
+		await expect(
+			created.session.refreshForInvalidation('chat', invalidations.version('local')),
+		).resolves.toBe(false);
 
 		expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(2);
 		expect(created.changes.filter((change) => change.reason === 'checkout')).toHaveLength(1);
 		expect(created.changes.filter((change) => change.reason === 'invalidation')).toHaveLength(0);
+	});
+
+	it('retains invalidations arriving after checkout while its reconciliation is pending', async () => {
+		const invalidations = new GitProjectInvalidationStore();
+		const entered = deferred<void>();
+		const release = deferred<void>();
+		const { session, changes } = createSession({
+			invalidationVersion: (executorId) => invalidations.version(executorId),
+			runMutation: async (_surface, executorId, _projectPath, _key, execute) => {
+				const result = await execute();
+				if (result.success) invalidations.markChanged(executorId);
+				return result;
+			},
+			afterCheckout: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		setProject(session, '/repo');
+		session.setPresentationVisible(true);
+		await session.activate();
+		const switching = session.switchBranch('feature', 'local-branch');
+		await entered.promise;
+		const version = invalidations.markChanged('local');
+		await expect(session.refreshForInvalidation('/repo', version)).resolves.toBe(false);
+		release.resolve();
+		await expect(switching).resolves.toBe(true);
+		expect(changes.map((change) => change.reason)).toEqual(['project', 'checkout', 'invalidation']);
+		expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(3);
+		await expect(session.refreshForInvalidation('/repo', version)).resolves.toBe(false);
+		session.dispose();
 	});
 
 	it('replays checkout invalidation after project availability interrupts reconciliation', async () => {
@@ -486,6 +804,7 @@ describe('GitTargetSessionController', () => {
 		const runMutation = vi.fn(
 			async (
 				_surfaceId: string,
+				_executorId: string,
 				_projectPath: string,
 				_effectiveProjectKey: string,
 				execute: () => Promise<{ success: boolean }>,
@@ -508,7 +827,11 @@ describe('GitTargetSessionController', () => {
 		await vi.waitFor(() => expect(api.getGitTargetCandidates).toHaveBeenCalledTimes(2));
 		session.setProjectState({
 			kind: 'unavailable',
-			context: { chatId: 'chat', projectPath: '/chat' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'chat', projectPath: '/chat' },
+				chatId: 'chat',
+				projectPath: '/chat',
+			},
 			reason: 'not-found',
 		});
 		await expect(switching).resolves.toBe(true);
@@ -517,9 +840,10 @@ describe('GitTargetSessionController', () => {
 		expect(changes.filter((change) => change.reason === 'checkout')).toEqual([]);
 		setProject(session, '/chat', 'chat');
 		await session.activate();
-		await expect(session.refreshForInvalidation('chat', invalidationVersion)).resolves.toBe(true);
+		await expect(session.refreshForInvalidation('chat', invalidationVersion)).resolves.toBe(false);
 
-		expect(changes.filter((change) => change.reason === 'invalidation')).toHaveLength(1);
+		expect(changes.filter((change) => change.reason === 'session')).toHaveLength(1);
+		expect(session.activeTarget?.branch).toBe('feature');
 	});
 
 	it('rejects target and branch changes while the owner is busy', async () => {
@@ -562,7 +886,7 @@ describe('GitTargetSessionController', () => {
 		api.getGitTargetCandidates.mockReturnValueOnce(load.promise);
 		const { session } = createSession({});
 		setProject(session, '/chat');
-		session.showTargetDialog = true;
+		session.projectSelection.showFolderDialog = true;
 		session.branches.showBranchDropdown = true;
 		session.setPresentationVisible(true);
 		const activation = session.activate();
@@ -572,7 +896,7 @@ describe('GitTargetSessionController', () => {
 		await activation;
 
 		expect(session.isLoadingTargets).toBe(false);
-		expect(session.showTargetDialog).toBe(false);
+		expect(session.projectSelection.showFolderDialog).toBe(false);
 		expect(session.branches.showBranchDropdown).toBe(false);
 		session.dispose();
 		expect(session.activeTarget).toBeNull();

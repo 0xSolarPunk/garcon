@@ -130,6 +130,7 @@ export function isPreambleSelectionUnavailableReason(
 }
 
 export interface PreambleProjectPathRule {
+  readonly executorId?: string | null;
   readonly projectPath: string;
   readonly includeNested: boolean;
 }
@@ -403,13 +404,16 @@ export function normalizePreambleScope(value: unknown): PreambleScope | null {
   const paths = new Set<string>();
   for (const valueRule of raw.rules) {
     const rule = asRecord(valueRule);
-    if (!rule || !hasOnlyKeys(rule, ['projectPath', 'includeNested'])) return null;
+    if (!rule || !hasOnlyKeys(rule, ['executorId', 'projectPath', 'includeNested'])) return null;
+    const executorId = parseExecutorId(rule.executorId);
     const projectPath = nonEmptyString(rule.projectPath);
-    if (!projectPath || typeof rule.includeNested !== 'boolean' || paths.has(projectPath)) {
+    const key = JSON.stringify([effectiveExecutorId(executorId), projectPath]);
+    if (!executorId || !projectPath || typeof rule.includeNested !== 'boolean' || paths.has(key)) {
       return null;
     }
-    paths.add(projectPath);
-    rules.push({ projectPath, includeNested: rule.includeNested });
+    paths.add(key);
+    rules.push({ projectPath, includeNested: rule.includeNested,
+      ...(executorId === LOCAL_EXECUTOR_ID ? {} : { executorId }) });
   }
   return { type: 'project-paths', rules };
 }
@@ -555,3 +559,4 @@ export function normalizePreamblesSnapshot(value: unknown): PreamblesSnapshot | 
   }
   return { revision: raw.revision as number, preambles };
 }
+import { effectiveExecutorId, parseExecutorId, LOCAL_EXECUTOR_ID } from './executors.js';

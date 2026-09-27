@@ -15,9 +15,11 @@ import type { AgentId } from '$shared/agents';
 import { SNIPPET_SHORT_NAME_PATTERN } from '$shared/snippets';
 import { normalizeTagSlug } from '$lib/utils/tags.js';
 import { createRandomId } from '$lib/utils/random-id.js';
+import { effectiveExecutorId } from '$shared/executors';
 import * as m from '$lib/paraglide/messages.js';
 
 export interface PreamblePathRuleDraft {
+	executorId?: string | null;
 	readonly key: string;
 	projectPath: string;
 	includeNested: boolean;
@@ -102,7 +104,7 @@ export class PreambleFormState {
 		const projectPath = rule?.projectPath.trim() ?? '';
 		if (!projectPath) return m.preambles_path_required();
 		const matchingPathCount = this.pathRules.filter(
-			(candidate) => candidate.projectPath.trim() === projectPath,
+			(candidate) => candidate.projectPath.trim() === projectPath && effectiveExecutorId(candidate.executorId) === effectiveExecutorId(rule?.executorId),
 		).length;
 		if (matchingPathCount > 1) return m.preambles_duplicate_path();
 		return null;
@@ -185,6 +187,7 @@ export class PreambleFormState {
 		return {
 			type: 'project-paths',
 			rules: this.pathRules.map((rule) => ({
+				...(effectiveExecutorId(rule.executorId) === 'local' ? {} : { executorId: rule.executorId }),
 				projectPath: rule.projectPath.trim(),
 				includeNested: rule.includeNested,
 			})),

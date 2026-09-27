@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as clientApi from '$lib/api/client';
 import { LOCAL_STORAGE_KEYS } from '$lib/utils/local-persistence';
 import { createModelCatalogStore } from '../model-catalog-store.svelte';
+import { localExecutor, remoteExecutor } from '$lib/executors/__tests__/fixtures';
 
 vi.mock('$lib/api/client', () => ({
 	apiFetch: vi.fn(),
@@ -52,6 +53,45 @@ describe('ModelCatalogStore', () => {
 		vi.mocked(clientApi.apiFetch).mockReset();
 	});
 
+	it('isolates identical agent/model identities by executor in requests and persisted catalogs', async () => {
+		const store = createModelCatalogStore();
+		const remote = store.forExecutor(remoteExecutor.id);
+		vi.mocked(clientApi.apiFetch)
+			.mockResolvedValueOnce(mockResponse(catalogBody([agentEntry('sample', {
+				models: [{ value: 'same', label: 'Local model' }],
+			})])))
+			.mockResolvedValueOnce(mockResponse(catalogBody([agentEntry('sample', {
+				models: [{ value: 'same', label: 'Worker model' }],
+			})])));
+		await store.forceRefresh();
+		await remote.forceRefresh();
+		expect(clientApi.apiFetch).toHaveBeenNthCalledWith(1, '/api/v1/models');
+		expect(clientApi.apiFetch).toHaveBeenNthCalledWith(2, `/api/v1/models?executorId=${remoteExecutor.id}`);
+		expect(store.getModels('sample')[0]?.label).toBe('Local model');
+		expect(remote.getModels('sample')[0]?.label).toBe('Worker model');
+		const restored = createModelCatalogStore();
+		expect(restored.getModels('sample')[0]?.label).toBe('Local model');
+		expect(restored.forExecutor(remoteExecutor.id).getModels('sample')[0]?.label).toBe('Worker model');
+	});
+
+	it('fences a pending catalog request when its executor disconnects or is deleted', async () => {
+		const store = createModelCatalogStore();
+		const remote = store.forExecutor(remoteExecutor.id);
+		store.reconcileExecutors([localExecutor, remoteExecutor]);
+		const response = Promise.withResolvers<Response>();
+		vi.mocked(clientApi.apiFetch).mockReturnValue(response.promise);
+		const pending = remote.forceRefresh();
+		store.reconcileExecutors([localExecutor]);
+		response.resolve(mockResponse(catalogBody([agentEntry('sample', {
+			models: [{ value: 'late', label: 'Stale model' }],
+		})])));
+		await pending;
+		expect(remote.isRefreshing).toBe(false);
+		expect(remote.getModels('sample')).toEqual([]);
+		expect(store.forExecutor(remoteExecutor.id)).not.toBe(remote);
+		expect(localStorage.getItem(LOCAL_STORAGE_KEYS.modelCatalogExecutors)).toBe('{}');
+	});
+
 	it('starts empty instead of embedding integration-specific fallbacks', () => {
 		const store = createModelCatalogStore();
 
@@ -59,9 +99,75 @@ describe('ModelCatalogStore', () => {
 		expect(store.getModels('claude')).toEqual([]);
 		expect(store.supportsFork('claude')).toBe(false);
 		expect(store.supportsSteering('claude')).toBe(false);
-		expect(store.supportsGoals('claude')).toBe(false);
 		expect(store.getPermissionModes('claude')).toEqual([]);
 		expect(store.getThinkingModes('claude')).toEqual([]);
+	});
+
+	it('invalidates only the replaced executor catalog when the browser missed offline', async () => {
+		const store = createModelCatalogStore();
+		const remote = store.forExecutor(remoteExecutor.id);
+		store.reconcileExecutors([localExecutor, remoteExecutor]);
+		vi.mocked(clientApi.apiFetch).mockResolvedValue(mockResponse(catalogBody([agentEntry('sample', {
+			models: [{ value: 'same', label: 'Cached model' }],
+		})])));
+		await store.forceRefresh(); await remote.forceRefresh();
+		const stale = Promise.withResolvers<Response>();
+		vi.mocked(clientApi.apiFetch).mockReturnValueOnce(stale.promise);
+		const loading = remote.forceRefresh();
+		store.reconcileExecutors([localExecutor, { ...remoteExecutor, instanceId: 'replacement' }]);
+		expect(store.isValidated).toBe(true);
+		expect(remote.isValidated).toBe(false);
+		expect(remote.getModels('sample')[0]?.value).toBe('same');
+		stale.resolve(mockResponse(catalogBody([agentEntry('sample', { models: [{ value: 'stale', label: 'Stale' }] })])));
+		await loading;
+		expect(remote.getModels('sample')[0]?.value).toBe('same');
+		expect(createModelCatalogStore().forExecutor(remoteExecutor.id).isValidated).toBe(false);
+	});
+
+	it('invalidates live and uninstantiated persisted executor catalogs after global provider changes', async () => {
+		const original = createModelCatalogStore();
+		vi.mocked(clientApi.apiFetch).mockResolvedValue(mockResponse(catalogBody([agentEntry('sample', {
+			models: [{ value: 'cached', label: 'Cached Model' }],
+		})])));
+		await original.forceRefresh();
+		await original.forExecutor(remoteExecutor.id).forceRefresh();
+		const store = createModelCatalogStore();
+		expect(store.isValidated).toBe(true);
+		store.invalidateAll();
+		expect(store.isValidated).toBe(false);
+		expect(store.getModels('sample')).toHaveLength(1);
+		expect(store.forExecutor(remoteExecutor.id).isValidated).toBe(false);
+		const restored = createModelCatalogStore();
+		expect(restored.isValidated).toBe(false);
+		expect(restored.forExecutor(remoteExecutor.id).isValidated).toBe(false);
+	});
+
+	it('keeps an in-flight Local catalog request when the first executor snapshot arrives', async () => {
+		const response = Promise.withResolvers<Response>();
+		vi.mocked(clientApi.apiFetch).mockReturnValue(response.promise);
+		const store = createModelCatalogStore();
+		const pending = store.forceRefresh();
+		store.reconcileExecutors([localExecutor, remoteExecutor]);
+		response.resolve(mockResponse(catalogBody([agentEntry('sample', {
+			models: [{ value: 'same', label: 'Local model' }],
+		})])));
+		await pending;
+		expect(store.getModels('sample')[0]?.label).toBe('Local model');
+		expect(store.isStale()).toBe(false);
+	});
+
+	it.each([false, true])('invalidates persisted remote catalogs on reconnect (instantiated: %s)', async (instantiate) => {
+		const initial = createModelCatalogStore();
+		vi.mocked(clientApi.apiFetch).mockResolvedValue(mockResponse(catalogBody([agentEntry('sample', {
+			models: [{ value: 'same', label: 'Worker model' }],
+		})])));
+		await initial.forExecutor(remoteExecutor.id).forceRefresh();
+		const store = createModelCatalogStore();
+		if (instantiate) expect(store.forExecutor(remoteExecutor.id).isStale()).toBe(false);
+		store.reconcileExecutors([localExecutor, { ...remoteExecutor, availability: 'offline' }]);
+		store.reconcileExecutors([localExecutor, remoteExecutor]);
+		expect(store.forExecutor(remoteExecutor.id).isStale()).toBe(true);
+		expect(createModelCatalogStore().forExecutor(remoteExecutor.id).isStale()).toBe(true);
 	});
 
 	it('hydrates models, capabilities, modes, and settings from storage', () => {
@@ -111,7 +217,6 @@ describe('ModelCatalogStore', () => {
 		expect(store.getModels('sample')).toEqual([{ value: 'sample-model', label: 'Sample Model' }]);
 		expect(store.supportsFork('sample')).toBe(true);
 		expect(store.supportsSteering('sample')).toBe(false);
-		expect(store.supportsGoals('sample')).toBe(false);
 		expect(store.getPermissionModes('sample')).toEqual(['default', 'manualBypass']);
 		expect(store.getThinkingModes('sample')).toEqual(['none', 'high']);
 		expect(store.getAgentSettingsDescriptors('sample')).toEqual([
@@ -254,7 +359,6 @@ describe('ModelCatalogStore', () => {
 						supportsFork: true,
 						supportsForkAtMessage: true,
 						supportsSteering: true,
-						supportsGoals: true,
 						supportsUpdateProjectPath: true,
 						supportsImages: true,
 						supportedPermissionModes: ['default', 'plan'],
@@ -286,7 +390,6 @@ describe('ModelCatalogStore', () => {
 		expect(store.supportsFork('sample-agent')).toBe(true);
 		expect(store.supportsForkAtMessage('sample-agent')).toBe(true);
 		expect(store.supportsSteering('sample-agent')).toBe(true);
-		expect(store.supportsGoals('sample-agent')).toBe(true);
 		expect(store.supportsUpdateProjectPath('sample-agent')).toBe(true);
 		expect(store.supportsImages('sample-agent')).toBe(true);
 		expect(store.getPermissionModes('sample-agent')).toEqual(['default', 'plan']);
@@ -378,6 +481,7 @@ describe('ModelCatalogStore', () => {
 					[
 						{
 							id: 'acme',
+							revision: 1,
 							label: 'Acme',
 							templateId: 'custom',
 							createdAt: '2026-01-01T00:00:00.000Z',

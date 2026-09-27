@@ -12,8 +12,9 @@ import { createScopedAgentLogger } from '@garcon/server-agent-common/logging/sco
 import { createVersion1RecordMigration } from '@garcon/server-agent-common/migration/version-1-record-migration';
 import { createPathNativeSessionCodec } from '@garcon/server-agent-common/native-session/path-native-session';
 import { createVersionedSettings } from '@garcon/server-agent-common/settings/versioned-settings';
-import { singleQueryRuntimeOptions } from '@garcon/server-agent-common/shared/single-query-control';
+import { singleQueryRuntimeOptions, withSingleQueryDirectory } from '@garcon/server-agent-common/shared/single-query-control';
 import { createAgentProducerAdapter } from '@garcon/server-agent-common/execution/producer-adapter';
+import { createAgentProjectPathUpdates } from '@garcon/server-agent-common/execution/project-path-adapter';
 import {
   createHistoryImport,
   createNativeHistoryImport,
@@ -72,6 +73,8 @@ export default class CursorAgentIntegration implements AgentIntegration {
   readonly descriptor = CURSOR_DESCRIPTOR;
   readonly attachments = null;
   readonly execution;
+  readonly producers;
+  readonly permissions;
   readonly legacyHistoryImport;
   readonly nativeHistoryImport;
   readonly nativeActivity = null;
@@ -87,7 +90,6 @@ export default class CursorAgentIntegration implements AgentIntegration {
   readonly compaction = null;
   readonly forking = null;
   readonly steering = null;
-  readonly goals = null;
   readonly endpoints = null;
   readonly singleQuery: NonNullable<AgentIntegration['singleQuery']>;
 
@@ -116,12 +118,14 @@ export default class CursorAgentIntegration implements AgentIntegration {
         providerExecution.applySessionConfiguration(agentSessionId, configuration)
       ),
     };
-    this.projectPathUpdates = {
-      prepare: (request) => providerExecution.prepareProjectPathUpdate(request),
-    };
+    this.projectPathUpdates = createAgentProjectPathUpdates(host.scope,
+      (request) => providerExecution.prepareProjectPathUpdate(request));
     const nativeEvidence = createCursorNativeEvidence(transcriptReader, nativeSessions, runtime);
     this.nativeSessions = nativeEvidence;
-    this.execution = createAgentProducerAdapter(providerExecution, logger).execution;
+    const producer = createAgentProducerAdapter(providerExecution, host);
+    this.execution = producer.execution;
+    this.producers = producer.producers;
+    this.permissions = producer.permissions;
     this.legacyHistoryImport = createHistoryImport({
       async load(request) {
         try {
@@ -152,11 +156,11 @@ export default class CursorAgentIntegration implements AgentIntegration {
       async run(request) {
         request.signal.throwIfAborted();
         try {
-          return await runSingleQuery(request.prompt, {
-            projectPath: request.projectPath,
+          return await withSingleQueryDirectory(request.signal, (directory) => runSingleQuery(request.prompt, {
             model: request.model,
             ...singleQueryRuntimeOptions(request),
-          }, config);
+            projectPath: directory,
+          }, config));
         } catch (error) {
           if (error instanceof AgentIntegrationError) throw error;
           throw new AgentIntegrationError(

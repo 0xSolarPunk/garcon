@@ -34,10 +34,6 @@ import type {
 } from '$shared/chat-tag-mutations';
 import type { ChatOrderBoundary, ReorderChatResponse } from '$shared/chat-order-contracts';
 import {
-	chatExecutionDraftStorageKey,
-	removeLocalStorageItem,
-} from '$lib/utils/local-persistence.js';
-import {
 	ChatArchiveProjectionState,
 	type ChatArchiveProjectionOperation,
 } from './chat-archive-projection-state.svelte.js';
@@ -68,6 +64,7 @@ import {
 	normalizeExecutionFields,
 	reconcileActivityProjection,
 	sameRecord,
+	toDraftRecord,
 	toRecord,
 } from './chat-session-records.js';
 
@@ -172,7 +169,13 @@ export class ChatSessionsStore implements ChatSessionsPort {
 		try {
 			const fetchChats = this.#deps.listChats ?? listChats;
 			const projectPathRevisions = this.#projectBindings.captureRevisions();
+			const serverEntryGeneration = this.#nextServerEntryGeneration;
 			const res = await fetchChats();
+			// Command responses can install newer records while this snapshot is in flight.
+			if (serverEntryGeneration !== this.#nextServerEntryGeneration) {
+				this.#needsFollowUpFetch = true;
+				return;
+			}
 			this.lastSelectedChatId =
 				typeof res.lastSelectedChatId === 'string' ? res.lastSelectedChatId : null;
 			this.#upsertFromServer(res.sessions ?? [], projectPathRevisions, fetchGeneration);
@@ -488,6 +491,8 @@ export class ChatSessionsStore implements ChatSessionsPort {
 			this.#mergeServerEntry(entry, false);
 		} else {
 		this.patchChat(entry.id, {
+				executorId: entry.executorId ?? 'local',
+				projectPath: entry.projectPath,
 				agentId: entry.agentId as ChatSessionRecord['agentId'],
 				agentOwnershipEpoch: entry.agentOwnershipEpoch,
 				model: entry.model,
@@ -726,32 +731,7 @@ export class ChatSessionsStore implements ChatSessionsPort {
 			...normalizeExecutionFields(startup),
 		};
 
-		const draft: ChatSessionRecord = {
-			id,
-			parentChat: null,
-			projectPath,
-			orderGroup: null,
-			title: normalizedStartup.firstMessage.trim() || m.chat_sessions_new_session(),
-			agentId: normalizedStartup.agentId,
-			model: normalizedStartup.model,
-			apiProviderId: normalizedStartup.apiProviderId ?? null,
-			modelEndpointId: normalizedStartup.modelEndpointId ?? null,
-			modelProtocol: normalizedStartup.modelProtocol ?? null,
-			...normalizeExecutionFields(normalizedStartup),
-			createdAt: null,
-			lastActivityAt: null,
-			lastReadAt: null,
-			isPinned: false,
-			isArchived: false,
-			isProcessing: false,
-			processingPhase: null,
-			canReloadFromNativeHistory: false,
-			isUnread: false,
-			status: 'draft',
-			agentOwnershipEpoch: null,
-			tags: normalizedStartup.tags ?? [],
-			firstMessage: undefined,
-		};
+		const draft = toDraftRecord(id, projectPath, normalizedStartup, m.chat_sessions_new_session());
 
 		this.#baseById = { ...this.#baseById, [id]: draft };
 		this.#baseOrder = this.#baseOrder.includes(id) ? this.#baseOrder : [id, ...this.#baseOrder];
@@ -778,6 +758,7 @@ export class ChatSessionsStore implements ChatSessionsPort {
 
 	applyStartEntry(entry: ChatListEntry): void {
 		this.#mergeServerEntry(entry, true);
+		void this.quietRefreshChats();
 	}
 
 	upsertServerChat(entry: ChatListEntry): void {
@@ -787,7 +768,7 @@ export class ChatSessionsStore implements ChatSessionsPort {
 	#mergeServerEntry(entry: ChatListEntry, clearStartup: boolean): void {
 		const next = toRecord(entry);
 		const previous = this.#baseById[entry.id];
-		this.#projectBindings.publishIfChanged(entry.id, previous?.projectPath, next.projectPath);
+		this.#projectBindings.publishIfChanged(entry.id, previous?.projectPath, next.projectPath, previous?.executorId, next.executorId);
 		reconcileActivityProjection(previous, next);
 		next.processingPhase = this.#resolveProcessing(entry.id, next.processingPhase);
 		next.isProcessing = next.processingPhase !== null;
@@ -815,7 +796,6 @@ export class ChatSessionsStore implements ChatSessionsPort {
 		this.#processingSnapshot?.delete(chatId);
 		this.#serverEntryFetchGenerationByChatId.delete(chatId);
 		this.#tagReconciliation.remove(chatId);
-		removeLocalStorageItem(chatExecutionDraftStorageKey(chatId));
 		if (!this.#baseById[chatId]) return;
 		this.#projectBindings.publish(chatId, null);
 
@@ -881,9 +861,8 @@ export class ChatSessionsStore implements ChatSessionsPort {
 	patchChat(chatId: string, patch: Partial<ChatSessionRecord>): void {
 		const chat = this.#baseById[chatId];
 		if (!chat) return;
-		if (typeof patch.projectPath === 'string' && patch.projectPath !== chat.projectPath) {
-			this.#projectBindings.publish(chatId, patch.projectPath);
-		}
+		this.#projectBindings.publishIfChanged(chatId, chat.projectPath, patch.projectPath ?? chat.projectPath,
+			chat.executorId, 'executorId' in patch ? patch.executorId : chat.executorId);
 		const nextChat = {
 			...chat,
 			...patch,

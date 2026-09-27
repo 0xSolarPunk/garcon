@@ -8,6 +8,7 @@ import type { FileTreeStore } from '$lib/files/tree/file-tree.svelte.js';
 import type { FilesSurfaceController } from '$lib/workspace/singleton-surfaces.svelte.js';
 import { FileNavigationStore } from '$lib/files/navigation/file-navigation-store.svelte.js';
 import { createMemoryFileDraftRepository } from '$lib/files/persistence/file-draft-repository.js';
+import { fileIdentityKey } from '$lib/files/documents/file-identity.js';
 
 type CommandMenuWorkspacePort = Pick<
 	WorkspaceCoordinator,
@@ -17,10 +18,12 @@ type CommandMenuWorkspacePort = Pick<
 	| 'openSingleton'
 	| 'focusMostRecentTerminalOrCreate'
 	| 'createTerminalInAvailableSpace'
+	| 'terminalCreationExecutorId'
 >;
 
 const mocks = vi.hoisted(() => ({
 	workspace: {
+		terminalCreationExecutorId: 'local',
 		isMobile: false as boolean,
 		focusOwner: { kind: 'chat-list' },
 		focusChat: vi.fn(),
@@ -31,10 +34,7 @@ const mocks = vi.hoisted(() => ({
 	appShell: {
 		openNewChatDialog: vi.fn(),
 		openSettings: vi.fn(),
-	},
-	ghCapability: {
-		available: true,
-		hasChecked: true,
+		openAppSettings: vi.fn(),
 	},
 	notifications: {
 		error: vi.fn(),
@@ -54,24 +54,31 @@ vi.mock('$lib/context', async (importOriginal) => ({
 import CommandMenu from '../CommandMenu.svelte';
 
 const workspace: CommandMenuWorkspacePort = mocks.workspace;
-const terminals: Pick<WorkbenchCommandRegistryDeps['terminals'], 'listStatus' | 'orderedSessions'> =
-	{
-		listStatus: 'ready',
-		orderedSessions: [],
-	};
+let remoteHosts = false;
+const terminals: Pick<
+	WorkbenchCommandRegistryDeps['terminals'],
+	'listStatus' | 'orderedSessions' | 'hasRemoteHosts' | 'canCreate' | 'hosts'
+> = {
+	get hasRemoteHosts() {
+		return remoteHosts;
+	},
+	hosts: [{ id: 'local', label: 'Local', available: true, full: false }],
+	canCreate: (executorId) => executorId === 'local',
+	listStatus: 'ready',
+	orderedSessions: [],
+};
 const appShell: Pick<
 	WorkbenchCommandRegistryDeps['appShell'],
-	'openNewChatDialog' | 'openSettings'
+	'openNewChatDialog' | 'openSettings' | 'openAppSettings'
 > = mocks.appShell;
-const ghCapability: Pick<WorkbenchCommandRegistryDeps['ghCapability'], 'available' | 'hasChecked'> =
-	mocks.ghCapability;
 const files: Pick<WorkbenchCommandRegistryDeps['files'], 'navigation' | 'open'> = {
 	navigation: null,
 	open: vi.fn(async () => null),
 };
 let knownFiles: FileTreeStore['knownFiles'] = [];
 let fileRootPath: string | null = null;
-const tree: Pick<FileTreeStore, 'knownFiles' | 'fileRootPath'> = {
+const tree: Pick<FileTreeStore, 'knownFiles' | 'fileRootPath' | 'executorId'> = {
+	executorId: 'local',
 	get knownFiles() {
 		return knownFiles;
 	},
@@ -84,7 +91,6 @@ const commandRegistry = new WorkbenchCommandRegistry({
 	workspace: workspace as WorkbenchCommandRegistryDeps['workspace'],
 	terminals: terminals as WorkbenchCommandRegistryDeps['terminals'],
 	appShell: appShell as WorkbenchCommandRegistryDeps['appShell'],
-	ghCapability: ghCapability as WorkbenchCommandRegistryDeps['ghCapability'],
 	files: files as WorkbenchCommandRegistryDeps['files'],
 	filesSurface: () => filesSurface as FilesSurfaceController,
 	filesSurfaceIfPresent: () => filesSurface as FilesSurfaceController,
@@ -94,6 +100,7 @@ const commandRegistry = new WorkbenchCommandRegistry({
 
 afterEach(() => {
 	cleanup();
+	remoteHosts = false;
 	mocks.workspace.isMobile = false;
 	files.navigation = null;
 	knownFiles = [];
@@ -103,6 +110,25 @@ afterEach(() => {
 });
 
 describe('CommandMenu', () => {
+	it('routes app and server settings to their separate dialogs', async () => {
+		await commandRegistry.execute('open-app-settings');
+		expect(mocks.appShell.openAppSettings).toHaveBeenCalledOnce();
+		expect(mocks.appShell.openSettings).not.toHaveBeenCalled();
+		await commandRegistry.execute('open-settings');
+		expect(mocks.appShell.openSettings).toHaveBeenCalledOnce();
+	});
+	it('uses the same creation entry point when host discovery changes command presentation', async () => {
+		const { component } = render(CommandMenu);
+		component.toggle();
+		await fireEvent.click(await screen.findByText(m.workspace_new_terminal()));
+		remoteHosts = true;
+		component.toggle();
+		await fireEvent.click(await screen.findByText(`${m.workspace_new_terminal()}: Local`));
+		expect(mocks.workspace.createTerminalInAvailableSpace.mock.calls).toEqual([
+			['command-menu:new-terminal'],
+			['command-menu:new-terminal', 'local'],
+		]);
+	});
 	it('refreshes known files on reopening without requiring reactive controller creation', async () => {
 		const { component } = render(CommandMenu);
 		component.toggle();
@@ -161,7 +187,8 @@ describe('CommandMenu', () => {
 		});
 		files.navigation.recents = [
 			{
-				key: JSON.stringify(['/workspace', fileName]),
+				key: fileIdentityKey('/workspace', fileName),
+				executorId: 'local',
 				canonicalFileRootPath: '/workspace',
 				normalizedRelativePath: fileName,
 				displayPath: fileName,
@@ -185,6 +212,7 @@ describe('CommandMenu', () => {
 		await fireEvent.click(option);
 
 		expect(files.open).toHaveBeenCalledWith({
+			executorId: 'local',
 			fileRootPath: '/workspace',
 			relativePath: fileName,
 			mode: 'code',

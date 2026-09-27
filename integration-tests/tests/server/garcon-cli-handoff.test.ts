@@ -11,13 +11,15 @@ import {
   parseTranscriptExportResponse,
   type TranscriptExportResponse,
 } from '../../../common/chat-export-contracts.js';
+import { cliEnvironment } from '../../support/cli-environment.js';
 import type { ConfiguredDirectTestAgent } from '../../support/garcon-client.js';
 import {
-  withIntegrationFixture,
+  withCliFixture,
+  cliConnectionArguments,
   type IntegrationFixture,
-} from '../../support/integration-fixture.js';
+} from '../../support/cli-fixture.js';
 
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const WORKSPACE = 'cli-handoff';
 const CONTEXT_WINDOW_TOKENS = 131_072;
 const USABLE_TOKEN_BUDGET = 98_304;
@@ -26,7 +28,7 @@ const ORDINARY_NOTICE_MARKER = 'synthetic-ordinary-notice-excluded';
 
 describe('garcon-cli handoff', () => {
   test('publishes a pinned ordinal artifact without mutating a running chat', async () => {
-    await withIntegrationFixture('garcon-cli-handoff', async (fixture) => {
+    await withCliFixture('garcon-cli-handoff', async (fixture) => {
       const source = fixture.directAgents.openAi;
       const target = fixture.directAgents.anthropic;
       const chatId = await seedLargeHistory(fixture, source, 25);
@@ -154,7 +156,7 @@ describe('garcon-cli handoff', () => {
   }, 120_000);
 
   test('reports missing chats and rejects invalid context sizes through the real CLI', async () => {
-    await withIntegrationFixture('garcon-cli-handoff-errors', async (fixture) => {
+    await withCliFixture('garcon-cli-handoff-errors', async (fixture) => {
       const missing = await runCli(fixture, ['handoff', fixture.newChatId()]);
       expect(missing.exitCode).toBe(2);
       expect(missing.stdout).toBe('');
@@ -187,7 +189,7 @@ async function seedLargeHistory(
   const started = await fixture.client.startDirectChat({
     chatId,
     content: first,
-    projectPath: fixture.dirs.project,
+    projectPath: fixture.executionDirs.project,
     agent,
   });
   await fixture.client.waitForTurnTerminal(chatId, started.turnId);
@@ -205,6 +207,7 @@ function enableCompaction(
   return fixture.client.updateSettings({
     ui: {
       agentSwitchCompaction: {
+        executorId: fixture.client.executorId,
         enabled: true,
         contextWindowTokens: 200_000,
         agentId: agent.agentId,
@@ -265,17 +268,11 @@ async function runCli(
     cmd: [
       process.execPath,
       'cli/main.ts',
-      '--config-dir', fixture.dirs.config,
-      '--workspace', WORKSPACE,
-      '--server', fixture.garcon.baseUrl,
+      ...cliConnectionArguments(fixture),
       ...arguments_,
     ],
     cwd: REPO_ROOT,
-    env: {
-      ...process.env,
-      GARCON_CONFIG_DIR: '',
-      GARCON_WORKSPACE: '',
-    },
+    env: cliEnvironment(),
     stdout: 'pipe',
     stderr: 'pipe',
   });

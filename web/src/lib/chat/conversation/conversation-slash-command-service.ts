@@ -4,6 +4,7 @@ import { scheduleChatPrompt } from '$lib/api/scheduled-prompts.js';
 import type { ChatImage } from '$shared/chat-types';
 import type { ChatListEntry } from '$shared/chat-list';
 import type { ApiProtocol } from '$shared/api-providers';
+import { effectiveExecutorId } from '$shared/executors';
 import { resolveConversationModelSelection } from './conversation-model-selection.js';
 import {
 	steerSubmissionRejection,
@@ -16,7 +17,6 @@ import { parseForkCommand } from '$lib/chat/composer/fork-command.js';
 import { parseHandoffCommand } from '$lib/chat/composer/handoff-command.js';
 import {
 	parseCompactCommand,
-	isGoalCommand,
 	parseMoveChatBoundaryCommand,
 	parseRenameCommand,
 	parseScheduleInCommand,
@@ -50,7 +50,10 @@ import type { TranscriptMessage } from '$shared/chat-view';
 import type { ConversationSubmissionOutcome } from './conversation-submission-outcome.js';
 import * as m from '$lib/paraglide/messages.js';
 import type { ReorderChatResponse } from '$shared/chat-order-contracts';
-import type { ApplyChatTagDeltaRequest, ChatTagsMutationResponse } from '$shared/chat-tag-mutations';
+import type {
+	ApplyChatTagDeltaRequest,
+	ChatTagsMutationResponse,
+} from '$shared/chat-tag-mutations';
 import type { ChatTagReconciliationKind } from '$lib/chat/sessions/chat-sessions-contract.js';
 import { ChatTagMutationBlockedError } from '$lib/chat/sessions/chat-tag-mutation-result.js';
 
@@ -74,11 +77,7 @@ interface SlashCommandChatState {
 	isUserScrolledUp: boolean;
 	getCursor(): { transcriptViewId: string; lastOrdinal: number };
 	appendLocalNotice(noticeType: LocalNoticeType, content: string): void;
-	appendLocalNoticeForChat(
-		chatId: string,
-		noticeType: LocalNoticeType,
-		content: string,
-	): void;
+	appendLocalNoticeForChat(chatId: string, noticeType: LocalNoticeType, content: string): void;
 	noticeRevisionForChat(chatId: string): number;
 	clearLocalNoticesForChat(chatId: string, throughRevision?: number): void;
 }
@@ -123,7 +122,6 @@ interface SlashCommandModelCatalog {
 	supportsFork(agentId: SessionAgentId): boolean;
 	supportsForkWhileRunning(agentId: SessionAgentId): boolean;
 	supportsSteering(agentId: SessionAgentId): boolean;
-	supportsGoals(agentId: SessionAgentId): boolean;
 }
 
 export interface ConversationSlashCommandDeps {
@@ -132,7 +130,7 @@ export interface ConversationSlashCommandDeps {
 	composerState: SlashCommandComposerState;
 	agentState: SlashCommandAgentState;
 	lifecycle: SlashCommandLifecycle;
-	modelCatalog: SlashCommandModelCatalog;
+	modelCatalogForExecutor(executorId: string): SlashCommandModelCatalog;
 	navigation: { navigateToChat?(chatId: string): void };
 	refetchTranscript?: (chatId: string) => Promise<void>;
 	// Asks the user whether to continue when the provider cannot materialize a native fork.
@@ -147,7 +145,6 @@ export type SlashCommandSubmissionResolution =
 			outcome: ConversationSubmissionOutcome | Promise<ConversationSubmissionOutcome>;
 	  }
 	| { kind: 'steer'; content: string }
-	| { kind: 'goal-control'; content: string }
 	| { kind: 'continue'; content: string };
 
 export class ConversationSlashCommandService {
@@ -166,9 +163,8 @@ export class ConversationSlashCommandService {
 		text: string;
 		images: File[];
 		ownsComposer: boolean;
-		handoffPending: boolean;
 	}): SlashCommandSubmissionResolution {
-		const { chatId, chat, text, images, ownsComposer, handoffPending } = input;
+		const { chatId, chat, text, images, ownsComposer } = input;
 		const rename = parseRenameCommand(text);
 		if (rename) {
 			return {
@@ -202,14 +198,14 @@ export class ConversationSlashCommandService {
 		}
 
 		const agentId = chat.agentId as SessionAgentId;
+		const modelCatalog = this.deps.modelCatalogForExecutor(effectiveExecutorId(chat.executorId));
 		const steer = parseSteerCommand(text);
 		if (steer.kind !== 'not-command') {
 			const prompt = steer.kind === 'valid' ? steer.prompt : '';
 			const rejection = steerSubmissionRejection({
 				prompt,
-				supportsSteering: this.deps.modelCatalog.supportsSteering(agentId),
+				supportsSteering: modelCatalog.supportsSteering(agentId),
 				attachmentCount: images.length,
-				handoffPending,
 			});
 			if (rejection) {
 				this.deps.chatState.appendLocalNotice('error', steerSubmissionRejectionNotice(rejection));
@@ -218,29 +214,13 @@ export class ConversationSlashCommandService {
 			return { kind: 'steer', content: prompt };
 		}
 
-		if (
-			isGoalCommand(text) &&
-			chat.status === 'running' &&
-			chat.isProcessing &&
-			this.deps.modelCatalog.supportsGoals(agentId)
-		) {
-			if (images.length > 0) {
-				this.deps.chatState.appendLocalNotice(
-					'error',
-					m.chat_notice_queue_attachments_unavailable(),
-				);
-				return { kind: 'handled', outcome: 'rejected' };
-			}
-			return { kind: 'goal-control', content: text };
-		}
-
-		if (this.deps.modelCatalog.supportsFork(agentId)) {
+		if (modelCatalog.supportsFork(agentId)) {
 			const fork = parseForkCommand(text);
 			if (fork) {
 				if (
 					chat.status === 'running' &&
 					chat.isProcessing &&
-					!this.deps.modelCatalog.supportsForkWhileRunning(agentId)
+					!modelCatalog.supportsForkWhileRunning(agentId)
 				) {
 					this.deps.chatState.appendLocalNotice('error', m.chat_notice_cannot_fork_processing());
 					return { kind: 'handled', outcome: 'rejected' };
@@ -448,9 +428,7 @@ export class ConversationSlashCommandService {
 			try {
 				mutation = await deps.sessions.applyChatTagDelta({
 					chatId,
-					...(command.action === 'add'
-						? { addTags: command.tags }
-						: { removeTags: command.tags }),
+					...(command.action === 'add' ? { addTags: command.tags } : { removeTags: command.tags }),
 				});
 			} catch (error) {
 				this.#restoreComposerIfUntouched({
@@ -467,9 +445,7 @@ export class ConversationSlashCommandService {
 				);
 				return 'rejected';
 			}
-			const changedTags = command.action === 'add'
-				? mutation.addedTags
-				: mutation.removedTags;
+			const changedTags = command.action === 'add' ? mutation.addedTags : mutation.removedTags;
 
 			if (deps.chatState.activeChatId === chatId) {
 				const content =
@@ -703,13 +679,16 @@ export class ConversationSlashCommandService {
 
 			const forkChatId = createClientChatId();
 			const model = sourceChat.model ?? deps.agentState.model;
-			const selection = resolveConversationModelSelection({
-				agentId: sourceChat.agentId,
-				model,
-				apiProviderId: sourceChat.apiProviderId ?? null,
-				modelEndpointId: sourceChat.modelEndpointId ?? null,
-				modelProtocol: sourceChat.modelProtocol ?? null,
-			}, deps.modelCatalog);
+			const selection = resolveConversationModelSelection(
+				{
+					agentId: sourceChat.agentId,
+					model,
+					apiProviderId: sourceChat.apiProviderId ?? null,
+					modelEndpointId: sourceChat.modelEndpointId ?? null,
+					modelProtocol: sourceChat.modelProtocol ?? null,
+				},
+				deps.modelCatalogForExecutor(effectiveExecutorId(sourceChat.executorId)),
+			);
 			const submission = this.acceptedInputs.fork({
 				sourceChatId,
 				chatId: forkChatId,
@@ -771,11 +750,7 @@ export class ConversationSlashCommandService {
 		try {
 			await this.#performForkOnly(sourceChatId, upToOrdinal, source);
 		} catch (error) {
-			this.deps.chatState.appendLocalNoticeForChat(
-				sourceChatId,
-				'error',
-				forkFailureNotice(error),
-			);
+			this.deps.chatState.appendLocalNoticeForChat(sourceChatId, 'error', forkFailureNotice(error));
 		}
 	}
 
@@ -809,8 +784,7 @@ export class ConversationSlashCommandService {
 		} catch (error) {
 			const defaultRefetch = this.deps.refetchTranscript;
 			const refetchTranscript =
-				source?.refetchTranscript ??
-				(defaultRefetch ? () => defaultRefetch(sourceChatId) : null);
+				source?.refetchTranscript ?? (defaultRefetch ? () => defaultRefetch(sourceChatId) : null);
 			if (!selection || !isStaleForkPointError(error) || !refetchTranscript) {
 				throw error;
 			}

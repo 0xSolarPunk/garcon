@@ -10,6 +10,7 @@ import type {
 	GitWorkbenchSnapshotReady,
 } from '$lib/api/git.js';
 import { createGitSurfaceTestDeps } from '$lib/git/__tests__/git-surface-test-deps.js';
+import { ApiError } from '$lib/api/client.js';
 
 vi.mock('$lib/api/git.js', () => ({
 	getGitTargetCandidates: vi.fn().mockResolvedValue({ targets: [] }),
@@ -105,6 +106,7 @@ function snapshot(root: GitTreeNode[]): GitWorkbenchSnapshotReady {
 		status: 'ready',
 		project: '/project',
 		target: {
+			executorId: 'local',
 			projectPath: '/project',
 			repoRoot: '/project',
 			worktreePath: '/project',
@@ -114,6 +116,7 @@ function snapshot(root: GitTreeNode[]): GitWorkbenchSnapshotReady {
 		},
 		tree,
 		reviewSummary: {
+			document: { executorId: 'local', instanceId: 'test-instance', documentId: 'doc' },
 			documentId: 'doc',
 			project: '/project',
 			mode: 'working',
@@ -179,11 +182,110 @@ describe('CommitController', () => {
 		mockedApi.generateCommitMessage.mockResolvedValue({ message: 'test: commit' });
 	});
 
+	it.each(['success', 'failure'] as const)(
+		'requires tree revalidation after recovery: %s',
+		async (outcome) => {
+			const controller = makeController();
+			const project = {
+				target: {
+					kind: 'chat' as const,
+					chatId: 'chat1',
+					projectPath: '/project',
+					executorId: 'worker',
+				},
+				executorId: 'worker',
+				chatId: 'chat1',
+				projectPath: '/project',
+				effectiveProjectKey: '/project',
+				executorContextKey: 'session1',
+			};
+			await controller.setProjectState({ kind: 'available', project });
+			await controller.setPresentationVisible(true);
+			controller.message = 'Retained draft';
+			expect(controller.canCommit).toBe(true);
+			await controller.setProjectState({
+				kind: 'request-failed',
+				context: project,
+				message: 'Offline',
+			});
+			const replacement = deferred<GitWorkbenchSnapshotReady>();
+			mockedApi.getGitWorkbenchSnapshot.mockReturnValueOnce(replacement.promise);
+			const reads = mockedApi.getGitWorkbenchSnapshot.mock.calls.length;
+			const recovery = controller.setProjectState({
+				kind: 'available',
+				project: { ...project, executorContextKey: 'session2' },
+			});
+			await vi.waitFor(() =>
+				expect(mockedApi.getGitWorkbenchSnapshot).toHaveBeenCalledTimes(reads + 1),
+			);
+			expect(controller.canCommit).toBe(false);
+			controller.togglePath('unstaged.ts', true);
+			controller.toggleDirectory('unstaged.ts', true);
+			controller.includeUnstaged('staged.ts');
+			await controller.generateMessage();
+			expect(await controller.commit()).toBe(false);
+			expect(mockedApi.gitStagePaths).not.toHaveBeenCalled();
+			expect(mockedApi.gitCommitIndex).not.toHaveBeenCalled();
+			expect(mockedApi.generateCommitMessage).not.toHaveBeenCalled();
+			if (outcome === 'success')
+				replacement.resolve(snapshot([fileNode('replacement.ts', { staged: true })]));
+			else replacement.reject(new Error('Revalidation failed'));
+			await recovery;
+			expect(controller.canCommit).toBe(outcome === 'success');
+			expect(controller.message).toBe('Retained draft');
+			if (outcome === 'success') expect(controller.actualSelectedFiles).toEqual(['replacement.ts']);
+			else expect(controller.lastError).toContain('Revalidation failed');
+			controller.dispose();
+		},
+	);
+
+	it('rejects generated text from an earlier serving session without clearing a newer generation', async () => {
+		const controller = makeController();
+		const project = {
+			target: {
+				kind: 'chat' as const,
+				chatId: 'chat1',
+				projectPath: '/project',
+				executorId: 'worker',
+			},
+			executorId: 'worker',
+			chatId: 'chat1',
+			projectPath: '/project',
+			effectiveProjectKey: '/project',
+			executorContextKey: 'session1',
+		};
+		await controller.setProjectState({ kind: 'available', project });
+		await controller.setPresentationVisible(true);
+		controller.message = 'Retained draft';
+		const oldMessage = deferred<{ message: string }>();
+		const newMessage = deferred<{ message: string }>();
+		mockedApi.generateCommitMessage
+			.mockReturnValueOnce(oldMessage.promise)
+			.mockReturnValueOnce(newMessage.promise);
+		const oldGeneration = controller.generateMessage();
+		await vi.waitFor(() => expect(mockedApi.generateCommitMessage).toHaveBeenCalledOnce());
+		await controller.setProjectState({
+			kind: 'available',
+			project: { ...project, executorContextKey: 'session2' },
+		});
+		const newGeneration = controller.generateMessage();
+		await vi.waitFor(() => expect(mockedApi.generateCommitMessage).toHaveBeenCalledTimes(2));
+		oldMessage.resolve({ message: 'Obsolete message' });
+		await oldGeneration;
+		expect(controller.message).toBe('Retained draft');
+		expect(controller.isGeneratingMessage).toBe(true);
+		newMessage.resolve({ message: 'Current message' });
+		await newGeneration;
+		expect(controller.message).toBe('Current message');
+		controller.dispose();
+	});
+
 	it('retains its project state and starts no work while project identity resolves', async () => {
 		const controller = makeController();
 		await controller.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat1', projectPath: '/project' },
 				chatId: 'chat1',
 				projectPath: '/project',
 				effectiveProjectKey: '/canonical/project',
@@ -195,7 +297,11 @@ describe('CommitController', () => {
 
 		await controller.setProjectState({
 			kind: 'resolving',
-			context: { chatId: 'draft', projectPath: '/project' },
+			context: {
+				target: { kind: 'chat' as const, chatId: 'draft', projectPath: '/project' },
+				chatId: 'draft',
+				projectPath: '/project',
+			},
 		});
 		await controller.refreshTree();
 		controller.togglePath('unstaged.ts', true);
@@ -211,6 +317,7 @@ describe('CommitController', () => {
 		await controller.setProjectState({
 			kind: 'available',
 			project: {
+				target: { kind: 'chat' as const, chatId: 'chat2', projectPath: '/project' },
 				chatId: 'chat2',
 				projectPath: '/project',
 				effectiveProjectKey: '/canonical/project',
@@ -284,13 +391,20 @@ describe('CommitController', () => {
 		controller.message = 'test: commit';
 		const commitPromise = controller.commit();
 
-		expect(mockedApi.gitStagePaths).toHaveBeenCalledWith('/project', ['unstaged.ts'], 'stage');
+		expect(mockedApi.gitStagePaths).toHaveBeenCalledWith(
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
+			['unstaged.ts'],
+			'stage',
+		);
 		expect(mockedApi.gitCommitIndex).not.toHaveBeenCalled();
 
 		stage.resolve({ success: true });
 		await commitPromise;
 
-		expect(mockedApi.gitCommitIndex).toHaveBeenCalledWith('/project', 'test: commit');
+		expect(mockedApi.gitCommitIndex).toHaveBeenCalledWith(
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
+			'test: commit',
+		);
 		expect(controller.isPresentationVisible).toBe(true);
 	});
 
@@ -305,9 +419,100 @@ describe('CommitController', () => {
 
 		await controller.generateMessage();
 
-		expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith('/project', ['staged.ts']);
+		expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith(
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
+			['staged.ts'],
+		);
 		expect(controller.message).toBe('src/app: feat: generated');
 		expect(controller.lastError).toBeNull();
+	});
+
+	it('does not overwrite a user edit while generating on the captured node', async () => {
+		const generated = deferred<{ message: string }>();
+		mockedApi.generateCommitMessage.mockReturnValueOnce(generated.promise);
+		const controller = makeController();
+		await controller.setProjectState({
+			kind: 'available',
+			project: {
+				target: {
+					kind: 'chat' as const,
+					chatId: 'chat',
+					projectPath: '/project',
+					executorId: 'remote',
+				},
+				chatId: 'chat',
+				executorId: 'remote',
+				projectPath: '/project',
+				effectiveProjectKey: '/project',
+			},
+		});
+		await controller.setPresentationVisible(true);
+		const pending = controller.generateMessage();
+		await vi.waitFor(() => expect(mockedApi.generateCommitMessage).toHaveBeenCalledOnce());
+		controller.message = 'User-authored commit';
+		generated.resolve({ message: 'Generated commit' });
+		await pending;
+		expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith(
+			{ executorId: 'remote', projectPath: '/project' },
+			['staged.ts'],
+		);
+		expect(controller.message).toBe('User-authored commit');
+		controller.dispose();
+	});
+
+	it('retains commit text after an uncertain mutation without replaying it', async () => {
+		const controller = makeController();
+		await controller.setContext('/project', '/project');
+		await controller.setPresentationVisible(true);
+		controller.message = 'Preserved commit';
+		mockedApi.gitCommitIndex.mockRejectedValueOnce(
+			new ApiError(
+				503,
+				'Inspect the repository before trying again.',
+				'GIT_MUTATION_OUTCOME_UNKNOWN',
+			),
+		);
+		await expect(controller.commit()).resolves.toBe(false);
+		expect(controller.message).toBe('Preserved commit');
+		expect(controller.lastError).toContain('Inspect the repository');
+		expect(mockedApi.gitCommitIndex).toHaveBeenCalledOnce();
+		controller.dispose();
+	});
+
+	it('stops queued staging after uncertainty while retaining selections and commit text', async () => {
+		const staging = deferred<{ success: boolean }>();
+		mockedApi.gitStagePaths.mockReturnValueOnce(staging.promise);
+		const controller = makeController();
+		await controller.setContext('/project', '/project');
+		await controller.setPresentationVisible(true);
+		controller.message = 'Preserved commit';
+		controller.togglePath('unstaged.ts', true);
+		controller.togglePath('loose.ts', true);
+		staging.reject(new ApiError(503, 'Inspect the repository.', 'GIT_MUTATION_OUTCOME_UNKNOWN'));
+		await expect(controller.waitForQueue()).resolves.toBe(false);
+		await controller.refreshTree();
+		expect(mockedApi.gitStagePaths).toHaveBeenCalledOnce();
+		expect(controller.desiredSelectedFiles).toEqual(['staged.ts', 'unstaged.ts', 'loose.ts']);
+		expect(controller.hasPendingStageOperations).toBe(false);
+		expect(controller.hasErrors).toBe(true);
+		expect(controller.message).toBe('Preserved commit');
+		controller.dispose();
+	});
+
+	it('preserves the mutation failure when summary reconciliation also fails', async () => {
+		const refreshSummary = vi.fn().mockResolvedValue(undefined);
+		const controller = makeController({ refreshSummary });
+		await controller.setContext('/project', '/project');
+		await controller.setPresentationVisible(true);
+		controller.message = 'Preserved commit';
+		mockedApi.gitCommitIndex.mockRejectedValueOnce(
+			new ApiError(503, 'Inspect the repository.', 'GIT_MUTATION_OUTCOME_UNKNOWN'),
+		);
+		refreshSummary.mockRejectedValue(new Error('Summary unavailable'));
+		await expect(controller.commit()).resolves.toBe(false);
+		expect(controller.lastError).toContain('Inspect the repository.');
+		expect(controller.message).toBe('Preserved commit');
+		controller.dispose();
 	});
 
 	it('does not publish a generated message into a newly selected project', async () => {
@@ -319,7 +524,10 @@ describe('CommitController', () => {
 
 		const generation = controller.generateMessage();
 		await vi.waitFor(() => {
-			expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith('/project-a', ['staged.ts']);
+			expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ executorId: 'local', projectPath: '/project-a' }),
+				['staged.ts'],
+			);
 		});
 		await controller.setContext('/project-b', '/project-b');
 		generated.resolve({ message: 'message for project A' });
@@ -363,7 +571,10 @@ describe('CommitController', () => {
 		await expect(controller.commit()).resolves.toBe(true);
 
 		expect(controller.isPresentationVisible).toBe(true);
-		expect(mockedApi.gitCommitIndex).toHaveBeenCalledWith('/project', 'test: commit');
+		expect(mockedApi.gitCommitIndex).toHaveBeenCalledWith(
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
+			'test: commit',
+		);
 		expect(mockedApi.getGitWorkbenchSnapshot).toHaveBeenCalledOnce();
 		expect(controller.tree).toEqual([]);
 		expect(refreshSummary).toHaveBeenCalledOnce();
@@ -454,7 +665,10 @@ describe('CommitController', () => {
 
 		stage.resolve({ success: true });
 		await vi.waitFor(() => {
-			expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith('/project', ['unstaged.ts']);
+			expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
+				['unstaged.ts'],
+			);
 		});
 		expect(controller.isRefreshingTree).toBe(true);
 
@@ -492,7 +706,7 @@ describe('CommitController', () => {
 
 		expect(mockedApi.gitStagePaths).toHaveBeenCalledOnce();
 		expect(mockedApi.gitStagePaths).toHaveBeenCalledWith(
-			'/project',
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
 			['src/a.ts', 'src/b.ts'],
 			'stage',
 		);
@@ -526,7 +740,7 @@ describe('CommitController', () => {
 
 		expect(mockedApi.gitStagePaths).toHaveBeenCalledOnce();
 		expect(mockedApi.gitStagePaths).toHaveBeenCalledWith(
-			'/project',
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
 			['src/a.ts', 'src/b.ts'],
 			'unstage',
 		);
@@ -550,7 +764,11 @@ describe('CommitController', () => {
 		expect(await controller.waitForQueue()).toBe(true);
 
 		expect(mockedApi.gitStagePaths).toHaveBeenCalledOnce();
-		expect(mockedApi.gitStagePaths).toHaveBeenCalledWith('/project', ['src/unstaged.ts'], 'stage');
+		expect(mockedApi.gitStagePaths).toHaveBeenCalledWith(
+			expect.objectContaining({ executorId: 'local', projectPath: '/project' }),
+			['src/unstaged.ts'],
+			'stage',
+		);
 	});
 
 	it('keeps the existing tree visible during manual refresh', async () => {
@@ -587,7 +805,7 @@ describe('CommitController', () => {
 		mockedApi.getGitTargetCandidates.mockResolvedValue({
 			targets: [project, worktree],
 		});
-		mockedApi.getGitWorkbenchSnapshot.mockImplementation(async (projectPath) =>
+		mockedApi.getGitWorkbenchSnapshot.mockImplementation(async ({ projectPath }) =>
 			snapshot([
 				fileNode(projectPath === '/project' ? 'project.ts' : 'worktree.ts', {
 					staged: true,
@@ -596,7 +814,7 @@ describe('CommitController', () => {
 			]),
 		);
 		const controller = makeController();
-		await controller.setContext('chat', '/project');
+		await controller.setContext('/project', '/project');
 		await controller.setPresentationVisible(true);
 		controller.message = 'Project draft';
 
@@ -632,12 +850,15 @@ describe('CommitController', () => {
 
 		const pending = controller.generateMessage();
 		await vi.waitFor(() =>
-			expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith('/repo/worktree', ['staged.ts']),
+			expect(mockedApi.generateCommitMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ executorId: 'local', projectPath: '/repo/worktree' }),
+				['staged.ts'],
+			),
 		);
 		mockedApi.getGitTargetCandidates.mockResolvedValueOnce({
 			targets: [project],
 		});
-		await controller.target.refreshForInvalidation('chat', 1);
+		await controller.target.refreshForInvalidation('/repo/worktree', 1);
 		generation.resolve({ message: 'Stale project message' });
 		await pending;
 

@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
+	setExecutorsTestContext();
 	import NewChatDialog from '../NewChatDialog.svelte';
 	import {
 		setAppShell,
@@ -74,6 +76,11 @@
 		focusChat: () => Promise.resolve(),
 	} as never);
 	setModelCatalog({
+		forExecutor() { return this; },
+		isValidated: true,
+		lastValidatedAt: 1,
+		isRefreshing: false,
+		error: null,
 		version: 0,
 		agentMetadata: {
 			claude: { label: 'Claude' },
