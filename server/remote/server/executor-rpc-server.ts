@@ -3,7 +3,6 @@ import {
   type AgentHistoryImport,
   type AgentIntegration,
   type AgentImportedTranscriptRow,
-  type AgentProducerBinding,
   type ExecutionRuntimeApi,
   type ExecutorInfo,
 } from '@garcon/server-agent-interface';
@@ -15,12 +14,15 @@ import { TerminalRpcServer } from './terminal-rpc-server.js';
 import { GitRpcServer } from './git-rpc-server.js';
 import { isGitRpcMethod, type GitRpcRequest } from '../transport/git-protocol.js';
 import { historyPages } from '../transport/history-pages.js';
+import type { ProducerRelay, ProducerRelaySession } from './producer-relay.js';
 
 interface HistoryReader {
   readonly iterator: AsyncIterator<readonly AgentImportedTranscriptRow[]>;
   readonly controller: AbortController;
   timer: ReturnType<typeof setTimeout> | null;
-  reading: boolean;
+  // Pipelined page requests read the iterator one at a time in page order.
+  requestedPages: number;
+  tail: Promise<unknown>;
 }
 
 export interface ExecutorRpcServer {
@@ -28,7 +30,12 @@ export interface ExecutorRpcServer {
   dispose(): Promise<void>;
 }
 
-export function serveExecutionRuntime(runtime: ExecutionRuntimeApi, rpc: ExecutorRpc): ExecutorRpcServer {
+// `relay` outlives this session: it keeps bindings resumable by the next one.
+export function serveExecutionRuntime(
+  runtime: ExecutionRuntimeApi,
+  rpc: ExecutorRpc,
+  relay: ProducerRelay,
+): ExecutorRpcServer {
   let info: ExecutorInfo;
   let disposed = false;
   let terminalWorker: TerminalRpcServer | null = null;
@@ -36,10 +43,10 @@ export function serveExecutionRuntime(runtime: ExecutionRuntimeApi, rpc: Executo
   let disconnectTerminals = () => {};
   const unsubscribeAvailability = rpc.transport.onAvailability((connected) => { if (!connected) disconnectTerminals(); });
   const integrations = new Map<string, AgentIntegration>();
-  const bindings = new Map<string, { integration: AgentIntegration; ref: AgentProducerBinding }>();
+  const producerSession: ProducerRelaySession = { offer: (payload) => rpc.offerProducer(payload) };
+  relay.shortenSuspendedGrace();
   const readers = new Map<string, AgentResourceTable<'history-reader', HistoryReader>>();
   const readerResources = new Set<HistoryReader>();
-  const subscriptions = new Set<() => void>();
   const ready = (async () => {
     info = await runtime.getInfo();
     gitWorker = new GitRpcServer(runtime);
@@ -54,20 +61,17 @@ export function serveExecutionRuntime(runtime: ExecutionRuntimeApi, rpc: Executo
       if (disposed) throw new AgentCallError('not-dispatched', 'Worker session retired');
       integrations.set(id, integration);
       readers.set(id, new AgentResourceTable(integration.producers.scope, 'history-reader', 16));
-      subscriptions.add(integration.producers.subscribe((notification) => rpc.publish({ type: 'producer', notification })));
+      relay.track(integration);
     }
   })();
   const dispose = async (): Promise<void> => {
     if (disposed) return;
     disposed = true;
-    for (const { integration, ref } of bindings.values()) integration.producers.detach(ref);
-    bindings.clear();
+    relay.suspend(producerSession);
     unsubscribeAvailability();
     disconnectTerminals();
     unsubscribe();
     rpc.retireUnknown();
-    for (const unsubscribeProducer of subscriptions) unsubscribeProducer();
-    subscriptions.clear();
     for (const resource of readerResources) {
       if (resource.timer) clearTimeout(resource.timer);
       resource.controller.abort();
@@ -79,6 +83,7 @@ export function serveExecutionRuntime(runtime: ExecutionRuntimeApi, rpc: Executo
   let unsubscribe = () => {};
   unsubscribe = rpc.transport.onFailure(() => { void dispose(); });
   void ready.catch((error: unknown) => rpc.transport.close(error instanceof Error ? error : new Error(String(error))));
+  rpc.onProducerAck((acknowledgements) => relay.acknowledge(producerSession, acknowledgements));
   rpc.onTerminalDetach(async (request) => {
     await ready;
     if (!disposed) await terminalWorker?.handle({ method: 'terminals.detach', request });
@@ -131,14 +136,18 @@ export function serveExecutionRuntime(runtime: ExecutionRuntimeApi, rpc: Executo
       case 'producers.bind': {
         await integration.producers.bind(call.request, options);
         if (disposed) integration.producers.detach(call.request.binding);
-        else bindings.set(call.request.binding.id, { integration, ref: call.request.binding });
+        else relay.bind(producerSession, integration, call.request.binding);
         return;
       }
       case 'producers.close': {
-        if (bindings.get(call.request.id)?.integration !== integration) throw new AgentCallError('rejected', 'Producer binding belongs to a retired session', 'STALE_RESOURCE');
+        if (!relay.owns(producerSession, integration, call.request)) throw new AgentCallError('rejected', 'Producer binding belongs to a retired session', 'STALE_RESOURCE');
         await integration.producers.close(call.request, options);
-        bindings.delete(call.request.id);
+        relay.close(call.request);
         return;
+      }
+      case 'producers.resume': {
+        if (!Array.isArray(call.request?.bindings)) throw new AgentCallError('rejected', 'Invalid producer resume request');
+        return { resumed: relay.resume(producerSession, integration, call.request.bindings) };
       }
       case 'permissions.respond': return integration.permissions.respond(call.request, options);
       case 'execution.start': return integration.execution.start(call.request, options);
@@ -177,7 +186,7 @@ export function serveExecutionRuntime(runtime: ExecutionRuntimeApi, rpc: Executo
         const controller = new AbortController();
         const iterator = historyPages(history.load({ ...call.request.request, signal: controller.signal }));
         const table = readers.get(call.integrationId)!;
-        const resource: HistoryReader = { iterator, controller, timer: null, reading: false };
+        const resource: HistoryReader = { iterator, controller, timer: null, requestedPages: 0, tail: Promise.resolve() };
         let ref;
         try {
           ref = table.add(resource);
@@ -196,18 +205,23 @@ export function serveExecutionRuntime(runtime: ExecutionRuntimeApi, rpc: Executo
         return ref;
       }
       case 'history.next': {
-        const resource = readers.get(call.integrationId)!.get(call.request);
-        if (resource.reading) throw new AgentCallError('rejected', 'Concurrent history reads are not permitted');
-        resource.reading = true;
+        const resource = readers.get(call.integrationId)!.get(call.request.reader);
+        if (call.request.page !== resource.requestedPages) {
+          throw new AgentCallError('rejected', 'History pages must be requested in order');
+        }
+        resource.requestedPages += 1;
         resource.timer?.refresh();
+        const page = resource.tail.then(async () => {
+          const result = await resource.iterator.next();
+          return { done: result.done === true, rows: result.value ?? [] };
+        });
+        resource.tail = page.catch(() => undefined);
         const abort = () => resource.controller.abort();
         signal.addEventListener('abort', abort, { once: true });
         try {
-          const result = await resource.iterator.next();
-          return { done: result.done === true, rows: result.value ?? [] };
+          return await page;
         } finally {
           signal.removeEventListener('abort', abort);
-          resource.reading = false;
         }
       }
       case 'history.close': {

@@ -32,7 +32,7 @@ describe('TranscriptReloadService', () => {
         'user-input',
         'provider-row',
       ]);
-      expect(ledger.conversationMessages('chat-1').map((message) => message.content)).toEqual([
+      expect((await ledger.conversationMessages('chat-1')).map((message) => message.content)).toEqual([
         'frozen prompt',
         'frozen answer',
         'native prompt',
@@ -47,6 +47,43 @@ describe('TranscriptReloadService', () => {
       expect(lease.closed).toBe(true);
       expect(firstReplacementLease?.closed).toBe(true);
       expect(replacementLease.current?.closed).toBe(false);
+    });
+  });
+
+  it('reports reading progress per native batch before saving the imported rows', async () => {
+    await withReload(async ({ reload, integration }) => {
+      integration.nativeHistoryImport.load = async function* load() {
+        yield [{ message: new UserMessage(TS, 'native prompt') }];
+        yield [
+          { message: new AssistantMessage(TS, 'native answer') },
+          { message: new AssistantMessage(TS, 'native follow-up') },
+        ];
+      };
+      const progress = [];
+
+      await reload.reload('chat-1', { onProgress: (update) => progress.push(update) });
+
+      expect(progress).toEqual([
+        { phase: 'reading', rows: 0 },
+        { phase: 'reading', rows: 1 },
+        { phase: 'reading', rows: 3 },
+        { phase: 'saving', rows: 3 },
+      ]);
+    });
+  });
+
+  it('stops reading native history when cancelled and keeps the current view', async () => {
+    await withReload(async ({ ledger, reload, integration }) => {
+      const cancellation = new AbortController();
+      integration.nativeHistoryImport.load = async function* load() {
+        yield [{ message: new UserMessage(TS, 'native prompt') }];
+        cancellation.abort(new Error('reload cancelled'));
+        yield [{ message: new AssistantMessage(TS, 'native answer') }];
+      };
+
+      await expect(reload.reload('chat-1', { signal: cancellation.signal }))
+        .rejects.toThrow('reload cancelled');
+      expect(ledger.currentView('chat-1')?.viewId).toBe('view-1');
     });
   });
 
@@ -69,7 +106,7 @@ describe('TranscriptReloadService', () => {
 
       await expect(reload.reload('chat-1')).rejects.toThrow('native iteration failed');
       expect(ledger.currentView('chat-1')?.viewId).toBe('view-1');
-      expect(ledger.conversationMessages('chat-1').map((message) => message.content)).toEqual([
+      expect((await ledger.conversationMessages('chat-1')).map((message) => message.content)).toEqual([
         'frozen prompt',
         'frozen answer',
         'old current prompt',
@@ -83,7 +120,7 @@ describe('TranscriptReloadService', () => {
         rows: [{ message: new AssistantMessage(TS, 'output after failed reload') }],
       });
       expect(ledger.currentView('chat-1')?.viewId).toBe('view-1');
-      expect(ledger.conversationMessages('chat-1').at(-1)?.content)
+      expect((await ledger.conversationMessages('chat-1')).at(-1)?.content)
         .toBe('output after failed reload');
     });
   });
@@ -112,7 +149,7 @@ describe('TranscriptReloadService', () => {
 
       await reload.reload('chat-1');
       expect(ledger.currentView('chat-1')?.viewId).not.toBe(oldViewId);
-      expect(ledger.conversationMessages('chat-1').map((message) => message.content)).toEqual([
+      expect((await ledger.conversationMessages('chat-1')).map((message) => message.content)).toEqual([
         'frozen prompt',
         'frozen answer',
         'native prompt',
@@ -152,7 +189,7 @@ describe('TranscriptReloadService', () => {
         'provider-row',
         'session',
       ]);
-      expect(ledger.conversationMessages('chat-1').map((message) => message.content)).toEqual([
+      expect((await ledger.conversationMessages('chat-1')).map((message) => message.content)).toEqual([
         'frozen prompt',
         'frozen answer',
       ]);
@@ -205,7 +242,7 @@ describe('TranscriptReloadService', () => {
 
       expect(injection.triggered).toBe(true);
       expect(ledger.currentView('chat-1')?.viewId).toBe(oldViewId);
-      expect(ledger.conversationMessages('chat-1').map((message) => message.content)).toEqual([
+      expect((await ledger.conversationMessages('chat-1')).map((message) => message.content)).toEqual([
         'frozen prompt',
         'frozen answer',
         'old current prompt',
@@ -262,7 +299,7 @@ describe('TranscriptReloadService', () => {
 
       await reload.reload('chat-1');
 
-      expect(ledger.conversationMessages('chat-1').map((message) => message.content)).toEqual([
+      expect((await ledger.conversationMessages('chat-1')).map((message) => message.content)).toEqual([
         'frozen prompt',
         'frozen answer',
         'native unanswered prompt',

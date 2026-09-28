@@ -93,7 +93,7 @@ export interface ServerEventWiringDeps {
   queue: ChatExecutionCoordinator;
   processing: ChatProcessingActivity;
   metadata: MetadataIndex;
-  currentTranscriptMessages(chatId: string): readonly ChatMessage[];
+  currentTranscriptMessages(chatId: string): Promise<readonly ChatMessage[]>;
   transientFeeds: ChatTransientFeedStore;
   commandLedger: CommandLedger;
   shareStore: ShareStore;
@@ -381,8 +381,8 @@ export function wireServerEvents({
     updateMetadata: (chatId, messages) => {
       metadata.updateFromAppendedMessages(chatId, [...messages]);
     },
-    replaceMetadata: (chatId) => {
-      metadata.replaceFromTranscriptView(chatId, currentTranscriptMessages(chatId));
+    replaceMetadata: async (chatId) => {
+      metadata.replaceFromTranscriptView(chatId, await currentTranscriptMessages(chatId));
     },
     resendCandidates: (chatId) => processing.phase(chatId) === null
       ? agentRegistry.resendCandidates(chatId)
@@ -672,10 +672,18 @@ export function wireServerEvents({
     }
   };
   executors.onChanged(() => broadcast(new ExecutorsChangedMessage(executors.list())));
+  // Running turns on an executor show whether its link is reconnecting.
+  const publishExecutorProcessing = (executorId: string) => {
+    for (const { chatId } of processing.snapshot()) {
+      if (effectiveExecutorId(chatRegistry.getChat(chatId)?.executorId) === executorId) publishProcessing(chatId);
+    }
+  };
   executors.onAvailabilityChanged((executorId, availability) => {
+    if (availability === 'reconnecting' || availability === 'ready') publishExecutorProcessing(executorId);
     if (availability === 'offline') agentRegistry.executionSessionLost(executorId);
     if (availability === 'ready') {
       logger.info('Executor ready', { executorId });
+      agentRegistry.executionSessionResumed(executorId);
       executorReady(executorId);
     }
   });

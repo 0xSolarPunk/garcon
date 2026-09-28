@@ -49,6 +49,44 @@ it('isolates executor loss and queue wake-up, and publishes complete executor sn
   expect(fixture.published).toContainEqual({ type: 'executors-changed', executors });
 });
 
+it('keeps runs through a reconnect and resumes deferred work when ready', async () => {
+  const fixture = createFixture();
+  fixture.executor.availability('local', 'reconnecting');
+  expect(fixture.agentRegistry.executionSessionLost).not.toHaveBeenCalled();
+  expect(fixture.agentRegistry.executionSessionResumed).not.toHaveBeenCalled();
+  expect(fixture.queueService.triggerDrain).not.toHaveBeenCalled();
+  fixture.executor.availability('local', 'ready');
+  await Promise.resolve();
+  expect(fixture.agentRegistry.executionSessionResumed.mock.calls).toEqual([['local']]);
+  expect(fixture.agentRegistry.executionSessionLost).not.toHaveBeenCalled();
+  expect(fixture.queueService.triggerDrain).toHaveBeenCalledWith('chat-1');
+});
+
+it('republishes the processing phase of running chats whose executor starts reconnecting', async () => {
+  const remote = '22222222-2222-4222-8222-222222222222';
+  const fixture = createFixture({
+    chatRegistry: {
+      getChat: (id) => ({ executorId: id === 'remote-chat' ? remote : undefined }),
+      hasChat: () => true,
+    },
+    processing: {
+      phase: mock((chatId) => (chatId === 'remote-chat' ? 'reconnecting' : 'running')),
+      snapshot: mock(() => [
+        { chatId: 'local-chat', phase: 'running' },
+        { chatId: 'remote-chat', phase: 'reconnecting' },
+      ]),
+    },
+  });
+
+  fixture.executor.availability(remote, 'reconnecting');
+  await fixture.wiring.waitForIdle();
+
+  expect(fixture.published.filter((payload) => payload.type === 'chat-processing-updated')).toEqual([
+    { type: 'chat-processing-updated', chatId: 'remote-chat', phase: 'reconnecting' },
+  ]);
+  expect(fixture.agentRegistry.executionSessionLost).not.toHaveBeenCalled();
+});
+
 it('settles executor loss and drains only when ready', async () => {
   const fixture = createFixture();
   fixture.executor.availability('local', 'offline');
@@ -140,6 +178,7 @@ function createFixture(overrides = {}) {
     settleTurn: mock(() => undefined),
     discardTurn: mock(() => undefined),
     executionSessionLost: mock(() => undefined),
+    executionSessionResumed: mock(() => undefined),
     ...overrides.agentRegistry,
   };
   const queueService = overrides.queueService ?? {
@@ -203,6 +242,7 @@ function createFixture(overrides = {}) {
   };
   const processing = {
     phase: mock(() => null),
+    snapshot: mock(() => []),
     ...overrides.processing,
   };
   const ownershipJournal = {

@@ -37,6 +37,7 @@ import { ChatProcessingActivity } from './chats/chat-processing-activity.js';
 import { ChatRowService } from './chats/chat-row-service.js';
 import { TranscriptExportService } from './chats/transcript-export/service.js';
 import { HandoffArtifactService } from './chats/handoff-artifact/service.js';
+import { TokenFittingWorker } from './chats/token-fitting/client.js';
 import { TranscriptSearchController } from './chats/search/controller.js';
 import { TranscriptSearchSettingsCoordinator } from './chats/search/settings-coordinator.js';
 import { AgentRegistry, createForkNativeHistoryReader } from './agents/index.js';
@@ -79,6 +80,7 @@ import {
   waitForShutdownPhasesWithTimeout,
 } from './lib/shutdown.js';
 import { WebSocketAdmissionController } from '../common/websocket-capacity.js';
+import { monitorEventLoopStalls } from '../common/event-loop-stalls.js';
 import { TranscriptSearchService } from '@garcon/server-agent-common/search/transcript-search-service';
 import { ScheduledPromptStore } from './scheduled-prompts/store.js';
 import { ScheduledPromptRunLog } from './scheduled-prompts/run-log.js';
@@ -465,8 +467,10 @@ export async function startServer(): Promise<void> {
     await metadata.init();
 
     const transientFeeds = new ChatTransientFeedStore(runtimeState.identity.instanceId);
+    const tokenFitting = new TokenFittingWorker();
     carryOverCompaction = new CarryOverCompactionService({
       agents: agentRegistry,
+      fitting: tokenFitting,
       getUiSettings: () => settings.getUiSettings(),
       onCompactionStarted(chatId) {
         eventWiring?.notifyOperationalNotice(
@@ -572,7 +576,11 @@ export async function startServer(): Promise<void> {
       chatMutationLock,
       logger,
     });
-    const chatProcessingActivity = new ChatProcessingActivity(agentRegistry, queue);
+    const chatProcessingActivity = new ChatProcessingActivity(agentRegistry, queue, {
+      isChatExecutorReconnecting: (chatId) => executors.isReconnecting(
+        effectiveExecutorId(chatRegistry.getChat(chatId)?.executorId),
+      ),
+    });
     const lastSelectedChat = new InMemoryLastSelectedChatState();
     const chatIds = new ChatIdAllocator(chatRegistry);
     const chatListProjector = new ChatListProjector({
@@ -595,6 +603,7 @@ export async function startServer(): Promise<void> {
     const handoffArtifact = new HandoffArtifactService({
       summaries: chatListProjector,
       transcripts: transcriptReader,
+      fitting: tokenFitting,
     });
     const chatCommands = new ChatCommandService({
       chats: chatRegistry,
@@ -765,8 +774,8 @@ export async function startServer(): Promise<void> {
           transcriptReader.replay(chatId, viewId, afterOrdinal, throughOrdinal),
         resendCandidates: (chatId) => agentRegistry.resendCandidates(chatId),
       },
-      transcriptReload: async (chatId) => {
-        await transcriptReload.reload(chatId);
+      transcriptReload: async (chatId, options) => {
+        await transcriptReload.reload(chatId, options);
         return transcriptReader.page(chatId, 100);
       },
       queue,
@@ -878,9 +887,12 @@ export async function startServer(): Promise<void> {
     }
 
     // Graceful shutdown: flush pending writes and clean up timers.
+    // Browser heartbeats and executor links both treat a long stall as a lost peer.
+    const stopStallMonitor = monitorEventLoopStalls(logger);
     const shutdown = async () => {
       if (shuttingDown) return;
       shuttingDown = true;
+      stopStallMonitor();
       primaryDelivery.close();
       agentCommands.shutdown();
       carryOverGarbageCollector.shutdown();
@@ -927,6 +939,7 @@ export async function startServer(): Promise<void> {
         unsubscribeSearchStatus();
         unsubscribeSearchAvailability();
         await chatSearch.close();
+        tokenFitting.close();
         await executors.dispose();
         transcriptLedger.close();
         terminalManager.shutdown();
