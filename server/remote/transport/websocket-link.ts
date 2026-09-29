@@ -33,6 +33,7 @@ export interface WebSocketLinkOptions {
 }
 
 export const EXECUTOR_NOISE_CONTEXT = 'garcon-executor/v1';
+const LISTENER_STOP_SETTLE_MS = 25;
 
 // Peers must share both the release and the wire protocol revision.
 const LINK_VERSION = `${packageVersion}+protocol.${EXECUTOR_PROTOCOL_REVISION}`;
@@ -207,9 +208,10 @@ export class WebSocketLink {
     this.#listenerNoise = null;
     const server = this.#server;
     this.#server = null;
-    // Bun may leave a closed WebSocket in the server's active-connection set indefinitely.
-    // Starting listener shutdown is synchronous; waiting for that bookkeeping promise would hang disposal.
-    void server?.stop(true).catch(() => undefined);
+    // Bun starts listener shutdown synchronously but may retain a closed WebSocket in its
+    // active set indefinitely. Bounds only the bookkeeping wait so callers can reuse the port.
+    const stopped = server?.stop(true).catch(() => undefined);
+    if (stopped) await Promise.race([stopped, Bun.sleep(LISTENER_STOP_SETTLE_MS)]);
   }
 
   #noiseOptions(): NoiseOptions {
