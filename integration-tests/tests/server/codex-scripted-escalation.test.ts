@@ -152,14 +152,15 @@ describe('scripted Codex escalation', () => {
         }
 
         const streamed = await fixture.client.getMessages(chatId);
-        const streamedExecutions = expectExecutions(streamed, command, marker, sandboxDenied ? 2 : 1);
-        if (sandboxDenied) expect(streamedExecutions[0]?.isError).toBe(true);
+        // A sandbox-denied native attempt exists only in Codex's rollout. Garcon persists the
+        // streamed escalated retry and does not reconcile the native-only attempt into history.
+        const streamedExecutions = expectExecutions(streamed, command, marker, 1);
         expect(assistantContents(streamed.messages).some((content) => content.includes(reply)))
           .toBe(true);
 
         await fixture.restartGarcon();
         const restored = await fixture.client.getMessages(chatId);
-        expect(expectExecutions(restored, command, marker, sandboxDenied ? 2 : 1)).toEqual(streamedExecutions);
+        expect(expectExecutions(restored, command, marker, 1)).toEqual(streamedExecutions);
         expect(countUserContent(restored.messages, prompt)).toBe(1);
         testEnvironment.model.assertSettled();
       }, {
