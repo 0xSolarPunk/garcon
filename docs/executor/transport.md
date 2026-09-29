@@ -152,8 +152,9 @@ run active instead of failing the turn. The worker's relay records each
 binding's latest launch until its run ends or it fails, and the resume reply
 reports it with the sequence number the binding's replay ends at; the relay
 keeps that frame when pressure drops older rows. A launch that settles after
-its session was lost publishes its outcome on the binding instead: its own
-failure, or the dispatch failure below when the lost session cancelled it.
+its session was lost publishes its outcome on the binding instead: its handle,
+or for any failure the dispatch failure below. The lost session cancels its
+calls, so a failure the loss caused cannot be told apart from the launch's own.
 Once the replay reaches that sequence number, the controller settles every
 launch whose reply it had lost when it requested the resume: a run the worker
 is executing keeps a reachable handle, so Stop reaches it, and a Stop pressed
@@ -161,6 +162,17 @@ during the gap aborts it; a run the worker never began fails as a dispatch
 failure: "The executor connection was lost before this turn started. Send it
 again." A launch dispatched on the new session settles through its own reply,
 even while the replay is still arriving.
+
+A reply the worker's session queue cannot take reaches the controller as an
+unknown outcome on a live session: "The executor's reply could not be
+delivered, so the outcome is unknown." For a launch, the relay then publishes
+the outcome on the binding behind that reply, so a running turn keeps a
+reachable handle and a failed one reports its own failure. A launch cancelled
+by Stop, shutdown, or deletion also ends with an unknown outcome, but the same
+action already ends or removes its run. A launch that fails on the worker
+reports a definite failure even when a nested call, such as a credential read,
+had an unknown outcome; an unknown credential read fails as "Provider
+credential could not be read from the controller. Try again."
 
 A binding the worker no longer holds, a restarted worker (new instance ID), or
 an expired controller grace falls back to the loss path: the controller fails
@@ -182,16 +194,22 @@ more is logged with its operation name (`executor-slow-step` on a worker). Each
 closed connection that carried a session is logged with its cause and the
 link's running count for that cause (`executor-link-closed` on a worker):
 `liveness-timeout`, `socket-closed`, `socket-error`, `protocol-error`,
-`session-retired`, or `local-close`. When known, the log adds the reason: the
-Noise error code of a connection that ended without an encrypted close, such
-as `TRANSPORT_CLOSED` when a tunnel drops it, or the error that retired the
-session. A link failure carries the same code and is logged when it differs
-from the previous failure, until a session starts (`executor-unavailable` on a
-worker). The controller logs a session whose setup fails with the stage it
-reached (`describe`, `start-integrations`, `resume-bindings`, or `activate`)
-and the session's own reason rather than the generic loss its pending call
-reports. A parse error's message can echo the payload it failed on, so it is
-logged, and crosses the link, as `Malformed data`.
+`record-limit`, `session-retired`, or `local-close`. A record that fails Noise
+authentication or framing counts as `protocol-error`, a Noise handshake or
+message timeout as `liveness-timeout`, and a transport failure as
+`socket-error`; a socket the peer or network closed without an authenticated
+close record counts as `socket-closed`. `record-limit` marks a busy long-lived
+link that used up Noise's per-key record budget and reconnects with fresh keys.
+When known, the log adds the reason: the Noise error code of a connection that
+ended without an encrypted close, such as `TRANSPORT_CLOSED` when a tunnel
+drops it, or the error that retired the session. A link failure carries the
+same code and is logged when it differs from the previous failure, until a
+session starts (`executor-unavailable` on a worker). The controller logs a
+session whose setup fails with the stage it reached (`describe`,
+`start-integrations`, `resume-bindings`, or `activate`) and the session's own
+reason rather than the generic loss its pending call reports. A parse error's
+message can echo the payload it failed on, so it is logged, and crosses the
+link, as `Malformed data`.
 
 Only producer notifications and launch outcomes resume. Other RPC replies lost
 with a session remain uncertain outcomes, and requests are never resent. Hung

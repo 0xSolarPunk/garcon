@@ -88,7 +88,7 @@ export function serveExecutionRuntime(
     await ready;
     if (!disposed) await terminalWorker?.handle({ method: 'terminals.detach', request });
   });
-  rpc.handle(async (call, signal) => {
+  rpc.handle(async (call, signal, _guardReply, onUndeliveredReply) => {
     await ready;
     if (disposed || signal.aborted) throw new AgentCallError('not-dispatched', 'Worker session retired or request cancelled');
     if (call.method === 'executor.describe') return { info, integrations: [...integrations.values()].map(manifest) };
@@ -154,9 +154,9 @@ export function serveExecutionRuntime(
       }
       case 'permissions.respond': return integration.permissions.respond(call.request, options);
       case 'execution.start':
-        return relay.launch(producerSession, integration, call.request, signal, () => integration.execution.start(call.request, options));
+        return relay.launch(producerSession, integration, call.request, onUndeliveredReply, () => integration.execution.start(call.request, options));
       case 'execution.resume':
-        return relay.launch(producerSession, integration, call.request, signal, () => integration.execution.resume(call.request, options));
+        return relay.launch(producerSession, integration, call.request, onUndeliveredReply, () => integration.execution.resume(call.request, options));
       case 'execution.abort': return integration.execution.abort(call.request, options);
       case 'execution.runningSessions': return integration.execution.runningSessions(options);
       case 'catalog.snapshot': return integration.catalog.snapshot({ ...call.request, signal });
@@ -174,7 +174,7 @@ export function serveExecutionRuntime(
       case 'commands.discover': return required(integration.commands).discover(call.request.projectPath, signal);
       case 'compaction.compact': {
         const compaction = required(integration.compaction);
-        return relay.launch(producerSession, integration, call.request, signal, () => compaction.compact(call.request, options));
+        return relay.launch(producerSession, integration, call.request, onUndeliveredReply, () => compaction.compact(call.request, options));
       }
       case 'forking.fork': return required(integration.forking).fork({ ...call.request, signal });
       case 'forking.discard': return required(integration.forking).discard(call.request, signal);

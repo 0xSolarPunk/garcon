@@ -43,6 +43,7 @@ export type LinkClosureCause =
   | 'socket-closed'
   | 'socket-error'
   | 'protocol-error'
+  | 'record-limit'
   | 'session-retired'
   | 'local-close';
 
@@ -392,10 +393,13 @@ export class WebSocketLink {
   }
 }
 
-// Classifies a connection that Noise ended with an error.
+// Classifies a connection that Noise ended with an error. A busy long-lived link
+// that uses up its per-key record budget must reconnect with fresh keys, which
+// is routine rather than a protocol failure.
 function noiseClosureCause(code: NoiseErrorCode): LinkClosureCause {
   switch (code) {
     case 'TRANSPORT_CLOSED': return 'socket-closed';
+    case 'RECORD_LIMIT': return 'record-limit';
     case 'TRANSPORT_ERROR':
     case 'BACKPRESSURE': return 'socket-error';
     case 'HANDSHAKE_TIMEOUT':

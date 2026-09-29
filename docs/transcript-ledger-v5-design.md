@@ -2630,7 +2630,8 @@ relevant-entry definition under the 10.2 obligation.
 | Direct Responses checkpoint is unresolved before output | One fallback request uses the bounded native-history projection without `previous_response_id`; unrelated errors, post-output errors, and fallback failure do not retry. |
 | User interrupt | Run marked stopped in memory; `run-ended: interrupted` appended immediately; provider abort best-effort; the interruption row is transparent to the resend scan. |
 | Remote executor link lost; a replacement session resumes within the grace | Runs stay active in the `reconnecting` processing phase. The worker replays events after the controller's last received sequence number, and duplicates are ignored, so each event reaches the sink once. A permission answer during the gap fails as unavailable and stays actionable; Stop is delivered after resume. |
-| A remote start, resume, or compaction reply is lost with its session | The run stays active and the turn is not reported failed. After resume the worker reports the binding's latest launch, or publishes the outcome of one that settles later. A run it is executing keeps a reachable handle and a Stop pressed during the gap aborts it; a run it never began appends `run-ended: failed` (`origin: 'core'`) with "The executor connection was lost before this turn started. Send it again."; a launch that fails for another reason after the loss reports its own failure. A turn started on the new session settles through its own reply. |
+| A remote start, resume, or compaction reply is lost with its session | The run stays active and the turn is not reported failed. After resume the worker reports the binding's latest launch, or publishes the outcome of one that settles later. A run it is executing keeps a reachable handle and a Stop pressed during the gap aborts it; a run it never began appends `run-ended: failed` (`origin: 'core'`) with "The executor connection was lost before this turn started. Send it again.", as does a launch that fails for any reason after the loss, because the lost session cancels it. A turn started on the new session settles through its own reply. |
+| A remote launch reply cannot be delivered on a live session | The worker substitutes an unknown outcome and publishes the launch's outcome on its binding, so the run stays active with a reachable handle, or fails with the launch's own failure. |
 | A remote producer event or resume report cannot be read, or a controller consumer throws on an event | The session stays up. An undecodable row batch is logged and recorded as undelivered output; consecutive ones record one notice on the active run, as for dropped rows. Any other unreadable event, such as a permission request or a launch outcome, and an unreadable resume report fail the run with `OUTCOME_UNKNOWN`, and closing the binding stops the native turn. A consumer's exception is logged, and the other consumers still receive the event. |
 | Remote output retained during the gap, or backed up behind a slow link, exceeds the relay budget | The oldest row batches are dropped and one notice on the active run reports undelivered output; manual Reload after the turn recovers it. Session, permission, and run facts are never dropped. |
 | Reconnect grace expires, the worker restarted, or the worker no longer holds the binding | The run fails with `OUTCOME_UNKNOWN` and the manual Reload warning. After its own grace the worker detaches the binding, drops later output, and denies pending permissions. |
@@ -3089,26 +3090,27 @@ The catalog cites this revision, but its inventory is not repeated here.
   session queue through one session, the gap notice, a binding the worker
   released, an expired controller grace, a restarted worker, and a restarted
   controller's unresumed binding over real links; lost launch replies, whether
-  the request never arrived, a disconnect cancelled admission, or only the
-  reply was lost, settled in both dial directions and through the runtime
-  router, including a Stop during the gap and a turn started while the replay
-  still drains; output replayed while a session installs reaching the ledger
-  once; consecutive undecodable row batches recorded as one notice while the
-  session stays up, and through the runtime router during a reconnect; an
-  unreadable publication failure, permission request, launch outcome, or
-  resume report failing only its binding, with the permission request and
-  launch outcome failing the turn and stopping it through the runtime router;
-  a binding closed, failed or by its owner, through a replacement session that
-  is still installing; a consumer that throws, including while a replacement
-  session installs; a pending permission that survives a blip through the
-  runtime router and through the pinned Claude CLI; and the browser's
-  reconnecting indicator.
+  the request never arrived, a disconnect cancelled admission, only the reply
+  was lost, or the worker's session could not take the reply, settled in both
+  dial directions and through the runtime router, including a Stop during the
+  gap and a turn started while the replay still drains; output replayed while
+  a session installs reaching the ledger once; consecutive undecodable row
+  batches recorded as one notice while the session stays up, and through the
+  runtime router during a reconnect; an unreadable publication failure,
+  permission request, launch outcome, or resume report failing only its
+  binding, with the permission request and launch outcome failing the turn and
+  stopping it through the runtime router; a binding closed, failed or by its
+  owner, through a replacement session that is still installing; a consumer
+  that throws, including while a replacement session installs; a pending
+  permission that survives a blip through the runtime router and through the
+  pinned Claude CLI; and the browser's reconnecting indicator.
 - **Responsiveness**: a 30,000-row Direct chat reloads, forks, and renders a
   handoff artifact in every execution lane while WebSocket pings stay under
-  100 ms. The Claude, Pi, Amp, OpenCode, Factory, Cursor, and Direct
-  long-history loads, and the shared draft conversion, each keep their
-  longest event-loop gap under a limit that a single synchronous pass over
-  the same history exceeds.
+  200 ms, which leaves room for shared CI runners. The Claude, Codex, Pi, Amp,
+  OpenCode, Factory, Cursor, and Direct long-history loads, Codex's paginated
+  history, the Claude session fork, and the shared draft conversion each keep
+  their longest event-loop gap under a limit that a single synchronous pass
+  over the same history exceeds.
 - **Scripted tiers**: the existing real-binary scripted suites (Claude,
   Codex, OpenCode, Pi) are retained and re-anchored on end-state ledger
   assertions through direct V5 assertions. Live credential suites

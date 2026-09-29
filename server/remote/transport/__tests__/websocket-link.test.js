@@ -173,6 +173,31 @@ for (const dialer of ['controller', 'worker']) {
 }
 
 for (const dialer of ['controller', 'worker']) {
+  test(`counts a corrupted encrypted record as a protocol error where it arrives (${dialer} dials)`, async () => {
+    const common = { executorId: 'synthetic-executor', secret, allowInsecureDevelopment: true, reconnectDelayMs: 20 };
+    const controller = new WebSocketLink({ ...common, role: 'controller' });
+    const worker = new WebSocketLink({ ...common, role: 'worker' });
+    const [dialing, listening] = dialer === 'controller' ? [controller, worker] : [worker, controller];
+    const proxy = await tcpLinkProxy(new URL(listening.listen()));
+    const closures = { dialing: [], listening: [] };
+    dialing.onClosure(closure => closures.dialing.push(closure));
+    listening.onClosure(closure => closures.listening.push(closure));
+    try {
+      dialing.dial(proxy.url);
+      const [session] = await Promise.all([dialing.ready, listening.ready]);
+      proxy.corruptNextToTarget();
+      session.send('synthetic payload');
+      await eventually(() => closures.dialing.length === 1 && closures.listening.length === 1);
+
+      expect(closures.listening).toEqual([
+        { cause: 'protocol-error', count: 1, reason: 'Encrypted connection failed (AUTHENTICATION_FAILED)' },
+      ]);
+      expect(closures.dialing).toEqual([
+        { cause: 'socket-closed', count: 1, reason: 'Encrypted connection failed (TRANSPORT_CLOSED)' },
+      ]);
+    } finally { await controller.dispose(); await worker.dispose(); await proxy.close(); }
+  });
+
   test(`reports a dropped network path with its Noise error code on both ends (${dialer} dials)`, async () => {
     const common = { executorId: 'synthetic-executor', secret, allowInsecureDevelopment: true, reconnectDelayMs: 60_000 };
     const controller = new WebSocketLink({ ...common, role: 'controller' });

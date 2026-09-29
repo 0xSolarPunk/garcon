@@ -199,6 +199,28 @@ export function isProducerResumeReply(encoded: string): boolean {
   return encoded.startsWith('{"type":"result"') && encoded.includes('"resumed":');
 }
 
+// Matches the reply that carries a launch's execution handle.
+export function isExecutionHandleReply(encoded: string): boolean {
+  return encoded.includes('"type":"result"') && encoded.includes('"kind":"execution"');
+}
+
+// Refuses the next matching message at the session queue's admission check, as
+// a full queue does, without closing the session.
+export function admissionFault(link: WebSocketLink) {
+  let refused: ((encoded: string) => boolean) | null = null;
+  link.onSession((session) => {
+    const canAdmit = session.channel.canAdmit.bind(session.channel);
+    session.channel.canAdmit = (body) => {
+      if (!refused?.(body)) return canAdmit(body);
+      refused = null;
+      return false;
+    };
+  });
+  return {
+    refuseNext(matches: (encoded: string) => boolean): void { refused = matches; },
+  };
+}
+
 export async function requestFor(integration: AgentIntegration): Promise<AgentStartRequestV5> {
   const producerBinding = createAgentResourceRef(integration.producers.scope, 'producer');
   await integration.producers.bind({ binding: producerBinding, chatId: 'test-chat' });
