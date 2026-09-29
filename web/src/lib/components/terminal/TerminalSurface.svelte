@@ -344,7 +344,7 @@
 				title={m.terminal_exit()}
 			>
 				<LogOut class="h-4 w-4" />
-				<span>{m.terminal_exit()}</span>
+				<span class="terminal-exit-label">{m.terminal_exit()}</span>
 			</button>
 		</div>
 	{/if}
@@ -434,6 +434,11 @@
 		display: flex;
 		flex: 0 0 auto;
 		width: 2rem;
+	}
+	@container surface-toolbar (max-width: 35.999rem) {
+		.terminal-exit-label {
+			display: none;
+		}
 	}
 	@container surface-toolbar (min-width: 36rem) {
 		.terminal-context {
