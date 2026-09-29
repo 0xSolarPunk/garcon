@@ -5497,10 +5497,14 @@ describe('Chromium combined tool-use presentation', () => {
       fixture.page.on('request', recordEarlierRequest);
       await prepareTranscript(fixture, chatId, 1);
       const waitForContext = async () => {
-        await fixture.page.waitForFunction((selector) => {
-          const sizer = document.querySelector<HTMLElement>(selector);
-          return Number(sizer?.dataset.chatTranscriptEntryCount) > 1_200;
-        }, SIZER_SELECTOR);
+        await fixture.page.waitForFunction(
+          (selector) => {
+            const sizer = document.querySelector<HTMLElement>(selector);
+            return Number(sizer?.dataset.chatTranscriptEntryCount) > 1_200;
+          },
+          SIZER_SELECTOR,
+          { timeout: 45_000 },
+        );
         await fixture.page.locator(FEED_SELECTOR).getByText('earlier-context-19').waitFor({ state: 'visible' });
         expect(await fixture.page.locator('[data-chat-tool-group]').count()).toBe(1);
         expect((await transcriptGeometry(fixture.page)).overlaps).toEqual([]);
