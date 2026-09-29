@@ -238,9 +238,9 @@ fallback. The fallback preserves the provider-neutral transcript but starts a
 new native session. Fork-at-message is not exposed by this CLI command.
 
 Prompted forks use the command ledger and safely retry an identical correlated
-request after ambiguous transport failure. Bare forks are not automatically
-retried because the fork-only server operation has no command-ledger identity;
-an ambiguous failure names the generated target chat ID to inspect first.
+request after ambiguous transport failure. Bare forks are sent without a
+request identity, so they are not automatically retried; an ambiguous failure
+names the generated target chat ID to inspect first.
 
 ## Discover Exact Selections
 
@@ -464,7 +464,10 @@ and conflict protection apply while the bounded command record remains retained.
 After an ambiguous provider failure and later record eviction, retry protection
 is no longer guaranteed; inspect live permission status before another decision.
 Provider acknowledgement failure is reported as an unknown outcome and is not
-automatically redelivered while that record is retained.
+automatically redelivered while that record is retained. A decision the
+executor never received, for example while it reconnects, is reported as not
+delivered and leaves the request pending; repeating the same command once the
+executor is ready delivers it.
 
 ## Chat Metadata
 

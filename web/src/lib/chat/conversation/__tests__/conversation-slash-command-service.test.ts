@@ -1259,6 +1259,28 @@ describe('ConversationSlashCommandService', () => {
 		);
 	});
 
+	it('does not restore a bare fork command after two lost replies', async () => {
+		const { deps, composerState, appendLocalNotice } = createDeps();
+		mockForkChat.mockRejectedValue(new TypeError('connection closed'));
+
+		const outcome = await new ConversationSlashCommandService(deps).submitForkCommand(
+			'chat-1',
+			deps.sessions.byId['chat-1'],
+			'',
+			[],
+			true,
+		);
+
+		expect(outcome).toBe('unknown');
+		expect(mockForkChat).toHaveBeenCalledTimes(2);
+		expect(mockForkChat.mock.calls[1][0]).toEqual(mockForkChat.mock.calls[0][0]);
+		expect(composerState.restoreDraftIfRevision).not.toHaveBeenCalled();
+		expect(appendLocalNotice).toHaveBeenCalledWith(
+			'error',
+			'Could not confirm whether the fork was created. Check the chat list before trying again.',
+		);
+	});
+
 	it('clears the forking progress notice through its captured revision on success', async () => {
 		const { deps, appendLocalNotice, noticeRevisionForChat, clearLocalNoticesForChat } =
 			createDeps();
@@ -1351,6 +1373,7 @@ describe('ConversationSlashCommandService', () => {
 		expect(mockForkChat).toHaveBeenCalledWith({
 			sourceChatId: 'chat-1',
 			chatId: expect.stringMatching(/^\d+$/),
+			clientRequestId: expect.any(String),
 		});
 		expect(clearLocalNoticesForChat).toHaveBeenCalledWith('chat-1', 1);
 	});
@@ -1415,6 +1438,7 @@ describe('ConversationSlashCommandService', () => {
 			chatId: expect.stringMatching(/^\d+$/),
 			upToOrdinal: 9,
 			transcriptViewId: 'view-1',
+			clientRequestId: expect.any(String),
 		});
 		expect(deps.sessions.upsertServerChat).toHaveBeenCalledWith(forked);
 		expect(deps.lifecycle.setCurrentChatId).toHaveBeenCalledWith('chat-2');
@@ -1461,6 +1485,7 @@ describe('ConversationSlashCommandService', () => {
 			chatId: expect.stringMatching(/^\d+$/),
 			upToOrdinal: 4,
 			transcriptViewId: 'view-panel',
+			clientRequestId: expect.any(String),
 		});
 	});
 
@@ -1495,6 +1520,10 @@ describe('ConversationSlashCommandService', () => {
 			upToOrdinal: 12,
 			transcriptViewId: 'view-2',
 		});
+		// A different fork point is a new request, so it cannot conflict with the stale one.
+		expect(mockForkChat.mock.calls[1]?.[0].clientRequestId).not.toBe(
+			mockForkChat.mock.calls[0]?.[0].clientRequestId,
+		);
 		expect(deps.refetchTranscript).toHaveBeenCalledWith('chat-1');
 		expect(appendLocalNotice).toHaveBeenCalledExactlyOnceWith('progress', 'Forking chat...');
 		expect(deps.sessions.setSelectedChatId).toHaveBeenCalledWith('chat-2');
@@ -1541,6 +1570,7 @@ describe('ConversationSlashCommandService', () => {
 		expect(mockForkChat.mock.calls[0]?.[0]).not.toHaveProperty('allowHandoffFork');
 		expect(mockForkChat.mock.calls[1]?.[0]).toMatchObject({
 			chatId: mockForkChat.mock.calls[0]?.[0].chatId,
+			clientRequestId: mockForkChat.mock.calls[0]?.[0].clientRequestId,
 			upToOrdinal: 9,
 			allowHandoffFork: true,
 		});

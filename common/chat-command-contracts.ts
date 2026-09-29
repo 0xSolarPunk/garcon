@@ -98,6 +98,7 @@ export type CommandErrorCode = Extract<
   | 'QUEUE_STEER_FINALIZATION_FAILED'
   | 'QUEUE_STEER_RECOVERY_FAILED'
   | 'PERMISSION_NOT_ACTIONABLE'
+  | 'PERMISSION_DECISION_NOT_DELIVERED'
   | 'PERMISSION_DECISION_OUTCOME_UNKNOWN'
   | 'UNSUPPORTED_AGENT'
   | 'EXPECTED_AGENT_MISMATCH'
@@ -187,6 +188,9 @@ export interface ForkChatCommandRequest {
   // only after asking the user, so an unconfirmed request surfaces the refusal instead.
   allowHandoffFork?: boolean;
   transcriptViewId?: string;
+  // A repeat under the same ID returns the fork it completed. Without one, an existing target
+  // chat is refused.
+  clientRequestId?: string;
 }
 
 export interface DeleteChatCommandRequest {

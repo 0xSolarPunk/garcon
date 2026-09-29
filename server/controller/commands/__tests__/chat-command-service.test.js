@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import { AgentIntegrationError } from '@garcon/server-agent-interface';
+import { AgentCallError, AgentIntegrationError } from '@garcon/server-agent-interface';
 
 import { ChatCommandService } from '../chat-command-service.ts';
 import { inspectProjectDirectory } from '../../__tests__/project-inspector.ts';
@@ -4096,6 +4096,99 @@ describe('ChatCommandService', () => {
     expect(forkChatFileCopy).toHaveBeenCalledOnce();
   });
 
+  describe('repeated fork requests', () => {
+    function registeringForkCopy(failures = 0) {
+      let registry;
+      let remainingFailures = failures;
+      const forkChatFileCopy = mock(async ({ sourceChatId, targetChatId }) => {
+        registry.set(targetChatId, {
+          ...registry.get(sourceChatId),
+          id: targetChatId,
+          parentChat: { chatId: sourceChatId, relation: 'fork', transcriptViewId: 'view-1', ordinal: 2 },
+        });
+        if (remainingFailures > 0) {
+          remainingFailures -= 1;
+          throw new Error('Synthetic fork settings failure');
+        }
+        return {
+          sourceChatId,
+          chatId: targetChatId,
+          agentId: 'claude',
+          agentSessionId: 'agent-2',
+          rollback: mock(async () => undefined),
+        };
+      });
+      const fixture = makeService({ forkChatFileCopy });
+      registry = fixture.sessions;
+      return fixture;
+    }
+
+    it('returns the completed fork for a repeated request ID', async () => {
+      const { service, forkChatFileCopy } = registeringForkCopy();
+      const request = { sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID, clientRequestId: 'fork-request-1' };
+
+      const first = await service.forkChat(request);
+      const repeated = await service.forkChat(request);
+
+      expect(repeated).toEqual(first);
+      expect(forkChatFileCopy).toHaveBeenCalledOnce();
+    });
+
+    it('refuses a repeated request ID that names a different fork point', async () => {
+      const { service, forkChatFileCopy } = registeringForkCopy();
+      await service.forkChat({ sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID, clientRequestId: 'fork-request-1' });
+
+      await expect(service.forkChat({
+        sourceChatId: SOURCE_CHAT_ID,
+        chatId: TARGET_CHAT_ID,
+        clientRequestId: 'fork-request-1',
+        upToOrdinal: 1,
+        transcriptViewId: 'view-1',
+      })).rejects.toMatchObject({
+        code: 'IDEMPOTENCY_CONFLICT',
+        status: 409,
+        message: 'clientRequestId was reused with different payload',
+      });
+      expect(forkChatFileCopy).toHaveBeenCalledOnce();
+    });
+
+    it('does not report a fork that failed after registering its target as created', async () => {
+      const { service, forkChatFileCopy } = registeringForkCopy(1);
+      const request = { sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID, clientRequestId: 'fork-request-1' };
+
+      await expect(service.forkChat(request)).rejects.toThrow('Synthetic fork settings failure');
+      await expect(service.forkChat(request)).rejects.toMatchObject({
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: `Session already exists: ${TARGET_CHAT_ID}`,
+      });
+      expect(forkChatFileCopy).toHaveBeenCalledOnce();
+    });
+
+    it('runs a fork that failed without leaving a target again under the same request ID', async () => {
+      const { service, forkChatFileCopy } = makeService();
+      forkChatFileCopy.mockImplementationOnce(async () => { throw new Error('Synthetic provider fork failure'); });
+      const request = { sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID, clientRequestId: 'fork-request-1' };
+
+      await expect(service.forkChat(request)).rejects.toThrow('Synthetic provider fork failure');
+      await service.forkChat(request);
+
+      expect(forkChatFileCopy).toHaveBeenCalledTimes(2);
+    });
+
+    it('refuses an existing target when the request has no ID', async () => {
+      const { service, forkChatFileCopy } = registeringForkCopy();
+      const request = { sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID };
+      await service.forkChat(request);
+
+      await expect(service.forkChat(request)).rejects.toMatchObject({
+        code: 'IDEMPOTENCY_CONFLICT',
+        status: 409,
+        message: `Session already exists: ${TARGET_CHAT_ID}`,
+      });
+      expect(forkChatFileCopy).toHaveBeenCalledOnce();
+    });
+  });
+
   it('captures the authoritative source binding after first-use fork adoption', async () => {
     const { service, agents, sessions, forkChatFileCopy } = makeService();
     sessions.get(SOURCE_CHAT_ID).agentSessionId = null;
@@ -4503,6 +4596,112 @@ describe('ChatCommandService', () => {
       retryable: false,
     });
     expect(agents.resolvePermission).toHaveBeenCalledTimes(1);
+  });
+
+  for (const [label, undelivered] of [
+    ['an unavailable executor', new DomainError('EXECUTOR_UNAVAILABLE', 'Executor is unavailable', 503, true)],
+    ['an undispatched call', new AgentCallError('not-dispatched', 'Executor is reconnecting')],
+  ]) {
+    it(`reports a decision blocked by ${label} as not delivered and delivers its exact retry`, async () => {
+      const { service, agents } = makeService();
+      agents.resolvePermission.mockRejectedValueOnce(undelivered);
+      const input = {
+        chatId: SOURCE_CHAT_ID,
+        permissionOccurrenceId: 'incarnation-1',
+        allow: true,
+        alwaysAllow: false,
+        clientRequestId: 'req-perm-not-delivered',
+        control: {
+          serverInstanceId: 'server-instance-test',
+          chatId: SOURCE_CHAT_ID,
+          runId: 'run-1',
+          permissionOccurrenceId: 'incarnation-1',
+        },
+      };
+
+      await expect(service.submitPermissionDecision(input)).rejects.toMatchObject({
+        code: 'PERMISSION_DECISION_NOT_DELIVERED',
+        status: 503,
+        retryable: true,
+      });
+      await expect(service.submitPermissionDecision(input)).resolves.toMatchObject({ status: 'accepted' });
+      await expect(service.submitPermissionDecision(input)).resolves.toMatchObject({ status: 'duplicate' });
+      expect(agents.resolvePermission).toHaveBeenCalledTimes(2);
+    });
+  }
+
+  it('reports a rejected delivery as no longer actionable and replays it without provider IO', async () => {
+    const { service, agents } = makeService();
+    agents.resolvePermission.mockRejectedValueOnce(
+      new AgentCallError('rejected', 'Execution has retired', 'STALE_RESOURCE'),
+    );
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      permissionOccurrenceId: 'incarnation-1',
+      allow: false,
+      alwaysAllow: false,
+      clientRequestId: 'req-perm-rejected',
+      control: {
+        serverInstanceId: 'server-instance-test',
+        chatId: SOURCE_CHAT_ID,
+        runId: 'run-1',
+        permissionOccurrenceId: 'incarnation-1',
+      },
+    };
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(service.submitPermissionDecision(input)).rejects.toMatchObject({
+        code: 'PERMISSION_NOT_ACTIONABLE',
+        status: 409,
+      });
+    }
+    expect(agents.resolvePermission).toHaveBeenCalledTimes(1);
+  });
+
+  it('revalidates and delivers a structured answer the executor never received', async () => {
+    const permissionOccurrenceId = 'incarnation-1';
+    const validateAction = mock(() => ({
+      permissionOccurrenceId,
+      runId: 'run-1',
+      transcript: { transcriptViewId: 'view-1', afterOrdinal: 1 },
+      displayOrder: 1,
+      message: new PermissionRequestMessage(
+        '2026-09-08T00:00:00.000Z',
+        permissionOccurrenceId,
+        new AskUserQuestionToolUseMessage(
+          '2026-09-08T00:00:00.000Z',
+          'tool-1',
+          'Choose a mode',
+          [{ id: 'mode', prompt: 'Which mode?', options: [{ id: 'fast', label: 'Fast' }] }],
+        ),
+      ),
+    }));
+    const { service, agents } = makeService({ transientFeeds: { validateAction } });
+    agents.resolvePermission.mockRejectedValueOnce(new AgentCallError('not-dispatched', 'Executor is reconnecting'));
+    const input = {
+      chatId: SOURCE_CHAT_ID,
+      permissionOccurrenceId,
+      allow: true,
+      alwaysAllow: false,
+      clientRequestId: 'req-perm-structured-not-delivered',
+      response: {
+        type: 'ask-user-question-response',
+        outcome: 'answered',
+        answers: [{ questionId: 'mode', selectedOptionIds: ['fast'] }],
+      },
+      control: {
+        serverInstanceId: 'server-instance-test',
+        chatId: SOURCE_CHAT_ID,
+        runId: 'run-1',
+        permissionOccurrenceId,
+      },
+    };
+
+    await expect(service.submitPermissionDecision(input)).rejects.toMatchObject({
+      code: 'PERMISSION_DECISION_NOT_DELIVERED',
+    });
+    await expect(service.submitPermissionDecision(input)).resolves.toMatchObject({ status: 'accepted' });
+    expect(agents.resolvePermission).toHaveBeenCalledTimes(2);
   });
 
   it('routes /compact to the agent compaction dispatch', async () => {

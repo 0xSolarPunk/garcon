@@ -1980,6 +1980,7 @@ describe('ConversationSessionController', () => {
 		expect(mockForkChat).toHaveBeenCalledWith({
 			sourceChatId: '123',
 			chatId: expect.stringMatching(/^\d+$/),
+			clientRequestId: expect.any(String),
 		});
 		expect(deps.chatState.appendLocalNotice).toHaveBeenCalledWith('progress', 'Forking chat...');
 		expect(deps.chatState.clearLocalNoticesForChat).toHaveBeenCalledWith('123', 1);
@@ -2076,6 +2077,7 @@ describe('ConversationSessionController', () => {
 			chatId: expect.stringMatching(/^\d+$/),
 			upToOrdinal: 9,
 			transcriptViewId: 'generation-1',
+			clientRequestId: expect.any(String),
 		});
 		expect(deps.sessions.setSelectedChatId).toHaveBeenCalledWith('456');
 	});
@@ -2112,6 +2114,7 @@ describe('ConversationSessionController', () => {
 			chatId: expect.stringMatching(/^\d+$/),
 			upToOrdinal: 4,
 			transcriptViewId: 'generation-panel',
+			clientRequestId: expect.any(String),
 		});
 	});
 
@@ -3326,6 +3329,114 @@ describe('ConversationSessionController', () => {
 
 		expect(deps.conversationUi.updatePendingPermissionsForChat).not.toHaveBeenCalled();
 		expect(deps.lifecycleForChat).not.toHaveBeenCalled();
+	});
+
+	describe('permission answer delivery', () => {
+		const control = {
+			serverInstanceId: 'server-1',
+			chatId: 'chat-1',
+			runId: 'run-1',
+			permissionOccurrenceId: 'permission-1',
+		} satisfies ChatTransientControlAction;
+
+		function pendingPermissionController() {
+			const { deps } = createDeps();
+			deps.conversationUi.pendingPermissionRequests = [
+				{
+					permissionOccurrenceId: 'permission-1',
+					requestedTool: new BashToolUseMessage('', 'tool-1', 'printf hello'),
+					control,
+				},
+			];
+			return { deps, controller: new ConversationSessionController(deps) };
+		}
+
+		it('retries a lost reply under the same request identity', async () => {
+			const { deps, controller } = pendingPermissionController();
+			mockSendPermissionDecision
+				.mockRejectedValueOnce(new TypeError('connection reset'))
+				.mockResolvedValueOnce(permissionDecisionAccepted('decision-1'));
+
+			controller.handlePermissionDecisionForChat('chat-1', 'permission-1', { allow: true });
+			await vi.waitFor(() => expect(deps.conversationUi.pendingPermissionRequests).toEqual([]));
+
+			expect(mockSendPermissionDecision).toHaveBeenCalledTimes(2);
+			const [first, second] = mockSendPermissionDecision.mock.calls.map(([request]) => request);
+			expect(second).toEqual(first);
+			expect(deps.chatState.appendLocalNoticeForChat).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			[
+				'not sent while the executor is unavailable',
+				new ApiError(503, 'not sent', 'PERMISSION_DECISION_NOT_DELIVERED', undefined, true),
+				'your permission answer was not sent. Answer again once it reconnects.',
+			],
+			[
+				'unconfirmed by the server',
+				new ApiError(500, 'could not be confirmed', 'PERMISSION_DECISION_OUTCOME_UNKNOWN'),
+				'Could not confirm whether your permission answer reached the agent.',
+			],
+		])('keeps the prompt and explains an answer %s', async (_label, error, notice) => {
+			const { deps, controller } = pendingPermissionController();
+			mockSendPermissionDecision.mockRejectedValueOnce(error);
+
+			controller.handlePermissionDecisionForChat('chat-1', 'permission-1', { allow: true });
+			await vi.waitFor(() => expect(deps.chatState.appendLocalNoticeForChat).toHaveBeenCalled());
+
+			expect(deps.chatState.appendLocalNoticeForChat).toHaveBeenCalledWith(
+				'chat-1',
+				'error',
+				expect.stringContaining(notice),
+			);
+			expect(mockSendPermissionDecision).toHaveBeenCalledOnce();
+			expect(deps.conversationUi.pendingPermissionRequests).toHaveLength(1);
+		});
+
+		it('keeps a plan prompt whose denial was not sent', async () => {
+			const { deps, controller } = pendingPermissionController();
+			mockSendPermissionDecision.mockRejectedValueOnce(
+				new ApiError(503, 'not sent', 'PERMISSION_DECISION_NOT_DELIVERED', undefined, true),
+			);
+
+			controller.handleExitPlanModeForChat('chat-1', 'permission-1', 'deny', 'Synthetic plan');
+			await vi.waitFor(() => expect(deps.chatState.appendLocalNoticeForChat).toHaveBeenCalled());
+
+			expect(deps.chatState.appendLocalNoticeForChat).toHaveBeenCalledWith(
+				'chat-1',
+				'error',
+				expect.stringContaining('Answer again once it reconnects.'),
+			);
+			expect(mockSendPermissionDecision).toHaveBeenCalledWith(
+				expect.objectContaining({ control, allow: false, alwaysAllow: false }),
+			);
+			expect(deps.conversationUi.pendingPermissionRequests).toHaveLength(1);
+		});
+
+		it('removes a plan prompt once its denial is accepted', async () => {
+			const { deps, controller } = pendingPermissionController();
+			mockSendPermissionDecision.mockResolvedValueOnce(permissionDecisionAccepted('decision-1'));
+
+			controller.handleExitPlanModeForChat('chat-1', 'permission-1', 'deny', 'Synthetic plan');
+
+			await vi.waitFor(() => expect(deps.conversationUi.pendingPermissionRequests).toEqual([]));
+			expect(deps.chatState.appendLocalNoticeForChat).not.toHaveBeenCalled();
+		});
+
+		it('reports an unconfirmed answer after two lost replies', async () => {
+			const { deps, controller } = pendingPermissionController();
+			mockSendPermissionDecision.mockRejectedValue(new TypeError('connection reset'));
+
+			controller.handlePermissionDecisionForChat('chat-1', 'permission-1', { allow: false });
+			await vi.waitFor(() => expect(deps.chatState.appendLocalNoticeForChat).toHaveBeenCalled());
+
+			expect(deps.chatState.appendLocalNoticeForChat).toHaveBeenCalledWith(
+				'chat-1',
+				'error',
+				expect.stringContaining('Could not confirm whether your permission answer reached the agent.'),
+			);
+			expect(mockSendPermissionDecision).toHaveBeenCalledTimes(2);
+		});
 	});
 
 	it('does not recreate lifecycle state when plan approval settles after chat deletion', async () => {

@@ -3,6 +3,7 @@
 import {
 	ApiError,
 	ApiMutationOutcomeUnknownError,
+	isIntermediaryResponse,
 	apiGet,
 	apiPost,
 	apiPatch,
@@ -510,6 +511,8 @@ export interface ForkChatParams {
 	// Set only after the user confirms a handoff fork, so an unconfirmed request still
 	// surfaces the refusal the confirmation is asked about.
 	allowHandoffFork?: boolean;
+	// A repeat under the same ID returns the fork the server already completed.
+	clientRequestId: string;
 }
 
 /** Forks (clones) an existing chat session into a new chat. */
@@ -532,10 +535,6 @@ export async function sortChatOrder(request: SortChatOrderRequest): Promise<Sort
 	return parsed;
 }
 
-function isAmbiguousMutationStatus(status: number): boolean {
-	return status === 408 || status === 425 || status === 429 || status >= 500;
-}
-
 async function requestChatTagMutation(
 	request: () => Promise<unknown>,
 	invalidResponseMessage: string,
@@ -547,12 +546,7 @@ async function requestChatTagMutation(
 		return parsed;
 	} catch (error) {
 		if (error instanceof ApiMutationOutcomeUnknownError) throw error;
-		if (
-			error instanceof ApiError &&
-			(error.errorCode !== undefined || !isAmbiguousMutationStatus(error.status))
-		) {
-			throw error;
-		}
+		if (error instanceof ApiError && !isIntermediaryResponse(error)) throw error;
 		throw new ApiMutationOutcomeUnknownError(
 			'The chat tag mutation outcome could not be confirmed.',
 			{ cause: error },

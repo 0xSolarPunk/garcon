@@ -102,6 +102,9 @@
 	const resolveChatReference: ResolveChatReference = (chatId) =>
 		resolveChatReferenceTarget(chatId, activeChatContext?.chatId, sessions.byId[chatId]);
 	const isPending = $derived(!terminal && actionable);
+	// An executor known to be away cannot receive an answer, and the request stays pending.
+	// Before the executor list loads, the server still reports an undelivered answer safely.
+	const canAnswer = $derived(isPending && (!executors.hasSnapshot || executors.isReady(executorId)));
 	const isResolved = $derived(terminal?.state === 'resolved');
 	const wasAllowed = $derived(isResolved && terminal?.allowed === true);
 
@@ -346,6 +349,14 @@
 	}
 </script>
 
+{#snippet executorWaitNotice()}
+	{#if !canAnswer}
+		<div class="basis-full text-xs text-muted-foreground" role="status">
+			{m.chat_permission_waiting_for_executor()}
+		</div>
+	{/if}
+{/snippet}
+
 {#if isExitPlanMode}
 	<ChatEventCard variant={planCardVariant} class={resolvedOpacity}>
 		{#snippet header()}
@@ -414,6 +425,8 @@
 		{#snippet footer()}
 			{#if isPending}
 				<div class="flex flex-wrap items-center gap-2">
+					{@render executorWaitNotice()}
+					<!-- A new chat can start anywhere, so it does not wait for this chat's executor. -->
 					<button
 						type="button"
 						onclick={() => onExitPlanMode?.(request.permissionOccurrenceId, 'bypass-new', plan)}
@@ -424,36 +437,40 @@
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => onExitPlanMode?.(request.permissionOccurrenceId, 'bypass', plan)}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-warning-border text-status-warning hover:bg-status-warning/15"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-warning-border text-status-warning hover:bg-status-warning/15 disabled:opacity-50 disabled:cursor-not-allowed"
 						title={m.chat_permission_tooltip_bypass()}
 					>
 						{m.chat_permission_yes_bypass()}
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => onExitPlanMode?.(request.permissionOccurrenceId, 'approve-edits', plan)}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-info-border text-status-info hover:bg-status-info/15"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-info-border text-status-info hover:bg-status-info/15 disabled:opacity-50 disabled:cursor-not-allowed"
 						title={m.chat_permission_tooltip_approve_edits()}
 					>
 						{m.chat_permission_yes_approve_edits()}
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() =>
 							onDecision(request.permissionOccurrenceId, {
 								allow: false,
 								message: m.chat_permission_revise_plan_message(),
 							})}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-info-border text-status-info hover:bg-status-info/15"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-info-border text-status-info hover:bg-status-info/15 disabled:opacity-50 disabled:cursor-not-allowed"
 						title={m.chat_permission_tooltip_revise_plan()}
 					>
 						{m.chat_permission_revise_plan()}
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => onExitPlanMode?.(request.permissionOccurrenceId, 'deny', plan)}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-neutral-border text-status-neutral-foreground hover:bg-status-neutral/50"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 transition-colors border border-status-neutral-border text-status-neutral-foreground hover:bg-status-neutral/50 disabled:opacity-50 disabled:cursor-not-allowed"
 					>
 						<X class="w-3.5 h-3.5" />
 						{m.chat_permission_deny()}
@@ -538,9 +555,10 @@
 		{#snippet footer()}
 			{#if isPending}
 				<div class="flex flex-wrap gap-2">
+					{@render executorWaitNotice()}
 					<button
 						type="button"
-						disabled={!canAnswerAskUserQuestion}
+						disabled={!canAnswer || !canAnswerAskUserQuestion}
 						onclick={() => respondToAskUserQuestion('answered')}
 						class="inline-flex items-center gap-1.5 rounded-md border border-status-warning-border bg-status-warning text-status-warning-foreground text-xs font-medium px-3 py-1.5 hover:bg-status-warning/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
@@ -549,8 +567,9 @@
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => respondToAskUserQuestion('skipped')}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
 						<X class="w-3.5 h-3.5" />
 						{m.chat_permission_skip()}
@@ -615,9 +634,10 @@
 		{#snippet footer()}
 			{#if isPending}
 				<div class="flex flex-wrap gap-2">
+					{@render executorWaitNotice()}
 					<button
 						type="button"
-						disabled={!canAnswerCursorQuestion}
+						disabled={!canAnswer || !canAnswerCursorQuestion}
 						onclick={() => respondToCursorQuestion('answered')}
 						class="inline-flex items-center gap-1.5 rounded-md border border-status-warning-border bg-status-warning text-status-warning-foreground text-xs font-medium px-3 py-1.5 hover:bg-status-warning/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
@@ -626,8 +646,9 @@
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => respondToCursorQuestion('skipped')}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
 						<X class="w-3.5 h-3.5" />
 						{m.chat_permission_skip()}
@@ -737,18 +758,21 @@
 		{#snippet footer()}
 			{#if isPending}
 				<div class="flex flex-wrap gap-2">
+					{@render executorWaitNotice()}
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => respondToCursorPlan('accepted')}
-						class="inline-flex items-center gap-1.5 rounded-md border border-status-warning-border bg-status-warning text-status-warning-foreground text-xs font-medium px-3 py-1.5 hover:bg-status-warning/90 transition-colors"
+						class="inline-flex items-center gap-1.5 rounded-md border border-status-warning-border bg-status-warning text-status-warning-foreground text-xs font-medium px-3 py-1.5 hover:bg-status-warning/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
 						<Check class="w-3.5 h-3.5" />
 						{m.chat_permission_accept_plan()}
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => respondToCursorPlan('rejected')}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
 						<X class="w-3.5 h-3.5" />
 						{m.chat_permission_reject_plan()}
@@ -801,22 +825,25 @@
 		{#snippet footer()}
 			{#if isPending}
 				<div class="flex flex-wrap gap-2">
+					{@render executorWaitNotice()}
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() => onDecision(request.permissionOccurrenceId, { allow: true })}
-						class="inline-flex items-center gap-1.5 rounded-md border border-status-warning-border bg-status-warning text-status-warning-foreground text-xs font-medium px-3 py-1.5 hover:bg-status-warning/90 transition-colors"
+						class="inline-flex items-center gap-1.5 rounded-md border border-status-warning-border bg-status-warning text-status-warning-foreground text-xs font-medium px-3 py-1.5 hover:bg-status-warning/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
 						<Check class="w-3.5 h-3.5" />
 						{m.chat_permission_allow_once()}
 					</button>
 					<button
 						type="button"
+						disabled={!canAnswer}
 						onclick={() =>
 							onDecision(request.permissionOccurrenceId, {
 								allow: false,
 								message: 'User denied tool use',
 							})}
-						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors"
+						class="inline-flex items-center gap-1.5 rounded-md text-xs font-medium px-3 py-1.5 border border-status-error-border text-status-error-foreground hover:bg-status-error/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
 					>
 						<X class="w-3.5 h-3.5" />
 						{m.chat_permission_deny()}
