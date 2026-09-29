@@ -205,8 +205,11 @@ export class WebSocketLink {
     this.#closures.clear();
     this.#listenerNoise?.close();
     this.#listenerNoise = null;
-    await this.#server?.stop(true);
+    const server = this.#server;
     this.#server = null;
+    // Bun may leave a closed WebSocket in the server's active-connection set indefinitely.
+    // Starting listener shutdown is synchronous; waiting for that bookkeeping promise would hang disposal.
+    void server?.stop(true).catch(() => undefined);
   }
 
   #noiseOptions(): NoiseOptions {

@@ -59,7 +59,7 @@ function relay(target: string) {
   });
   cleanups.push(async () => {
     for (const socket of sockets) { socket.data.upstream?.close(); socket.close(); }
-    await server.stop(true);
+    void server.stop(true);
   });
   return { frames, handshakes, tamperNext: () => { tamper = true; }, url: `ws://127.0.0.1:${server.port}/executor` };
 }
@@ -158,7 +158,7 @@ test('a failed encrypted fragment is discarded without replay on a fresh connect
       },
     },
   });
-  cleanups.push(async () => { noise.close(); await server.stop(true); });
+  cleanups.push(async () => { noise.close(); void server.stop(true); });
   const received: string[] = [];
   const completed = Promise.withResolvers<void>();
   controller.onSession((session) => session.onMessage((message) => { received.push(message); completed.resolve(); }));
