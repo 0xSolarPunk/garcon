@@ -7,9 +7,13 @@ descriptions in the historical [first-stage](./interface.md) and
 Local remains available alongside configured remote executors. Each remote uses
 one bidirectional Noise-encrypted WebSocket, regardless of which side dials.
 The shared secret authenticates Noise and the application handshake binding
-executor, runtime, build version, and the fresh connection. TLS is required
-outside explicit development mode; Noise remains mandatory when outer TLS
-certificate verification is disabled. The default redial delay is five seconds.
+executor, runtime, version, and the fresh connection. The version is the
+package version followed by the executor protocol revision, as in
+`0.3.4+protocol.1`. The revision changes with anything either side sends or
+accepts, so builds that disagree fail the handshake with "Executor version
+mismatch" instead of failing mid-session. TLS is required outside explicit
+development mode; Noise remains mandatory when outer TLS certificate
+verification is disabled. The default redial delay is five seconds.
 
 Public connection URLs may use arbitrary paths and query strings. They need not
 contain an executor ID or an `/executor` suffix. A reverse proxy must forward
@@ -131,6 +135,18 @@ number means dropped output and records one notice on the active run: "Some
 agent output could not be delivered from the executor. Reload from native
 history after this turn finishes to recover it."
 
+A row batch the controller cannot decode is logged and counts as undelivered
+output; consecutive undecodable batches record one notice with the same text.
+Any other event it cannot read, such as a permission request or a launch
+outcome, leaves its run's state unknown. It is logged, the run fails with
+`OUTCOME_UNKNOWN`, and the binding closes through the session that holds it,
+which stops the native turn. A resume report the controller cannot read fails
+its binding the same way. None of these retire the session: that would
+interrupt every binding the session carries, and a failure that recurs on
+replayed events would retire each replacement session in turn. A controller
+consumer that throws on an event is logged, and the other consumers still
+receive it.
+
 A start, resume, or compaction whose reply was lost with its session leaves its
 run active instead of failing the turn. The worker's relay records each
 binding's latest launch until its run ends or it fails, and the resume reply
@@ -166,7 +182,16 @@ more is logged with its operation name (`executor-slow-step` on a worker). Each
 closed connection that carried a session is logged with its cause and the
 link's running count for that cause (`executor-link-closed` on a worker):
 `liveness-timeout`, `socket-closed`, `socket-error`, `protocol-error`,
-`session-retired`, or `local-close`.
+`session-retired`, or `local-close`. When known, the log adds the reason: the
+Noise error code of a connection that ended without an encrypted close, such
+as `TRANSPORT_CLOSED` when a tunnel drops it, or the error that retired the
+session. A link failure carries the same code and is logged when it differs
+from the previous failure, until a session starts (`executor-unavailable` on a
+worker). The controller logs a session whose setup fails with the stage it
+reached (`describe`, `start-integrations`, `resume-bindings`, or `activate`)
+and the session's own reason rather than the generic loss its pending call
+reports. A parse error's message can echo the payload it failed on, so it is
+logged, and crosses the link, as `Malformed data`.
 
 Only producer notifications and launch outcomes resume. Other RPC replies lost
 with a session remain uncertain outcomes, and requests are never resent. Hung
