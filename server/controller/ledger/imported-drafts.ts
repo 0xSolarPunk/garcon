@@ -6,6 +6,8 @@ import {
   extractGarconCommands,
   parseGarconMessage,
 } from '../../../common/garcon-commands.js';
+import { GARCON_ELEMENT_PREFIX } from '../../../common/garcon-command-envelope.js';
+import { EventLoopSteps } from '@garcon/server-agent-common/shared/event-loop';
 import {
   isCarryoverMigrationQuarantineNoticeDetail,
   isPreambleApplicationNoticeDetail,
@@ -37,12 +39,17 @@ export interface ImportedRow {
 
 // Turns provider-supplied history into ledger drafts. Adoption, reload, and native fork all
 // read a provider's own record and must agree on what it becomes, so they share this mapping.
-export function importedDrafts(
-  rows: readonly ImportedRow[],
+// A whole history converts in bounded steps, continuing those of the operation that read it.
+export async function importedDrafts(
+  rows: Iterable<ImportedRow>,
   now: () => string,
-): LedgerRowDraft[] {
-  return rows.flatMap(({ message, providerMeta, preambleApplication }) =>
-    importedDraftFor(message, providerMeta, now, preambleApplication));
+  steps = new EventLoopSteps('transcript-import-conversion'),
+): Promise<LedgerRowDraft[]> {
+  const drafts: LedgerRowDraft[] = [];
+  await steps.forEach(rows, ({ message, providerMeta, preambleApplication }) => {
+    drafts.push(...importedDraftFor(message, providerMeta, now, preambleApplication));
+  });
+  return drafts;
 }
 
 // Turns conversation carried over from an earlier agent into frozen drafts. No provider ever
@@ -66,7 +73,11 @@ function importedDraftFor(
   if (original.type === 'user-message' && preambleApplication) {
     return importedUserInputDrafts(original, providerMeta, at, preambleApplication);
   }
-  const commandTransform = extractGarconCommands(original);
+  // Only content containing a Garcon element can carry a command, result, message, or
+  // disclosure, and most messages have none, so the element parsers run only after this check.
+  const markup = (original.type === 'user-message' || original.type === 'assistant-message')
+    && original.content.includes(GARCON_ELEMENT_PREFIX);
+  const commandTransform = markup ? extractGarconCommands(original) : null;
   if (commandTransform) {
     return [
       ...(commandTransform.message
@@ -93,7 +104,7 @@ function importedDraftFor(
       }),
     ];
   }
-  if (original.type === 'user-message') {
+  if (markup && original.type === 'user-message') {
     const rejection = parseGarconCommandRejection(original.content);
     if (rejection) {
       return rejection.issues.map((issue) => ({ kind: 'notice', at,

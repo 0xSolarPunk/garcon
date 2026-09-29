@@ -3,13 +3,20 @@ import {
   isAgentResourceRef,
   type AgentIntegration,
   type AgentProducerBinding,
+  type AgentProducerNotification,
   type AgentRunFailureDetail,
 } from '@garcon/server-agent-interface';
 import type { TranscriptProducerLease } from '../ledger/service.js';
 
+export type LaunchSettledEvent = Extract<AgentProducerNotification['event'], { readonly type: 'launch-settled' }>;
+
 export class ProducerBindings {
   readonly #leases = new WeakMap<TranscriptProducerLease, Promise<AgentProducerBinding>>();
-  readonly #routes = new Map<string, { readonly chatId: string; readonly lease: TranscriptProducerLease }>();
+  readonly #routes = new Map<string, {
+    readonly chatId: string;
+    readonly lease: TranscriptProducerLease;
+    readonly binding: AgentProducerBinding;
+  }>();
   readonly #subscriptions = new Map<AgentIntegration, () => void>();
   readonly #progress = new Map<string, () => Promise<void>>();
 
@@ -17,6 +24,9 @@ export class ProducerBindings {
     private readonly onError: (error: unknown) => void,
     private readonly onPublicationFailed: (chatId: string, lease: TranscriptProducerLease, error: AgentRunFailureDetail) => void,
     private readonly onPublicationGap: (chatId: string, lease: TranscriptProducerLease) => void,
+    private readonly onLaunchSettled: (
+      chatId: string, lease: TranscriptProducerLease, agentId: string, event: LaunchSettledEvent,
+    ) => void,
   ) {}
 
   async bind(integration: AgentIntegration, chatId: string, lease: TranscriptProducerLease): Promise<AgentProducerBinding> {
@@ -29,9 +39,11 @@ export class ProducerBindings {
     }
     if (!this.#subscriptions.has(integration)) {
       const unsubscribe = integration.producers.subscribe(({ binding, event }) => {
-        if (!isAgentResourceRef(binding, 'producer', integration.producers.scope)) return;
+        // Matches the route's own reference rather than the integration's live
+        // scope, which a remote executor cannot report while a replacement
+        // session installs and replays retained events.
         const route = this.#routes.get(binding.id);
-        if (!route || route.lease.closed) return;
+        if (!route || route.lease.closed || !isAgentResourceRef(binding, 'producer', route.binding)) return;
         if (event.type === 'publication-failed') {
           try { this.onPublicationFailed(route.chatId, route.lease, event.error); }
           catch (error) { this.onError(error); }
@@ -40,6 +52,11 @@ export class ProducerBindings {
         }
         if (event.type === 'publication-gap') {
           try { this.onPublicationGap(route.chatId, route.lease); }
+          catch (error) { this.onError(error); }
+          return;
+        }
+        if (event.type === 'launch-settled') {
+          try { this.onLaunchSettled(route.chatId, route.lease, integration.descriptor.id, event); }
           catch (error) { this.onError(error); }
           return;
         }
@@ -59,7 +76,7 @@ export class ProducerBindings {
       this.#subscriptions.set(integration, unsubscribe);
     }
     const binding = createAgentResourceRef(integration.producers.scope, 'producer');
-    this.#routes.set(binding.id, { chatId, lease });
+    this.#routes.set(binding.id, { chatId, lease, binding });
     const registered = integration.producers.bind({ binding, chatId }).then(() => binding);
     this.#leases.set(lease, registered);
     lease.onClosed(() => {
