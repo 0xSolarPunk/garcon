@@ -4528,7 +4528,7 @@ async function verifyLiveEdgeRetention(
     pinned: true,
     userScrolledUp: false,
   });
-  await fixture.page.clock.runFor(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
+  await fixture.page.clock.fastForward(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
   expect(await transcriptEntryCount(fixture.page)).toBe(expectedEntryCount);
   expect(await viewportPolicy(fixture.page)).toEqual({
     pinned: true,
@@ -4568,7 +4568,7 @@ async function verifyLiveEdgeRetention(
   const expectedAfterGrowth = expectedEntryCount + laterPrompts.length * 2;
   expect(await transcriptEntryCount(fixture.page)).toBe(expectedAfterGrowth);
 
-  await fixture.page.clock.runFor(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
+  await fixture.page.clock.fastForward(RETIRED_LIVE_EDGE_PRUNE_INTERVAL_MS + 1);
   expect(await transcriptEntryCount(fixture.page)).toBe(expectedAfterGrowth);
 
   const canonicalAfterGrowth = await readCompleteCanonicalTranscript(fixture, chatId);
