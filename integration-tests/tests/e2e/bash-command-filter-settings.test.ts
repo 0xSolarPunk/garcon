@@ -57,6 +57,7 @@ describe('Lightpanda hidden Bash command settings', () => {
         { timeout: 20_000 },
       );
 
+      await app.waitForButtonEnabled('Add preset');
       await app.clickButton('Add preset');
       await app.waitForMenuItemEnabled('Garcon-amp rules');
       await app.clickMenuItem('Garcon-amp rules');

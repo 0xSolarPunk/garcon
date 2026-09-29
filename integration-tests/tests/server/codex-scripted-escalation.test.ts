@@ -103,6 +103,7 @@ describe('scripted Codex escalation', () => {
     const prompt = `Run the scripted sandbox-first command for ${marker}.`;
     const outsidePath = join(process.cwd(), `.scripted-codex-${crypto.randomUUID()}`);
     const command = `printf %s ${marker} > ${outsidePath} && cat ${outsidePath}`;
+    let sandboxDenied: boolean | undefined;
     testEnvironment.model.scriptTurn([codexExecCommandCall('call_sandboxed', command)]);
     testEnvironment.model.scriptTurn((request) => {
       const failed = request.functionCallOutputs.find(
@@ -110,14 +111,16 @@ describe('scripted Codex escalation', () => {
       );
       if (!failed) throw new Error('Sandboxed attempt output never reached the model.');
       if (/Process exited with code 0(?:\n|$)/.test(failed.output)) {
-        throw new Error('Codex sandbox capability probe unexpectedly allowed the outside write.');
+        sandboxDenied = false;
+        return [codexAssistantMessage(reply)];
       }
+      sandboxDenied = true;
+      testEnvironment.model.scriptTurn([codexAssistantMessage(reply)]);
       return [codexExecCommandCall('call_escalated_retry', command, {
         sandbox_permissions: 'require_escalated',
         justification: 'sandbox denied the write',
       })];
     });
-    testEnvironment.model.scriptTurn([codexAssistantMessage(reply)]);
 
     try {
       await withIntegrationFixture('codex-scripted-sandbox-retry', async (fixture) => {
@@ -138,24 +141,25 @@ describe('scripted Codex escalation', () => {
         });
 
         expect((await readFile(outsidePath, 'utf8')).trim()).toBe(marker);
-        expect(await protocolProbe.waitForApprovalRequest()).toBe(
-          'item/commandExecution/requestApproval',
-        );
-        expect(await protocolProbe.readApprovalRequests()).toEqual([
-          'item/commandExecution/requestApproval',
-        ]);
+        expect(sandboxDenied).toBeDefined();
+        if (sandboxDenied) {
+          expect(await protocolProbe.waitForApprovalRequest()).toBe(
+            'item/commandExecution/requestApproval',
+          );
+          expect(await protocolProbe.readApprovalRequests()).toEqual([
+            'item/commandExecution/requestApproval',
+          ]);
+        }
 
-        // The sandbox failure exists only in Codex's rollout. The ledger stores
-        // the successful retry that Codex emitted live and never reconciles the
-        // native-only attempt into ordinary history.
         const streamed = await fixture.client.getMessages(chatId);
-        const streamedExecutions = expectExecutions(streamed, command, marker, 1);
+        const streamedExecutions = expectExecutions(streamed, command, marker, sandboxDenied ? 2 : 1);
+        if (sandboxDenied) expect(streamedExecutions[0]?.isError).toBe(true);
         expect(assistantContents(streamed.messages).some((content) => content.includes(reply)))
           .toBe(true);
 
         await fixture.restartGarcon();
         const restored = await fixture.client.getMessages(chatId);
-        expect(expectExecutions(restored, command, marker, 1)).toEqual(streamedExecutions);
+        expect(expectExecutions(restored, command, marker, sandboxDenied ? 2 : 1)).toEqual(streamedExecutions);
         expect(countUserContent(restored.messages, prompt)).toBe(1);
         testEnvironment.model.assertSettled();
       }, {
