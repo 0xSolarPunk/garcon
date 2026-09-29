@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { readFile, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { shellQuote } from '../../../cli/shell-quote.js';
 import {
   assistantContents,
   countUserContent,
@@ -39,7 +41,7 @@ describe('scripted Codex escalation', () => {
     const marker = `SCRIPTED_CODEX_ESCALATE_FIRST_${crypto.randomUUID().replaceAll('-', '')}`;
     const reply = `SCRIPTED_CODEX_ESCALATE_FIRST_REPLY_${crypto.randomUUID().replaceAll('-', '')}`;
     const outsidePath = join(process.cwd(), `.scripted-codex-${crypto.randomUUID()}`);
-    const command = `printf %s ${marker} > ${outsidePath} && cat ${outsidePath}`;
+    const command = `printf %s ${marker} > ${shellQuote(outsidePath)} && cat ${shellQuote(outsidePath)}`;
     testEnvironment.model.scriptTurn([
       codexExecCommandCall('call_escalated', command, {
         sandbox_permissions: 'require_escalated',
@@ -101,9 +103,8 @@ describe('scripted Codex escalation', () => {
     const marker = `SCRIPTED_CODEX_SANDBOX_RETRY_${crypto.randomUUID().replaceAll('-', '')}`;
     const reply = `SCRIPTED_CODEX_SANDBOX_RETRY_REPLY_${crypto.randomUUID().replaceAll('-', '')}`;
     const prompt = `Run the scripted sandbox-first command for ${marker}.`;
-    const outsidePath = join(process.cwd(), `.scripted-codex-${crypto.randomUUID()}`);
-    const command = `printf %s ${marker} > ${outsidePath} && cat ${outsidePath}`;
-    let sandboxDenied: boolean | undefined;
+    const outsidePath = join(homedir(), `.scripted-codex-${crypto.randomUUID()}`);
+    const command = `printf %s ${marker} > ${shellQuote(outsidePath)} && cat ${shellQuote(outsidePath)}`;
     testEnvironment.model.scriptTurn([codexExecCommandCall('call_sandboxed', command)]);
     testEnvironment.model.scriptTurn((request) => {
       const failed = request.functionCallOutputs.find(
@@ -111,10 +112,8 @@ describe('scripted Codex escalation', () => {
       );
       if (!failed) throw new Error('Sandboxed attempt output never reached the model.');
       if (/Process exited with code 0(?:\n|$)/.test(failed.output)) {
-        sandboxDenied = false;
-        return [codexAssistantMessage(reply)];
+        throw new Error('Codex sandbox capability probe unexpectedly allowed the outside write.');
       }
-      sandboxDenied = true;
       testEnvironment.model.scriptTurn([codexAssistantMessage(reply)]);
       return [codexExecCommandCall('call_escalated_retry', command, {
         sandbox_permissions: 'require_escalated',
@@ -141,15 +140,12 @@ describe('scripted Codex escalation', () => {
         });
 
         expect((await readFile(outsidePath, 'utf8')).trim()).toBe(marker);
-        expect(sandboxDenied).toBeDefined();
-        if (sandboxDenied) {
-          expect(await protocolProbe.waitForApprovalRequest()).toBe(
-            'item/commandExecution/requestApproval',
-          );
-          expect(await protocolProbe.readApprovalRequests()).toEqual([
-            'item/commandExecution/requestApproval',
-          ]);
-        }
+        expect(await protocolProbe.waitForApprovalRequest()).toBe(
+          'item/commandExecution/requestApproval',
+        );
+        expect(await protocolProbe.readApprovalRequests()).toEqual([
+          'item/commandExecution/requestApproval',
+        ]);
 
         const streamed = await fixture.client.getMessages(chatId);
         // A sandbox-denied native attempt exists only in Codex's rollout. Garcon persists the
