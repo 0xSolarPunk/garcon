@@ -33,7 +33,7 @@ for (const role of ['controller', 'worker'] as const) {
       hostname: '0.0.0.0', port: 0, tls: await certificate(), websocket: noise.websocket,
       fetch(request, server) { return peer.upgrade(request, server, noise); },
     });
-    cleanups.push(async () => { noise.close(); await server.stop(true); });
+    cleanups.push(async () => { noise.close(); void server.stop(true); });
     const address = `wss://127.0.0.1:${server.port}/executor`;
     for (const config of [
       { secret },

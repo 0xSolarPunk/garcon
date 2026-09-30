@@ -194,9 +194,15 @@ test('normal app onboarding supports both directions and sends remote chat input
       await app.clickMenuItem('Settings');
       await app.waitForButton('Automation');
       await app.clickButton('Automation');
+      await fixture.page.waitForFunction(() => {
+        const secondary = document.querySelector('[role="dialog"] [data-slot="model-selector-trigger-secondary"]');
+        const button = secondary?.closest('button');
+        return button instanceof HTMLButtonElement && !button.disabled;
+      });
       await fixture.page.evaluate(() => {
-        const button = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((entry) => entry.getAttribute('aria-label')?.includes(' / '));
-        if (!button) throw new Error('Generation model selector is unavailable');
+        const secondary = document.querySelector('[role="dialog"] [data-slot="model-selector-trigger-secondary"]');
+        const button = secondary?.closest('button');
+        if (!(button instanceof HTMLButtonElement)) throw new Error('Generation model selector is unavailable');
         button.click();
       });
       await app.clickButton('Inbound Worker');

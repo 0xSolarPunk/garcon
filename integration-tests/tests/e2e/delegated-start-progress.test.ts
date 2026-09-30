@@ -20,14 +20,7 @@ describe('Lightpanda delegated startup', () => {
       const accepted = await waitForStartOutcome(integration, parent, 'accepted', cursor);
       if (accepted.status !== 'accepted') throw new Error('Missing child');
       await compacting.received;
-      const link = `a[href="/chat/${accepted.chatId}"]`;
-      await fixture.page.waitForFunction((selector) => {
-        const target = [...document.querySelectorAll<HTMLAnchorElement>(selector)]
-          .find((element) => element.textContent?.trim() === 'Open chat');
-        if (!target) return false;
-        target.click();
-        return true;
-      }, {}, link);
+      await app.clickSidebarChatById(accepted.chatId);
       await app.waitForSelectedChat(accepted.chatId);
       await app.waitForText('Compacting inherited context.');
       for (let index = 0; index < 3; index++) {

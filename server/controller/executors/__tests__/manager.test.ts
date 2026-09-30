@@ -167,7 +167,7 @@ function sharedListener(manager: ExecutorManager, limits?: NoiseServerOptions) {
       delivery: new PrimarySocketDelivery(1024),
     }),
   });
-  cleanups.push(async () => { noise.close(); await server.stop(true); });
+  cleanups.push(async () => { noise.close(); server.stop(true); });
   return { noise, primary, url: (id: string) => `ws://127.0.0.1:${server.port}/executor/${id}` };
 }
 

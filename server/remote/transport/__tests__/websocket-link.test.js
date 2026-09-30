@@ -75,6 +75,30 @@ for (const dialer of ['controller', 'worker']) {
   });
 }
 
+test('disposing an authenticated listener releases its port for replacement', async () => {
+  const common = {
+    executorId: 'synthetic-executor', secret,
+    allowInsecureDevelopment: true, reconnectDelayMs: 60_000,
+  };
+  const controller = new WebSocketLink({ ...common, role: 'controller' });
+  const worker = new WebSocketLink({ ...common, role: 'worker' });
+  const replacement = new WebSocketLink({ ...common, role: 'controller' });
+  try {
+    const address = controller.listen(0, '127.0.0.1');
+    const port = Number(new URL(address).port);
+    worker.dial(address);
+    await Promise.all([controller.ready, worker.ready]);
+
+    await controller.dispose();
+
+    expect(new URL(replacement.listen(port, '127.0.0.1')).port).toBe(String(port));
+  } finally {
+    await controller.dispose();
+    await worker.dispose();
+    await replacement.dispose();
+  }
+});
+
 for (const role of ['controller', 'worker']) {
   for (const attack of ['reflected proof', 'wrong secret']) {
     test(`rejects ${attack} when authenticating a ${role} peer`, async () => {

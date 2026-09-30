@@ -54,7 +54,8 @@ test('chat host selectors fit narrow containers and commit cancellable handoffs 
       await browserExpect.poll(() => controls().evaluate(element => {
         const outer = element.getBoundingClientRect();
         const buttons = [...element.querySelectorAll<HTMLButtonElement>('button')]
-          .filter(button => button.checkVisibility({ checkVisibilityCSS: true }));
+          .filter(button => button.checkVisibility({ checkVisibilityCSS: true })
+            && !button.closest('[aria-hidden="true"]'));
         const rectangles = buttons.map(button => button.getBoundingClientRect());
         return rectangles.every((rect, index) => rect.left >= outer.left && rect.right <= outer.right
           && rectangles.slice(index + 1).every(other => rect.right <= other.left || rect.left >= other.right
