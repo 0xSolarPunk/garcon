@@ -19,6 +19,7 @@ import {
 	DEFAULT_PROMPT_REFINEMENT_PROMPT,
 	GENERATION_PROMPT_TEMPLATE_MAX_LENGTH,
 } from '$shared/generation-prompts';
+import { DEFAULT_TICKET_CHAT_PROMPT, TICKET_CHAT_TOKENS } from '$shared/ticket-chat';
 import {
 	makeRemoteSettingsSnapshot,
 	mockRemoteSettingsUpdate,
@@ -961,6 +962,51 @@ describe('remote settings sections', () => {
 						customPrompt: 'Rewrite: {{USER_PROMPT}}',
 					}),
 				},
+			});
+		});
+	});
+
+	it('edits the ticket chat prompt without introducing separate model settings', async () => {
+		const store = new RemoteSettingsStore();
+		store.applySnapshot(
+			makeRemoteSettingsSnapshot({
+				ui: {},
+			}),
+		);
+		setTestRemoteSettingsStore(store);
+		mockRemoteSettingsUpdate(store);
+		render(RemoteSettingsSectionTestHost, { section: 'automation' });
+
+		expect(screen.queryByRole('button', { name: 'Same as new chat' })).toBeNull();
+		await fireEvent.click(screen.getByRole('button', { name: 'Edit ticket chat prompt' }));
+		const prompt = screen.getByRole('textbox', { name: 'Edit ticket chat prompt' });
+		expect((prompt as HTMLTextAreaElement).value).toBe(DEFAULT_TICKET_CHAT_PROMPT);
+		for (const token of Object.values(TICKET_CHAT_TOKENS)) expect(screen.getByText(token)).toBeTruthy();
+
+		await fireEvent.input(prompt, { target: { value: 'Fix it.' } });
+		expect(screen.getByText('The generation prompt must include {{ticket_id}}.')).toBeTruthy();
+		expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+
+		await fireEvent.input(prompt, { target: { value: '{{ticket_id}} {{ticket}}' } });
+		expect(screen.getByText('Unknown template variable. Use the ticket variables listed below.')).toBeTruthy();
+		expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+		await fireEvent.input(prompt, { target: { value: 'Fix: {{ticket_id}}' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await waitFor(() => {
+			expect(updateRemoteSettings).toHaveBeenLastCalledWith({
+				ui: {
+					ticketChat: { customPrompt: 'Fix: {{ticket_id}}' },
+				},
+			});
+		});
+
+		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+		await fireEvent.click(screen.getByRole('button', { name: 'Edit ticket chat prompt' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Restore default' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await waitFor(() => {
+			expect(updateRemoteSettings).toHaveBeenLastCalledWith({
+				ui: { ticketChat: { customPrompt: '' } },
 			});
 		});
 	});

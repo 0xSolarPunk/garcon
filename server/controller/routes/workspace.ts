@@ -29,6 +29,7 @@ import {
   normalizeChatTitleUiSettings,
   normalizeCommitMessageUiSettings,
   normalizePromptRefinementUiSettings,
+  normalizeTicketChatUiSettings,
   parseExecutorProjectPreferences,
   parseExecutorProjectPreferencesPatch,
   type AgentCommandsFeatureSettings,
@@ -40,6 +41,7 @@ import {
   GENERATION_PROMPT_TEMPLATE_MAX_LENGTH,
   PROMPT_REFINEMENT_USER_PROMPT_TOKEN,
 } from '../../../common/generation-prompts.js';
+import { TICKET_CHAT_TOKENS, ticketChatPromptError } from '../../../common/ticket-chat.js';
 import { AppTitleValidationError, sanitizeAppIdentityPatch } from '../app-title-settings.js';
 import { TranscriptSearchSettingsError } from '../chats/search/settings-coordinator.js';
 import { isGenerationTestTarget } from '../../../common/generation-test-contracts.js';
@@ -273,6 +275,11 @@ export default function createWorkspaceRoutes(
       if (promptRefinement || isEmptyObject(patch.promptRefinement)) patch.promptRefinement = promptRefinement ?? {};
       else delete patch.promptRefinement;
     }
+    if ('ticketChat' in patch) {
+      const ticketChat = normalizeTicketChatUiSettings(patch.ticketChat);
+      if (ticketChat || isEmptyObject(patch.ticketChat)) patch.ticketChat = ticketChat ?? {};
+      else delete patch.ticketChat;
+    }
     if ('hiddenBashCommandPatterns' in patch) {
       const patterns = parseHiddenBashCommandPatterns(patch.hiddenBashCommandPatterns);
       if (patterns !== null) patch.hiddenBashCommandPatterns = patterns;
@@ -311,6 +318,20 @@ export default function createWorkspaceRoutes(
         && !targetPatch.customPrompt.includes(PROMPT_REFINEMENT_USER_PROMPT_TOKEN)
       ) {
         return `promptRefinement.customPrompt must include ${PROMPT_REFINEMENT_USER_PROMPT_TOKEN}.`;
+      }
+    }
+    const ticketChat = ui.ticketChat;
+    if (isRecord(ticketChat) && Object.hasOwn(ticketChat, 'customPrompt')) {
+      if (typeof ticketChat.customPrompt !== 'string') return 'ticketChat.customPrompt must be a string.';
+      const error = ticketChatPromptError(ticketChat.customPrompt);
+      if (error === 'too-long') {
+        return `ticketChat.customPrompt must be at most ${GENERATION_PROMPT_TEMPLATE_MAX_LENGTH} characters.`;
+      }
+      if (error === 'missing-ticket-id') {
+        return `ticketChat.customPrompt must include ${TICKET_CHAT_TOKENS.id}.`;
+      }
+      if (error === 'unknown-variable') {
+        return `ticketChat.customPrompt supports only ${Object.values(TICKET_CHAT_TOKENS).join(', ')}.`;
       }
     }
     return null;

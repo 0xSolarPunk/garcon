@@ -1,6 +1,11 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { setNotifications, setTransientLayers } from '$lib/context';
+	import { RemoteSettingsStore } from '$lib/stores/remote-settings.svelte.js';
+	import { makeRemoteSettingsSnapshot } from '$lib/stores/__tests__/remote-settings-snapshot-fixture';
+	import { TicketChatController } from '$lib/tickets/chat/ticket-chat-controller.svelte.js';
+	import { AppShellStore } from '$lib/stores/app-shell.svelte';
+	import { setTicketChat } from '$lib/context/tickets-context.js';
 	import { createNotificationsStore } from '$lib/stores/notifications.svelte.js';
 	import { WorkspaceInteractionGate } from '$lib/workspace/workspace-interaction-gate.svelte.js';
 	import { TransientLayerRegistry } from '$lib/workspace/transient-layers.svelte.js';
@@ -17,16 +22,25 @@
 		pinnedProjectPaths = [],
 		chats = [],
 		onOpenChat = () => {},
+		appShell,
 	}: {
 		controller: TicketsController;
 		frame?: SurfaceFrameBridge;
 		pinnedProjectPaths?: string[];
 		chats?: readonly TicketChatSummary[];
 		onOpenChat?: (id: string) => void;
+		appShell?: AppShellStore;
 	} = $props();
 	setSurfaceFrameBridge(() => frame);
 	setNotifications(createNotificationsStore());
 	setTransientLayers(new TransientLayerRegistry(new WorkspaceInteractionGate()));
+	const remoteSettings = new RemoteSettingsStore();
+	remoteSettings.applySnapshot(makeRemoteSettingsSnapshot());
+	setTicketChat(new TicketChatController({
+		appShell: untrack(() => appShell) ?? new AppShellStore(),
+		remoteSettings,
+		notifications: createNotificationsStore(),
+	}));
 	onMount(() => {
 		void frame.activate(false);
 		return () => frame.deactivate();

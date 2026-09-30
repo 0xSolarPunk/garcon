@@ -15,6 +15,7 @@ import type { PortableSingletonController } from '$lib/workspace/portable-single
 import type { WorkspaceProjectState } from '$lib/workspace/workspace-context.svelte.js';
 import { TicketDetailState } from '../detail/ticket-detail-state.svelte.js';
 import { TicketMutationFeedback } from '../commands/ticket-mutation-feedback.svelte.js';
+import { canSubmitTicketForm, submitTicketForm } from '../commands/ticket-form.js';
 import { TicketDraftStore } from '../drafts/ticket-draft-store.svelte.js';
 import { attachTicketDraftExitGuard } from '../drafts/ticket-draft-exit-guard.js';
 import {
@@ -86,6 +87,11 @@ export class TicketsController implements PortableSingletonController {
 	#request: AbortController | null = null;
 	#pageRequest: AbortController | null = null;
 	#createRequest: AbortController | null = null;
+	#createChatIntent: {
+		draft: TicketDraftState;
+		version: number;
+		open: (ticket: Ticket) => void;
+	} | null = null;
 	#collectionQuery = $state.raw<TicketListQuery | null>(null);
 
 	constructor(deps: TicketsControllerDeps) {
@@ -591,7 +597,18 @@ export class TicketsController implements PortableSingletonController {
 		}
 	}
 
+	async createAndOpenChat(open: (ticket: Ticket) => void): Promise<void> {
+		const draft = this.createDraft;
+		if (!draft || !canSubmitTicketForm(draft)) return;
+		const intent = { draft, version: draft.current.version, open };
+		this.#createChatIntent = intent;
+		await submitTicketForm(draft);
+		// An uncertain create retains the continuation only for an explicit retry of this request.
+		if (this.#createChatIntent === intent && !draft.current.frozen) this.#createChatIntent = null;
+	}
+
 	closeCreate(): void {
+		this.#createChatIntent = null;
 		this.#createRequest?.abort();
 		this.createDraft?.flush();
 		this.createDraft = null;
@@ -698,14 +715,21 @@ export class TicketsController implements PortableSingletonController {
 			...(result.relatedTicket ? [result.relatedTicket.id] : []),
 		]);
 		if (draft.current.kind === 'create') {
+			const intent = this.#createChatIntent;
+			const openChat =
+				cleared && intent?.draft === draft && intent.version === draft.current.version
+					? intent.open
+					: null;
 			this.createdTicketId = result.ticket.id;
 			if (cleared) this.closeCreate();
 			this.detail.select(result.ticket.id);
+			openChat?.(result.ticket);
 		}
 		this.#supersede();
 	}
 
 	dispose(): void {
+		this.#createChatIntent = null;
 		this.mutations.reset();
 		this.#disposed = true;
 		this.#epoch++;

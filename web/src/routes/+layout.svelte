@@ -106,7 +106,8 @@
 	import { ChatBoardsRouter } from '$lib/events/chat-boards-router.svelte.js';
 	import { TicketsRouter } from '$lib/events/tickets-router.svelte.js';
 	import { TicketsInvalidationHub } from '$lib/tickets/catalog/tickets-invalidation-hub.js';
-	import { setTicketsInvalidations } from '$lib/context/tickets-context.js';
+	import { setTicketChat, setTicketsInvalidations } from '$lib/context/tickets-context.js';
+	import { TicketChatController } from '$lib/tickets/chat/ticket-chat-controller.svelte.js';
 
 	let { children } = $props();
 
@@ -171,6 +172,12 @@
 				terminalIdentity.clientId,
 			),
 	});
+	const ticketChat = new TicketChatController({
+		remoteSettings,
+		notifications,
+		appShell,
+	});
+	setTicketChat(ticketChat);
 	const workspaceLayout = workspaceServices.layout;
 	const workspaceContext = workspaceServices.context;
 	const projectResolution = workspaceServices.projectResolution;

@@ -1097,12 +1097,51 @@ describe('PUT /api/app/settings', () => {
     });
   });
 
+  it('preserves the ticket chat prompt while stripping execution settings', async () => {
+    parseJsonBody.mockImplementation(() => Promise.resolve({
+      ui: {
+        ticketChat: {
+          enabled: true,
+          agentId: 'codex',
+          model: 'gpt-5.5',
+          thinkingMode: 'high',
+          executorId: 'remote',
+          customPrompt: '{{ticket_id}}: {{ticket_title}}\n{{ticket_project}}\n{{ticket_description}}',
+          useCommonDirPrefix: true,
+        },
+      },
+    }));
+
+    const response = await handler(makeRequest('http://localhost/api/app/settings', 'PUT', {}));
+
+    expect(response.status).toBe(200);
+    expect(ctx.settings.setUiSettings).toHaveBeenCalledWith({
+      ticketChat: {
+        customPrompt: '{{ticket_id}}: {{ticket_title}}\n{{ticket_project}}\n{{ticket_description}}',
+      },
+    });
+  });
+
+  it('accepts an empty ticket chat prompt as the default prompt', async () => {
+    parseJsonBody.mockImplementation(() => Promise.resolve({ ui: { ticketChat: { customPrompt: '' } } }));
+
+    const response = await handler(makeRequest('http://localhost/api/app/settings', 'PUT', {}));
+
+    expect(response.status).toBe(200);
+    expect(ctx.settings.setUiSettings).toHaveBeenCalledWith({ ticketChat: { customPrompt: '' } });
+  });
+
   it('rejects invalid generation prompt patches before persistence', async () => {
     const cases = [
       { commitMessage: { customPrompt: 42 } },
       { commitMessage: { customPrompt: 'x'.repeat(32_001) } },
       { promptRefinement: { customPrompt: 'Missing the required token' } },
       { promptRefinement: { customPrompt: 'x'.repeat(32_001) } },
+      { ticketChat: { customPrompt: 7 } },
+      { ticketChat: { customPrompt: 'Missing the ticket token' } },
+      { ticketChat: { customPrompt: '{{ticket_id}} {{ticket}}' } },
+      { ticketChat: { customPrompt: '{{ticket_id}} {{ticket_unknown}}' } },
+      { ticketChat: { customPrompt: `{{ticket_id}}${'x'.repeat(32_000)}` } },
     ];
 
     for (const ui of cases) {
@@ -1153,7 +1192,7 @@ describe('PUT /api/app/settings', () => {
       }
     });
 
-    for (const target of ['chatTitle', 'agentSwitchCompaction', 'commitMessage', 'promptRefinement']) {
+    for (const target of GENERATION_UI_SETTING_KEYS) {
       ctx.settings.setUiSettings.mockClear();
       ctx.settings.setFeatureSettings.mockClear();
       ctx.settings.setPathSettings.mockClear();

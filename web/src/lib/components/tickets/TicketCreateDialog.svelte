@@ -5,6 +5,8 @@
 	import { canSubmitTicketForm, submitTicketForm } from '$lib/tickets/commands/ticket-form.js';
 	import TicketFieldsEditor from './TicketFieldsEditor.svelte';
 	import TicketDraftFeedback from './TicketDraftFeedback.svelte';
+	import TicketChatButton from './TicketChatButton.svelte';
+	import { getTicketChat } from '$lib/context/tickets-context.js';
 	import * as m from '$lib/paraglide/messages.js';
 	let {
 		controller,
@@ -21,11 +23,13 @@
 		onClose: () => void;
 		pinnedProjectPaths?: string[];
 	} = $props();
+	const ticketChat = getTicketChat();
 	const draft = $derived(controller.createDraft);
 	let content = $state<HTMLElement | null>(null);
 	let closeRequested = $state(false);
 	let composing = $state(false);
 	let refining = $state(false);
+	let chatRequested = $state(false);
 	const canSubmit = $derived(
 		draft !== null && canSubmitTicketForm(draft) && !composing && !refining,
 	);
@@ -42,6 +46,15 @@
 	async function submit() {
 		if (!draft || !canSubmit) return;
 		await submitTicketForm(draft);
+	}
+	async function createAndOpenChat() {
+		if (!draft || !canSubmit) return;
+		chatRequested = true;
+		try {
+			await controller.createAndOpenChat((ticket) => void ticketChat.open(ticket));
+		} finally {
+			chatRequested = false;
+		}
 	}
 </script>
 
@@ -119,8 +132,14 @@
 						>{m.tickets_cancel()}</button
 					>
 					<button type="submit" class="ticket-button ticket-primary" disabled={!canSubmit}
-						>{draft.pending ? m.tickets_creating() : m.tickets_create()}</button
+						>{draft.pending && !chatRequested ? m.tickets_creating() : m.tickets_create()}</button
 					>
+					<TicketChatButton
+						label={m.tickets_create_and_open_chat()}
+						pending={draft.pending && chatRequested}
+						disabled={!canSubmit}
+						onOpen={() => void createAndOpenChat()}
+					/>
 				</Dialog.Footer>
 			</form>
 		{/if}

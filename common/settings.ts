@@ -54,6 +54,10 @@ export interface CommitMessageUiSettings extends PromptGenerationUiSettings {
 
 export type PromptRefinementUiSettings = PromptGenerationUiSettings;
 
+export interface TicketChatUiSettings {
+  customPrompt?: string;
+}
+
 // Names the model that compacts a carried-over transcript when a chat hands off
 // to another agent, or continues in a new chat through `/handoff`.
 export interface AgentSwitchCompactionUiSettings extends GenerationSelectionUiSettings {
@@ -87,6 +91,7 @@ export interface RemoteUiSettings {
   agentSwitchCompaction?: AgentSwitchCompactionUiSettings;
   commitMessage?: CommitMessageUiSettings;
   promptRefinement?: PromptRefinementUiSettings;
+  ticketChat?: TicketChatUiSettings;
   appIdentity?: AppIdentityUiSettings;
   notifications?: {
     telegram?: TelegramNotificationSettings;
@@ -390,6 +395,14 @@ export function normalizePromptRefinementUiSettings(
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+export function normalizeTicketChatUiSettings(
+  value: unknown,
+): TicketChatUiSettings | undefined {
+  const raw = asRecord(value);
+  if (!raw || typeof raw.customPrompt !== 'string') return undefined;
+  return { customPrompt: raw.customPrompt };
+}
+
 function normalizeAppIdentityUiSettings(value: unknown): AppIdentityUiSettings | undefined {
   const raw = asRecord(value);
   if (!raw || typeof raw.title !== 'string') return undefined;
@@ -532,6 +545,9 @@ function normalizeRemoteUiSettings(value: unknown): RemoteUiSettings | null {
 
   const promptRefinement = normalizePromptRefinementUiSettings(raw.promptRefinement);
   if (promptRefinement) normalized.promptRefinement = promptRefinement;
+
+  const ticketChat = normalizeTicketChatUiSettings(raw.ticketChat);
+  if (ticketChat) normalized.ticketChat = ticketChat;
 
   const appIdentity = normalizeAppIdentityUiSettings(raw.appIdentity);
   if (appIdentity) normalized.appIdentity = appIdentity;

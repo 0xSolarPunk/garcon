@@ -26,6 +26,8 @@
 	import TicketExecutorReference from './TicketExecutorReference.svelte';
 	import TicketRelationships from './TicketRelationships.svelte';
 	import TicketMarkdown from './TicketMarkdown.svelte';
+	import TicketChatButton from './TicketChatButton.svelte';
+	import { getTicketChat } from '$lib/context/tickets-context.js';
 	import * as m from '$lib/paraglide/messages.js';
 	let {
 		controller,
@@ -54,6 +56,7 @@
 		visible?: boolean;
 		onStatus: (status: TicketStatus) => void;
 	} = $props();
+	const ticketChat = getTicketChat();
 	const editing = $derived(controller.detail.fieldsDraft);
 	let copied = $state('');
 	let cancelRequested = $state(false);
@@ -206,6 +209,15 @@
 					disabled={saving}
 					onclick={() => onStatus('closed')}>{m.tickets_close()}</button
 				>{/if}
+			<TicketChatButton
+				label={m.tickets_new_chat()}
+				pending={ticketChat.opening}
+				disabled={saving || ticket.description === null}
+				onOpen={() => {
+					if (ticket.description !== null)
+						void ticketChat.open({ ...ticket, description: ticket.description });
+				}}
+			/>
 		</div>
 		<dl class="ticket-properties-read">
 			<dt>{m.tickets_project()}</dt>

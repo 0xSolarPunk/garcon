@@ -415,7 +415,7 @@ describe('Tickets stable, immediate interactions', () => {
 				within(status.parentElement!)
 					.getAllByRole('button')
 					.map((button) => button.textContent?.trim()),
-			).toEqual(['Open', 'Edit', 'Close ticket']);
+			).toEqual(['Open', 'Edit', 'Close ticket', 'New chat from ticket']);
 			const identity = detail.querySelector('.ticket-detail-identity')!;
 			expect(identity.textContent).toContain('G-1');
 			expect(identity.nextElementSibling?.classList.contains('ticket-detail-title')).toBe(true);

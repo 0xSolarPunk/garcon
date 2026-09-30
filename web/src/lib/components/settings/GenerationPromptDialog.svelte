@@ -11,9 +11,10 @@
 		GENERATION_PROMPT_TEMPLATE_MAX_LENGTH,
 		PROMPT_REFINEMENT_USER_PROMPT_TOKEN,
 	} from '$shared/generation-prompts';
+	import { TICKET_CHAT_TOKENS, ticketChatPromptError } from '$shared/ticket-chat';
 	import type { GenerationPromptSaveResult } from './remote-generation-settings-card-state.svelte';
 
-	export type GenerationPromptKind = 'commit-message' | 'prompt-refinement';
+	export type GenerationPromptKind = 'commit-message' | 'prompt-refinement' | 'ticket-chat';
 
 	interface Props {
 		kind: GenerationPromptKind;
@@ -46,18 +47,28 @@
 				token: PROMPT_REFINEMENT_USER_PROMPT_TOKEN,
 			});
 		}
+		if (kind === 'ticket-chat') {
+			const error = ticketChatPromptError(draft);
+			if (error === 'missing-ticket-id')
+				return m.settings_generation_prompt_required_token({ token: TICKET_CHAT_TOKENS.id });
+			if (error === 'unknown-variable') return m.settings_ticket_chat_prompt_unknown_variable();
+		}
 		return null;
 	});
 
 	let title = $derived(
 		kind === 'commit-message'
 			? m.settings_commit_prompt_dialog_title()
-			: m.settings_prompt_refinement_prompt_dialog_title(),
+			: kind === 'ticket-chat'
+				? m.settings_ticket_chat_prompt_dialog_title()
+				: m.settings_prompt_refinement_prompt_dialog_title(),
 	);
 	let description = $derived(
 		kind === 'commit-message'
 			? m.settings_commit_prompt_dialog_description()
-			: m.settings_prompt_refinement_prompt_dialog_description(),
+			: kind === 'ticket-chat'
+				? m.settings_ticket_chat_prompt_dialog_description()
+				: m.settings_prompt_refinement_prompt_dialog_description(),
 	);
 
 	function handleCloseRequest(): void {
@@ -122,7 +133,7 @@
 				<div class="text-xs font-medium text-foreground">
 					{m.settings_generation_prompt_legend_title()}
 				</div>
-				<div class="mt-1 flex flex-col gap-1 text-xs text-muted-foreground sm:flex-row sm:gap-5">
+				<div class="mt-1 flex flex-col gap-1 text-xs text-muted-foreground sm:flex-row sm:flex-wrap sm:gap-x-5">
 					{#if kind === 'commit-message'}
 						<div>
 							<code class="font-mono text-foreground">{COMMIT_MESSAGE_FILES_TOKEN}</code>
@@ -131,6 +142,23 @@
 						<div>
 							<code class="font-mono text-foreground">{COMMIT_MESSAGE_DIFF_TOKEN}</code>
 							{m.settings_commit_prompt_legend_diff()}
+						</div>
+					{:else if kind === 'ticket-chat'}
+						<div>
+							<code class="font-mono text-foreground">{TICKET_CHAT_TOKENS.id}</code>
+							{m.settings_ticket_chat_prompt_legend_id()}
+						</div>
+						<div>
+							<code class="font-mono text-foreground">{TICKET_CHAT_TOKENS.title}</code>
+							{m.settings_ticket_chat_prompt_legend_title()}
+						</div>
+						<div>
+							<code class="font-mono text-foreground">{TICKET_CHAT_TOKENS.project}</code>
+							{m.settings_ticket_chat_prompt_legend_project()}
+						</div>
+						<div>
+							<code class="font-mono text-foreground">{TICKET_CHAT_TOKENS.description}</code>
+							{m.settings_ticket_chat_prompt_legend_description()}
 						</div>
 					{:else}
 						<div>
