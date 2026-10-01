@@ -105,7 +105,7 @@ export class AcceptedInputHandler {
             ? { excludedResendOrdinals: [...input.excludedResendOrdinals] }
             : {}),
         },
-      });
+      }, input.admissionDeadline);
       await input.settlement.settleQueueMutation(input.command, result.entryId);
       this.#coordinator.requestDrain(input.command.chatId, 'accepted enqueue');
       return result;
@@ -211,7 +211,7 @@ export class AcceptedInputHandler {
       assertDirectControlAvailable(control);
       await this.#checkpointAfter(
         reservation,
-        this.#projectAdmission.assertAvailable(input.command.chatId),
+        this.#projectAdmission.assertAvailable(input.command.chatId, input.admissionDeadline),
       );
       await this.#checkpointAfter(
         reservation,
@@ -570,13 +570,22 @@ export class AcceptedInputHandler {
       }
       const control = await this.#checkpointAfter(reservation, this.#controls.read(input.command.chatId));
       assertDirectControlAvailable(control);
+      const preparing = performance.now();
       await this.#checkpointAfter(reservation, Promise.resolve(input.preparation?.prepare({
           signal: reservation.executionAdmission.signal,
           assertAdmissionActive: () => this.#checkpoint(reservation),
         })));
+      // A preparation, such as a fork run's native fork or a handoff's carryover
+      // compaction, runs outside the interactive budget, so its own duration does
+      // not count against the admission check's deadline. A budget spent before the
+      // preparation began ends at once, and a read sent then still gets its grace.
+      const prepared = performance.now();
+      const admissionDeadline = input.preparation && input.admissionDeadline !== null
+        ? Math.max(prepared, input.admissionDeadline + prepared - preparing)
+        : input.admissionDeadline;
       await this.#checkpointAfter(
         reservation,
-        this.#projectAdmission.assertAvailable(input.command.chatId),
+        this.#projectAdmission.assertAvailable(input.command.chatId, admissionDeadline),
       );
       const inserted = await this.#checkpointAfter(
         reservation,

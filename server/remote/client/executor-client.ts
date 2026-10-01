@@ -15,6 +15,7 @@ import type { SessionTransport } from '../transport/session-transport.js';
 import type { WebSocketLink } from '../transport/websocket-link.js';
 import { failureReason } from '../transport/failure-reason.js';
 import { createLogger, type Logger } from '../../common/log.js';
+import { ExecutorSessionLostError, reconnectTimedOut } from '../../common/executor-disconnect.js';
 import { unavailableService } from '../../common/unavailable-service.js';
 import { MODEL_DISCOVERY_TIMEOUT_MS } from '../../common/provider-discovery.js';
 import { RemoteFilesService } from './remote-files.js';
@@ -37,6 +38,13 @@ export interface RemoteExecutorInventory {
 export interface HeldCallOptions {
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number | null;
+  // Bounds only the wait; see `ExecutorCallOptions`.
+  readonly dispatchDeadline?: number;
+  // Pins the call to one worker instance: a session of another instance fails it
+  // as not dispatched. Cleanup belongs to the instance holding its resource. A
+  // worker restart already fails waiting calls and forgets that instance's
+  // bindings, so this guards the rule for any later caller.
+  readonly instanceId?: string;
 }
 
 export interface HeldSession {
@@ -53,9 +61,13 @@ export interface RemoteSessions {
   // identity, capabilities, and manifests.
   latest(): RemoteSessionBacking;
   acquire(options?: HeldCallOptions): Promise<HeldSession>;
+  // Sends through a held session. A send that provably never left, because its
+  // session retired first, is repeated on the next session of the same worker
+  // within the caller's deadline.
+  send<T>(options: HeldCallOptions | undefined, send: (session: HeldSession) => Promise<T>): Promise<T>;
   call<K extends keyof ExecutorRpcMethods>(
     integrationId: string, method: K, request: ExecutorRpcMethods[K]['request'],
-    options?: RpcCallOptions<ExecutorRpcMethods[K]['result']>,
+    options?: RpcCallOptions<ExecutorRpcMethods[K]['result']> & Pick<HeldCallOptions, 'dispatchDeadline' | 'instanceId'>,
   ): Promise<ExecutorRpcMethods[K]['result']>;
 }
 
@@ -99,10 +111,10 @@ export class RemoteExecutorClient implements ExecutionRuntimeApi {
   readonly #sessions: RemoteSessions = {
     latest: () => this.#latestSession(),
     acquire: (options) => this.#acquire(options),
-    call: async (integrationId, method, request, options) => {
-      const { backing, timeoutMs } = await this.#acquire(options);
-      return backing.rpc.call(integrationId, method, request, { ...options, timeoutMs });
-    },
+    send: (options, send) => this.#send(options, send),
+    call: (integrationId, method, request, options) => this.#send(options, ({ backing, timeoutMs }) => (
+      backing.rpc.call(integrationId, method, request, { ...options, timeoutMs })
+    )),
   };
   readonly #files = new RemoteFilesService(this.#sessions);
   readonly #git = new RemoteGitServices(this.#sessions);
@@ -329,15 +341,43 @@ export class RemoteExecutorClient implements ExecutionRuntimeApi {
   }
 
   async #acquire(options: HeldCallOptions = {}): Promise<HeldSession> {
+    const session = await this.#holdSession(options);
+    if (options.instanceId !== undefined && session.backing.info.instanceId !== options.instanceId) {
+      throw new AgentCallError('not-dispatched', 'The executor restarted before the request was sent.');
+    }
+    return session;
+  }
+
+  async #holdSession(options: HeldCallOptions): Promise<HeldSession> {
     const timeoutMs = options.timeoutMs === undefined ? DEFAULT_RPC_TIMEOUT_MS : options.timeoutMs;
     if (this.#current?.rpc.transport.connected) return { backing: this.#current, timeoutMs };
     if (!this.#latest || !this.#holdsCalls()) throw new AgentCallError('not-dispatched', `Executor is ${this.#availability}`);
     if (options.signal?.aborted) throw heldCallCancelled();
-    if (timeoutMs === null) return { backing: await this.#nextSession(options.signal, null), timeoutMs };
+    const dispatchWaitMs = options.dispatchDeadline === undefined ? null : options.dispatchDeadline - performance.now();
+    if (dispatchWaitMs !== null && dispatchWaitMs <= 0) throw reconnectTimedOut();
+    if (timeoutMs === null) return { backing: await this.#nextSession(options.signal, dispatchWaitMs), timeoutMs };
     const reserved = Math.min(HELD_CALL_BUDGET_MS, Math.floor(timeoutMs / 2));
     const started = performance.now();
-    const backing = await this.#nextSession(options.signal, timeoutMs - reserved);
+    const backing = await this.#nextSession(options.signal, Math.min(timeoutMs - reserved, dispatchWaitMs ?? Infinity));
     return { backing, timeoutMs: Math.max(reserved, Math.ceil(timeoutMs - (performance.now() - started))) };
+  }
+
+  async #send<T>(options: HeldCallOptions = {}, send: (session: HeldSession) => Promise<T>): Promise<T> {
+    const timeoutMs = options.timeoutMs === undefined ? DEFAULT_RPC_TIMEOUT_MS : options.timeoutMs;
+    const started = performance.now();
+    let held = options;
+    for (let previous: RemoteSessionBacking | null = null; ;) {
+      const session = await this.#acquire(held);
+      try {
+        return await send(session);
+      } catch (error) {
+        const remaining = timeoutMs === null ? null : Math.ceil(timeoutMs - (performance.now() - started));
+        const unsent = error instanceof ExecutorSessionLostError && error.outcome === 'not-dispatched';
+        if (!unsent || session.backing === previous || (remaining !== null && remaining < 1)) throw error;
+        previous = session.backing;
+        held = { ...options, timeoutMs: remaining, instanceId: session.backing.info.instanceId };
+      }
+    }
   }
 
   #nextSession(signal: AbortSignal | undefined, timeoutMs: number | null): Promise<RemoteSessionBacking> {
@@ -371,8 +411,4 @@ export class RemoteExecutorClient implements ExecutionRuntimeApi {
 
 function heldCallCancelled(): AgentCallError {
   return new AgentCallError('not-dispatched', 'The request was cancelled while the executor reconnected.');
-}
-
-function reconnectTimedOut(): AgentCallError {
-  return new AgentCallError('not-dispatched', 'The executor did not reconnect in time.');
 }

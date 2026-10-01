@@ -8,6 +8,7 @@ import {
   type ChatStopOutcome,
 } from '../../../common/chat-types.ts';
 import type { AgentExecutionAdmission, RunAgentTurnOptions } from '../agents/session-types.js';
+import { waitAbortably } from '../../common/abortable-wait.js';
 import { KeyedPromiseLock } from '../../common/keyed-lock.js';
 import { createLogger } from '../../common/log.js';
 import { DomainError } from '../../common/domain-error.js';
@@ -46,6 +47,7 @@ import {
   type ExecutionControlUpdatedCallback,
   type ServerControlDisposition,
   type ServerControlInput,
+  type ServerControlOffer,
   type UserInputAdmissionOptions,
   type ProcessingInvalidatedCallback,
   type ProjectAdmissionPort,
@@ -67,7 +69,6 @@ import { AcceptedInputTranscript, type AcceptedInputTranscriptPort } from './acc
 import { SteerInputDelivery } from './steer-input-delivery.ts';
 import { QueuedSteerDelivery, type QueuedSteerDeliveryOptions } from './queued-steer-delivery.ts';
 import { ControlInputDelivery } from './control-input-delivery.ts';
-import { ControlSteerDelivery } from './control-steer-delivery.ts';
 
 export type { QueueCommandIdentity } from './chat-execution-control-transitions.ts';
 export {
@@ -113,7 +114,6 @@ export class ChatExecutionCoordinator extends EventEmitter<ChatExecutionCoordina
   #steerInputDelivery: SteerInputDelivery;
   #queuedSteers: QueuedSteerDelivery;
   #controlInputDelivery: ControlInputDelivery;
-  #controlSteerDelivery: ControlSteerDelivery;
 
   constructor(
     _workspaceDir: string,
@@ -180,16 +180,10 @@ export class ChatExecutionCoordinator extends EventEmitter<ChatExecutionCoordina
       requestDrain: (chatId, context) => { this.#requestDrain(chatId, context); },
       trackTask: (task) => { this.#trackDispatch(task); },
     });
-    const deliverControlSteer = (
-      chatId: string,
-      content: string,
-      viewId: string,
-      target: CapturedSteerTarget,
-    ) => this.#steerInputDelivery.deliverControl(chatId, content, viewId, target);
-    this.#controlSteerDelivery = new ControlSteerDelivery(deliverControlSteer);
     this.#controlInputDelivery = new ControlInputDelivery({
-      captureTarget: (chatId) => this.#steerInputDelivery.captureControlTarget(chatId),
-      deliverSteer: deliverControlSteer,
+      // Chat ID disclosures hold no chat lock, so their steers keep their own deadlines.
+      captureTarget: (chatId) => this.#steerInputDelivery.captureControlTarget(chatId, null),
+      deliverSteer: (chatId, content, viewId, target) => this.#steerInputDelivery.deliverControl(chatId, content, viewId, target),
       scheduleRun: (chatId, content, viewId, onReserved) => (
         this.#scheduleControlRun(chatId, content, viewId, onReserved)
       ),
@@ -445,8 +439,8 @@ export class ChatExecutionCoordinator extends EventEmitter<ChatExecutionCoordina
     await this.#acceptedInputHandler.scheduleOperation(input);
   }
 
-  captureSteerTarget(chatId: string): Promise<CapturedSteerTarget | null> {
-    return this.#steerInputDelivery.captureTarget(chatId);
+  captureSteerTarget(chatId: string, deadline: number): Promise<CapturedSteerTarget | null> {
+    return this.#steerInputDelivery.captureTarget(chatId, deadline);
   }
 
   async deliverControlInput(
@@ -457,16 +451,32 @@ export class ChatExecutionCoordinator extends EventEmitter<ChatExecutionCoordina
     signal: AbortSignal,
     onControlRun: (turnId: string) => void,
   ): Promise<void> {
-    return this.#controlInputDelivery.deliver(
-      chatId, content, transcriptViewId, emittingRunId, signal, onControlRun,
-    );
+    return this.#controlInputDelivery.deliver(chatId, content, transcriptViewId, emittingRunId, signal, onControlRun);
   }
 
+  // For callers that hold no chat lock, such as agent command replies, whose
+  // steers keep their own deadlines.
   async deliverServerControlInput(
     chatId: string,
     input: ServerControlInput,
     signal: AbortSignal,
   ): Promise<ServerControlDisposition> {
+    const offer = await this.offerServerControlInput(chatId, input, signal, null);
+    if (offer.kind !== 'after-turn') return offer.kind;
+    await waitAbortably(offer.turnSettled, signal);
+    return this.queueServerControlInput(chatId, input, signal);
+  }
+
+  // Steers server control input into the running turn, or queues it while the chat
+  // is idle or its queue is paused or holds control input. A running turn that
+  // provably did not receive it is returned instead: the caller queues the input
+  // once that turn settles, and need not hold a lock Stop needs meanwhile.
+  async offerServerControlInput(
+    chatId: string,
+    input: ServerControlInput,
+    signal: AbortSignal,
+    deadline: number | null,
+  ): Promise<ServerControlOffer> {
     signal.throwIfAborted();
     if (this.#shuttingDown) throw serverShuttingDownError();
     if (!this.#chatExists(chatId)) throw chatNotFoundError();
@@ -474,22 +484,25 @@ export class ChatExecutionCoordinator extends EventEmitter<ChatExecutionCoordina
     const control = await this.#controlOperations.read(chatId);
     signal.throwIfAborted();
     if (control.pause || control.controlEntries.length > 0) {
-      return this.#enqueueServerControlInput(chatId, input, signal);
+      return { kind: await this.queueServerControlInput(chatId, input, signal) };
     }
 
-    const target = await this.#steerInputDelivery.captureControlTarget(chatId);
-    if (target) {
-      const outcome = await this.#controlSteerDelivery.toCapturedTarget(
-        chatId,
-        input.content,
-        input.transcriptViewId,
-        target,
-        signal,
-      );
-      if (outcome === 'delivered') return 'delivered';
-    }
+    const target = await this.#steerInputDelivery.captureControlTarget(chatId, deadline);
+    if (!target) return { kind: await this.queueServerControlInput(chatId, input, signal) };
+    return this.#controlInputDelivery.offerToCapturedTarget(chatId, input.content, input.transcriptViewId, target, signal);
+  }
 
-    return this.#enqueueServerControlInput(chatId, input, signal);
+  async queueServerControlInput(
+    chatId: string,
+    input: ServerControlInput,
+    signal: AbortSignal,
+  ): Promise<'queued'> {
+    signal.throwIfAborted();
+    if (this.#shuttingDown) throw serverShuttingDownError();
+    if (!this.#chatExists(chatId)) throw chatNotFoundError();
+    await this.#controlOperations.enqueueControl(chatId, input);
+    this.#requestDrain(chatId, 'server control input');
+    return 'queued';
   }
 
   async deliverAcceptedSteer(input: AcceptedSteerInput): Promise<AcceptedSteerOutcome> {
@@ -796,7 +809,8 @@ export class ChatExecutionCoordinator extends EventEmitter<ChatExecutionCoordina
       if (hasPendingTurnInput(control) || control.pause) {
         throw controlInputBlockedError();
       }
-      await this.#projectAdmission.assertAvailable(chatId);
+      // Control runs start in the background, holding no chat lock.
+      await this.#projectAdmission.assertAvailable(chatId, null);
       this.#checkpointDirect(reservation);
       reservation.executionAdmission.signal.throwIfAborted();
       options = {
@@ -828,19 +842,6 @@ export class ChatExecutionCoordinator extends EventEmitter<ChatExecutionCoordina
       );
     });
     this.#trackDispatch(task);
-  }
-
-  async #enqueueServerControlInput(
-    chatId: string,
-    input: ServerControlInput,
-    signal: AbortSignal,
-  ): Promise<'queued'> {
-    signal.throwIfAborted();
-    if (this.#shuttingDown) throw serverShuttingDownError();
-    if (!this.#chatExists(chatId)) throw chatNotFoundError();
-    await this.#controlOperations.enqueueControl(chatId, input);
-    this.#requestDrain(chatId, 'server control input');
-    return 'queued';
   }
 
   #retireAttempt(chatId: string, attempt: QueueExecutionAttempt, reason?: Error): void {

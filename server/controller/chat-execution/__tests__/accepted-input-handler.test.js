@@ -1,7 +1,8 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { describe, expect, mock, spyOn, test } from 'bun:test';
 import { AgentCallError } from '@garcon/server-agent-interface';
 import { AcceptedInputHandler } from '../accepted-input-handler.ts';
 import { DomainError, ProjectUnavailableError, SteerDeliveryError } from '../../../common/domain-error.js';
+import { reconnectTimedOut } from '../../../common/executor-disconnect.js';
 import { QueueEntrySteerError } from '../queue-steer-error.js';
 
 function command(overrides = {}) {
@@ -327,6 +328,61 @@ describe('AcceptedInputHandler', () => {
     expect(m.admitInput).not.toHaveBeenCalled();
   });
 
+  describe('admission deadline after a preparation', () => {
+    // The operation asked for its chat lock at 1 s, so its deadline is 21 s.
+    async function admissionDeadlineAfter({ startsAt, lasts, operation = 'fork-run', admissionDeadline = 21_000 }) {
+      let now = startsAt;
+      const clock = spyOn(performance, 'now').mockImplementation(() => now);
+      try {
+        const { handler, m } = scaffold();
+        await handler.schedule({
+          command: command(),
+          content: 'prepared work',
+          options: { clientRequestId: 'request-1', clientMessageId: 'message-1', turnId: 'turn-1' },
+          settlement: settlement(),
+          admissionDeadline,
+          preparation: { operation, prepare: mock(async () => { now += lasts; }), compensate: mock(async () => undefined) },
+        });
+        return m.assertProjectAvailable.mock.calls[0][1];
+      } finally {
+        clock.mockRestore();
+      }
+    }
+
+    test('does not count a slow preparation, such as a native fork, against the deadline', async () => {
+      // 2 s of the budget were left when a 60 s fork began.
+      expect(await admissionDeadlineAfter({ startsAt: 19_000, lasts: 60_000 })).toBe(81_000);
+    });
+
+    test('leaves the deadline in place after a quick preparation of any kind', async () => {
+      for (const operation of ['chat-start', 'fork-run', 'agent-handoff']) {
+        expect(await admissionDeadlineAfter({ operation, startsAt: 19_000, lasts: 5 })).toBe(21_005);
+      }
+    });
+
+    test('ends a budget spent before the preparation began at once', async () => {
+      expect(await admissionDeadlineAfter({ startsAt: 30_000, lasts: 1_000 })).toBe(31_000);
+    });
+
+    test('keeps background admission without a deadline', async () => {
+      expect(await admissionDeadlineAfter({ startsAt: 1_000, lasts: 1_000, admissionDeadline: null })).toBeNull();
+    });
+  });
+
+  test('checks admission within the given deadline without a preparation', async () => {
+    const { handler, m } = scaffold();
+
+    await handler.schedule({
+      command: command(),
+      content: 'new work',
+      options: { clientRequestId: 'request-1', clientMessageId: 'message-1', turnId: 'turn-1' },
+      settlement: settlement(),
+      admissionDeadline: 21_000,
+    });
+
+    expect(m.assertProjectAvailable).toHaveBeenCalledWith('chat-1', 21_000);
+  });
+
   test('compensates preparation when the project is unavailable before transcript admission', async () => {
     const events = [];
     const unavailable = new ProjectUnavailableError('/workspace/missing', 'not-found');
@@ -503,6 +559,8 @@ describe('AcceptedInputHandler', () => {
   test.each([
     ['ordinary failure', new Error('provider failed'), ['compensated', 'settled', 'released']],
     ['setup failure', new AgentCallError('not-dispatched', 'setup reply lost'), ['compensated', 'settled', 'released']],
+    // A start holding its chat's lock stops waiting for a reconnecting executor.
+    ['missed dispatch deadline', reconnectTimedOut(), ['compensated', 'settled', 'released']],
     ['uncertain launch', new AgentCallError('unknown', 'execution reply lost'), ['settled', 'released']],
   ])('finishes initial-input settlement before release after %s', async (_name, providerError, expected) => {
     const events = [];

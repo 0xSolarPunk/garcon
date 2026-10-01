@@ -12,7 +12,7 @@ import {
 import type { SessionTransport } from './session-transport.js';
 import type { JournaledCall, RpcJournalOwner, RpcReplyJournal } from './rpc-journal.js';
 import { DomainError } from '../../common/domain-error.js';
-import { ExecutorSessionLostError } from '../../common/executor-disconnect.js';
+import { ExecutorSessionLostError, reconnectTimedOut } from '../../common/executor-disconnect.js';
 import { withActivity } from '../../common/event-loop-stalls.js';
 import { createLogger } from '../../common/log.js';
 import { failureReason, MALFORMED_DATA } from './failure-reason.js';
@@ -43,6 +43,13 @@ type RpcFrame = ExecutorRpcRequest | AgentProducerFrame | ProducerAckFrame | Rep
 export interface RpcCallOptions<Result = unknown> extends Omit<ExecutorCallOptions, 'timeoutMs'> {
   readonly timeoutMs?: number | null;
   readonly onLateResult?: (value: Result) => void | Promise<unknown>;
+  // Runs when the session is lost before a cancelled call's late cleanup begins.
+  readonly onLateResultLost?: () => void;
+}
+
+interface LateResult {
+  readonly receive: (value: unknown) => void | Promise<unknown>;
+  readonly lost: (() => void) | undefined;
 }
 
 const log = createLogger('executor-rpc');
@@ -75,9 +82,21 @@ interface OutgoingCall {
   seq: number;
   // The session holding the call; null while it is parked.
   rpc: ExecutorRpc | null;
+  // Once its session is lost, the call waits for a replacement session to
+  // reconcile it only until then.
+  readonly dispatchDeadline: number | undefined;
+  // Armed from parking until a replacement session has reconciled the call.
+  expiry: ReturnType<typeof setTimeout> | null;
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: Error) => void;
   cleanup: () => void;
+  // Settles the call with an unknown outcome.
+  expire: () => void;
+}
+
+function disarmExpiry(call: OutgoingCall): void {
+  if (call.expiry) clearTimeout(call.expiry);
+  call.expiry = null;
 }
 
 interface IncomingCall {
@@ -87,7 +106,8 @@ interface IncomingCall {
 
 // Journaled calls whose session was lost, which a controller keeps until a
 // replacement session of the same worker reconciles them. Their deadlines and
-// signals keep running meanwhile.
+// signals keep running meanwhile, and a call's dispatch deadline ends its wait
+// for the replacement, including the reconciliation, with an unknown outcome.
 export class ParkedRpcCalls {
   readonly #calls = new Map<string, OutgoingCall>();
   #closed = false;
@@ -97,11 +117,19 @@ export class ParkedRpcCalls {
   park(call: OutgoingCall): void {
     call.rpc = null;
     this.#calls.set(call.id, call);
+    if (call.dispatchDeadline !== undefined && !call.expiry) {
+      call.expiry = setTimeout(() => call.expire(), Math.max(0, call.dispatchDeadline - performance.now()));
+      call.expiry.unref?.();
+    }
     if (this.#closed) this.rejectAll();
   }
 
-  release(call: OutgoingCall): boolean { return this.#calls.delete(call.id); }
+  release(call: OutgoingCall): boolean {
+    disarmExpiry(call);
+    return this.#calls.delete(call.id);
+  }
 
+  // The calls' expiries stay armed while a replacement session reconciles them.
   take(): OutgoingCall[] {
     const calls = [...this.#calls.values()];
     this.#calls.clear();
@@ -132,7 +160,7 @@ export interface ExecutorRpcContinuity {
 
 export class ExecutorRpc {
   readonly #pending = new Map<string, OutgoingCall>();
-  readonly #lateResults = new Map<string, (value: unknown) => void | Promise<unknown>>();
+  readonly #lateResults = new Map<string, LateResult>();
   readonly #incoming = new Map<string, IncomingCall>();
   readonly #parked: ParkedRpcCalls | null;
   readonly #journal: RpcReplyJournal | null;
@@ -184,6 +212,7 @@ export class ExecutorRpc {
       call.reject(new ExecutorSessionLostError('unknown', 'The connection to the executor dropped before it replied.'));
     }
     this.#pending.clear();
+    const lostLateResults = [...this.#lateResults.values()];
     this.#lateResults.clear();
     // A launch outlives its session; the producer relay reports its outcome.
     for (const { controller, continuity } of this.#incoming.values()) {
@@ -191,6 +220,9 @@ export class ExecutorRpc {
     }
     this.#incoming.clear();
     this.#journal?.ownerLost(this.#journalOwner);
+    for (const { lost } of lostLateResults) {
+      try { lost?.(); } catch (error) { log.warn('Failed to record a cancelled executor call whose late result was lost', error); }
+    }
   }
 
   handle(handler: RpcHandler): void { this.#handler = handler; }
@@ -239,8 +271,8 @@ export class ExecutorRpc {
     const call: OutgoingCall = {
       id: crypto.randomUUID(), integrationId, method, request,
       journaled: this.#parked !== null && rpcContinuity(method) === 'journaled',
-      session: this.transport.id, seq: 0, rpc: this,
-      resolve: result.resolve, reject: result.reject, cleanup: () => {},
+      session: this.transport.id, seq: 0, rpc: this, dispatchDeadline: options?.dispatchDeadline, expiry: null,
+      resolve: result.resolve, reject: result.reject, cleanup: () => {}, expire: () => {},
     };
     const parked = this.#parked;
     const cancel = (message: string) => {
@@ -249,7 +281,12 @@ export class ExecutorRpc {
       if (holder) holder.#pending.delete(call.id);
       // Resource-producing calls retain their budget until settlement or session loss.
       const onLateResult = options?.onLateResult;
-      if (holder && onLateResult) holder.#lateResults.set(call.id, (value) => onLateResult(value as ExecutorRpcMethods[K]['result']));
+      if (holder && onLateResult) {
+        holder.#lateResults.set(call.id, {
+          receive: (value) => onLateResult(value as ExecutorRpcMethods[K]['result']),
+          lost: options?.onLateResultLost,
+        });
+      }
       call.cleanup();
       call.reject(new AgentCallError('unknown', message));
       // A parked call's worker learns of it at the next reconcile, which does not name it.
@@ -261,7 +298,12 @@ export class ExecutorRpc {
     timer?.unref();
     const abort = () => cancel('The request was cancelled after it was sent to the executor.');
     options?.signal?.addEventListener('abort', abort, { once: true });
-    call.cleanup = () => { if (timer) clearTimeout(timer); options?.signal?.removeEventListener('abort', abort); };
+    call.cleanup = () => {
+      if (timer) clearTimeout(timer);
+      options?.signal?.removeEventListener('abort', abort);
+      disarmExpiry(call);
+    };
+    call.expire = () => cancel('The executor did not reconnect in time, so the outcome is unknown.');
     try {
       this.#dispatch(call);
     } catch (error) {
@@ -293,8 +335,23 @@ export class ExecutorRpc {
     for (const call of calls) {
       if (this.#pending.get(call.id) !== call) continue;
       const state = states.get(call.id);
-      if (state === 'pending') continue;
+      // The reply can be read after the call's dispatch deadline, before its expiry has run.
+      const overdue = call.dispatchDeadline !== undefined && performance.now() >= call.dispatchDeadline;
+      if (state === 'pending') {
+        // A call still running on the worker stops waiting as its expiry would have stopped it.
+        if (overdue) call.expire();
+        else disarmExpiry(call);
+        continue;
+      }
       if (state === 'not-received') {
+        // A call the worker never received is not sent after its deadline.
+        if (overdue) {
+          this.#pending.delete(call.id);
+          call.cleanup();
+          call.reject(reconnectTimedOut());
+          continue;
+        }
+        disarmExpiry(call);
         try { this.#dispatch(call); }
         catch (error) {
           if (this.#pending.get(call.id) !== call) continue;
@@ -371,11 +428,12 @@ export class ExecutorRpc {
     if (frame.type === 'result' || frame.type === 'error') {
       const call = this.#pending.get(frame.id);
       if (!call) {
-        const onLateResult = this.#lateResults.get(frame.id);
+        const late = this.#lateResults.get(frame.id);
         this.#lateResults.delete(frame.id);
-        if (frame.type === 'result' && onLateResult) {
+        if (frame.type === 'result' && late) {
+          // The deferred callback owns cleanup after the map releases the budget slot.
           void Promise.resolve().then(() => {
-            if (!this.#retired) return onLateResult(frame.value);
+            return this.#retired ? late.lost?.() : late.receive(frame.value);
           }).catch((error) => log.warn('Failed to clean up a cancelled executor call', error));
         }
         return;

@@ -9,7 +9,7 @@ one bidirectional Noise-encrypted WebSocket, regardless of which side dials.
 The shared secret authenticates Noise and the application handshake binding
 executor, runtime, version, and the fresh connection. The version is the
 package version followed by the executor protocol revision, as in
-`0.3.4+protocol.4`. The revision changes with anything either side sends or
+`0.3.4+protocol.5`. The revision changes with anything either side sends or
 accepts, so builds that disagree fail the handshake with "Executor version
 mismatch" instead of failing mid-session. TLS is required outside explicit
 development mode; Noise remains mandatory when outer TLS certificate
@@ -152,9 +152,12 @@ continues its setup on the replacement session. A setup step that is safe to
 repeat runs again if the lost session left its outcome unknown: endpoint
 validation, file mention resolution, and the carryover compaction query, which
 are read-only, and producer binding, with a fresh binding ID. Stop, deletion,
-and shutdown cancel a held turn. Stop is recorded and delivered once the
-executor is ready again. While installing a replacement session, the controller
-calls `producers.resume` with each binding's last received sequence number. The
+and shutdown cancel a held turn. A new chat's start holds its chat's lock
+through setup, so Stop and deletion wait behind it until it gives up at its
+interactive deadline; see Calls Across Reconnects. Stop is recorded and
+delivered once the executor is ready again. While installing a replacement
+session, the controller calls `producers.resume` with each binding's last
+received sequence number. The
 worker then resends the newer retained frames, paced like live output, so the
 tail of a large replay follows the reply. The controller ignores numbers it
 already has, so each notification reaches the ledger sink once. A skipped
@@ -196,25 +199,30 @@ failure: "The executor connection was lost before this turn started. Send it
 again." A launch dispatched on the new session settles through its own reply,
 even while the replay is still arriving.
 
-A reply the worker's session queue cannot take, unless the journal holds it
-(see Calls Across Reconnects), reaches the controller as an unknown outcome on
-a live session: "The executor's reply could not be delivered, so the outcome is
+A reply the worker's session queue cannot take, unless the journal holds it (see
+Calls Across Reconnects), reaches the controller as an unknown outcome on a live
+session: "The executor's reply could not be delivered, so the outcome is
 unknown." For a launch, the relay then publishes the outcome on the binding
 behind that reply, so a running turn keeps a reachable handle and a failed one
 reports its own failure. A launch cancelled by Stop, shutdown, or deletion also
 ends with an unknown outcome, but the same action already ends or removes its
 run. A launch that fails on the worker reports a definite failure even when a
-nested call, such as a credential read, had an unknown outcome; an unknown
-credential read fails as "Provider credential could not be read from the
-controller. Try again."
+nested call, such as a credential read, had an unknown outcome; a credential
+read whose outcome is unknown, or that never reached the controller, fails as
+"Provider credential could not be read from the controller. Try again."
 
 A lost call no longer carries its caller's cancellation, so Stop reaches a
 launch whose call was lost through the worker's relay: the controller names the
-run with `producers.cancelLaunch`, sent on the replacement session if the link is
-still down, and the relay cancels its native admission. A launch that finishes
-admission after it was cancelled is aborted through its handle. A newer launch
-on the same binding likewise cancels an older one still in admission, because
-the controller begins another run only after abandoning the previous one.
+run with `producers.cancelLaunch`, which waits for the replacement session
+without a deadline, and the relay cancels its native admission. A launch that
+finishes admission after it was cancelled is aborted through its handle. When
+Stop cancels a launch call on a live session, a turn that starts anyway is
+aborted through the call's late reply; if that session is lost before the reply
+arrives, the controller records the launch as unsettled, never sends it again,
+and sends `producers.cancelLaunch` on the replacement session, whose resume
+report gives the router the handle to stop. A newer launch on the same binding
+likewise cancels an older one still in admission, because the controller begins
+another run only after abandoning the previous one.
 
 A binding the worker no longer holds, a restarted worker (new instance ID), or
 an expired controller grace falls back to the loss path: the controller fails
@@ -280,7 +288,9 @@ executor handshake frame`.
 
 Hung detached turns require worker restart. Controller crash leaves execution
 state empty on restart; graceful controller shutdown still requests native
-abort. Explicit handoff to another provider does not coordinate with detached
+abort, best effort: an executor that is reconnecting when shutdown begins does
+not receive it, because shutdown stops redialing first, and its turns continue
+detached. Explicit handoff to another provider does not coordinate with detached
 work on the old provider.
 
 ## Calls Across Reconnects
@@ -291,19 +301,65 @@ returns a reconnecting executor whose integrations are known, and a call made
 while it reconnects waits for the replacement session of the same worker within
 its own deadline and signal. It keeps up to a second of that deadline for the
 call itself, and it fails as not dispatched when the executor goes offline, is
-disposed, or the deadline passes. Sequences that belong to one session, such as
-a history reader's pages, acquire their session once. Closing a binding goes
-through the session that holds it. If that session was lost, the close waits for
-the replacement, and the worker closes the suspended binding, which no session
-owns, without resuming it, so its native turn stops.
+disposed, or the deadline passes. A call made through `RemoteSessions.call` or
+`send` whose session retires before it is sent is sent on the next session of
+the same worker within that deadline. Calls that acquire their session
+themselves, such as Git, GitHub, terminal, producer-binding, fork,
+path-preparation, and history-reader calls, fail as not dispatched instead.
+Sequences that belong to one session, such as a history reader's pages, acquire
+their session once. Closing a binding goes through the session that holds it and
+waits without a deadline, until the worker answers, the executor goes offline,
+or the client is disposed. If that session was lost, the replacement session of
+the same worker closes the suspended binding, which no session owns, without
+resuming it, so its native turn stops; a restarted worker never receives it.
+
+Interactive operations that hold a chat's lock or its queue-control lock wait
+for a reconnecting executor for at most 20 seconds
+(`INTERACTIVE_EXECUTOR_WAIT_MS` in `server/common/interactive-deadline.ts`).
+Browsers give each request 30 seconds, so the server answers first, and a Stop
+or deletion queued behind the lock still completes. The operation's deadline
+starts when it asks for the lock, so operations queued behind a long wait give
+up in turn, and all of the operation's calls share it. A call passes it as
+`dispatchDeadline`: a call not yet sent fails as not dispatched at the
+deadline, and a sent journaled call whose session is lost stops waiting for a
+replacement session to reconcile it then, with an unknown outcome, or as not
+dispatched if the reconciliation shows that the worker never received it; it is
+never sent again after the deadline. A read-only call, such as a
+validation, a project inspection, or a catalog read, may run until 5 seconds
+past the deadline once sent, so a read sent late still gets time to answer, and
+all of the operation's reads end by then. A sent mutation or launch otherwise
+keeps its own deadline, because native startup can take longer. Settings
+changes, submits, queue creation, compaction scheduling, handoff preflight,
+permission answers, inter-agent messages, and steering follow this rule; a
+steer's capture and delivery share one deadline. So does a new chat's start,
+which holds its chat's lock through dispatch: if the executor has not
+reconnected by the deadline, the start fails as not dispatched, its chat is
+rolled back, and the user sends it again. A start or resume that an agent
+command requests takes its deadline when it asks for the requesting chat's
+lock, and a delegated start dispatches after releasing it. A scheduled prompt
+sends through the same locked paths after claiming its occurrence, so an
+occurrence that cannot reach a reconnecting executor in time fails, is recorded
+in the run log, and is not retried. Queued turns, the
+queue drain's admission check, chat-ID disclosures, and replies to agent
+commands run without one, so they keep waiting within their own deadlines. Some
+lock holders do not follow the rule yet and wait within their own deadlines
+and, where the route passes one, the request's signal: forks and fork runs'
+native forks, project-path updates, Reload, handoff carryover compaction, and
+adopting a chat created before the transcript ledger. A new chat adopts without
+calling its executor. A turn's preparation, such as a fork run's native fork or
+a handoff's carryover compaction, does not count against the deadline of the
+admission check after it; if the deadline ran out before the preparation began,
+the check does not wait for a reconnecting executor, and a read it sends still
+gets its 5 seconds.
 
 Each method has a continuity class, `rpcContinuity` in `rpc-protocol.ts`:
 
 - `session` calls belong to their session: history readers, terminal
-  attachments, producer bindings, forks, path-update preparations, lifecycle,
-  CLI, and credentials. Losing the session cancels the handler and leaves the
-  caller with an uncertain outcome. Compensation for a fork or preparation is
-  issued on its session and is then journaled like other calls.
+  attachments, binding and resuming producer bindings, forks, path-update
+  preparations, lifecycle, CLI, and credentials. Losing the session cancels the
+  handler and leaves the caller with an uncertain outcome. Cleanup of a resource
+  that outlives its session is issued on its session and journaled:
+  compensation for a fork or preparation, and closing a producer binding.
 - `launch` calls (start, resume, and compaction) keep running on the worker;
   the producer relay reports their outcomes, as described above.
 - `journaled` calls are all others, including Files, Git, projects, catalogs,
@@ -325,7 +381,11 @@ the same worker instance, the controller adopts every parked call into the new
 session and, ahead of producer resumption, sends `calls.reconcile` with each
 call's ID and the session and sequence number it was last sent with. The worker
 answers per call: `pending`, whose reply follows on the new session;
-`not-received`, which the controller sends again; or `unknown`. Calls of lost
+`not-received`, which the controller sends again; or `unknown`. A call whose
+dispatch deadline passes while it is reconciled is not sent again: it stops
+waiting with an unknown outcome and is cancelled on the worker, or, when the
+worker's late answer already shows that it never received the call, fails as
+not dispatched. Calls of lost
 sessions that a reconcile does not name belong to callers that gave up, so the
 worker cancels them as those callers' lost cancels would have. Retained replies
 are bounded at 64 MiB, dropping the oldest delivered ones first. A dropped reply

@@ -6,7 +6,9 @@ import type { AgentEndpointSelection } from '../../../common/agent-execution.js'
 import { AssistantMessage } from '../../../common/chat-types.js';
 import type { AgentRuntimeEvent } from '../../../server-agents/common/src/execution/runtime-events.js';
 import { resolveAgentEndpoint } from '../../../server-agents/common/src/execution/resolve-endpoint.js';
-import { AgentCallError, type AgentHost, type ExecutorAvailability } from '../../../server-agents/interface/src/index.js';
+import {
+  AgentCallError, AgentIntegrationError, type AgentHost, type ExecutorAvailability,
+} from '../../../server-agents/interface/src/index.js';
 import { ApiProviderEndpointResolver } from '../../../server/controller/api-providers/endpoint-resolver.js';
 import { ChatRegistry } from '../../../server/controller/chats/store.js';
 import { AgentDirectory, type ExecutionIntegrationDirectory } from '../../../server/controller/agents/directory.js';
@@ -213,6 +215,61 @@ function runEnds(ledger: TranscriptLedgerService) {
 }
 
 for (const dialer of ['controller', 'worker'] as const) {
+  test(`a Stop on a live link whose start reply is then lost stops the turn once after the reconnect (${dialer} dials)`, async () => {
+    await withRemoteRouter(dialer, async ({ router, ledger, native, remote, restored, workerFault }) => {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      // The native runtime finishes admission despite the cancellation.
+      native.hooks.start = async () => { entered.resolve(); await release.promise; };
+      const admission = new AbortController();
+      const turn = router.startSession(CHAT, 'Synthetic input', {
+        executionAdmission: { signal: admission.signal, markStarted: async () => {} },
+      }).then(() => null, (error: unknown) => error);
+      await entered.promise;
+      // The execution coordinator's Stop aborts admission, then the session.
+      admission.abort(new Error('Synthetic stop'));
+      await router.abortSession(CHAT);
+      await turn;
+      workerFault.inject = (encoded) => {
+        if (!isExecutionHandleReply(encoded)) return null;
+        workerFault.inject = () => null;
+        return 'disconnect';
+      };
+      const reconnected = restored();
+      release.resolve();
+      await reconnected;
+      await until(() => native.calls.abort > 0);
+      // Any second abort would have reached the worker before this round trip returns.
+      await integrationRoundTrip(remote);
+
+      expect(native.calls.abort).toBe(1);
+      expect(runEnds(ledger)).toEqual([{ outcome: 'interrupted', origin: 'core' }]);
+    });
+  }, 30_000);
+
+  test(`a start that fails on its own after its session was lost fails its turn with that failure (${dialer} dials)`, async () => {
+    await withRemoteRouter(dialer, async ({ router, ledger, native, controller, restored }) => {
+      const entered = Promise.withResolvers<void>();
+      const fail = Promise.withResolvers<void>();
+      native.hooks.start = async () => {
+        entered.resolve();
+        await fail.promise;
+        throw new AgentIntegrationError('AUTH_REQUIRED', 'Synthetic sign-in required', false);
+      };
+      const turn = router.startSession(CHAT, 'Synthetic input');
+      await entered.promise;
+      const reconnected = restored();
+      controller.disconnect();
+      await reconnected;
+      await turn;
+      fail.resolve();
+      await until(() => runEnd(ledger) !== undefined);
+
+      expect(runEnds(ledger)).toEqual([{ outcome: 'failed', origin: 'core' }]);
+      expect(runEnd(ledger)).toMatchObject({ error: { code: 'AUTH_REQUIRED', message: 'Synthetic sign-in required' } });
+    });
+  }, 30_000);
+
   test(`a start in flight when the link drops keeps running, and Stop reaches it after the reconnect (${dialer} dials)`, async () => {
     await withRemoteRouter(dialer, async ({ router, ledger, native, controller, restored }) => {
       const entered = Promise.withResolvers<void>();
@@ -468,6 +525,43 @@ for (const dialer of ['controller', 'worker'] as const) {
         expect(runEnd(ledger)).toMatchObject({ error: EXECUTOR_DISCONNECTED_BEFORE_START });
       } finally { release(); }
     }, { reconnectGraceMs: 300 });
+  }, 30_000);
+
+  // A new chat start holds its chat lock through dispatch, so it waits for a
+  // reconnecting executor only until its dispatch deadline.
+  test(`a start still waiting for the executor at its dispatch deadline fails before it starts (${dialer} dials)`, async () => {
+    await withRemoteRouter(dialer, async ({ router, ledger, native, integration, remote, controller }) => {
+      const release = holdNextReconnect(native);
+      const reconnecting = availability(remote, 'reconnecting');
+      controller.disconnect();
+      await reconnecting;
+      const failure = await router.startSession(CHAT, 'Synthetic input', { dispatchDeadline: performance.now() + 200 })
+        .then(() => null, (error: unknown) => error);
+
+      expect(failure).toMatchObject({ outcome: 'not-dispatched', message: 'The executor did not reconnect in time.' });
+      expect(runEnds(ledger)).toEqual([{ outcome: 'failed', origin: 'core' }]);
+      const ready = availability(remote, 'ready');
+      release();
+      await ready;
+      await integration.execution.runningSessions();
+      expect(native.calls.start).toBe(0);
+    });
+  }, 30_000);
+
+  test(`a start whose executor reconnects before its dispatch deadline runs once (${dialer} dials)`, async () => {
+    await withRemoteRouter(dialer, async ({ router, ledger, native, remote, controller }) => {
+      const release = holdNextReconnect(native);
+      const reconnecting = availability(remote, 'reconnecting');
+      controller.disconnect();
+      await reconnecting;
+      const turn = router.startSession(CHAT, 'Synthetic input', { dispatchDeadline: performance.now() + 10_000 });
+      await until(() => router.isChatRunning(CHAT));
+      release();
+      await turn;
+
+      expect(native.calls.start).toBe(1);
+      expect(runEnds(ledger)).toEqual([]);
+    });
   }, 30_000);
 
   test(`a start lost as it is sent runs once after the executor reconnects, and Stop reaches it (${dialer} dials)`, async () => {
