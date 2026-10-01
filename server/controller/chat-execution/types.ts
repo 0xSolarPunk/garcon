@@ -4,6 +4,7 @@ import type {
   SteerDeliveryOutcome,
 } from '../../../common/chat-command-contracts.ts';
 import type { AutomaticQueuePauseKind, QueueEntry } from '../../../common/queue-state.ts';
+import type { AgentCommandImage } from '../../../common/ws-requests.ts';
 import type {
   ChatStopIntent,
   ChatStopOutcome,
@@ -20,6 +21,7 @@ import type {
   RunAgentTurnOptions,
 } from '../agents/session-types.ts';
 import {
+  MAX_QUEUED_ATTACHMENT_BYTES,
   cloneStoredChatExecutionControl,
   type StoredChatExecutionControlState,
   type StoredControlInputEntry,
@@ -153,6 +155,7 @@ export interface AcceptedDirectOperation {
 export interface AcceptedQueueCreate {
   command: AcceptedExecutionCommand & { entryId: string };
   content: string;
+  images: readonly AgentCommandImage[];
   clientMessageId: string;
   transcriptViewId: string;
   excludedResendOrdinals?: readonly number[];
@@ -260,6 +263,12 @@ export interface AgentTurnRunnerPort {
 
 export interface ProjectAdmissionPort {
   assertAvailable(chatId: string): Promise<void>;
+}
+
+// Checks queued attachments against the chat's current execution selection.
+// Synchronous so dequeue can check inside the block that reads that selection.
+export interface QueuedAttachmentAdmissionPort {
+  assertSupported(chatId: string, attachments: readonly AgentCommandImage[]): void;
 }
 
 export type ExecutionControlUpdatedCallback = (
@@ -439,6 +448,8 @@ export function transitionError(
   control: StoredChatExecutionControlState,
 ): DomainError {
   switch (rejection.code) {
+    case 'VALIDATION_FAILED':
+      return new DomainError('VALIDATION_FAILED', 'content or attachments are required', 400);
     case 'IDEMPOTENCY_CONFLICT':
       return new DomainError(
         'IDEMPOTENCY_CONFLICT',
@@ -481,6 +492,13 @@ export function transitionError(
       return new DomainError(
         'CONTROL_INPUT_QUEUE_FULL',
         'The inter-agent control input lane is full',
+        409,
+      );
+    case 'QUEUE_ATTACHMENTS_FULL':
+      return new DomainError(
+        'QUEUE_ATTACHMENTS_FULL',
+        `Queued attachments are limited to ${MAX_QUEUED_ATTACHMENT_BYTES / (1024 * 1024)} MB per chat. `
+          + 'Send or remove queued messages with attachments first.',
         409,
       );
   }

@@ -32,7 +32,7 @@ export class QueueCommands {
 
   async submitQueueEntryCreate(input: QueueEntryCreateCommandRequest): Promise<QueueEntryCommandResponse> {
     this.support.requireChat(input.chatId);
-    this.support.assertContent(input.content);
+    this.support.assertContent(input.content, input.images);
     return this.support.withChatMutationLock(input.chatId, async () => {
       await this.support.assertCurrentTranscriptView(input.chatId, input.transcriptViewId);
       return this.submitQueueEntryCreateLocked(input);
@@ -41,7 +41,6 @@ export class QueueCommands {
 
   async submitQueueEntryReplace(input: QueueEntryReplaceCommandRequest): Promise<QueueEntryCommandResponse> {
     this.support.requireChat(input.chatId);
-    this.support.assertContent(input.content);
     const entryId = this.support.requireQueueEntryId(input.entryId);
     if (!Number.isInteger(input.expectedRevision) || input.expectedRevision < 1) {
       throw new CommandValidationError('VALIDATION_FAILED', 'expectedRevision must be a positive integer');
@@ -281,6 +280,7 @@ export class QueueCommands {
         clientMessageId: input.clientMessageId,
         excludedResendOrdinals: input.excludedResendOrdinals,
         content,
+        images: input.images,
       },
       entryId: preparedEntryId,
     });
@@ -304,6 +304,7 @@ export class QueueCommands {
         entryId: ledger.record.entryId ?? preparedEntryId,
       },
       content,
+      images: input.images ?? [],
       clientMessageId: input.clientMessageId,
       transcriptViewId: input.transcriptViewId,
       excludedResendOrdinals: input.excludedResendOrdinals,

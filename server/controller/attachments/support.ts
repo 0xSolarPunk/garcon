@@ -2,25 +2,36 @@ import type { AgentRegistryServiceContract } from '../agents/registry.js';
 import type { RunAgentTurnOptions } from '../agents/session-types.js';
 import { CommandValidationError } from '../lib/command-validation-error.js';
 
-type AttachmentAgentCapabilities = Pick<
+export type AttachmentAgentCapabilities = Pick<
   AgentRegistryServiceContract,
   'assertExecutorReady' | 'modelSupportsImages' | 'supportsImages' | 'supportsFileAttachmentMimeType'
 >;
 
+type Attachments = NonNullable<RunAgentTurnOptions['images']>;
+
 export interface AttachmentSupportInput {
   executorId?: string | null;
   agentId: string;
-  model: string;
+  model?: string | null;
   apiProviderId?: string | null;
   modelEndpointId?: string | null;
-  attachments: NonNullable<RunAgentTurnOptions['images']>;
+  attachments: Readonly<Attachments>;
 }
 
-export async function assertAttachmentsSupported(
+// Synchronous so queued dequeue can revalidate inside its admission block,
+// where the chat's selection may have changed since the entry was queued.
+export function assertAttachmentsSupported(
   agents: AttachmentAgentCapabilities,
   input: AttachmentSupportInput,
-): Promise<void> {
+): void {
   if (input.attachments.length === 0) return;
+  if (!input.model) {
+    throw new CommandValidationError(
+      'INCOMPLETE_EXECUTION_CONFIG',
+      'The chat has no model to receive attachments',
+      422,
+    );
+  }
   agents.assertExecutorReady(input.executorId);
   const mimeTypes = input.attachments.map((attachment) => {
     const mimeType = attachment.mimeType?.trim().toLowerCase();
@@ -37,7 +48,7 @@ export async function assertAttachmentsSupported(
   if (mimeTypes.some((mimeType) => mimeType.startsWith('image/'))) {
     let modelSupportsImages = false;
     try {
-      modelSupportsImages = await agents.modelSupportsImages({
+      modelSupportsImages = agents.modelSupportsImages({
         executorId: input.executorId,
         agentId: input.agentId,
         model: input.model,

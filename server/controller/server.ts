@@ -8,10 +8,7 @@ import { getConfigDir, initializeServerConfig } from './config.js';
 import { wrapRoutes, serverShuttingDownResponse, unhandledRouteErrorResponse } from './lib/http-route.js';
 import { ControllerCliDispatcher } from './executors/cli-dispatcher.js';
 import { verifyAuthTokenClaims } from './auth/token.js';
-import {
-  getWebSocketAuthToken,
-  webSocketUpgradeHeaders,
-} from './lib/websocket-auth.js';
+import { getWebSocketAuthToken, webSocketUpgradeHeaders } from './lib/websocket-auth.js';
 import { init as initAuthStore } from './auth/store.js';
 import { forkChatFileCopy } from './chats/fork-chat.js';
 import { wireSearchSourceAvailability, wireServerEvents, type ServerEventWiring } from './server-event-wiring.js';
@@ -26,7 +23,7 @@ import { ShareStore } from './chats/share-store.js';
 import { SettingsStore } from './settings/store.js';
 import { ChatExecutionCoordinator } from './chat-execution/chat-execution-coordinator.js';
 import { InMemoryChatExecutionControlRepository } from './chat-execution/chat-execution-control-repository.js';
-import { queueDrainOptions } from './chats/chat-execution-options.js';
+import { queueDrainOptions, queuedAttachmentAdmission } from './chats/chat-execution-options.js';
 import { TerminalController } from './terminals/controller.js';
 import { TerminalStreamHandler } from './ws/terminal-stream.js';
 import { PrimaryWsHandler } from './ws/primary.js';
@@ -550,6 +547,7 @@ export async function startServer(): Promise<void> {
       new InMemoryChatExecutionControlRepository(runtimeState.identity.instanceId),
       {
         projectAdmission,
+        attachmentAdmission: queuedAttachmentAdmission(chatRegistry, agentRegistry),
         canDispatch: (chatId) => executors.isReady(effectiveExecutorId(chatRegistry.getChat(chatId)?.executorId)),
         unsettledQueueReceiptKeys: (chatId) => commandLedger.unsettledQueueReceiptKeys(chatId),
         appendControlReceipt: agentCommands.appendControlReceipt,

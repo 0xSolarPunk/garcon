@@ -17,6 +17,7 @@ import {
   type AgentTurnRunnerPort,
   type ProjectAdmissionPort,
   type QueueDrainOptionsResolver,
+  type QueuedAttachmentAdmissionPort,
 } from './types.ts';
 
 const logger = createLogger('queue-dispatch');
@@ -45,6 +46,7 @@ export interface QueueDispatchDeps {
   // type itself stays inside the coordinator.
   runSelectionAdmissionExclusive<T>(chatId: string, operation: () => Promise<T>): Promise<T>;
   projectAdmission: ProjectAdmissionPort;
+  attachmentAdmission: QueuedAttachmentAdmissionPort;
   callbacks: QueueDispatchCallbacks;
 }
 
@@ -63,6 +65,9 @@ function optionsForTurn(
       : submission ? { transcriptViewId: submission.transcriptViewId } : {}),
     ...(submission?.excludedResendOrdinals?.length
       ? { excludedResendOrdinals: [...submission.excludedResendOrdinals] }
+      : {}),
+    ...(input.kind === 'user' && input.entry.images.length > 0
+      ? { images: input.entry.images.map((image) => ({ ...image })) }
       : {}),
     createdAt: input.entry.createdAt,
   };
@@ -119,7 +124,10 @@ export class QueueDrainer {
 
       let options: RunAgentTurnOptions | undefined;
       let inputInserted = false;
-      const admission = { failure: null as DomainError | null };
+      const admission = {
+        failure: null as DomainError | null,
+        attachmentEntryId: null as string | null,
+      };
       let result: Awaited<ReturnType<ChatExecutionControlOperations['dequeueNextTurn']>>;
       try {
         // The dequeue transition and its synchronous registerQueued() callback
@@ -143,6 +151,13 @@ export class QueueDrainer {
               inputInserted = true;
               return true;
             }
+            // The selection may have changed since enqueue. Throwing aborts the
+            // dequeue uncommitted, so the entry and its attachments stay queued.
+            if (input.entry.images.length > 0) {
+              admission.attachmentEntryId = input.entry.id;
+              this.deps.attachmentAdmission.assertSupported(chatId, input.entry.images);
+              admission.attachmentEntryId = null;
+            }
             try {
               inputInserted = callbacks.registerQueued(chatId, input.entry.content, options);
             } catch (error) {
@@ -155,6 +170,19 @@ export class QueueDrainer {
         );
       } catch (error) {
         if (error === halted) return;
+        if (admission.attachmentEntryId && options) {
+          // Readiness triggers a new drain after a retryable admission failure.
+          if (error instanceof DomainError && error.retryable) return;
+          const message = error instanceof Error ? error.message : String(error);
+          logger.warn('queue: queued attachments unsupported by the current selection', {
+            chatId,
+            entryId: admission.attachmentEntryId,
+            message,
+          });
+          await controls.pauseAfterDispatchFailure(chatId, admission.attachmentEntryId);
+          callbacks.publishTurnFailed(chatId, message, options);
+          return;
+        }
         if (inputInserted) callbacks.discardPreparedInput(chatId, options?.clientMessageId);
         throw error;
       }

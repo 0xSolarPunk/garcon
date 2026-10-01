@@ -64,6 +64,7 @@ import {
   requiredContent,
   requiredQueueEntryId,
   requiredString,
+  requiredStringContent,
 } from './command-request-validation.js';
 
 export {
@@ -87,6 +88,7 @@ export type CommandErrorCode = Extract<
   | 'QUEUE_ENTRY_IN_FLIGHT'
   | 'QUEUE_ENTRY_REVISION_CONFLICT'
   | 'QUEUE_ENTRY_REORDER_CONFLICT'
+  | 'QUEUE_ATTACHMENTS_FULL'
   | 'QUEUE_PAUSE_CHANGED'
   | 'STEER_NOT_DELIVERED'
   | 'STEER_OUTCOME_UNKNOWN'
@@ -308,8 +310,11 @@ export interface QueueEntryCreateCommandRequest {
   transcriptViewId: string;
   excludedResendOrdinals?: number[];
   content: string;
+  images?: AgentCommandImage[];
 }
 
+// Replacement edits text only; the entry keeps its attachments, so empty
+// content is valid for an entry that has any.
 export interface QueueEntryReplaceCommandRequest {
   clientRequestId: string;
   chatId: string;
@@ -709,13 +714,19 @@ export function parseForkRunCommandRequest(value: unknown): ForkRunCommandReques
 
 export function parseQueueEntryCreateCommandRequest(value: unknown): QueueEntryCreateCommandRequest {
   const body = requestRecord(value);
+  const images = optionalImages(body.images);
+  const content = requiredStringContent(body, 'content');
+  if (!content.trim() && !images?.length) {
+    throw new CommandRequestValidationError('content or images are required');
+  }
   return {
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
     clientMessageId: requiredCommandCorrelationId(body, 'clientMessageId'),
     chatId: requiredChatId(body, 'chatId'),
     transcriptViewId: requiredString(body, 'transcriptViewId'),
     ...(optionalResendOrdinals(body.excludedResendOrdinals) ?? {}),
-    content: requiredContent(body, 'content'),
+    content,
+    ...(images === undefined ? {} : { images }),
   };
 }
 
@@ -744,7 +755,7 @@ export function parseQueueEntryReplaceCommandRequest(value: unknown): QueueEntry
     clientRequestId: requiredCommandCorrelationId(body, 'clientRequestId'),
     chatId: requiredChatId(body, 'chatId'),
     entryId: requiredQueueEntryId(body, 'entryId'),
-    content: requiredContent(body, 'content'),
+    content: requiredStringContent(body, 'content'),
     expectedRevision: Number(body.expectedRevision),
   };
 }
