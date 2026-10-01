@@ -47,6 +47,18 @@ export const TRANSCRIPT_UNAVAILABLE_MESSAGE = 'Chat transcript is unavailable.';
 export const TRANSCRIPT_TEMPORARILY_UNAVAILABLE_MESSAGE =
   'Chat transcript is temporarily unavailable. Retry the request.';
 
+export function steeringUnsupportedError(): DomainError {
+  return new DomainError('OPERATION_UNSUPPORTED', 'This agent does not support steering', 422);
+}
+
+export function steerTurnChangedError(): DomainError {
+  return new DomainError(
+    'STEER_TURN_CHANGED',
+    'The active turn changed before steering could be applied',
+    409,
+  );
+}
+
 export function transcriptUnavailableMessage(retryable: boolean): string {
   return retryable
     ? TRANSCRIPT_TEMPORARILY_UNAVAILABLE_MESSAGE

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { AgentCallError, type AgentSteerRejectionReason } from '@garcon/server-agent-interface';
 import type { AgentSteerOptions } from '../agents/session-types.ts';
-import { DomainError, SteerDeliveryError } from '../../common/domain-error.ts';
+import { DomainError, SteerDeliveryError, steerTurnChangedError } from '../../common/domain-error.ts';
 import type { ExecutionOwnership } from './execution-ownership.ts';
 import type {
   AcceptedSteerOutcome,
@@ -69,6 +69,9 @@ export class SteerInputDelivery {
     let inserted = false;
     try {
       this.#assertTarget(chatId, target);
+      // The provider refuses a turn it cannot steer yet. Refusing first keeps a
+      // steer that was never delivered out of the transcript.
+      if (!target.providerTarget) throw steerTurnNotReadyError();
       inserted = await this.options.admitInput(chatId, content, {
         clientRequestId: options.clientRequestId,
         clientMessageId: options.clientMessageId,
@@ -148,14 +151,18 @@ export class SteerInputDelivery {
       || currentIdentity?.turnId !== target.identity.turnId
       || currentIdentity?.clientRequestId !== target.identity.clientRequestId
     ) {
-      throw new DomainError(
-        'STEER_TURN_CHANGED',
-        'The active turn changed before steering could be applied',
-        409,
-      );
+      throw steerTurnChangedError();
     }
   }
 
+}
+
+function steerTurnNotReadyError(): DomainError {
+  return new DomainError(
+    'STEER_TURN_UNAVAILABLE',
+    'The active turn cannot take steering input yet',
+    409,
+  );
 }
 
 function steerRejectionError(reason: AgentSteerRejectionReason): DomainError {
@@ -163,11 +170,7 @@ function steerRejectionError(reason: AgentSteerRejectionReason): DomainError {
     case 'no-active-turn':
       return new DomainError('STEER_TURN_UNAVAILABLE', 'There is no active turn to steer', 409);
     case 'turn-changed':
-      return new DomainError(
-        'STEER_TURN_CHANGED',
-        'The active turn changed before steering could be applied',
-        409,
-      );
+      return steerTurnChangedError();
     case 'turn-not-steerable':
       return new DomainError(
         'STEER_TURN_NOT_STEERABLE',

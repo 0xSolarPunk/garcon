@@ -20,7 +20,10 @@ const MAX_LINES = 1000;
 // Delegated starts add an admission gate and noncompensating startup settlement;
 // progress observation and rendering remain outside command/execution ownership.
 // Remote execution adds an availability gate and retains uncertain dispatch attempts.
-const EXECUTION_FOOTPRINT_BUDGET = 8719;
+// Queued steers add one delivery pass per chat that steers the queue head into the active
+// turn once the turn can take it, and the steer commands' choice to queue a steer the turn
+// cannot take yet instead of refusing it.
+const EXECUTION_FOOTPRINT_BUDGET = 9043;
 
 const GRANDFATHER = {
   'server/runtime/git/diff-engine.ts': 1575,

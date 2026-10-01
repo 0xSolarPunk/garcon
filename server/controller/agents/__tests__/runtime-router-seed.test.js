@@ -75,7 +75,7 @@ function makeRouter(overrides = {}) {
       resume,
       abort: overrides.abort ?? mock(async () => undefined),
     },
-    steering: { captureTarget, steer },
+    steering: overrides.steering === undefined ? { captureTarget, steer } : overrides.steering,
     settings: { defaults: () => settings, parse: (input) => input },
   };
   const registry = {
@@ -88,6 +88,7 @@ function makeRouter(overrides = {}) {
     trackTurn: mock((_chatId, turn) => { activeTurn = turn; }),
     clearTurn: mock(() => { activeTurn = undefined; }),
     getActiveTurn: mock(() => activeTurn),
+    publishRunSteerable: mock(async () => undefined),
   };
   const endpointResolver = {
     describePrevious(input) { return this.resolveSelection(input); },
@@ -699,6 +700,38 @@ describe('AgentRuntimeRouter producer boundary', () => {
     }));
     expect(prepareDelivery).toHaveBeenCalledTimes(1);
     expect(events.getActiveTurn()).toEqual(activeTurn);
+  });
+
+  it('reports only the active run as steerable', async () => {
+    const producer = createProducerFixture();
+    const start = mock(async (request) => {
+      producer.emit(request.producerBinding, { type: 'steerable', runId: 'run-elsewhere' });
+      producer.emit(request.producerBinding, { type: 'steerable', runId: request.runId });
+      producer.emit(request.producerBinding, { type: 'run-ended', runId: request.runId, outcome: 'finished' });
+      producer.emit(request.producerBinding, { type: 'steerable', runId: request.runId });
+      return { id: 'start-handle' };
+    });
+    const { router, events } = makeRouter({ start, producer });
+
+    await router.runAgentTurn('chat-1', 'first', { turnId: 'turn-1' });
+
+    expect(events.publishRunSteerable.mock.calls).toEqual([['chat-1']]);
+  });
+
+  it('captures no steering target before the chat has a native session', async () => {
+    const { router, captureTarget } = makeRouter();
+
+    await expect(router.captureSteerTarget('chat-1')).resolves.toBeNull();
+    expect(captureTarget).not.toHaveBeenCalled();
+  });
+
+  it('reports an agent without steering when capturing a target', async () => {
+    const { router } = makeRouter({ entry: { agentSessionId: 'native-1' }, steering: null });
+
+    await expect(router.captureSteerTarget('chat-1')).rejects.toMatchObject({
+      code: 'OPERATION_UNSUPPORTED',
+      status: 422,
+    });
   });
 
   it('replaces the producer capability before the next run', async () => {

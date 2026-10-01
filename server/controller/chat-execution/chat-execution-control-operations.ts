@@ -14,18 +14,22 @@ import {
   clearQueue,
   discardPendingInput,
   createQueueEntry,
+  createQueuedSteer,
   deleteQueueEntry,
   moveQueueEntry,
   pauseQueue,
   dequeueNextTurn,
   enqueueControlInput,
   consumeQueueSteer,
+  markQueueEntrySteer,
   releaseQueueSteer,
   replaceQueueEntry,
+  reservePendingSteer,
   reserveQueueSteer,
   requeueAndPause,
   pauseAfterDispatchFailure,
   resumeQueue,
+  type ObservedQueueHead,
   type ControlTransition,
   type DequeuedTurnInput,
   type QueueCommandIdentity,
@@ -47,6 +51,7 @@ export interface ChatExecutionControlOperationsHost {
 }
 
 type ControlChangeResult = { control: StoredChatExecutionControlState; changed: boolean };
+type ReservedSteer = { entry: StoredQueueEntry; control: StoredChatExecutionControlState };
 
 export class ChatExecutionControlOperations {
   constructor(
@@ -87,6 +92,41 @@ export class ChatExecutionControlOperations {
         this.#logMutation('create', chatId, result.entryId, committed.control, result.entry?.revision);
       }
       return { ...result, control: committed.control };
+    });
+  }
+
+  async createSteer(
+    chatId: string,
+    content: string,
+    command: QueueCommandIdentity,
+    submission: StoredQueueSubmissionIdentity,
+  ): Promise<QueueCommandMutationResult> {
+    return this.host.runExclusive(chatId, async () => {
+      const current = await this.#load(chatId);
+      const committed = await this.#commitTransition(
+        chatId,
+        current,
+        createQueuedSteer(current, { content, command, submission }, this.#transitionContext(chatId)),
+      );
+      const result = committed.value;
+      if (!result.duplicate) {
+        this.#logMutation('create-steer', chatId, result.entryId, committed.control);
+      }
+      return { entryId: result.entryId, control: committed.control, duplicate: result.duplicate };
+    });
+  }
+
+  async markSteer(chatId: string, input: ObservedQueueHead): Promise<StoredChatExecutionControlState> {
+    return this.host.runExclusive(chatId, async () => {
+      this.#assertChatExists(chatId);
+      const current = await this.#load(chatId);
+      const committed = await this.#commitTransition(
+        chatId,
+        current,
+        markQueueEntrySteer(current, input, transitionContext()),
+      );
+      if (committed.changed) this.#logMutation('mark-steer', chatId, input.entryId, committed.control);
+      return committed.control;
     });
   }
 
@@ -306,21 +346,27 @@ export class ChatExecutionControlOperations {
     });
   }
 
-  async reserveSteer(
+  reserveSteer(chatId: string, input: ObservedQueueHead): Promise<ReservedSteer> {
+    return this.#reserveSteer(chatId, input, reserveQueueSteer);
+  }
+
+  // Reserves the head steer for automatic delivery, which a paused queue holds back.
+  reservePendingSteer(chatId: string, input: ObservedQueueHead): Promise<ReservedSteer> {
+    return this.#reserveSteer(chatId, input, reservePendingSteer);
+  }
+
+  #reserveSteer(
     chatId: string,
-    input: {
-      entryId: string;
-      expectedRevision: number;
-      expectedReorderRevision: number;
-    },
-  ): Promise<{ entry: StoredQueueEntry; control: StoredChatExecutionControlState }> {
+    input: ObservedQueueHead,
+    reserve: typeof reserveQueueSteer,
+  ): Promise<ReservedSteer> {
     return this.host.runExclusive(chatId, async () => {
       this.#assertChatExists(chatId);
       const current = await this.#load(chatId);
       const committed = await this.#commitTransition(
         chatId,
         current,
-        reserveQueueSteer(current, input, transitionContext()),
+        reserve(current, input, transitionContext()),
       );
       const entry = committed.control.entries.find((candidate) => candidate.id === input.entryId)!;
       this.#logMutation('steer-reserve', chatId, entry.id, committed.control, entry.revision);
@@ -469,6 +515,8 @@ export class ChatExecutionControlOperations {
   #logMutation(
     operation:
       | 'create'
+      | 'create-steer'
+      | 'mark-steer'
       | 'replace'
       | 'delete'
       | 'pop'

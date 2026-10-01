@@ -8,13 +8,17 @@ import {
   discardPendingInput,
   consumeQueueSteer,
   createQueueEntry,
+  createQueuedSteer,
   dequeueNextTurn,
   deleteQueueEntry,
+  markQueueEntrySteer,
   moveQueueEntry,
   pauseAfterDispatchFailure,
   pauseQueue,
   releaseQueueSteer,
   replaceQueueEntry,
+  requeueAndPause,
+  reservePendingSteer,
   reserveQueueSteer,
   resumeQueue,
   enqueueControlInput,
@@ -172,6 +176,111 @@ describe('chat execution control transitions', () => {
     const consumed = consumeQueueSteer(reservedAgain.next, firstId, context(8));
     expect(consumed.next.entries.map((entry) => entry.id)).toEqual([secondId]);
     expect(consumed.next.recentlyDispatched.at(-1)?.entryId).toBe(firstId);
+  });
+
+  it('reserves a steer for automatic delivery only while the queue is unpaused', () => {
+    const steer = createQueuedSteer(initial(), {
+      content: 'guidance',
+      submission: { clientMessageId: 'message-steer', transcriptViewId: 'view-1' },
+    }, context(1));
+    const paused = pauseQueue(steer.next, context(2));
+    const input = { entryId: value(steer).entryId, expectedRevision: 1, expectedReorderRevision: 0 };
+
+    expect(rejection(reservePendingSteer(paused.next, input, context(3))).code).toBe('QUEUE_PAUSE_CHANGED');
+    expect(value(reserveQueueSteer(paused.next, input, context(4))).entry.status).toBe('steering');
+    expect(value(reservePendingSteer(steer.next, input, context(5))).entry.status).toBe('steering');
+  });
+
+  it('queues steers in order ahead of queued turns and behind an entry being steered', () => {
+    const turn = add(initial(), 'turn', 1);
+    const turnId = value(turn).entryId;
+    const reserved = reserveQueueSteer(turn.next, {
+      entryId: turnId,
+      expectedRevision: 1,
+      expectedReorderRevision: 0,
+    }, context(2));
+    const future = add(reserved.next, 'future turn', 3);
+    const firstSteer = createQueuedSteer(future.next, {
+      content: 'first steer',
+      submission: { clientMessageId: 'message-steer-1', transcriptViewId: 'view-1' },
+    }, context(4));
+    const secondSteer = createQueuedSteer(firstSteer.next, {
+      content: 'second steer',
+      submission: { clientMessageId: 'message-steer-2', transcriptViewId: 'view-1' },
+    }, context(5));
+
+    expect(secondSteer.next.entries.map(({ content, kind, status }) => [content, kind, status])).toEqual([
+      ['turn', 'turn', 'steering'],
+      ['first steer', 'steer', 'queued'],
+      ['second steer', 'steer', 'queued'],
+      ['future turn', 'turn', 'queued'],
+    ]);
+    expect(value(secondSteer).entry).toMatchObject({ content: 'second steer', kind: 'steer' });
+    const retried = createQueuedSteer(secondSteer.next, {
+      content: 'second steer',
+      submission: { clientMessageId: 'message-steer-2', transcriptViewId: 'view-1' },
+    }, context(6));
+    expect(value(retried)).toMatchObject({ entryId: value(secondSteer).entryId, duplicate: true });
+    expect(retried.changed).toBe(false);
+    expect(rejection(createQueuedSteer(secondSteer.next, {
+      content: 'changed steer',
+      submission: { clientMessageId: 'message-steer-2', transcriptViewId: 'view-1' },
+    }, context(7))).code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
+  it('turns only the unchanged queue head into a steer', () => {
+    const first = add(initial(), 'first', 1);
+    const firstId = value(first).entryId;
+    const second = add(first.next, 'second', 2);
+    const secondId = value(second).entryId;
+    const request = (entryId, overrides = {}) => ({
+      entryId,
+      expectedRevision: 1,
+      expectedReorderRevision: 0,
+      ...overrides,
+    });
+
+    expect(rejection(markQueueEntrySteer(second.next, request(secondId), context(3))).code)
+      .toBe('QUEUE_ENTRY_REORDER_CONFLICT');
+    expect(rejection(markQueueEntrySteer(
+      second.next,
+      request(firstId, { expectedRevision: 2 }),
+      context(4),
+    )).code).toBe('QUEUE_ENTRY_REVISION_CONFLICT');
+
+    const marked = markQueueEntrySteer(second.next, request(firstId), context(5));
+    expect(marked.changed).toBe(true);
+    expect(marked.next.entries.map(({ id, kind, revision }) => [id, kind, revision])).toEqual([
+      [firstId, 'steer', 1],
+      [secondId, 'turn', 1],
+    ]);
+    expect(marked.next.version).toBe(second.next.version + 1);
+    expect(markQueueEntrySteer(marked.next, request(firstId), context(6)).changed).toBe(false);
+  });
+
+  it('keeps the entry kind through replace, move, and requeue', () => {
+    const turn = add(initial(), 'turn', 1);
+    const steer = createQueuedSteer(turn.next, { content: 'steer' }, context(2));
+    const steerId = value(steer).entryId;
+    const replaced = replaceQueueEntry(steer.next, {
+      entryId: steerId,
+      content: 'edited steer',
+      expectedRevision: 1,
+    }, context(3));
+    const moved = moveQueueEntry(replaced.next, {
+      entryId: steerId,
+      targetEntryId: value(turn).entryId,
+      placement: 'after',
+      expectedReorderRevision: 0,
+      expectedSourceRevision: 2,
+      expectedTargetRevision: 1,
+    }, context(4));
+    const requeued = requeueAndPause(moved.next, { entryId: steerId, kind: 'completion-uncertain' }, context(5));
+
+    expect(requeued.next.entries.map(({ content, kind }) => [content, kind])).toEqual([
+      ['turn', 'turn'],
+      ['edited steer', 'steer'],
+    ]);
   });
 
   it('pauses only the remaining tail after a dequeued dispatch fails', () => {

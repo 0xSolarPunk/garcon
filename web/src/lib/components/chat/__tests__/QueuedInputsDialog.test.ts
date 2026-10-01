@@ -14,6 +14,7 @@ function entry(index: number, revision = 1, content = `Queued message ${index}`)
 	return {
 		id: `entry-${index}`,
 		content,
+		kind: 'turn',
 		revision,
 		createdAt: '2026-07-16T00:00:00.000Z',
 		updatedAt: '2026-07-16T00:00:00.000Z',
@@ -79,6 +80,19 @@ describe('QueuedInputsDialog', () => {
 		expect(visibleMessages).toHaveLength(100);
 		expect(visibleMessages[0].textContent).toBe('Queued message 0');
 		expect(visibleMessages.at(-1)?.textContent).toBe('Queued message 99');
+	});
+
+	it('explains pending steers until their delivery starts', async () => {
+		const pendingSteer = (index: number) => ({ ...entry(index), kind: 'steer' as const });
+		const { component } = renderDialog(queue([pendingSteer(0), pendingSteer(1), entry(2)]));
+
+		expect(screen.getAllByText(m.chat_queue_pending_steer_detail())).toHaveLength(2);
+
+		component.setQueue(
+			queue([pendingSteer(0), pendingSteer(1), entry(2)], { steeringEntryId: 'entry-0' }),
+		);
+		await waitFor(() => expect(screen.getByText(m.chat_queue_steering())).toBeTruthy());
+		expect(screen.getAllByText(m.chat_queue_pending_steer_detail())).toHaveLength(1);
 	});
 
 	it('updates live, removes popped rows, and stays open when the queue becomes empty', async () => {
