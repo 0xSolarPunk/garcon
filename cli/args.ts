@@ -12,6 +12,7 @@ import {
 } from '@garcon/common/chat-modes';
 import { parseChatId, type ChatId } from '@garcon/common/chat-id';
 import { isAgentId, type AgentId } from '@garcon/common/agents';
+import { isExecutorId } from '@garcon/common/executors';
 import {
   parseChatRowTitle,
 } from '@garcon/common/chat-row-contracts';
@@ -77,6 +78,7 @@ import {
 } from '@garcon/common/native-session-lookup';
 import { argumentError } from './errors.js';
 import { TICKET_PARSE_OPTIONS, TICKET_STRING_OPTIONS, parseTicketCliCommand, type TicketCliCommand } from './ticket-args.js';
+import { EXECUTOR_PARSE_OPTIONS, EXECUTOR_STRING_OPTIONS, parseExecutorCliCommand, type ExecutorCliCommand } from './executor-args.js';
 
 const ADD_ROW_PRESENTATION_REQUIREMENT = [
   ...CLI_PRESET_PRESENTATION_STYLES.map((style) => `--type ${style}`),
@@ -84,6 +86,7 @@ const ADD_ROW_PRESENTATION_REQUIREMENT = [
 ].join(' or ');
 
 export const CLI_HELP = `Usage:
+  garcon-cli [connection options] executor <list|show|create|update|enable|disable|delete|connection|wait|providers|assign-provider|unassign-provider> [executor-id] [options]
   garcon-cli [connection options] ticket <create|list|read|update|claim|release|close|reopen|comment|comment-edit|comment-delete|link|unlink|history> [ticket-id] [options]
   garcon-cli [options] start [--parent <chat-id>] [--no-preamble | --preamble <id>...] [--json] [--message-title <title>] [--message-style <info|notice|error|custom>] [--collapsible] <prompt>
   garcon-cli [options] start-async [--parent <chat-id>] [--no-preamble | --preamble <id>...] [--json] [--message-title <title>] [--message-style <info|notice|error|custom>] [--collapsible] <prompt>
@@ -129,6 +132,24 @@ uses notice; a style without a title displays its CLI label. --color selects cus
 --collapsible starts the CLI-authored body collapsed without requiring a style.
 Ordinary restart, replay, shares, and frozen forks preserve it. Native-history
 Reload and provider-native fork segments may drop Garcon-only presentation.
+
+Executor management:
+  list|show <id> [--json]        Redacted configuration and readiness (list takes no ID)
+  create --label <text> --direction executor-connects --advertise-url <public-ws-url> [--json]
+  create --label <text> --direction controller-connects --connection-url <url|-> [--json]
+  update <id> [--label <text>] [access flags] [connection flags] [--json]
+  enable|disable|delete <id> [--json]
+  connection <id> [--output <new-file> | --json]  Explicit credential reveal
+  wait <id> --ready [--timeout <1..3600 seconds>] [--json]
+  providers [--json]            Existing provider IDs and assigned executors
+  assign-provider|unassign-provider <id> --provider <profile-id> [--json]
+  Access flags: --allow-controller-cli true|false, --allow-executor-management true|false.
+  Connection updates require --direction, --connection-url and --allow-insecure-development true|false;
+  --allow-unverified-tls true|false applies only to outbound TLS connections.
+  --advertise-url may contain {executorId}; the controller replaces it with the new UUID.
+  --connection-url - reads the credential from stdin. Ordinary output never reveals credentials.
+  Remote administration requires both CLI grants. Self-disruptive changes require another origin.
+  No automatic mutation retries. After an uncertain result, inspect configuration before retrying.
 
 Ticket management:
   create --title <text> [--description <text> | --stdin] [--project <text>]
@@ -179,6 +200,7 @@ Options:
   --config-dir <path>          Garcon config root (default: ~/.garcon)
   --runtime <role>             auto, controller, or executor (default: auto)
   --server <url>               Assert the selected runtime's exact URL
+  --executor <local|uuid>      Execution target for start, scoped lists, or native-session lookup
   --cwd <path>                 Project directory for a new chat (default: current directory)
   --parent <chat-id>           Record an existing parent for a new delegated chat
   --no-preamble               Disable all preambles for this new chat
@@ -233,6 +255,9 @@ Use a single - as the prompt to read UTF-8 text from stdin.
 Flags override GARCON_CONFIG_DIR and GARCON_RUNTIME, then defaults apply.
 auto selects the newer startedAt when both runtime files exist, with a stderr warning.
 Workspace options belong only to the controller. Runtime failures never switch roles.
+--executor changes the execution target, not the authenticated origin. Cross-executor
+starts require an explicit absolute --cwd on that target; it is sent unchanged.
+Existing-chat commands retain their owner and reject --executor. Preambles are workspace-scoped.
 Use -- before prompt text that begins with an option-like token.
 The cli tag records creation through garcon-cli; resume, resume-async, and stop never add it.`;
 
@@ -271,6 +296,8 @@ export interface StartCliInvocation extends CliInvocationBase {
   agentId: string;
   model: string;
   cwd: string;
+  executorId?: string;
+  requestedCwd?: string;
   parentChatId?: ChatId;
   orderedPreambleIds?: readonly PreambleId[];
 }
@@ -305,6 +332,7 @@ export interface ListCliCommand extends CliConnectionOptions {
   agentId?: string;
   providerId?: string;
   endpointId?: string;
+  executorId?: string;
 }
 
 export interface ResumeAsyncCliCommand extends CliConnectionOptions {
@@ -440,6 +468,7 @@ export interface LookupNativeSessionCliCommand extends CliConnectionOptions {
   readonly kind: 'lookup-native-session';
   readonly nativeSessionId: string;
   readonly agentId?: AgentId;
+  readonly executorId?: string;
 }
 
 export interface ChatsCliCommand extends CliConnectionOptions {
@@ -496,14 +525,17 @@ export type ParsedCliCommand =
   | SearchCliCommand
   | ReadCliCommand
   | TicketCliCommand
+  | ExecutorCliCommand
   | StartAsyncCliInvocation
   | CliInvocation;
 
 const SINGLE_STRING_OPTIONS = [
   ...TICKET_STRING_OPTIONS,
+  ...EXECUTOR_STRING_OPTIONS,
   'config-dir',
   'runtime',
   'server',
+  'executor',
   'cwd',
   'parent',
   'agent',
@@ -697,7 +729,7 @@ const WAIT_OPTIONS = optionSet('turn', 'json');
 const STATUS_OPTIONS = optionSet('messages', 'json');
 const EXPORT_OPTIONS = optionSet('format', 'exclude', 'output', 'force');
 const HANDOFF_OPTIONS = optionSet('context-window-size', 'output', 'force');
-const LOOKUP_NATIVE_SESSION_OPTIONS = optionSet('agent');
+const LOOKUP_NATIVE_SESSION_OPTIONS = optionSet('agent', 'executor');
 const CHATS_OPTIONS = optionSet('filter', 'limit', 'offset', 'json');
 const SEARCH_OPTIONS = optionSet('filter', 'sort', 'limit', 'offset', 'snippets', 'json');
 const READ_OPTIONS = optionSet(
@@ -707,9 +739,10 @@ const READ_OPTIONS = optionSet(
   'transcript-view-id',
   'json',
 );
-const LIST_OPTIONS = optionSet('agent', 'provider', 'endpoint', 'json');
+const LIST_OPTIONS = optionSet('agent', 'provider', 'endpoint', 'executor', 'json');
 const START_OPTIONS = optionSet(
   'cwd',
+  'executor',
   'parent',
   'agent',
   'provider',
@@ -1241,6 +1274,7 @@ function parseLookupNativeSession(
   values: Record<string, ParsedOptionValue>,
   connection: CliConnectionOptions,
   agentId: string | undefined,
+  executorId: string | undefined,
 ): LookupNativeSessionCliCommand {
   rejectOptionsExcept(values, LOOKUP_NATIVE_SESSION_OPTIONS, 'lookup-native-session');
   if (parsed.positionals.length < 2) {
@@ -1268,6 +1302,7 @@ function parseLookupNativeSession(
     ...connection,
     nativeSessionId,
     ...(agentId === undefined ? {} : { agentId }),
+    ...(executorId === undefined ? {} : { executorId }),
   };
 }
 
@@ -1478,9 +1513,11 @@ export function parseCliArgs(
       strict: true,
       options: {
         ...TICKET_PARSE_OPTIONS,
+        ...EXECUTOR_PARSE_OPTIONS,
         'config-dir': { type: 'string' },
         runtime: { type: 'string' },
         server: { type: 'string' },
+        executor: { type: 'string' },
         cwd: { type: 'string' },
         parent: { type: 'string' },
         preamble: { type: 'string', multiple: true },
@@ -1567,6 +1604,8 @@ export function parseCliArgs(
   const endpointId = nonEmptyOption(values.endpoint as string | undefined, '--endpoint');
   const model = nonEmptyOption(values.model as string | undefined, '--model');
   const cwd = nonEmptyOption(values.cwd as string | undefined, '--cwd');
+  const executorId = nonEmptyOption(values.executor as string | undefined, '--executor');
+  if (executorId !== undefined && !isExecutorId(executorId)) throw argumentError('--executor requires local or a remote executor UUID');
   const parent = nonEmptyOption(values.parent as string | undefined, '--parent');
   const additionalTags = parseAdditionalTags(values.tag);
   const connection: CliConnectionOptions = {
@@ -1578,6 +1617,7 @@ export function parseCliArgs(
   const commandName = parsed.positionals[0];
   if (commandName === undefined) throw argumentError('a command is required');
   if (commandName === 'ticket') return parseTicketCliCommand(parsed.positionals, values, connection, currentDirectory);
+  if (commandName === 'executor') return parseExecutorCliCommand(parsed.positionals, values, connection, currentDirectory);
   if (commandName === 'resume-async') return parseResumeAsync(parsed, values, connection);
   if (commandName === 'fork' || commandName === 'fork-async') {
     return parseFork(commandName, parsed, values, connection);
@@ -1608,7 +1648,7 @@ export function parseCliArgs(
   if (commandName === 'export') return parseExport(parsed, values, connection);
   if (commandName === 'handoff') return parseHandoff(parsed, values, connection);
   if (commandName === 'lookup-native-session') {
-    return parseLookupNativeSession(parsed, values, connection, agentId);
+    return parseLookupNativeSession(parsed, values, connection, agentId, executorId);
   }
   if (commandName === 'chats') return parseChats(parsed, values, connection);
   if (commandName === 'search') return parseSearch(parsed, values, connection);
@@ -1620,6 +1660,7 @@ export function parseCliArgs(
       throw argumentError(`list requires one resource: ${LIST_RESOURCE_VALUES.join(', ')}`);
     }
     rejectOptionsExcept(values, LIST_OPTIONS, 'list');
+    if (resource === 'preambles' && executorId !== undefined) throw argumentError('--executor cannot be used with list preambles');
     if (endpointId !== undefined && providerId === undefined) {
       throw argumentError('--endpoint requires --provider');
     }
@@ -1658,6 +1699,7 @@ export function parseCliArgs(
       kind: 'list',
       resource,
       ...connection,
+      ...(executorId === undefined ? {} : { executorId }),
       json: values.json === true,
       ...(agentId === undefined ? {} : { agentId }),
       ...(providerId === undefined ? {} : { providerId }),
@@ -1721,6 +1763,7 @@ export function parseCliArgs(
     agentId,
     model,
     cwd: path.resolve(currentDirectory, cwd ?? '.'),
+    ...(executorId === undefined ? {} : { executorId, ...(cwd === undefined ? {} : { requestedCwd: cwd }) }),
     ...(parentChatId === undefined ? {} : { parentChatId }),
     ...(orderedPreambleIds === undefined ? {} : { orderedPreambleIds }),
   };

@@ -33,7 +33,7 @@ Explicit flags take precedence over environment variables; nonempty environment 
 
 ## Executor Connections
 
-Add executors from the Executors dialog. For an executor that connects to the controller, pass the complete generated URL as one quoted argument:
+Add executors from the Executors dialog or the CLI management commands below. For an executor that connects to the controller, pass the complete generated URL as one quoted argument:
 
 ```bash
 bun server/main.ts executor --connect 'wss://controller.example.com/executor/NODE_ID#secret=SECRET' \
@@ -60,6 +60,14 @@ GARCON_CONFIG_DIR="$HOME/.garcon" bun cli/main.ts list agents
 bun cli/main.ts --config-dir "$HOME/.garcon" --runtime executor list agents
 ```
 
+**Allow executor management via CLI** is a separate, default-off grant. It is
+effective only while workspace CLI access is also enabled. It trusts the worker
+OS account with executor configuration, connection credentials, access grants,
+and assignment of existing provider profiles to Local or other executors.
+Disabling either grant cancels the old CLI authorization lease without stopping
+the worker or its running agents. Provider credentials already disclosed to a
+worker cannot be recalled by revoking an assignment.
+
 Worker-launched terminals and provider subprocesses inherit the config root and `GARCON_RUNTIME=executor`. Ordinary shells default to automatic selection, described below. Access grants are workspace-wide, including permission decisions and agent execution on other hosts. Provider sandboxes may independently block loopback HTTP.
 
 Every executor connection requires [Noise NNpsk0 encryption](https://github.com/cfal/noise-ws/tree/536eb503e81a1f9d90436006d3821e2080630488), on both `ws:` and `wss:`. Each physical reconnect negotiates fresh keys before the existing authenticated Garcon session resumes. There is no plaintext fallback. Upgrade the controller and all workers together. The pinned library is new and unaudited; vector, interoperability, and integration tests are not a security audit. Bun 1.4.2 or later is required.
@@ -67,6 +75,107 @@ Every executor connection requires [Noise NNpsk0 encryption](https://github.com/
 WSS certificate verification is enabled by default. **Allow unverified TLS certificates** in an outbound executor's editor, or `--allow-unverified-tls` on a dialing worker, explicitly disables only outer certificate verification. Noise still requires the shared secret. Optional certificate pinning is deferred pending [Bun issue 43635](https://github.com/oven-sh/bun/issues/43635). Non-TLS connections require the separate **Allow connection without TLS** checkbox or `--allow-insecure-development` flag. HTTP metadata and traffic timing remain visible without outer TLS; Noise protects the execution payload, not the browser UI or other HTTP routes.
 
 Connection URLs are credentials. Their `#secret` fragment is removed before dialing the execution endpoint, never sent in the upgrade's HTTP headers, query, or WebSocket subprotocol. The authenticated management API still carries full descriptors; protect browser-to-controller access with HTTPS or a trusted private network. Keep the URL private: clipboard contents, shell history, process arguments, and captured onboarding output can expose it locally. Stored listener credentials and controller executor configuration require private file permissions. Use an independent random 32-byte secret for every executor; human-chosen passwords are not supported. Disable a compromised executor immediately, replace its credential on both endpoints, then re-enable it. Routine connection diagnostics and executor-list responses omit credentials.
+
+## Executor Management
+
+`garcon-cli executor` configures the running controller. It does not install or
+start worker processes; `garcon executor --connect` / `--listen` still does that.
+Every command works through direct controller HTTP and an authorized executor
+gateway. Keep the same explicit `--config-dir` and `--runtime` selectors when
+following up on a mutation.
+
+```bash
+bun cli/main.ts executor list --json
+bun cli/main.ts executor create --label 'Build machine' --direction executor-connects \
+  --advertise-url 'wss://controller.example.com/executor/{executorId}' --json
+bun cli/main.ts executor connection <executor-id> --output ./worker-connection.txt
+bun cli/main.ts executor create --label 'Listening worker' --direction controller-connects \
+  --connection-url - < ./listener-connection.txt
+bun cli/main.ts executor update <executor-id> --allow-controller-cli true --allow-executor-management true
+bun cli/main.ts executor wait <executor-id> --ready --timeout 60 --json
+bun cli/main.ts executor providers --json
+bun cli/main.ts executor assign-provider <executor-id> --provider existing-profile
+bun cli/main.ts executor unassign-provider <executor-id> --provider existing-profile
+bun cli/main.ts executor disable <executor-id>
+bun cli/main.ts executor enable <executor-id>
+bun cli/main.ts executor delete <executor-id>
+```
+
+Executor IDs are UUIDs; labels are not selectors. New labels and renames must be
+unique, ignoring case and surrounding whitespace, including disabled executors;
+`Local` is reserved. Existing duplicates remain readable and can be renamed.
+`show`, `wait`, and provider
+assignments also accept `local`. Provider assignment uses an exact existing
+profile ID; it does not create profiles, accept API keys, or change native login.
+The `providers` management listing shows all existing profiles and their assigned
+executor IDs, unlike the executor-scoped execution catalog from `list providers`.
+
+Inbound creation requires an explicit reachable, secret-free advertised URL. The
+literal `{executorId}` is expanded atomically before saving; arbitrary proxy paths
+and query strings are preserved. The CLI never derives an external address from
+its discovered loopback endpoint. Outbound creation takes the listening worker's
+full credential URL. Creation returns only the new ID. Saving configuration does
+not claim the worker is ready; use the bounded readiness wait separately.
+
+`update` accepts a label or either access grant. Connection edits require a full
+`--connection-url`, `--direction`, and explicit `--allow-insecure-development
+true|false`. `--allow-unverified-tls true|false` applies only to outbound TLS.
+Neither TLS opt-out disables Noise authentication. Changing an active executor's
+connector or deleting it can fail with an in-use conflict; no command force-stops
+work. Deletion leaves saved references unavailable and does not delete worker data.
+
+Connection URLs are secrets. `connection` explicitly reveals one; `--output`
+writes a new private file atomically and refuses overwrite. `--connection-url -`
+accepts one bounded UTF-8 URL from stdin so it need not appear in process arguments.
+Avoid recording reveal output in agent transcripts. Ordinary list/create/update
+output omits credentials. Provider assignment may disclose a profile's credentials
+to subsequent execution on the target; removing it does not recall disclosed keys.
+
+Remote callers need ordinary workspace CLI access for redacted executor listing,
+and the separate management grant for administrative operations and the global
+provider assignment list. A caller may rename its own executor, but must use the
+controller or another authorized executor to change its own grants/connection,
+disable it, or delete it. New workers cannot bootstrap their own grants.
+
+Mutation requests are not retried automatically. A timeout, interrupted CLI,
+invalid reply, or server error after dispatch can mean the save succeeded.
+Definitive validation and pre-dispatch rejections retain their original errors.
+Inspect executors/provider assignments
+before retrying, especially creation, which generates a new UUID for each request.
+`--json` emits one JSON result; diagnostics go to stderr. Ctrl-C exits 130 without
+claiming rollback. An offline target remains configurable through a healthy origin.
+
+## Execution Targets
+
+`--executor local|<uuid>` selects where a new chat runs. It also scopes `list`
+catalogs (except workspace-wide preambles) and `lookup-native-session`. Omission
+preserves the authenticated origin's default: Local through the controller,
+or the originating executor through its gateway. Selection requires ordinary
+workspace CLI access, not the administrative management grant.
+
+```bash
+bun cli/main.ts executor list --json
+bun cli/main.ts list models --executor <executor-id> --agent codex --json
+bun cli/main.ts start-async --executor <executor-id> --cwd /srv/project \
+  --agent codex --model <model-id> 'Review the changes'
+bun cli/main.ts --runtime executor start --executor local --cwd /srv/controller-project \
+  --agent codex --model <model-id> 'Review the controller project'
+bun cli/main.ts lookup-native-session <native-session-id> --executor <executor-id>
+```
+
+`--runtime` selects the authenticated origin; `--executor` never changes that
+connection or its authority. Model/provider resolution and chat creation use the
+same selected target. Unknown or unavailable targets fail without falling back
+to another executor.
+
+Cross-executor starts require an explicit absolute `--cwd` on the target machine.
+The CLI sends it unchanged, including Windows drive/UNC paths; it does not expand
+`~`, normalize remote paths, or check them against the CLI machine's filesystem.
+The target validates its own filesystem boundary. Same-origin starts retain local
+directory validation and canonicalization, including when `--executor` is explicit.
+
+`resume`, `resume-async`, `fork`, and all other existing-chat commands retain the
+chat's saved executor and reject `--executor`. Target selection does not move chats.
 
 ## Tickets
 

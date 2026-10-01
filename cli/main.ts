@@ -1,5 +1,6 @@
 import packageJson from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { CLI_HELP, parseCliArgs, type CliConnectionOptions, type ParsedCliCommand } from './args.js';
 import { runCatalogQuery } from './catalog-query.js';
 import { resumeChatAsync, stopChat } from './chat-control.js';
@@ -40,6 +41,8 @@ import { createCliOutput, type CliOutput } from './output.js';
 import { applyTicketStdin, runTicketCommand } from './ticket-commands.js';
 import { ticketLineOutput } from './ticket-output.js';
 import { readTicketStdin } from './ticket-stdin.js';
+import { applyExecutorConnectionStdin, readExecutorConnectionStdin } from './executor-args.js';
+import { runExecutorCommand } from './executor-commands.js';
 import { requireCompletedTurnReceipt, writeTerminalResult } from './terminal-receipt.js';
 
 export interface MainOptions {
@@ -135,6 +138,14 @@ async function canonicalProjectDirectory(cwd: string): Promise<string> {
   }
 }
 
+function remoteProjectDirectory(cwd: string | undefined): string {
+  if (cwd === undefined || cwd.includes('\0') || !(path.posix.isAbsolute(cwd)
+    || /^[a-z]:[\\/]/iu.test(cwd) || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/u.test(cwd))) {
+    throw new CliError('arguments', 'cross-executor starts require an explicit absolute --cwd on the selected executor', 2);
+  }
+  return cwd;
+}
+
 async function connectedClient<T extends CliConnectionOptions>(
   command: T,
   options: MainOptions,
@@ -218,6 +229,7 @@ export async function main(
   const output = options.output ?? createCliOutput();
   let command: ParsedCliCommand | undefined;
   let ticketSubmissionStarted = false;
+  let executorSubmissionStarted = false;
   let forkTargetChatId: string | undefined;
   try {
     command = parseCliArgs(argv);
@@ -227,6 +239,14 @@ export async function main(
     }
     if (command.kind === 'version') {
       process.stdout.write(`${packageJson.version}\n`);
+      return 0;
+    }
+    if (command.kind === 'executor') {
+      const executorCommand = command.readsConnectionFromStdin
+        ? applyExecutorConnectionStdin(command, await readConfiguredStdin(options,
+          (signal) => readExecutorConnectionStdin(Bun.stdin.stream(), signal))) : command;
+      const { client, command: connected } = await connectedClient(executorCommand, options);
+      await runExecutorCommand(connected, client, output, options.signal, () => { executorSubmissionStarted = true; });
       return 0;
     }
     if (command.kind === 'ticket') {
@@ -286,6 +306,7 @@ export async function main(
       const { client } = await connectedClient(command, options);
       const chatId = await client.lookupNativeSession({
         nativeSessionId: command.nativeSessionId,
+        ...(command.executorId === undefined ? {} : { executorId: command.executorId }),
         ...(command.agentId === undefined ? {} : { agent: command.agentId }),
       }, options.signal);
       output.result(chatId);
@@ -447,10 +468,15 @@ export async function main(
     if (prompt.trim().length === 0) {
       throw new CliError('arguments', 'the prompt read from stdin must not be empty', 2);
     }
-    const invocation = command.kind === 'start' || command.kind === 'start-async'
+    let invocation = (command.kind === 'start' || command.kind === 'start-async') && command.executorId === undefined
       ? { ...command, cwd: await canonicalProjectDirectory(command.cwd) }
       : command;
     const { client } = await connectedClient(invocation, options);
+    if ((invocation.kind === 'start' || invocation.kind === 'start-async') && invocation.executorId !== undefined) {
+      invocation = { ...invocation, cwd: invocation.executorId === client.defaultExecutorId
+        ? await canonicalProjectDirectory(invocation.cwd)
+        : remoteProjectDirectory(invocation.requestedCwd) };
+    }
     if (invocation.kind === 'start-async') {
       const result = await startConsultationAsync(invocation, prompt, client, options.signal);
       if (invocation.json) {
@@ -489,7 +515,9 @@ export async function main(
     return 0;
   } catch (error) {
     if (options.signal?.aborted) {
-      output.diagnostic(command?.kind === 'ticket'
+      output.diagnostic(command?.kind === 'executor'
+        ? executorSubmissionStarted ? 'terminal interrupted; executor configuration may have committed. Inspect before retrying.' : 'terminal interrupted; no executor mutation was submitted'
+        : command?.kind === 'ticket'
         ? ticketSubmissionStarted
           ? 'terminal interrupted; the ticket save is not confirmed. Retry with the printed identity and identical body.'
           : 'terminal interrupted; no ticket mutation was submitted'
@@ -500,7 +528,7 @@ export async function main(
       ? error
       : new CliError('submission', error instanceof Error ? error.message : String(error), 3);
     const diagnostic = `${cliError.phase}: ${cliError.message}`;
-    output.diagnostic(command?.kind === 'ticket' || argv.includes('ticket') ? ticketLineOutput(diagnostic) : diagnostic);
+    output.diagnostic(command?.kind === 'ticket' || command?.kind === 'executor' || argv.includes('ticket') || argv.includes('executor') ? ticketLineOutput(diagnostic) : diagnostic);
     return cliError.exitCode;
   }
 }
