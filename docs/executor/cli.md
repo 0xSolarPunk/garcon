@@ -1,5 +1,14 @@
 # CLI Access Through Executors
 
+Current worker startup and credential handling are documented in
+[Executor Connections](../cli.md#executor-connections): `GARCON_CONTROLLER_URL`
+replaces `--connect`; TLS listeners require a certificate/private-key pair or
+explicit `--no-tls`. The worker consumes the controller URL before creating
+provider/PTY children. These changes do not alter runtime discovery, the
+loopback gateway, or the separate workspace CLI grant below. Listener startup
+output is secret-free; `executor connection-url` explicitly reveals its existing
+credential without opening a second worker or gateway.
+
 Status: implemented and reviewed, 2026-09-24. Opus and Astra reviewed the design against `e9a9cfcf5` and the implementation through `3279b49e0`; `ce725e1d5` adds the final requested regression coverage. The [current transport contract](./transport.md) supersedes older replay and chunk-transfer proposals. Source links below identify the original investigation baseline; the corrections in this document govern implementation.
 
 This extends [Executor Interfaces](./interface.md) and [Executors In The App](./app-integration.md), which deliberately excluded a spawned-CLI bridge. It reuses the current shared channel with [Files](./files.md), [Terminals](./terminal.md), and [Git](./git.md); channel splitting remains a separate pending decision. Existing CLI behavior is documented in [Garcon CLI And Server](../cli.md).
@@ -79,6 +88,14 @@ Content-Type: application/json
 ```
 
 Against the controller, the existing HTTP boundary invokes the start handler. Against the gateway, local authentication is consumed at the gateway and the request is carried by `controllerCli.request`; the controller dispatcher invokes that same start handler with a derived delegated-executor principal. The gateway returns the controller's application response to the CLI.
+
+Forwarded requests use an internal synthetic URL, not a public controller Host.
+Executor onboarding and connection reveal therefore use an explicit saved
+advertised URL or the controller's `GARCON_PUBLIC_URL` / `--public-url`; without
+either they return a configuration error. Host-derived suggestions remain
+available only to direct HTTP callers and are never persisted. Executor creation
+without an advertised override fails before saving when the gateway cannot
+resolve a public base.
 
 The HTTP capability is endpoint-local. A gateway capability is never forwarded as controller authentication, and the controller's local capability is never copied to the worker. The executor secret remains private to the connector.
 

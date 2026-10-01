@@ -25,6 +25,9 @@ const SMOKE_ISOLATION_ENV_KEYS = new Set([
   'GARCON_WORKSPACE',
   'GARCON_PORT',
   'GARCON_BIND_ADDRESS',
+  'GARCON_PUBLIC_URL',
+  'GARCON_CONTROLLER_URL',
+  'GARCON_EXECUTOR_ADVERTISE_URL',
   'GARCON_PROJECT_BASE_DIR',
   'GARCON_DISABLE_AUTH',
   'GARCON_AGENT_EXECUTOR_CONFIG',
@@ -100,10 +103,11 @@ async function waitForServerUrl(processHandle) {
     throw new Error(`Executable exited early with code ${code}. Captured output:\n${output}`);
   });
 
-  const url = await Promise.race([startedPromise, timeoutPromise, exitPromise]);
+  const url = new URL(await Promise.race([startedPromise, timeoutPromise, exitPromise]));
+  url.hostname = '127.0.0.1';
   await Promise.race([stdoutPump, delay(50)]);
   await Promise.race([stderrPump, delay(50)]);
-  return { url, getOutput: () => output };
+  return { url: url.origin, getOutput: () => output };
 }
 
 async function stopProcess(processHandle) {
@@ -160,7 +164,7 @@ async function assertCompiledExecutor(url, executablePath, workspaceDir, apiFetc
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      label: 'Compiled Worker', direction: 'executor-connects', allowInsecureDevelopment: true,
+      label: 'Compiled Worker', direction: 'executor-connects', noTls: true,
     }),
   });
   if (!response.ok) throw new Error(`Unable to configure compiled worker: ${response.status}`);
@@ -171,11 +175,11 @@ async function assertCompiledExecutor(url, executablePath, workspaceDir, apiFetc
   connection.hostname = '127.0.0.1';
   const worker = Bun.spawn({
     cmd: [
-      executablePath, 'executor', '--connect', connection.href,
-      '--allow-insecure-development', '--config-dir', path.join(workspaceDir, 'worker'),
+      executablePath, 'executor',
+      '--no-tls', '--config-dir', path.join(workspaceDir, 'worker'),
       '--project-base-dir', workspaceDir,
     ],
-    env: isolatedServerEnvironment(piAgentDir),
+    env: { ...isolatedServerEnvironment(piAgentDir), GARCON_CONTROLLER_URL: connection.href },
     stdout: 'ignore',
     stderr: 'pipe',
   });

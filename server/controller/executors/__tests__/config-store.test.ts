@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { ExecutorConfigStore } from '../config-store.js';
 import { createExecutorSecret, executorConnectionUrl } from '../../../remote/transport/connection-url.js';
+import { CorruptStateFileError } from '../../../common/json-file-store.js';
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
@@ -38,7 +39,10 @@ test('executor configuration is private, durable, and never persists a Local exe
   const { root, store } = await fixture();
   expect(store.list()).toEqual([]);
   const executor = await store.create({ direction: 'executor-connects', label: 'Build machine' });
-  expect(store.connection(executor.id).connectionUrl).toBe(`wss://example.com/executor/${executor.id}#secret=${executor.secret}`);
+  expect(executor.connection).toEqual({ kind: 'executor-connects', advertisedUrl: null });
+  expect(store.connection(executor.id).connectionUrl).toBe('');
+  expect(store.connection(executor.id, 'https://controller.test/base/').connectionUrl)
+    .toBe(`wss://controller.test/base/executor/${executor.id}#secret=${executor.secret}`);
   const filePath = join(root, 'executors.json');
   if (process.platform !== 'win32') expect((await stat(filePath)).mode & 0o777).toBe(0o600);
   expect(JSON.parse(await readFile(filePath, 'utf8')).executors).toEqual([executor]);
@@ -68,11 +72,12 @@ test('URL updates preserve identity and configuration objects are not mutable ca
   const { store } = await fixture();
   const original = await store.create({ direction: 'executor-connects', label: 'Original' });
   const connectionUrl = `ws://127.0.0.1:8080/executor/${original.id}#secret=${original.secret}`;
-  await store.update(original.id, { connection: { direction: 'executor-connects', connectionUrl, allowInsecureDevelopment: true } });
+  await store.update(original.id, { connection: { direction: 'executor-connects', connectionUrl, noTls: true } });
   const updated = await store.update(original.id, { label: 'Renamed', enabled: false });
   expect(updated.id).toBe(original.id);
   expect(updated.secret).toBe(original.secret);
   expect(store.connection(original.id).connectionUrl).toBe(connectionUrl);
+  expect(store.connection(original.id, 'not a public URL').connectionUrl).toBe(connectionUrl);
   const copy = store.list() as { label: string }[];
   copy[0].label = 'Corrupted';
   expect(store.require(original.id).label).toBe('Renamed');
@@ -99,8 +104,32 @@ test('normalized connection addresses remain usable within request and response 
   const created = await store.create({ direction: 'executor-connects', label: 'Synthetic worker' });
   const connectionUrl = `wss://worker.test/${' '.repeat(1500)}/#secret=${createExecutorSecret()}`;
   await expect(store.create({ direction: 'controller-connects', label: 'Oversized', connectionUrl })).rejects.toThrow('exceeds 4096');
-  await expect(store.update(created.id, { connection: { direction: 'controller-connects', connectionUrl, allowInsecureDevelopment: false } })).rejects.toThrow('exceeds 4096');
+  await expect(store.update(created.id, { connection: { direction: 'controller-connects', connectionUrl, noTls: false } })).rejects.toThrow('exceeds 4096');
   expect(store.list()).toEqual([created]);
+});
+
+test('policy-only updates preserve inherited public URLs across restart and public-base changes', async () => {
+  const { root, store } = await fixture();
+  const executor = await store.create({ direction: 'executor-connects', label: 'Inherited' });
+  await store.update(executor.id, { connection: { direction: 'executor-connects', noTls: true } });
+  const reloaded = new ExecutorConfigStore(root);
+  await reloaded.initialize();
+  expect(reloaded.require(executor.id).connection).toEqual({ kind: 'executor-connects', advertisedUrl: null });
+  expect(reloaded.connection(executor.id, 'https://new-controller.test/base').connectionUrl)
+    .toBe(`wss://new-controller.test/base/executor/${executor.id}#secret=${executor.secret}`);
+  await expect(reloaded.update(executor.id, { connection: { direction: 'controller-connects', noTls: true } }))
+    .rejects.toThrow('Changing connection direction requires a connection URL');
+});
+
+test.each(['executor-connects', 'controller-connects'] as const)('policy-only updates validate the retained explicit URL (%s)', async direction => {
+  const { store } = await fixture();
+  const executor = await store.create({ direction: 'executor-connects', label: 'Explicit' });
+  const connectionUrl = executorConnectionUrl('ws://worker.test/executor', executor.secret);
+  await store.update(executor.id, { connection: { direction, connectionUrl, noTls: true } });
+  await store.update(executor.id, { connection: { direction, noTls: true } });
+  expect(store.connection(executor.id).connectionUrl).toBe(connectionUrl);
+  await expect(store.update(executor.id, { connection: { direction, noTls: false } })).rejects.toThrow('require TLS');
+  expect(store.connection(executor.id).noTls).toBe(true);
 });
 
 test('pasted worker credentials are unique and concurrent creates do not overwrite each other', async () => {
@@ -173,7 +202,7 @@ test.each(['executor-connects', 'controller-connects'] as const)(
     const executor = await store.create(direction === 'executor-connects'
       ? { direction, label: 'Proxied worker' }
       : { direction, label: 'Proxied worker', connectionUrl });
-    await store.update(executor.id, { connection: { direction, connectionUrl, allowInsecureDevelopment: false } });
+    await store.update(executor.id, { connection: { direction, connectionUrl, noTls: false } });
     const reloaded = new ExecutorConfigStore(root);
     await reloaded.initialize();
     expect(reloaded.connection(executor.id).connectionUrl).toBe(connectionUrl);
@@ -189,23 +218,66 @@ test('insecurely readable persisted secrets reject startup', async () => {
   await expect(new ExecutorConfigStore(root).initialize()).rejects.toThrow('OS account');
 });
 
+test('retired executor schema rejects startup with explicit upgrade and restore instructions', async () => {
+  const { root, store } = await fixture();
+  const executor = await store.create({ direction: 'executor-connects', label: 'Upgrade' });
+  const file = join(root, 'executors.json');
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  stored.executors[0].allowInsecureDevelopment = stored.executors[0].noTls;
+  delete stored.executors[0].noTls;
+  const legacy = JSON.stringify(stored);
+  await writeFile(file, legacy);
+  const error = await new ExecutorConfigStore(root).initialize().then(() => null, error => error);
+  expect(error.message).toContain('rename it to noTls, preserving its boolean value');
+  expect(error.message).toContain('restore it to');
+  expect(error.cause).toBeInstanceOf(CorruptStateFileError);
+  expect(error.message).toContain(error.cause.quarantinePath);
+  expect(error.message).not.toContain(executor.secret);
+  expect(await readFile(error.cause.quarantinePath, 'utf8')).toBe(legacy);
+  stored.executors[0].noTls = stored.executors[0].allowInsecureDevelopment;
+  delete stored.executors[0].allowInsecureDevelopment;
+  await writeFile(file, JSON.stringify(stored), { mode: 0o600 });
+  const upgraded = new ExecutorConfigStore(root);
+  await upgraded.initialize();
+  expect(upgraded.require(executor.id).secret).toBe(executor.secret);
+});
+
+test.each([
+  { kind: 'executor-connects' },
+  { kind: 'executor-connects', advertisedUrl: 1 },
+  { kind: 'controller-connects' },
+  { kind: 'controller-connects', targetUrl: null },
+  { kind: 'controller-connects', targetUrl: 1 },
+  { kind: 'unknown', targetUrl: 'wss://worker.test/executor' },
+])('malformed stored connections retain their validation failure: %j', async connection => {
+  const { root, store } = await fixture();
+  await store.create({ direction: 'executor-connects', label: 'Malformed' });
+  const file = join(root, 'executors.json');
+  const stored = JSON.parse(await readFile(file, 'utf8'));
+  stored.executors[0].connection = connection;
+  await writeFile(file, JSON.stringify(stored));
+  await expect(new ExecutorConfigStore(root).initialize()).rejects.toMatchObject({
+    cause: { message: 'Invalid executor connection configuration' },
+  });
+});
+
 test('TLS verification defaults on and explicit opt-out survives restart and rename', async () => {
   const { root, store } = await fixture();
   const connectionUrl = executorConnectionUrl('wss://worker.example.com/executor', createExecutorSecret());
   const executor = await store.create({ direction: 'controller-connects', label: 'Worker', connectionUrl });
   expect(store.connection(executor.id).allowUnverifiedTls).toBe(false);
   await store.update(executor.id, { connection: {
-    direction: 'controller-connects', connectionUrl, allowInsecureDevelopment: false, allowUnverifiedTls: true,
+    direction: 'controller-connects', connectionUrl, noTls: false, allowUnverifiedTls: true,
   } });
   await store.update(executor.id, { label: 'Renamed' });
   const reloaded = new ExecutorConfigStore(root);
   await reloaded.initialize();
-  expect(reloaded.connection(executor.id)).toEqual({ connectionUrl, allowInsecureDevelopment: false, allowUnverifiedTls: true });
-  await reloaded.update(executor.id, { connection: { direction: 'controller-connects', connectionUrl, allowInsecureDevelopment: false } });
+  expect(reloaded.connection(executor.id)).toEqual({ connectionUrl, noTls: false, allowUnverifiedTls: true });
+  await reloaded.update(executor.id, { connection: { direction: 'controller-connects', connectionUrl, noTls: false } });
   expect(reloaded.connection(executor.id).allowUnverifiedTls).toBe(false);
   await reloaded.update(executor.id, { connection: {
     direction: 'controller-connects', connectionUrl: connectionUrl.replace('wss:', 'ws:'),
-    allowInsecureDevelopment: true, allowUnverifiedTls: true,
+    noTls: true, allowUnverifiedTls: true,
   } });
   expect(reloaded.connection(executor.id).allowUnverifiedTls).toBe(false);
 });

@@ -2,10 +2,22 @@ import { expect, test } from 'bun:test';
 import { ExecutorsChangedMessage, parseServerWsMessage } from '../ws-events.ts';
 import {
   effectiveExecutorId, parseExecutorId, parseCreateExecutorRequest, parseUpdateExecutorRequest,
-  parseExecutors,
+  parseExecutors, isExecutorSecret,
 } from '../executors.ts';
 
 const remoteId = '22222222-2222-4222-8222-222222222222';
+
+test('executor secrets match canonical 32-byte base64url encoding in browser and worker', () => {
+  for (const suffix of 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_') {
+    const secret = 'A'.repeat(42) + suffix;
+    const bytes = Buffer.from(secret, 'base64url');
+    expect(isExecutorSecret(secret)).toBe(bytes.length === 32 && bytes.toString('base64url') === secret);
+  }
+  for (let byte = 0; byte <= 255; byte++) expect(isExecutorSecret(Buffer.alloc(32, byte).toString('base64url'))).toBe(true);
+  for (const value of [null, undefined, 3, '', 'A'.repeat(42), 'A'.repeat(44), '+'.repeat(43), '/'.repeat(43), 'A'.repeat(43) + '=']) {
+    expect(isExecutorSecret(value)).toBe(false);
+  }
+});
 
 test('only absent or null executor identity defaults to Local', () => {
   for (const value of [undefined, null, 'local']) expect(parseExecutorId(value)).toBe('local');
@@ -16,7 +28,7 @@ test('only absent or null executor identity defaults to Local', () => {
 
 test('executor mutation contracts reject incomplete and extraneous fields', () => {
   expect(parseCreateExecutorRequest({ label: ' Worker ', direction: 'executor-connects' }))
-    .toEqual({ label: 'Worker', direction: 'executor-connects', allowInsecureDevelopment: undefined, allowUnverifiedTls: undefined });
+    .toEqual({ label: 'Worker', direction: 'executor-connects', noTls: undefined, allowUnverifiedTls: undefined });
   expect(parseCreateExecutorRequest({ label: 'Worker', direction: 'controller-connects' })).toBeNull();
   expect(parseCreateExecutorRequest({ label: 'Worker', direction: 'executor-connects', secret: 'hidden' })).toBeNull();
   expect(parseUpdateExecutorRequest({})).toBeNull();
@@ -30,7 +42,7 @@ test('certificate verification opt-out is explicit and only applies to the diali
   expect(parseCreateExecutorRequest({ ...request, allowUnverifiedTls: true })?.allowUnverifiedTls).toBe(true);
   expect(parseCreateExecutorRequest({ ...request, allowUnverifiedTls: 'true' })).toBeNull();
   expect(parseCreateExecutorRequest({ label: 'Worker', direction: 'executor-connects', allowUnverifiedTls: true })).toBeNull();
-  const connection = { direction: 'controller-connects', connectionUrl: request.connectionUrl, allowInsecureDevelopment: false, allowUnverifiedTls: true };
+  const connection = { direction: 'controller-connects', connectionUrl: request.connectionUrl, noTls: false, allowUnverifiedTls: true };
   expect(parseUpdateExecutorRequest({ connection })).toEqual({ connection });
   expect(parseUpdateExecutorRequest({ connection: { ...connection, direction: 'executor-connects' } })).toBeNull();
   expect(parseUpdateExecutorRequest({ connection: { ...connection, allowUnverifiedTls: 1 } })).toBeNull();
@@ -45,6 +57,16 @@ test('management grants are explicit booleans independent of workspace CLI acces
   for (const allowExecutorManagement of [null, 'true', 1, {}]) {
     expect(parseCreateExecutorRequest({ ...request, allowExecutorManagement })).toBeNull();
     expect(parseUpdateExecutorRequest({ allowExecutorManagement })).toBeNull();
+  }
+});
+
+test('connection updates permit an omitted URL but reject empty or malformed URL fields', () => {
+  for (const direction of ['executor-connects', 'controller-connects']) {
+    const connection = { direction, noTls: true };
+    expect(parseUpdateExecutorRequest({ connection })).toEqual({ connection });
+    for (const connectionUrl of ['', null, 3]) {
+      expect(parseUpdateExecutorRequest({ connection: { ...connection, connectionUrl } })).toBeNull();
+    }
   }
 });
 

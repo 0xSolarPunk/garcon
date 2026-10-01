@@ -15,7 +15,7 @@ const snapshot: ExecutorSnapshot = { id, label: 'Worker', kind: 'remote', enable
   allowControllerCli: true, allowExecutorManagement: false, direction: 'executor-connects', availability: 'ready',
   instanceId: 'synthetic', projectBasePath: '/workspace', lastError: null,
   machineServices: { files: true, git: true, gh: true, terminals: true } };
-const connection = { connectionUrl: `wss://worker.test/executor#secret=${'A'.repeat(43)}`, allowInsecureDevelopment: false, allowUnverifiedTls: false };
+const connection = { connectionUrl: `wss://worker.test/executor#secret=${'A'.repeat(43)}`, noTls: false, allowUnverifiedTls: false };
 const providers = [{ id: 'synthetic-profile', label: 'Profile', executorIds: [id] }];
 
 function command(args: string[]) {
@@ -38,12 +38,15 @@ function fixture() {
 }
 
 test('executor parser handles independent grants, both directions, and strict update flags', () => {
+  const inherited = command(['create', '--label', 'Worker', '--direction', 'executor-connects']).operation;
+  expect(inherited).toMatchObject({ action: 'create', request: { label: 'Worker', direction: 'executor-connects' } });
+  expect(inherited).not.toHaveProperty('request.advertisedUrl');
   expect(command(['create', '--label', ' Worker ', '--direction', 'executor-connects', '--advertise-url', 'wss://controller.test/executor/{executorId}',
     '--allow-controller-cli', 'true', '--allow-executor-management', 'false']).operation).toMatchObject({ action: 'create', request: {
       label: 'Worker', allowControllerCli: true, allowExecutorManagement: false, advertisedUrl: 'wss://controller.test/executor/{executorId}',
     } });
   expect(command(['update', id, '--allow-executor-management', 'false']).operation).toEqual({ action: 'update', id, request: { allowExecutorManagement: false } });
-  expect(command(['update', id, '--direction', 'controller-connects', '--connection-url', '-', '--allow-insecure-development', 'false']).readsConnectionFromStdin).toBe(true);
+  expect(command(['update', id, '--direction', 'controller-connects', '--connection-url', '-', '--no-tls', 'false']).readsConnectionFromStdin).toBe(true);
   expect(command(['assign-provider', 'local', '--provider', 'synthetic-profile']).operation).toEqual({ action: 'assign-provider', id: 'local', providerId: 'synthetic-profile' });
 });
 
@@ -52,7 +55,9 @@ test('executor parser rejects irrelevant, ambiguous, unsafe, and incomplete opti
     [], ['missing'], ['list', id], ['list', '--provider', 'synthetic'], ['show'], ['show', 'unknown'], ['delete', 'local'],
     ['update', id], ['update', id, '--allow-controller-cli', 'yes'], ['update', id, '--connection-url', connection.connectionUrl],
     ['update', id, '--allow-executor-management', 'true', '--allow-executor-management', 'false'],
-    ['create', '--label', 'Worker', '--direction', 'executor-connects'],
+    ['update', id, '--direction', 'executor-connects', '--no-tls', 'true'],
+    ['create', '--label', 'Worker', '--direction', 'executor-connects', '--advertise-url', ''],
+    ['create', '--label', 'Worker', '--direction', 'executor-connects', '--allow-insecure-development', 'true'],
     ['create', '--label', 'Worker', '--label', 'Other', '--direction', 'executor-connects', '--advertise-url', 'wss://worker.test'],
     ['create', '--label', 'Worker', '--direction', 'controller-connects', '--connection-url', connection.connectionUrl, '--advertise-url', 'wss://worker.test'],
     ['wait', id], ['wait', id, '--ready', '--timeout', '0'], ['wait', id, '--ready', '--timeout', 'Infinity'],

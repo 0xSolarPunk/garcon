@@ -15,6 +15,7 @@ Common options and environment variables:
 
 - `GARCON_PORT` / `--port`: listen port. Use `0` for a random port.
 - `GARCON_BIND_ADDRESS` / `--bind-address`: server bind address.
+- `GARCON_PUBLIC_URL` / `--public-url`: external HTTP(S) base URL for executor onboarding, including any proxy path prefix.
 - `GARCON_CONFIG_DIR` / `--config-dir`: base config directory. Defaults to `~/.garcon`.
 - `GARCON_WORKSPACE` / `--workspace`: named workspace under the config directory.
 - `GARCON_WORKSPACE_DIR` / `--workspace-dir`: explicit workspace directory.
@@ -33,22 +34,66 @@ Explicit flags take precedence over environment variables; nonempty environment 
 
 ## Executor Connections
 
-Add executors from the Executors dialog or the CLI management commands below. For an executor that connects to the controller, pass the complete generated URL as one quoted argument:
+Set `--public-url https://controller.example.com/garcon/` or `GARCON_PUBLIC_URL`
+on a proxied controller. The flag wins; the base path is retained when generating
+`wss://controller.example.com/garcon/executor/<id>`. Without configuration, the
+authenticated management request's validated `Host` and actual HTTP(S) scheme
+provide a best-effort suggestion. Forwarded headers are not used. This cannot
+infer external TLS termination or proxy path rewriting: configure those explicitly.
+An executor's manually saved full URL overrides the generated default. No example
+URL is generated, and Copy is disabled for unusable addresses or WS without the
+explicit no-TLS opt-in. Changing the public base does not rotate executor secrets.
+TLS-policy edits preserve the inherited public URL. In connection PATCH requests,
+omit `connectionUrl` to retain the current address and secret; an explicit URL
+sets an override. Changing direction requires an explicit URL.
+
+Add executors from the Executors dialog or the CLI management commands below.
+For an executor that connects to the
+controller, supply the complete generated URL through `GARCON_CONTROLLER_URL`.
+Use a private service environment file or secret manager, not a literal assignment
+in shell history. For example, read a mode-0600 file into the environment:
 
 ```bash
-bun server/main.ts executor --connect 'wss://controller.example.com/executor/NODE_ID#secret=SECRET' \
+GARCON_CONTROLLER_URL="$(cat /private/controller-connection-url)" \
+bun server/main.ts executor \
   --config-dir "$HOME/.garcon" --project-base-dir /path/to/repos
 ```
 
-For a controller that connects to a worker, start its listener and paste the printed connection URL into the dialog:
+The value is a `wss://...#secret=...` URL. `--connect` is no longer accepted.
+The worker consumes the variable before runtime startup and excludes its value
+from provider and PTY child environments. PTYs explicitly receive an empty
+variable because their native launcher inherits variables omitted from its
+environment overrides. The initial environment can still be inspected by
+privileged processes or retained by diagnostics.
+
+For a controller that connects to a worker, start a TLS listener:
 
 ```bash
 bun server/main.ts executor --listen 19781 --bind-address 0.0.0.0 \
-  --allow-insecure-development --config-dir "$HOME/.garcon" \
+  --tls-cert /private/fullchain.pem --tls-private-key /private/key.pem \
+  --config-dir "$HOME/.garcon" \
   --project-base-dir /path/to/repos
 ```
 
-Replace `0.0.0.0` in the printed URL with a reachable hostname or IP. `--advertise-url wss://worker.example.com/executor` advertises an external TLS proxy; it does not enable TLS on the listener. Keep raw listeners on trusted private networks or behind access-controlled proxies.
+Alternatively, use `--no-tls` instead of both TLS flags behind an access-controlled
+TLS proxy, or on a trusted private network. Never combine the modes. Incomplete,
+unreadable, invalid, or mismatched certificate/key pairs fail startup. Certificates
+are loaded at startup; restart the worker to load renewed files.
+
+`--advertise-url wss://worker.example.com/executor` sets the complete public endpoint;
+it overrides `GARCON_EXECUTOR_ADVERTISE_URL` and does not change listener TLS.
+Proxy paths and queries are preserved. Routine startup output contains no secret.
+Reveal the existing listener credential explicitly, then paste it into the editor:
+
+```bash
+bun server/main.ts executor connection-url --config-dir "$HOME/.garcon" \
+  --advertise-url wss://worker.example.com/executor
+```
+
+This command neither starts a worker nor creates or rotates a credential. Its
+stdout is sensitive. Replace wildcard bind addresses with a reachable hostname.
+A `ws:` reveal URL requires `--no-tls`; a dialing worker likewise needs `--no-tls`
+for a `ws:` controller URL, and rejects that flag with a `wss:` controller URL.
 
 One controller and one executor may run simultaneously under the same config root. Each role holds its own lease; two controllers or two workers cannot share the same role's storage. Controller workspace data and worker data stay separate, so switching roles does not overwrite either. Worker credentials and provider data live under `<config-dir>/executor`; this directory is reserved for executor storage, not a controller workspace. Use separate roots for independent workers. Existing default worker storage is unchanged. Replace an old `--workspace-dir /root/executor` with `--config-dir /root`, not `--config-dir /root/executor`. For a custom data directory, move its contents under the new root's `executor` directory while the worker is stopped.
 
@@ -72,14 +117,20 @@ Worker-launched terminals and provider subprocesses inherit the config root and 
 
 Every executor connection requires [Noise NNpsk0 encryption](https://github.com/cfal/noise-ws/tree/536eb503e81a1f9d90436006d3821e2080630488), on both `ws:` and `wss:`. Each physical reconnect negotiates fresh keys before the existing authenticated Garcon session resumes. There is no plaintext fallback. Upgrade the controller and all workers together. The pinned library is new and unaudited; vector, interoperability, and integration tests are not a security audit. Bun 1.4.2 or later is required.
 
-WSS certificate verification is enabled by default. **Allow unverified TLS certificates** in an outbound executor's editor, or `--allow-unverified-tls` on a dialing worker, explicitly disables only outer certificate verification. Noise still requires the shared secret. Optional certificate pinning is deferred pending [Bun issue 43635](https://github.com/oven-sh/bun/issues/43635). Non-TLS connections require the separate **Allow connection without TLS** checkbox or `--allow-insecure-development` flag. HTTP metadata and traffic timing remain visible without outer TLS; Noise protects the execution payload, not the browser UI or other HTTP routes.
+WSS certificate verification is enabled by default. **Allow unverified TLS certificates** in an outbound executor's editor, or `--allow-unverified-tls` on a dialing worker, explicitly disables only outer certificate verification. Noise still requires the shared secret. Optional certificate pinning is deferred pending [Bun issue 43635](https://github.com/oven-sh/bun/issues/43635). Non-TLS connections require the separate **Allow connection without TLS** checkbox or `--no-tls` flag. HTTP metadata and traffic timing remain visible without outer TLS; Noise protects the execution payload, not the browser UI or other HTTP routes.
 
-Connection URLs are credentials. Their `#secret` fragment is removed before dialing the execution endpoint, never sent in the upgrade's HTTP headers, query, or WebSocket subprotocol. The authenticated management API still carries full descriptors; protect browser-to-controller access with HTTPS or a trusted private network. Keep the URL private: clipboard contents, shell history, process arguments, and captured onboarding output can expose it locally. Stored listener credentials and controller executor configuration require private file permissions. Use an independent random 32-byte secret for every executor; human-chosen passwords are not supported. Disable a compromised executor immediately, replace its credential on both endpoints, then re-enable it. Routine connection diagnostics and executor-list responses omit credentials.
+Upgrade controller and workers together. Executor configuration and management
+payloads now use `noTls`, replacing `allowInsecureDevelopment`; stored executor
+entries must use the new field before startup. The old startup flags are rejected,
+not treated as aliases. General controller HTTP TLS configuration is unchanged.
+
+Connection URLs are credentials. Their `#secret` fragment is removed before dialing the execution endpoint, never sent in the upgrade's HTTP headers, query, or WebSocket subprotocol. The authenticated management API still carries full descriptors; protect browser-to-controller access with HTTPS or a trusted private network. Keep the URL private: clipboard contents, shell history, process arguments, and captured onboarding output can expose it locally. Stored listener credentials and controller executor configuration require private file permissions. Use an independent random 32-byte secret for every executor; human-chosen passwords are not supported. For compromise, contain network access and revoke workspace CLI access first. Disabling an executor or changing its connection requires idle work; stop native work when necessary, then disable it and replace its credential on both endpoints before reconnecting. See [credential revocation](./security.md#connection-credentials-and-revocation). Routine connection diagnostics and executor-list responses omit credentials.
 
 ## Executor Management
 
 `garcon-cli executor` configures the running controller. It does not install or
-start worker processes; `garcon executor --connect` / `--listen` still does that.
+start worker processes; `garcon executor` with `GARCON_CONTROLLER_URL` or
+`--listen` still does that.
 Every command works through direct controller HTTP and an authorized executor
 gateway. Keep the same explicit `--config-dir` and `--runtime` selectors when
 following up on a mutation.
@@ -110,15 +161,20 @@ profile ID; it does not create profiles, accept API keys, or change native login
 The `providers` management listing shows all existing profiles and their assigned
 executor IDs, unlike the executor-scoped execution catalog from `list providers`.
 
-Inbound creation requires an explicit reachable, secret-free advertised URL. The
-literal `{executorId}` is expanded atomically before saving; arbitrary proxy paths
-and query strings are preserved. The CLI never derives an external address from
-its discovered loopback endpoint. Outbound creation takes the listening worker's
+Inbound creation inherits the controller's public URL by default. An optional
+`--advertise-url` supplies a reachable, secret-free per-executor override; the
+literal `{executorId}` is expanded atomically before saving, preserving arbitrary
+proxy paths and query strings. Generated URLs are not saved. Direct HTTP requests
+can fall back to their Host as a suggestion, which may be loopback for a local CLI.
+Forwarded CLI requests have no public Host: without an explicit override they
+require `GARCON_PUBLIC_URL` / `--public-url` on the controller, for both creation
+and `connection` reveal. Otherwise they fail with a configuration error rather
+than returning a synthetic address. Outbound creation takes the listening worker's
 full credential URL. Creation returns only the new ID. Saving configuration does
 not claim the worker is ready; use the bounded readiness wait separately.
 
 `update` accepts a label or either access grant. Connection edits require a full
-`--connection-url`, `--direction`, and explicit `--allow-insecure-development
+`--connection-url`, `--direction`, and explicit `--no-tls
 true|false`. `--allow-unverified-tls true|false` applies only to outbound TLS.
 Neither TLS opt-out disables Noise authentication. Changing an active executor's
 connector or deleting it can fail with an in-use conflict; no command force-stops

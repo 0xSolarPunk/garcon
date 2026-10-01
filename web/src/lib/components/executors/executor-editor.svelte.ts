@@ -1,13 +1,13 @@
 import * as api from '$lib/api/executors.js';
 import type { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
-import type { ExecutorDirection, ExecutorSnapshot } from '$shared/executors';
+import { isExecutorSecret, type ExecutorDirection, type ExecutorSnapshot, type UpdateExecutorRequest } from '$shared/executors';
 
 export class ExecutorEditor {
 	id = $state<string | null>(null);
 	label = $state('');
 	direction = $state<ExecutorDirection>('executor-connects');
 	connectionUrl = $state('');
-	allowInsecureDevelopment = $state(false);
+	noTls = $state(false);
 	allowUnverifiedTls = $state(false);
 	enabled = $state(true);
 	allowControllerCli = $state(false);
@@ -18,7 +18,7 @@ export class ExecutorEditor {
 	#version = 0;
 	#originalUrl = '';
 	#originalDirection: ExecutorDirection = 'executor-connects';
-	#originalInsecure = false;
+	#originalNoTls = false;
 	#originalUnverifiedTls = false;
 	#originalEnabled = true;
 	#originalControllerCli = false;
@@ -31,6 +31,17 @@ export class ExecutorEditor {
 		catch { return false; }
 	}
 
+	get canCopyConnection(): boolean {
+		if (this.busy) return false;
+		try {
+			const url = new URL(this.connectionUrl.trim());
+			const fragment = new URLSearchParams(url.hash.slice(1));
+			return (url.protocol === 'wss:' || url.protocol === 'ws:' && this.noTls)
+				&& !url.username && !url.password && !['0.0.0.0', '[::]', 'example.com'].includes(url.hostname)
+				&& fragment.size === 1 && isExecutorSecret(fragment.get('secret'));
+		} catch { return false; }
+	}
+
 	clear(): void {
 		this.#version += 1;
 		this.id = null;
@@ -38,7 +49,7 @@ export class ExecutorEditor {
 		this.direction = 'executor-connects';
 		this.connectionUrl = '';
 		this.#originalUrl = '';
-		this.allowInsecureDevelopment = false;
+		this.noTls = false;
 		this.allowUnverifiedTls = false;
 		this.enabled = true;
 		this.allowControllerCli = false;
@@ -63,7 +74,7 @@ export class ExecutorEditor {
 			if (version !== this.#version) return;
 			this.connectionUrl = this.#originalUrl = connection.connectionUrl;
 			this.#originalDirection = this.direction;
-			this.allowInsecureDevelopment = this.#originalInsecure = connection.allowInsecureDevelopment;
+			this.noTls = this.#originalNoTls = connection.noTls;
 			this.allowUnverifiedTls = this.#originalUnverifiedTls = connection.allowUnverifiedTls;
 		} catch (error) {
 			if (version === this.#version) this.error = error instanceof Error ? error.message : 'Unable to load connection';
@@ -81,21 +92,31 @@ export class ExecutorEditor {
 		const allowUnverifiedTls = this.direction === 'controller-connects' && !this.withoutTls && this.allowUnverifiedTls;
 		try {
 			if (this.id) {
-				const connectionChanged = this.connectionUrl !== this.#originalUrl || this.direction !== this.#originalDirection
-					|| this.allowInsecureDevelopment !== this.#originalInsecure || allowUnverifiedTls !== this.#originalUnverifiedTls;
+				const addressChanged = this.connectionUrl.trim() !== this.#originalUrl.trim() || this.direction !== this.#originalDirection;
+				const connectionChanged = addressChanged
+					|| this.noTls !== this.#originalNoTls || allowUnverifiedTls !== this.#originalUnverifiedTls;
+				let connection: UpdateExecutorRequest['connection'];
+				if (connectionChanged) {
+					connection = {
+						direction: this.direction,
+						...(addressChanged ? { connectionUrl: this.connectionUrl.trim() } : {}),
+						noTls: this.noTls,
+						allowUnverifiedTls,
+					};
+				}
 				const executors = await this.transport.updateExecutor(this.id, {
 					label: this.label.trim(),
 					...(this.enabled !== this.#originalEnabled ? { enabled: this.enabled } : {}),
 					...(this.allowControllerCli !== this.#originalControllerCli ? { allowControllerCli: this.allowControllerCli } : {}),
 					...(this.allowExecutorManagement !== this.#originalExecutorManagement ? { allowExecutorManagement: this.allowExecutorManagement } : {}),
-					...(connectionChanged ? { connection: { direction: this.direction, connectionUrl: this.connectionUrl.trim(), allowInsecureDevelopment: this.allowInsecureDevelopment, allowUnverifiedTls } } : {}),
+					...(connection ? { connection } : {}),
 				});
 				if (this.executors.executors === previousExecutors) this.executors.applySnapshot(executors);
 				else await this.executors.refreshAfterMutation();
 				if (version !== this.#version) return false;
 			} else {
 				const result = await this.transport.createExecutor({
-					label: this.label.trim(), allowInsecureDevelopment: this.allowInsecureDevelopment, allowUnverifiedTls,
+					label: this.label.trim(), noTls: this.noTls, allowUnverifiedTls,
 					allowControllerCli: this.allowControllerCli,
 					allowExecutorManagement: this.allowExecutorManagement,
 					...(this.direction === 'executor-connects' ? { direction: 'executor-connects' } : { direction: 'controller-connects', connectionUrl: this.connectionUrl.trim() }),
@@ -104,11 +125,11 @@ export class ExecutorEditor {
 				if (version !== this.#version) return false;
 				this.id = result.id;
 				this.connectionUrl = result.connectionUrl;
-				this.allowInsecureDevelopment = result.allowInsecureDevelopment;
+				this.noTls = result.noTls;
 			}
 			this.#originalUrl = this.connectionUrl;
 			this.#originalDirection = this.direction;
-			this.#originalInsecure = this.allowInsecureDevelopment;
+			this.#originalNoTls = this.noTls;
 			this.allowUnverifiedTls = this.#originalUnverifiedTls = allowUnverifiedTls;
 			this.#originalEnabled = this.enabled;
 			this.#originalControllerCli = this.allowControllerCli;
