@@ -1,5 +1,8 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { connectNoiseWebSocket, createNoiseServer, type NoiseErrorCode, type NoiseOptions, type NoiseSocketData, type NoiseWebSocket } from '@cfal/noise-ws';
+import {
+  connectNoiseWebSocket, createNoiseServer,
+  type NoiseErrorCode, type NoiseLimits, type NoiseOptions, type NoiseSocketData, type NoiseWebSocket,
+} from '@cfal/noise-ws';
 import { isExecutorSecret } from './connection-url.js';
 import { failureReason } from './failure-reason.js';
 import { MessageContinuityError } from './message-session.js';
@@ -33,6 +36,8 @@ export interface WebSocketLinkOptions {
   readonly redialDelaysMs?: readonly number[];
   // How long a session must stay up before losing it restarts the redial delays.
   readonly stableSessionMs?: number;
+  // Noise's timeouts, buffer, and per-key record budget, when not its defaults.
+  readonly noiseLimits?: NoiseLimits;
 }
 
 export const EXECUTOR_NOISE_CONTEXT = 'garcon-executor/v1';
@@ -47,6 +52,8 @@ const REDIAL_DELAYS_MS = [0, 5_000, 5_000, 10_000, 10_000, 10_000, 10_000, 10_00
 // A lost session that lasted this long is redialed at once. A peer that drops each
 // session right after it opens, such as one failing initialization, is backed off.
 const STABLE_SESSION_MS = 10_000;
+// Sockets a link holds at once, including those still authenticating.
+const MAX_SOCKETS = 4;
 
 // Why a connection carrying a session closed; each closure retires its session.
 export type LinkClosureCause =
@@ -65,6 +72,27 @@ export interface LinkClosure {
   // Why the connection or its session failed, when known: the Noise error
   // code, or the error that retired the session.
   readonly reason?: string;
+}
+
+// A connection that failed to open, to authenticate, or to keep its session.
+export interface LinkFailure {
+  readonly message: string;
+  // Failures of this kind since the last session started, including this one.
+  // A kind whose message or reason changes, such as a mismatch with another
+  // build, counts again from one.
+  readonly count: number;
+  // Why a peer that holds the secret failed to authenticate or lost its connection.
+  readonly reason?: string;
+}
+
+type LinkFailureKind = NoiseErrorCode | 'authentication-timeout' | 'authentication-failed' | 'version-mismatch' | 'connection-lost';
+
+// Logs keep each kind of failure at its 1st, 2nd, 4th, 8th, ... occurrence since
+// the last session started. A peer without the secret reaches only kinds whose
+// message is fixed, so it cannot flood them by failing repeatedly or by
+// alternating between failures.
+export function shouldLogLinkFailure(failure: LinkFailure): boolean {
+  return Number.isInteger(Math.log2(failure.count));
 }
 
 interface Connection {
@@ -91,7 +119,8 @@ export class WebSocketLink {
   readonly #sessions = new Set<(session: SessionTransport) => void>();
   readonly #connections = new Set<Connection>();
   readonly #sockets = new Set<NoiseWebSocket>();
-  readonly #errors = new Set<(message: string) => void>();
+  readonly #errors = new Set<(failure: LinkFailure) => void>();
+  readonly #failures = new Map<LinkFailureKind, LinkFailure>();
   readonly #closures = new Set<(closure: LinkClosure) => void>();
   readonly #closureCounts = new Map<LinkClosureCause, number>();
   #current: SessionTransport | null = null;
@@ -118,9 +147,11 @@ export class WebSocketLink {
 
   get current(): SessionTransport | null { return this.#current; }
   get executorId(): string | null { return this.options.role === 'controller' ? this.options.executorId! : this.#current?.executorId ?? null; }
-  get acceptsSocket(): boolean { return !this.#disposed && !this.#quiescing && this.#sockets.size < 4; }
+  get acceptsSocket(): boolean {
+    return !this.#disposed && !this.#quiescing && (this.#sockets.size < MAX_SOCKETS || this.#displaceableSocket() !== null);
+  }
 
-  onError(listener: (message: string) => void): () => void {
+  onError(listener: (failure: LinkFailure) => void): () => void {
     this.#errors.add(listener);
     return () => { this.#errors.delete(listener); };
   }
@@ -132,6 +163,13 @@ export class WebSocketLink {
 
   upgrade(request: Request, server: Pick<Bun.Server<NoiseSocketData>, 'upgrade'>, noise: ReturnType<typeof createNoiseServer>): Response | undefined {
     if (!this.acceptsSocket) return new Response(null, { status: 503 });
+    // A peer without the secret never finishes the encrypted handshake, so a full
+    // link makes room by closing a socket still in that handshake. Only an upgrade
+    // the server will accept may do so, so a refused request cannot close a socket.
+    if (this.#sockets.size >= MAX_SOCKETS) {
+      if (!isWebSocketUpgrade(request)) return new Response(null, { status: 400 });
+      this.#displaceableSocket()?.close();
+    }
     const options = this.#noiseOptions();
     try {
       return noise.upgrade(request, {
@@ -153,7 +191,7 @@ export class WebSocketLink {
   listen(port = 0, hostname = '0.0.0.0'): string {
     if (!this.options.allowInsecureDevelopment) throw new Error('A listener without TLS requires explicit development mode; use a TLS terminator otherwise');
     if (this.#server || this.#disposed) throw new Error('Executor listener cannot start');
-    const noise = createNoiseServer({ maxConnections: 4, maxPendingHandshakes: 4 });
+    const noise = createNoiseServer({ maxConnections: MAX_SOCKETS, maxPendingHandshakes: MAX_SOCKETS });
     this.#listenerNoise = noise;
     this.#server = Bun.serve<NoiseSocketData>({
       hostname, port,
@@ -234,7 +272,7 @@ export class WebSocketLink {
   #noiseOptions(): NoiseOptions {
     let connection: Connection | null = null;
     return {
-      psk: Buffer.from(this.options.secret, 'base64url'), context: EXECUTOR_NOISE_CONTEXT,
+      psk: Buffer.from(this.options.secret, 'base64url'), context: EXECUTOR_NOISE_CONTEXT, limits: this.options.noiseLimits,
       onOpen: (socket) => {
         if (this.#disposed || this.#quiescing) { socket.close(); return; }
         connection = this.#open(socket);
@@ -245,10 +283,11 @@ export class WebSocketLink {
       },
       onError: (_socket, error) => {
         if (connection) {
-          connection.closeCause ??= noiseClosureCause(error.code);
+          connection.closeCause ??= NOISE_CLOSURE_CAUSES[error.code];
           connection.closeReason ??= `Encrypted connection failed (${error.code})`;
         }
-        this.#reportError(`Executor encrypted connection failed (${error.code})`);
+        // Noise reports a socket this link closed before it opened as CLOSED, which is not the peer failing.
+        if (error.code !== 'CLOSED') this.#reportFailure(error.code, `Executor encrypted connection failed (${error.code})`);
       },
       onClose: (socket) => {
         this.#sockets.delete(socket);
@@ -267,7 +306,7 @@ export class WebSocketLink {
       socket, hello, peer: null, session: null, hooks: null, heartbeat: null,
       closed: false, authenticated: false, frames: null, lastReceivedAt: Date.now(), closeCause: null, closeReason: null, sessionStartedAt: null,
       timeout: setTimeout(() => {
-        this.#reportError('Executor authentication timed out');
+        this.#reportFailure('authentication-timeout', 'Executor authentication timed out');
         this.#close(connection, 'protocol-error');
       }, 5000),
     };
@@ -297,10 +336,10 @@ export class WebSocketLink {
         return;
       }
       if (Buffer.byteLength(encoded) > 8192) throw new Error('Handshake exceeds budget');
-      const frame: unknown = JSON.parse(encoded);
+      const frame = parseHandshakeFrame(encoded);
       if (isHello(frame) && !connection.peer) {
         if (frame.version !== LINK_VERSION) {
-          this.#reportError(`Executor version mismatch: local ${LINK_VERSION}, peer ${JSON.stringify(frame.version.slice(0, 80))}. Use matching builds.`);
+          this.#reportFailure('version-mismatch', `Executor version mismatch: local ${LINK_VERSION}, peer ${JSON.stringify(frame.version.slice(0, 80))}. Use matching builds.`);
           this.#close(connection, 'protocol-error');
           return;
         }
@@ -314,16 +353,19 @@ export class WebSocketLink {
       if (!connection.peer || !frame || typeof frame !== 'object' || !('type' in frame) || frame.type !== 'proof'
         || !('signature' in frame) || typeof frame.signature !== 'string' || !/^[a-f0-9]{64}$/.test(frame.signature)
         || !timingSafeEqual(Buffer.from(frame.signature, 'hex'), Buffer.from(this.#signature(connection, connection.peer.role), 'hex'))) {
-        throw new Error('Executor authentication failed');
+        throw new Error('Executor proof is missing or invalid');
       }
       connection.authenticated = true;
       this.#accept(connection);
     } catch (error) {
       // Closing the session closes this connection first, so the cause is recorded before.
+      const reason = failureReason(error);
       connection.closeCause ??= 'protocol-error';
-      connection.closeReason ??= failureReason(error);
+      connection.closeReason ??= reason;
+      // Reported while the session is still current, so listeners learn of the loss before its closure.
+      if (connection.authenticated) this.#reportFailure('connection-lost', 'Executor connection lost', reason);
+      else this.#reportFailure('authentication-failed', 'Executor authentication failed', reason);
       if (error instanceof MessageContinuityError) connection.session?.close(error);
-      this.#reportError(connection.authenticated ? 'Executor connection lost' : 'Executor authentication failed');
       this.#close(connection, 'protocol-error');
     }
   }
@@ -358,6 +400,7 @@ export class WebSocketLink {
     }
     if (connection.closed) { connection.hooks.disconnected(); return; }
     connection.sessionStartedAt = performance.now();
+    this.#failures.clear();
     this.#ready.resolve(session);
     connection.heartbeat = setInterval(() => {
       try {
@@ -379,8 +422,26 @@ export class WebSocketLink {
     return createHmac('sha256', this.options.secret).update(JSON.stringify(['garcon-executor', purpose, transcript])).digest('hex');
   }
 
-  #reportError(message: string): void {
-    if (!this.#disposed) for (const listener of this.#errors) listener(message);
+  // The oldest socket whose peer has not proven the secret, or else the oldest
+  // still finishing the handshake. A listener reaches 'confirming' only after
+  // decrypting a first message keyed by the secret, so its peer holds the secret
+  // or replayed an observed handshake.
+  #displaceableSocket(): NoiseWebSocket | null {
+    let confirming: NoiseWebSocket | null = null;
+    for (const socket of this.#sockets) {
+      if (socket.readyState === 'connecting' || socket.readyState === 'handshaking') return socket;
+      if (socket.readyState === 'confirming') confirming ??= socket;
+    }
+    return confirming;
+  }
+
+  #reportFailure(kind: LinkFailureKind, message: string, reason?: string): void {
+    if (this.#disposed) return;
+    const previous = this.#failures.get(kind);
+    const count = previous?.message === message && previous.reason === reason ? previous.count + 1 : 1;
+    const failure: LinkFailure = reason === undefined ? { message, count } : { message, count, reason };
+    this.#failures.set(kind, failure);
+    for (const listener of this.#errors) listener(failure);
   }
 
   #close(connection: Connection, cause: LinkClosureCause, failure?: unknown): void {
@@ -422,17 +483,38 @@ export class WebSocketLink {
 
 // Classifies a connection that Noise ended with an error. A busy long-lived link
 // that uses up its per-key record budget must reconnect with fresh keys, which
-// is routine rather than a protocol failure.
-function noiseClosureCause(code: NoiseErrorCode): LinkClosureCause {
-  switch (code) {
-    case 'TRANSPORT_CLOSED': return 'socket-closed';
-    case 'RECORD_LIMIT': return 'record-limit';
-    case 'TRANSPORT_ERROR':
-    case 'BACKPRESSURE': return 'socket-error';
-    case 'HANDSHAKE_TIMEOUT':
-    case 'MESSAGE_TIMEOUT': return 'liveness-timeout';
-    default: return 'protocol-error';
-  }
+// is routine rather than a protocol failure. Handshake timeouts and CLOSED end
+// connections before they open, and NOT_OPEN only rejects a send, so no closure
+// reports them.
+const NOISE_CLOSURE_CAUSES = {
+  TRANSPORT_CLOSED: 'socket-closed',
+  RECORD_LIMIT: 'record-limit',
+  TRANSPORT_ERROR: 'socket-error',
+  BACKPRESSURE: 'socket-error',
+  HANDSHAKE_TIMEOUT: 'liveness-timeout',
+  MESSAGE_TIMEOUT: 'liveness-timeout',
+  AUTHENTICATION_FAILED: 'protocol-error',
+  PROTOCOL_ERROR: 'protocol-error',
+  MESSAGE_TOO_LARGE: 'protocol-error',
+  HANDLER_ERROR: 'protocol-error',
+  NOT_OPEN: 'protocol-error',
+  CLOSED: 'protocol-error',
+} as const satisfies Record<NoiseErrorCode, LinkClosureCause>;
+
+// Names the frame instead of keeping the parse error, whose message can echo the payload.
+function parseHandshakeFrame(encoded: string): unknown {
+  try { return JSON.parse(encoded); }
+  catch { throw new Error('Malformed executor handshake frame'); }
+}
+
+// The checks a WebSocket upgrade must pass, from RFC 6455 section 4.2.1.
+function isWebSocketUpgrade(request: Request): boolean {
+  const headers = request.headers;
+  return request.method === 'GET'
+    && headers.get('upgrade')?.toLowerCase() === 'websocket'
+    && (headers.get('connection') ?? '').split(',').some((token) => token.trim().toLowerCase() === 'upgrade')
+    && headers.get('sec-websocket-version') === '13'
+    && /^[A-Za-z0-9+/]{22}==$/.test(headers.get('sec-websocket-key') ?? '');
 }
 
 function isHello(value: unknown): value is Hello {
