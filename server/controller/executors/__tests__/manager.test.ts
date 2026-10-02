@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { ExecutorManager } from '../manager.js';
 import { WebSocketLink, EXECUTOR_NOISE_CONTEXT } from '../../../remote/transport/websocket-link.js';
 import { ExecutorRpc, type GuardRpcReply } from '../../../remote/transport/rpc.js';
+import type { ExecutorRpcConnection } from '../../../remote/transport/rpc-connection.js';
+import { servePairedRuntime } from '../../../remote/__tests__/runtime-adapter.js';
 import { serveExecutionRuntime } from '../../../remote/server/executor-rpc-server.js';
 import { ProducerRelay } from '../../../remote/server/producer-relay.js';
 import { integrationFixture } from '../../../remote/__tests__/integration-fixture.js';
@@ -45,8 +47,8 @@ test.each(['executor-connects', 'controller-connects'] as const)(
     cleanups.push(() => link.dispose());
     const connected = Promise.withResolvers<ExecutorRpc>();
     link.onSession(transport => {
-      const rpc = new ExecutorRpc(transport);
-      const serving = serveExecutionRuntime(integrationFixture(root, transport.executorId).executor, rpc, new ProducerRelay());
+      const serving = servePairedRuntime(link, transport, integrationFixture(root, transport.executorId).executor, new ProducerRelay());
+      const rpc = serving.connection.primary;
       cleanups.push(() => serving.dispose());
       connected.resolve(rpc);
     });
@@ -115,13 +117,21 @@ function waitReady(manager: ExecutorManager, id: string): Promise<void> {
   });
 }
 
+function waitBulkReady(manager: ExecutorManager, id: string): Promise<void> {
+  const ready = () => manager.list().find(executor => executor.id === id)?.bulk?.availability === 'ready';
+  if (ready()) return Promise.resolve();
+  return new Promise(resolve => {
+    const off = manager.onChanged(() => { if (ready()) { off(); resolve(); } });
+  });
+}
+
 function worker(secret: string, projectPath: string, configure: (fixture: ReturnType<typeof integrationFixture>) => void = () => {}) {
   const link = new WebSocketLink({ role: 'worker', secret, noTls: true, redialDelaysMs: [20] });
   cleanups.push(() => link.dispose());
   link.onSession((transport) => {
     const provider = integrationFixture(projectPath, transport.executorId);
     configure(provider);
-    const serving = serveExecutionRuntime(provider.executor, new ExecutorRpc(transport), new ProducerRelay());
+    const serving = servePairedRuntime(link, transport, provider.executor, new ProducerRelay());
     cleanups.push(() => serving.dispose());
   });
   return link;
@@ -133,15 +143,15 @@ test('reverse CLI dispatch checks initialization, executor grant, revocation lea
   const { url } = sharedListener(manager);
   const link = new WebSocketLink({ role: 'worker', secret: config.secret, noTls: true });
   cleanups.push(() => link.dispose());
-  const connected = Promise.withResolvers<ExecutorRpc>();
+  const connected = Promise.withResolvers<ExecutorRpcConnection>();
   link.onSession((transport) => {
-    const rpc = new ExecutorRpc(transport);
-    const serving = serveExecutionRuntime(integrationFixture(root, transport.executorId).executor, rpc, new ProducerRelay());
+    const serving = servePairedRuntime(link, transport, integrationFixture(root, transport.executorId).executor, new ProducerRelay());
     cleanups.push(() => serving.dispose());
-    connected.resolve(rpc);
+    connected.resolve(serving.connection);
   });
   link.dial(url(config.id));
-  const rpc = await connected.promise;
+  const connection = await connected.promise;
+  const rpc = connection.primary;
   await waitReady(manager, config.id);
   await expect(rpc.call('', 'controllerCli.describe', null)).rejects.toMatchObject({ code: 'CLI_ACCESS_DENIED' });
   await manager.update(config.id, { allowControllerCli: true });
@@ -155,9 +165,10 @@ test('reverse CLI dispatch checks initialization, executor grant, revocation lea
     } } } }));
   const request = { expectedServerInstanceId: 'controller', http: { operation: 'POST /api/v1/chats/run' as const, query: [], body: {} } };
   try {
+    const bulk = await connection.bulk.wait();
     expect(await rpc.call('', 'controllerCli.describe', null)).toMatchObject({ defaultExecutorId: config.id });
-    await expect(rpc.call('forged-provider', 'controllerCli.request', request)).rejects.toMatchObject({ code: 'CLI_ACCESS_DENIED' });
-    const pending = rpc.call('', 'controllerCli.request', request);
+    await expect(bulk.call('forged-provider', 'controllerCli.request', request)).rejects.toMatchObject({ code: 'CLI_ACCESS_DENIED' });
+    const pending = bulk.call('', 'controllerCli.request', request);
     const result = Promise.allSettled([pending]);
     await entered.promise;
     await manager.update(config.id, { allowControllerCli: false });
@@ -178,15 +189,15 @@ test.each(['context', 'read', 'mutation'] as const)('quiescence after handler se
   const { url } = sharedListener(manager);
   const link = new WebSocketLink({ role: 'worker', secret: config.secret, noTls: true });
   cleanups.push(() => link.dispose());
-  const connected = Promise.withResolvers<ExecutorRpc>();
+  const connected = Promise.withResolvers<ExecutorRpcConnection>();
   link.onSession((transport) => {
-    const rpc = new ExecutorRpc(transport);
-    const serving = serveExecutionRuntime(integrationFixture(root, transport.executorId).executor, rpc, new ProducerRelay());
+    const serving = servePairedRuntime(link, transport, integrationFixture(root, transport.executorId).executor, new ProducerRelay());
     cleanups.push(() => serving.dispose());
-    connected.resolve(rpc);
+    connected.resolve(serving.connection);
   });
   link.dial(url(config.id));
-  const rpc = await connected.promise;
+  const connection = await connected.promise;
+  const rpc = operation === 'context' ? connection.primary : await connection.bulk.wait();
   await waitReady(manager, config.id);
   class QuiescingDispatcher extends ControllerCliDispatcher {
     override describe(access: CliDispatchAccess, guardReply: GuardRpcReply) {
@@ -341,7 +352,7 @@ test('a reconnecting executor holds calls instead of reporting itself unavailabl
   link.onSession((transport) => {
     // One worker process keeps its instance across sessions.
     provider ??= integrationFixture(root, transport.executorId);
-    const serving = serveExecutionRuntime(provider.executor, new ExecutorRpc(transport), relay);
+    const serving = servePairedRuntime(link, transport, provider.executor, relay);
     cleanups.push(() => serving.dispose());
   });
   link.dial(url(config.id));
@@ -494,7 +505,10 @@ test('logs each closed executor session with its cause and reason', async () => 
   manager.inboundLink(config.id)!.current!.close(new Error('Synthetic session retirement'));
   await closed.promise;
 
-  expect(closures).toEqual([{ executorId: config.id, cause: 'session-retired', count: 1, reason: 'Synthetic session retirement' }]);
+  expect(closures).toMatchObject([{ executorId: config.id, lane: 'primary', sessionId: expect.any(String),
+    primarySessionId: expect.any(String), cause: 'session-retired', count: 1, reason: 'Synthetic session retirement' }]);
+  expect(closures[0]).toMatchObject({ queues: { total: { bytes: expect.any(Number), oldestAgeMs: expect.any(Number) } },
+    calls: { outgoing: { total: expect.any(Number) }, incoming: { total: expect.any(Number) } }, bulkPhase: expect.any(String) });
 });
 
 test('logs failed connections alongside a ready executor without showing them as its error', async () => {
@@ -505,6 +519,7 @@ test('logs failed connections alongside a ready executor without showing them as
   const ready = waitReady(manager, config.id);
   worker(config.secret, root).dial(url(config.id));
   await ready;
+  await waitBulkReady(manager, config.id);
   let changes = 0;
   manager.onChanged(() => { changes++; });
   await connectWithWrongKey(url(config.id));
@@ -513,6 +528,28 @@ test('logs failed connections alongside a ready executor without showing them as
   expect(warnings.filter(([message]) => message === 'Executor link failed')).toHaveLength(2);
   expect(manager.list().find((item) => item.id === config.id)).toMatchObject({ availability: 'ready', lastError: null });
   expect(changes).toBe(0);
+});
+
+test('bulk loss publishes a separate snapshot without changing executor availability', async () => {
+  const { manager, root } = await fixture();
+  const config = await manager.create({ label: 'Paired', direction: 'executor-connects' });
+  expect(manager.list()[0]?.bulk).toBeNull();
+  expect(manager.list()[1]?.bulk).toEqual({ availability: 'offline', lastError: null });
+  worker(config.secret, root).dial(sharedListener(manager).url(config.id));
+  await waitReady(manager, config.id);
+  await waitBulkReady(manager, config.id);
+  const availability = mock(() => {});
+  const changed = mock(() => {});
+  manager.onAvailabilityChanged(availability);
+  manager.onChanged(changed);
+  manager.inboundLink(config.id)!.bulk!.close(new Error('Synthetic bulk loss'));
+  expect(manager.isReady(config.id)).toBe(true);
+  expect(manager.list()[1]).toMatchObject({ availability: 'ready', lastError: null,
+    bulk: { availability: 'reconnecting', lastError: { code: 'EXECUTOR_BULK_UNAVAILABLE', message: 'Synthetic bulk loss' } } });
+  expect(availability).not.toHaveBeenCalled();
+  expect(changed).toHaveBeenCalledTimes(1);
+  await manager.update(config.id, { enabled: false });
+  expect(manager.list()[1]?.bulk).toEqual({ availability: 'offline', lastError: null });
 });
 
 test('keeps a connection failure off an executor whose disruptive update fails to persist', async () => {
@@ -581,6 +618,29 @@ test('shows why a ready executor lost its own session', async () => {
   expect(manager.list().find((item) => item.id === config.id)).toMatchObject({
     availability: 'reconnecting',
     lastError: { code: 'EXECUTOR_UNAVAILABLE', message: 'Executor connection lost: Encrypted connection failed (TRANSPORT_CLOSED)' },
+  });
+});
+
+test('unidentified handshake failures preserve the primary reconnect error', async () => {
+  const { manager, root } = await fixture();
+  const config = await manager.create({ label: 'Reconnecting', direction: 'executor-connects' });
+  const { url } = sharedListener(manager);
+  const remote = worker(config.secret, root);
+  remote.dial(url(config.id));
+  await waitReady(manager, config.id);
+  await waitBulkReady(manager, config.id);
+  remote.quiesce();
+  manager.inboundLink(config.id)!.current!.close(new Error('Synthetic primary loss'));
+  const before = manager.list().find(item => item.id === config.id)!;
+  expect(before).toMatchObject({ availability: 'reconnecting', lastError: {
+    code: 'EXECUTOR_UNAVAILABLE', message: 'Executor connection lost: Synthetic primary loss',
+  } });
+
+  await connectWithWrongKey(url(config.id));
+  await sendMalformedRecord(url(config.id));
+
+  expect(manager.list().find(item => item.id === config.id)).toMatchObject({
+    availability: 'reconnecting', lastError: before.lastError,
   });
 });
 

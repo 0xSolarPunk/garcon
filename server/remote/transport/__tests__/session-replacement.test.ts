@@ -6,10 +6,9 @@ import {
   admissionFault, integrationFixture, isExecutionHandleReply, isProducerResumeReply, linkOptions, outgoingFault, outgoingHold,
   remoteFixture, requestFor,
 } from '../../__tests__/integration-fixture.js';
-import { connectRemoteExecutor } from '../../__tests__/runtime-adapter.js';
+import { connectRemoteExecutor, servePairedRuntime } from '../../__tests__/runtime-adapter.js';
 import { serveExecutionRuntime } from '../../server/executor-rpc-server.js';
 import { ProducerRelay } from '../../server/producer-relay.js';
-import { ExecutorRpc } from '../rpc.js';
 import { WebSocketLink } from '../websocket-link.js';
 import type { Logger } from '../../../common/log.js';
 
@@ -48,6 +47,18 @@ function setupFailureLog() {
     warn(message: unknown, detail: unknown) { if (message === 'Executor session setup failed') failures.push(detail); },
   } satisfies Logger;
   return { failures, logger };
+}
+
+function setupFailureDetails(sessionId: string, stage: string, reason: string) {
+  const emptyQueue = { bytes: 0, messages: 0, oldestAgeMs: 0 };
+  const emptyCalls = { primary: 0, bulk: 0, total: 0 };
+  return {
+    executorId: linkOptions.executorId, stage, reason,
+    lane: 'primary', primarySessionId: sessionId, sessionId,
+    bulkPhase: 'offline', bulkRetries: 0,
+    queues: { primary: emptyQueue, bulk: emptyQueue, total: emptyQueue },
+    calls: { incoming: emptyCalls, outgoing: emptyCalls },
+  };
 }
 
 function warnings() {
@@ -567,7 +578,9 @@ for (const dialer of ['controller', 'worker'] as const) {
       const fixture = await remoteFixture(dialer, undefined, undefined, undefined, { client: { logger: log.logger } });
       try {
         const worker = fixture.generations[0]!;
+        let failedSessionId = '';
         worker.hooks.initialize = async () => {
+          failedSessionId = fixture.controller.current!.id;
           worker.hooks.initialize = async () => {};
           throw thrown();
         };
@@ -576,7 +589,7 @@ for (const dialer of ['controller', 'worker'] as const) {
         await ready;
 
         expect(log.failures).toEqual([
-          { executorId: linkOptions.executorId, stage: 'start-integrations', reason },
+          setupFailureDetails(failedSessionId, 'start-integrations', reason),
         ]);
       } finally { await fixture.dispose(); }
     });
@@ -591,13 +604,18 @@ for (const dialer of ['controller', 'worker'] as const) {
     try {
       const integration = await fixture.executor.getAgentIntegration('test');
       await integration.execution.start(await requestFor(integration));
-      disconnectOn(fault, (encoded) => encoded.includes('"method":"producers.resume"'));
+      let failedSessionId = '';
+      disconnectOn(fault, (encoded) => {
+        if (!encoded.includes('"method":"producers.resume"')) return false;
+        failedSessionId = fixture.controller.current!.id;
+        return true;
+      });
       const ready = nextAvailability(fixture.executor, 'ready');
       fixture.controller.disconnect(); fixture.worker.disconnect();
       await ready;
 
       expect(log.failures).toEqual([
-        { executorId: linkOptions.executorId, stage: 'resume-bindings', reason: 'Executor connection lost' },
+        setupFailureDetails(failedSessionId, 'resume-bindings', 'Executor connection lost'),
       ]);
     } finally { await fixture.dispose(); }
   });
@@ -726,7 +744,7 @@ test('a restarted worker cannot resume bindings, so the controller reports them 
   worker.onSession((transport) => {
     const fixture = integrationFixture();
     generations.push(fixture);
-    scopes.push(serveExecutionRuntime(fixture.executor, new ExecutorRpc(transport), new ProducerRelay()));
+    scopes.push(servePairedRuntime(worker, transport, fixture.executor, new ProducerRelay()));
   });
   const connected = connectRemoteExecutor(controller);
   controller.dial(worker.listen());
@@ -768,7 +786,7 @@ for (const phase of ['held', 'parked'] as const) {
       }
       generations.push(fixture);
       closes.push(spyOn(fixture.integration.producers, 'close'));
-      scopes.push(serveExecutionRuntime(fixture.executor, new ExecutorRpc(transport), new ProducerRelay()));
+      scopes.push(servePairedRuntime(worker, transport, fixture.executor, new ProducerRelay()));
     });
     const connected = connectRemoteExecutor(controller);
     controller.dial(worker.listen());
@@ -810,7 +828,7 @@ test('bindings a restarted controller cannot resume expire after the short grace
   const relay = new ProducerRelay({ supersededGraceMs: 20 });
   const scopes: ReturnType<typeof serveExecutionRuntime>[] = [];
   worker.onSession((transport) => {
-    scopes.push(serveExecutionRuntime(fixture.executor, new ExecutorRpc(transport), relay));
+    scopes.push(servePairedRuntime(worker, transport, fixture.executor, relay));
   });
   const url = worker.listen();
   const crashed = new WebSocketLink({ ...linkOptions, role: 'controller' });

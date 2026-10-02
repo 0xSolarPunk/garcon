@@ -13,6 +13,7 @@ import { ExecutorConfigStore, type RemoteExecutorConfig } from './config-store.j
 import { ExecutionRuntime } from '../../runtime/execution-runtime.js';
 import { RemoteExecutorClient, type RemoteExecutorInventory } from '../../remote/client/executor-client.js';
 import { shouldLogLinkFailure, WebSocketLink } from '../../remote/transport/websocket-link.js';
+import { ExecutorSocketAdmission } from '../../remote/transport/socket-admission.js';
 import { ExecutorReferenceWrites } from './reference-writes.js';
 import type { ControllerCliDispatcher } from './cli-dispatcher.js';
 
@@ -37,6 +38,7 @@ interface ManagedRemote {
 
 export class ExecutorManager {
   readonly #remotes = new Map<string, ManagedRemote>();
+  readonly #socketAdmission = new ExecutorSocketAdmission();
   readonly #changes = new Set<() => void>();
   readonly #availability = new Set<(executorId: string, value: ExecutorAvailability) => void>();
   readonly #changing = new Set<string>();
@@ -134,6 +136,7 @@ export class ExecutorManager {
       allowExecutorManagement: true,
       availability: this.#disposed ? 'offline' : 'ready', projectBasePath: this.localInfo.projectBasePath,
       instanceId: this.localInfo.instanceId,
+      bulk: null,
       lastError: null, machineServices: { files: true, git: true, gh: true, terminals: true },
     }, ...[...this.#remotes.values()].map((entry): ExecutorSnapshot => ({
       id: entry.config.id, label: entry.config.label, kind: 'remote', enabled: entry.config.enabled,
@@ -143,6 +146,7 @@ export class ExecutorManager {
       availability: this.#snapshotAvailability(entry.config.id),
       projectBasePath: entry.info?.projectBasePath ?? null, lastError: entry.error,
       instanceId: entry.info?.instanceId ?? null,
+      bulk: entry.executor?.bulkStatus ?? { availability: 'offline', lastError: null },
       machineServices: { files: entry.info?.services.files === true, git: entry.info?.services.git === true, gh: entry.info?.services.gh === true, terminals: entry.info?.services.terminals === true },
     }))];
   }
@@ -270,26 +274,29 @@ export class ExecutorManager {
         if (recordError(reason ? `${message}: ${reason}` : message)) noticeLinkFailure();
       };
       const link = new WebSocketLink({ role: 'controller', executorId: config.id, secret: config.secret,
-        noTls: config.noTls, allowUnverifiedTls: config.allowUnverifiedTls });
+        noTls: config.noTls, allowUnverifiedTls: config.allowUnverifiedTls, socketAdmission: this.#socketAdmission });
       entry.link = link;
       link.onError((failure) => {
         if (shouldLogLinkFailure(failure)) this.logger.warn('Executor link failed', { executorId: config.id, ...failure });
-        // Another connection failing leaves an established session unaffected, even while a
-        // configuration change or the session's preparation keeps the executor from ready.
-        if (entry.executor?.availability !== 'ready') showLinkFailure(failure.message, failure.reason);
+        // Unidentified inbound sockets cannot explain the loss of an established primary.
+        const availability = entry.executor?.availability;
+        const unclassifiedOffline = failure.lane === undefined && availability === 'offline' && link.current === null;
+        if (availability !== 'ready' && (failure.lane === 'primary' || unclassifiedOffline)) showLinkFailure(failure.message, failure.reason);
       });
       link.onClosure((closure) => {
-        this.logger.warn('Executor link closed', { executorId: config.id, ...closure });
+        this.logger.warn('Executor link closed', { executorId: config.id, ...closure, ...entry.executor?.diagnostics });
         // Only the connection carrying the session reports a closure, so this is the
         // executor's own loss, unless setup retired the session after reporting why.
-        if (closure.cause === 'local-close' || (closure.cause === 'session-retired' && entry.error !== null)) return;
+        if (closure.lane === 'bulk' || closure.cause === 'local-close' || (closure.cause === 'session-retired' && entry.error !== null)) return;
         showLinkFailure('Executor connection lost', closure.reason);
       });
       entry.executor = new RemoteExecutorClient(config.id, link, (rpc) => rpc.handle(async (call, signal, guardReply) => {
         if (call.method === 'controllerCli.describe' || call.method === 'controllerCli.request') {
           const lease = entry.cliLease;
           const assertCurrent = () => {
-            if (!this.#current(entry) || this.#quiescing || entry.link?.current !== rpc.transport || !this.isReady(config.id)) {
+            const currentLane = rpc.transport.lane === 'primary' ? entry.link?.current : entry.link?.bulk;
+            if (!this.#current(entry) || this.#quiescing || currentLane !== rpc.transport
+              || entry.link?.current?.id !== rpc.transport.primarySessionId || !this.isReady(config.id)) {
               throw new DomainError('CLI_CONTROLLER_UNAVAILABLE', 'Controller CLI connection is unavailable', 503, true);
             }
             if (call.integrationId !== '' || !entry.config.allowControllerCli || lease.signal.aborted || entry.cliLease !== lease) {
@@ -317,6 +324,7 @@ export class ExecutorManager {
         }
         return this.options.resolveCredential({ executorId: config.id, agentId: call.integrationId, reference: call.request.reference, signal });
       }), reportError, entry.inventory, { logger: this.logger });
+      entry.executor.onBulkChanged(() => { if (this.#current(entry)) this.#changed(); });
       entry.executor.onAvailabilityChanged((value) => {
         if (!this.#current(entry)) return;
         if (value === 'ready') {

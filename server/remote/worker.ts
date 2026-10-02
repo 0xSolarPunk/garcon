@@ -2,6 +2,8 @@ import { AgentCallError } from '@garcon/server-agent-interface';
 import { mkdir, rm } from 'node:fs/promises';
 import { defaultAgentIntegrations } from '../runtime/agents/default-agent-integrations.js';
 import { ExecutorRpc } from './transport/rpc.js';
+import { ExecutorRpcConnection } from './transport/rpc-connection.js';
+import { RpcAdmissionBudgets } from './transport/rpc-admission.js';
 import { RpcReplyJournal } from './transport/rpc-journal.js';
 import { serveExecutionRuntime } from './server/executor-rpc-server.js';
 import { ProducerRelay } from './server/producer-relay.js';
@@ -57,6 +59,7 @@ async function serveExecutorWorker(options: ExecutorWorkerOptions, dataDir: stri
   let runtime: ExecutionRuntime | null = null;
   const relay = new ProducerRelay();
   const journal = new RpcReplyJournal();
+  const admission = new RpcAdmissionBudgets();
   // A stalled worker stops answering pings, and the controller retires its link after 15 s.
   const stopStallMonitor = monitorEventLoopStalls(({ stallMs, activities, heapUsedMb }) => {
     console.warn(JSON.stringify({ type: 'executor-event-loop-stalled', stallMs, heapUsedMb, activities }));
@@ -64,13 +67,13 @@ async function serveExecutorWorker(options: ExecutorWorkerOptions, dataDir: stri
   const stopSlowStepReports = reportSlowSteps((operation, stepMs) => {
     console.warn(JSON.stringify({ type: 'executor-slow-step', operation, stepMs: Math.round(stepMs) }));
   });
-  let currentRpc: ExecutorRpc | null = null;
+  let currentConnection: ExecutorRpcConnection | null = null;
   let gateway: Awaited<ReturnType<typeof startCliGateway>> | null = null;
   let terminals: TerminalRuntime | null = null;
   const stopped = Promise.withResolvers<void>();
   let stopping: Promise<void> | undefined;
   const stop = () => stopping ??= (async () => {
-    currentRpc = null;
+    currentConnection = null;
     let failure: unknown;
     try {
       for (const dispose of [stopStallMonitor, stopSlowStepReports, () => gateway?.dispose(), () => link.dispose(), () => serving?.dispose(), () => relay.dispose(), () => journal.dispose(), () => runtime?.dispose(), () => terminals?.shutdown()]) {
@@ -81,7 +84,7 @@ async function serveExecutorWorker(options: ExecutorWorkerOptions, dataDir: stri
   })();
   const onSignal = () => { void stop().catch((error: unknown) => { console.error('Executor cleanup failed:', error); }); };
   try {
-    gateway = await startCliGateway({ dataDir, currentRpc: () => currentRpc }).catch((error: unknown) => {
+    gateway = await startCliGateway({ dataDir, currentConnection: () => currentConnection }).catch((error: unknown) => {
       console.warn(JSON.stringify({ type: 'executor-cli-unavailable',
         message: error instanceof Error ? error.message : 'CLI gateway could not start' }));
       return null;
@@ -90,7 +93,7 @@ async function serveExecutorWorker(options: ExecutorWorkerOptions, dataDir: stri
     process.on('SIGTERM', onSignal);
     process.on('SIGINT', onSignal);
     link.onClosure((closure) => {
-      console.warn(JSON.stringify({ type: 'executor-link-closed', ...closure }));
+      console.warn(JSON.stringify({ type: 'executor-link-closed', ...closure, ...currentConnection?.diagnostics }));
     });
     link.onError((failure) => {
       if (shouldLogLinkFailure(failure)) console.warn(JSON.stringify({ type: 'executor-unavailable', ...failure }));
@@ -99,7 +102,7 @@ async function serveExecutorWorker(options: ExecutorWorkerOptions, dataDir: stri
       void serving?.dispose();
       if (runtime && transport.executorId !== runtime.id) {
         const rpc = new ExecutorRpc(transport);
-        currentRpc = null;
+        currentConnection = null;
         const retained = runtime;
         // Description lets the controller report the required restart without rebinding retained processes.
         rpc.handle(async (call) => {
@@ -109,19 +112,26 @@ async function serveExecutorWorker(options: ExecutorWorkerOptions, dataDir: stri
         return;
       }
       // Replies outlive sessions only for the controller of the executor this worker serves.
-      const rpc = new ExecutorRpc(transport, { journal });
-      currentRpc = rpc;
-      transport.onFailure(() => { if (currentRpc === rpc) currentRpc = null; });
+      const connection = new ExecutorRpcConnection(link, transport, { journal, admission,
+        bulkFailed: (failure) => {
+          if (Number.isInteger(Math.log2(failure.retries + 1))) console.warn(JSON.stringify({ type: 'executor-bulk-failed', ...failure }));
+        },
+      });
+      const rpc = connection.primary;
+      currentConnection = connection;
+      transport.onFailure(() => { if (currentConnection === connection) currentConnection = null; });
       runtime ??= new ExecutionRuntime({
         id: transport.executorId, workspaceDir: dataDir, projectBasePath: options.projectBasePath,
         integrations: defaultAgentIntegrations,
         terminalRuntime: terminals!,
         resolveCredential: ({ agentId, reference, signal }) => {
-          if (!currentRpc) throw new AgentCallError('not-dispatched', 'Executor controller is disconnected');
-          return currentRpc.call(agentId, 'credentials.resolve', { reference }, { signal });
+          if (!currentConnection) throw new AgentCallError('not-dispatched', 'Executor controller is disconnected');
+          return currentConnection.primary.call(agentId, 'credentials.resolve', { reference }, { signal });
         },
       });
       serving = serveExecutionRuntime(runtime, rpc, relay);
+      const scope = serving;
+      connection.onEndpoint((endpoint) => { if (endpoint !== rpc) scope.attachBulk(endpoint); });
       transport.onAvailability((connected) => {
         if (!connected) return;
         console.log(JSON.stringify({ type: 'executor-connected', executorId: transport.executorId, runtimeId: link.runtimeId }));

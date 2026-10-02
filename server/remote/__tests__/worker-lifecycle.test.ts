@@ -82,7 +82,7 @@ test('gateway cleanup errors do not skip listener shutdown or lease release on s
   await lease.release();
 });
 
-test('logs failed connections to a listening worker at powers of two per kind', async () => {
+test('logs unidentified connections without a lane at powers of two per kind', async () => {
   gatewayFailure = 'startup';
   const f = await fixture();
   const lines: unknown[] = [];

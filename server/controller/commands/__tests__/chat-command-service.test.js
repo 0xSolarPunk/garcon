@@ -33,6 +33,7 @@ import { KeyedPromiseLock } from '../../../common/keyed-lock.js';
 import { AtomicJsonWriteError } from '../../../common/json-file-store.js';
 import { AgentStartController } from '../../chats/agent-start-controller.js';
 import { AgentResumeController } from '../../chats/agent-resume-controller.js';
+import { createForkedChat as createForkedChatTransaction } from '../../chats/fork-chat.js';
 import { CommandSupport, CommandValidationError } from '../command-support.js';
 import { parseGarconCommandResult } from '../../../../common/garcon-command-results.js';
 import {
@@ -587,6 +588,7 @@ function makeService(overrides = {}) {
     chatId: TARGET_CHAT_ID,
     agentId: 'claude',
     agentSessionId: 'agent-2',
+    nativeCleanup: null,
     rollback: mock(() => Promise.resolve(undefined)),
   }));
   const carryOver = {
@@ -3756,6 +3758,82 @@ describe('ChatCommandService', () => {
         sourceChatId: SOURCE_CHAT_ID,
       },
     });
+  });
+
+  it('uses retained native cleanup rather than the current chat binding on fork-run retry', async () => {
+    const cleanup = { scope: { executorId: 'local', instanceId: 'original', integrationId: 'claude' },
+      session: { agentSessionId: 'original-native', nativeSession: null, nativeSeedReceipt: null } };
+    const createForkedChat = mock(async ({ registry }) => {
+      registry.addChat({ ...registry.getChat(SOURCE_CHAT_ID), id: TARGET_CHAT_ID, agentSessionId: 'rebound-native' });
+      return { sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID, agentId: 'claude',
+        agentSessionId: 'original-native', nativeCleanup: cleanup, rollback: async () => { throw new Error('rollback failed'); } };
+    });
+    const { service, queue, agents, ledger } = makeService({ createForkedChat });
+    const update = ledger.update.bind(ledger);
+    let failSettlement = true;
+    ledger.update = mock((key, patch) => {
+      if (failSettlement && patch.status === 'failed') {
+        failSettlement = false;
+        return Promise.reject(new Error('settlement unavailable'));
+      }
+      return update(key, patch);
+    });
+    queue.admitUserInput.mockRejectedValue(new Error('append failed'));
+    const input = { sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID, command: 'continue',
+      clientRequestId: 'fork-captured-cleanup', clientMessageId: 'fork-captured-cleanup-message' };
+    await expect(service.submitForkRun(input)).rejects.toThrow('settlement unavailable');
+    expect((await readLedgerRecord(ledger, 'fork-run', input.clientRequestId, TARGET_CHAT_ID)).forkPreparation.nativeCleanup).toEqual(cleanup);
+    await expect(service.submitForkRun(input)).rejects.toThrow('append failed');
+    expect(createForkedChat).toHaveBeenCalledOnce();
+    expect(agents.discardForkedAgentSession).toHaveBeenCalledWith(cleanup);
+    expect((await readLedgerRecord(ledger, 'fork-run', input.clientRequestId, TARGET_CHAT_ID)).forkPreparation).toBeUndefined();
+  });
+
+  it.each(['transient', 'persistent', 'none'])('retains only unresolved native cleanup after creation throws: %s discard failure', async (failure) => {
+    const session = { agentSessionId: 'original-native', nativeSession: null, nativeSeedReceipt: null };
+    const cleanup = { scope: { executorId: 'local', instanceId: 'original', integrationId: 'claude' }, session };
+    const queue = makeRealQueue(makeInputProjection());
+    const f = makeService({
+      queueService: queue,
+      session: { carryOverSegments: [], preambleSelection: { revision: 0, orderedPreambleIds: [] } },
+      createForkedChat: (input) => createForkedChatTransaction({ ...input, readForkedNativeHistory: async () => null }),
+      agents: { forkAgentSession: mock(async () => ({ kind: 'materialized', session, cleanup })) },
+    });
+    f.transcripts.currentView.mockImplementation((chatId) => chatId === SOURCE_CHAT_ID
+      ? { viewId: 'view-1', contentStartOrdinal: 1 } : null);
+    f.settings.setDerivedSessionName = mock(async () => { throw new Error('synthetic finalization failure'); });
+    f.settings.removeFromAllOrderLists.mockRejectedValueOnce(new Error('synthetic settings rollback failure'));
+    let artifactPresent = true;
+    let discards = 0;
+    f.agents.discardForkedAgentSession.mockImplementation(async (captured) => {
+      expect(captured).toEqual(cleanup);
+      discards++;
+      if (failure === 'persistent' || failure === 'transient' && discards === 1) {
+        f.chats.updateChat(TARGET_CHAT_ID, { agentSessionId: 'rebound-native' });
+        throw new Error('synthetic native discard failure');
+      }
+      artifactPresent = false;
+    });
+    const input = { sourceChatId: SOURCE_CHAT_ID, chatId: TARGET_CHAT_ID, command: 'continue',
+      clientRequestId: 'fork-pre-return-cleanup', clientMessageId: 'fork-pre-return-message' };
+    await expect(f.service.submitForkRun(input)).rejects.toThrow('Failed to');
+    await queue.waitForDispatches();
+    expect(discards).toBe(failure === 'none' ? 1 : 2);
+    expect(artifactPresent).toBe(failure === 'persistent');
+    expect(f.sessions.has(TARGET_CHAT_ID)).toBe(false);
+    const record = await readLedgerRecord(f.ledger, 'fork-run', input.clientRequestId, TARGET_CHAT_ID);
+    if (failure === 'persistent') {
+      expect(record.status).toBe('failed');
+      expect(record.forkPreparation).toEqual({ phase: 'creating', sourceChatId: SOURCE_CHAT_ID, nativeCleanup: cleanup });
+      await expect(f.service.submitForkRun(input)).rejects.toMatchObject({ code: 'INTERNAL_ERROR', status: 409 });
+      expect(f.agents.forkAgentSession).toHaveBeenCalledTimes(1);
+      expect(discards).toBe(2);
+      expect((await readLedgerRecord(f.ledger, 'fork-run', input.clientRequestId, TARGET_CHAT_ID)).forkPreparation)
+        .toEqual(record.forkPreparation);
+    } else {
+      expect(record.forkPreparation).toBeUndefined();
+      expect(record.errorCode).toBe('PRE_SCHEDULE_FAILED');
+    }
   });
 
   it('recovers a duplicate accepted command instead of returning false success', async () => {

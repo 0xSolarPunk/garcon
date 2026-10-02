@@ -11,6 +11,8 @@ export interface MessageSessionOptions {
   readonly maxQueuedBytes?: number;
   readonly maxQueuedFrames?: number;
   readonly maxFrameBytes?: number;
+  readonly budget?: MessageQueueBudget;
+  readonly lane?: RpcLane;
 }
 
 export class MessageContinuityError extends Error {
@@ -18,13 +20,14 @@ export class MessageContinuityError extends Error {
 }
 
 export class MessageSession {
-  readonly #pending: { body: string; bytes: number }[] = [];
+  readonly #pending: { body: string; bytes: number; release: () => void }[] = [];
   readonly #limits;
   #bytes = 0;
   #socket: SessionSocket | null = null;
   #failure: Error | null = null;
   #flushing = false;
   #retry: ReturnType<typeof setTimeout> | null = null;
+  #closedQueues: MessageQueueSnapshot | null = null;
 
   constructor(private readonly options: MessageSessionOptions) {
     this.#limits = {
@@ -42,13 +45,31 @@ export class MessageSession {
   get failure(): Error | null { return this.#failure; }
   get queuedBytes(): number { return this.#bytes; }
   get queuedFrames(): number { return this.#pending.length; }
+  get queueSnapshot(): MessageQueueSnapshot | null { return this.#closedQueues ?? this.options.budget?.snapshot() ?? null; }
 
   fitsFrame(body: string): boolean { return Buffer.byteLength(body) <= this.#limits.frame; }
 
   canAdmit(body: string): boolean {
     const bytes = Buffer.byteLength(body);
     return this.connected && bytes <= this.#limits.frame && this.#bytes + bytes <= this.#limits.bytes
-      && this.#pending.length < this.#limits.count;
+      && this.#pending.length < this.#limits.count
+      && (this.options.budget?.canAdmit(this.options.lane ?? 'primary', bytes) ?? true);
+  }
+
+  offerBulkControl(frame: BulkConnectionControl): boolean {
+    const body = JSON.stringify(frame);
+    const bytes = Buffer.byteLength(body);
+    const budget = this.options.budget;
+    if (this.options.lane === 'bulk' || !budget || !this.connected || this.#failure
+      || bytes > BULK_CONTROL_BYTES || bytes > this.#limits.frame
+      || this.#bytes + bytes > this.#limits.bytes || this.#pending.length >= this.#limits.count
+      || !budget.canAdmitControl(bytes)) return false;
+    this.#enqueue(body, bytes, budget.reserveControl(bytes));
+    return this.connected;
+  }
+
+  onCapacity(listener: () => void): () => void {
+    return this.options.budget?.onCapacity(listener) ?? (() => {});
   }
 
   // Producer output fills at most its share of the queue, so RPC traffic is
@@ -66,7 +87,7 @@ export class MessageSession {
   // Terminal output yields capacity to RPC and producer events before admission.
   trySend(body: string): boolean {
     const bytes = Buffer.byteLength(body);
-    if (!this.connected || bytes > this.#limits.frame
+    if (!this.canAdmit(body)
       || this.#bytes + bytes > Math.min(this.#limits.bytes / 2, 2 * 1024 * 1024)
       || this.#pending.length >= Math.min(this.#limits.count / 2, 256)
       || this.#socket?.canSend?.(bytes) === false) return false;
@@ -81,10 +102,14 @@ export class MessageSession {
       throw error;
     }
     const bytes = Buffer.byteLength(body);
-    this.#pending.push({ body, bytes });
+    this.#enqueue(body, bytes, this.options.budget?.reserve(this.options.lane ?? 'primary', bytes) ?? (() => {}));
+    if (this.#failure) throw this.#failure;
+  }
+
+  #enqueue(body: string, bytes: number, release: () => void): void {
+    this.#pending.push({ body, bytes, release });
     this.#bytes += bytes;
     this.#flush();
-    if (this.#failure) throw this.#failure;
   }
 
   attach(socket: SessionSocket): { receive(encoded: string): void; disconnected(): void } {
@@ -106,11 +131,13 @@ export class MessageSession {
 
   close(error: Error = new MessageContinuityError('Message session closed')): void {
     if (this.#failure) return;
+    this.#closedQueues = this.options.budget?.snapshot() ?? null;
     this.#failure = error;
     const socket = this.#socket;
     this.#socket = null;
     if (this.#retry) clearTimeout(this.#retry);
     this.#retry = null;
+    for (const pending of this.#pending) pending.release();
     this.#pending.length = 0;
     this.#bytes = 0;
     socket?.close();
@@ -133,9 +160,13 @@ export class MessageSession {
         }
         this.#pending.shift();
         this.#bytes -= message.bytes;
+        message.release();
         this.#socket.send(message.body);
       }
     } catch (error) { this.close(error instanceof Error ? error : new Error(String(error))); }
     finally { this.#flushing = false; }
   }
 }
+import type { MessageQueueBudget, MessageQueueSnapshot } from './message-queue-budget.js';
+import type { BulkConnectionControl, RpcLane } from './rpc-lane.js';
+import { BULK_CONTROL_BYTES } from './limits.js';
