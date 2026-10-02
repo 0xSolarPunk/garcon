@@ -512,6 +512,7 @@ describe('settings store', () => {
 
       const paths = await store.getPathSettings();
       expect(paths.pinnedProjectPaths).toEqual([
+        ' /workspace/alpha ',
         '/workspace/alpha',
         '/workspace/beta',
         '/workspace/zeta',
@@ -532,6 +533,7 @@ describe('settings store', () => {
 
       const paths = await store.getPathSettings();
       expect(paths.pinnedProjectPaths).toEqual([
+        ' /workspace/alpha ',
         '/workspace/alpha',
         '/workspace/beta',
         '/workspace/zeta',
