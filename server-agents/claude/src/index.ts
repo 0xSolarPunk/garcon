@@ -33,6 +33,7 @@ import {
   runSingleQuery,
 } from './agents/claude/claude-cli.js';
 import { ClaudeCliVersionProbe } from './agents/claude/cli-version.js';
+import { ClaudeInstallation } from './agents/claude/installation.js';
 import {
   buildClaudeEndpointRuntime,
   buildClaudeHostEnvironment,
@@ -93,6 +94,7 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
   readonly lifecycle;
   readonly migration;
   readonly auth: NonNullable<AgentIntegration['auth']>;
+  readonly installation: NonNullable<AgentIntegration['installation']>;
   readonly commands: NonNullable<AgentIntegration['commands']>;
   readonly compaction = null;
   readonly forking;
@@ -105,6 +107,7 @@ export default class ClaudeAgentIntegration implements AgentIntegration {
     const logger = createScopedAgentLogger(host.logger, 'claude');
     const nativeSessions = createPathNativeSessionCodec('claude');
     const versionProbe = new ClaudeCliVersionProbe();
+    this.installation = new ClaudeInstallation(config, versionProbe);
     const runtime = new ClaudeCliRuntime({
       binary: config.binary,
       logger,

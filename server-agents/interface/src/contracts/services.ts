@@ -12,6 +12,7 @@ import type {
   AgentSettingsEnvelope,
 } from '@garcon/common/agent-integration';
 import type { AgentModelOption } from '@garcon/common/agents';
+import type { AgentCliInstallationStatus, AgentCliUpdateResult } from '@garcon/common/agent-installation';
 import type { ThinkingMode } from '@garcon/common/chat-modes';
 import type { JsonObject } from '@garcon/common/json';
 import type { SlashCommand } from '@garcon/common/slash-commands';
@@ -58,6 +59,11 @@ export interface AgentAuth {
   launchLogin?(): Promise<AgentAuthLoginLaunchResult>;
   completeLogin?(sessionId: string, code: string): Promise<AgentAuthLoginCompleteResult>;
   loginStatus?(expectedSessionId?: string): Promise<AgentAuthLoginStatus>;
+}
+
+export interface AgentInstallation {
+  status(options?: ExecutorCallOptions): Promise<AgentCliInstallationStatus>;
+  update(options?: ExecutorCallOptions): Promise<AgentCliUpdateResult>;
 }
 
 export interface AgentCommands {

@@ -26,6 +26,10 @@ describe('agent auth login routes', () => {
     getAgentAuthStatus: mock(() => Promise.resolve(null)),
     getAgentAuthStatusMap: mock(() => Promise.resolve({})),
     getAgentReadinessMap: mock(() => Promise.resolve({})),
+    getAgentInstallationStatus: mock(() => Promise.resolve({ version: '2.1.207', minimumVersion: '2.1.238', supported: false })),
+    updateAgentInstallation: mock(() => Promise.resolve({
+      installation: { version: '2.1.285', minimumVersion: '2.1.238', supported: true }, output: 'Update complete',
+    })),
     getAgentCatalogEntries: mock(() => Promise.resolve([])),
     launchAgentAuthLogin: mock(() => Promise.resolve({
       launched: true,
@@ -72,6 +76,43 @@ describe('agent auth login routes', () => {
     expect(response.status).toBe(200);
     expect(body).toEqual({ launched: true, alreadyRunning: false, sessionId: 'session-a' });
     expect(agents.launchAgentAuthLogin).toHaveBeenCalledWith('claude', 'local');
+  });
+
+  it('reports the configured executor installation even when Claude cannot start', async () => {
+    const url = new URL('http://localhost/api/v1/agents/installation?agent=claude&executorId=22222222-2222-4222-8222-222222222222');
+    const response = await routes[url.pathname].GET(new Request(url), url);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ version: '2.1.207', supported: false });
+    expect(agents.getAgentInstallationStatus).toHaveBeenCalledWith('claude', '22222222-2222-4222-8222-222222222222');
+  });
+
+  it('updates only the selected executor installation', async () => {
+    parseJsonBody.mockResolvedValueOnce({ agentId: 'claude', executorId: '22222222-2222-4222-8222-222222222222' });
+    const response = await routes['/api/v1/agents/installation/update'].POST(new Request('http://localhost/api/v1/agents/installation/update', { method: 'POST' }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ installation: { version: '2.1.285', supported: true } });
+    expect(agents.updateAgentInstallation).toHaveBeenCalledWith('claude', '22222222-2222-4222-8222-222222222222');
+  });
+
+  it('exposes actionable update errors instead of claiming success', async () => {
+    parseJsonBody.mockResolvedValueOnce({ agentId: 'claude' });
+    agents.updateAgentInstallation.mockRejectedValueOnce(new AgentIntegrationError('PROVIDER_FAILURE', 'Run your package manager', true));
+    const response = await routes['/api/v1/agents/installation/update'].POST(new Request('http://localhost/api/v1/agents/installation/update', { method: 'POST' }));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: 'Run your package manager', errorCode: 'PROVIDER_FAILURE' });
+  });
+
+  it('rejects missing or unknown agents and malformed executor IDs', async () => {
+    const url = new URL('http://localhost/api/v1/agents/installation');
+    expect((await routes[url.pathname].GET(new Request(url), url)).status).toBe(400);
+    parseJsonBody.mockResolvedValueOnce({ executorId: 'local' });
+    expect((await routes['/api/v1/agents/installation/update'].POST(new Request(url, { method: 'POST' }))).status).toBe(400);
+    parseJsonBody.mockResolvedValueOnce({ agentId: 'claude', executorId: 'invalid' });
+    expect((await routes['/api/v1/agents/installation/update'].POST(new Request(url, { method: 'POST' }))).status).toBe(400);
+    parseJsonBody.mockResolvedValueOnce({ agentId: 'unknown' });
+    agents.hasAgent.mockReturnValueOnce(false);
+    expect((await routes['/api/v1/agents/installation/update'].POST(new Request(url, { method: 'POST' }))).status).toBe(400);
+    expect(agents.updateAgentInstallation).not.toHaveBeenCalled();
   });
 
   it.each([

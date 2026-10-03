@@ -71,6 +71,7 @@ export class RemoteAgentIntegration implements AgentIntegration {
   readonly lifecycle: AgentIntegration['lifecycle'];
   readonly migration: AgentIntegration['migration'];
   readonly auth: AgentIntegration['auth'];
+  readonly installation: AgentIntegration['installation'];
   readonly commands: AgentIntegration['commands'];
   readonly compaction: AgentIntegration['compaction'];
   readonly forking: AgentIntegration['forking'];
@@ -225,6 +226,10 @@ export class RemoteAgentIntegration implements AgentIntegration {
       translateLegacySettings: ({ signal, ...request }) => call('migration.translateLegacySettings', request, { signal }),
     };
     const cap = manifest.capabilities;
+    this.installation = cap.installation ? {
+      status: (options) => call('installation.status', null, options),
+      update: (options) => call('installation.update', null, options),
+    } : null;
     this.auth = cap.auth ? {
       status: (signal) => call('auth.status', null, { signal }),
       ...(manifest.authMethods.launchLogin ? { launchLogin: () => call('auth.launchLogin', null) } : {}),

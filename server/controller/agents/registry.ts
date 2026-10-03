@@ -11,6 +11,11 @@ import type { ChatMessage } from '@garcon/common/chat-types';
 import type { ChatTransientControlAction } from '../../../common/chat-transient-feed.js';
 import type { PermissionMode, ThinkingMode } from '../../../common/chat-modes.js';
 import type { AgentCatalogEntry, AgentModelOption } from '../../../common/agents.js';
+import {
+  AGENT_CLI_UPDATE_TIMEOUT_MS,
+  type AgentCliInstallationStatus,
+  type AgentCliUpdateResult,
+} from '../../../common/agent-installation.js';
 import type { SlashCommand } from '../../../common/slash-commands.js';
 import type {
   AgentAuthLoginCompleteResult,
@@ -120,6 +125,8 @@ export interface AgentRegistryServiceContract {
   getAgentAuthStatusMap(executorId?: string | null): Promise<Record<string, unknown>>;
   getAgentReadinessMap(authByAgent?: Record<string, unknown>, executorId?: string | null): Promise<Record<string, unknown>>;
   getAgentAuthStatus(agentId: string, executorId?: string | null): Promise<unknown | null>;
+  getAgentInstallationStatus(agentId: string, executorId: string): Promise<AgentCliInstallationStatus>;
+  updateAgentInstallation(agentId: string, executorId: string): Promise<AgentCliUpdateResult>;
   getAgentCatalogEntries(executorId?: string | null): Promise<AgentCatalogEntry[]>;
   getAgentCatalogEntry(agentId: string, query?: AgentModelQuery): Promise<AgentCatalogEntry | null>;
   assertExecutionModeSelectionSupported(agentId: string, selection: {
@@ -465,6 +472,18 @@ export class AgentRegistry implements AgentRegistryServiceContract {
     const auth = this.#directory.require(agentId, executorId).auth;
     if (!auth?.launchLogin) throw new Error(`Auth login is not supported for agent: ${agentId}`);
     return auth.launchLogin();
+  }
+  async getAgentInstallationStatus(agentId: string, executorId: string): Promise<AgentCliInstallationStatus> {
+    this.#directory.requireReady(executorId);
+    const installation = this.#directory.require(agentId, executorId).installation;
+    if (!installation) throw new DomainError('OPERATION_UNSUPPORTED', 'This agent does not support CLI updates.', 400);
+    return installation.status();
+  }
+  async updateAgentInstallation(agentId: string, executorId: string): Promise<AgentCliUpdateResult> {
+    this.#directory.requireReady(executorId);
+    const installation = this.#directory.require(agentId, executorId).installation;
+    if (!installation) throw new DomainError('OPERATION_UNSUPPORTED', 'This agent does not support CLI updates.', 400);
+    return installation.update({ timeoutMs: AGENT_CLI_UPDATE_TIMEOUT_MS + 15_000 });
   }
   async completeAgentAuthLogin(agentId: string, sessionId: string, code: string, executorId?: string | null): Promise<AgentAuthLoginCompleteResult> {
     const complete = this.#directory.require(agentId, executorId).auth?.completeLogin;
