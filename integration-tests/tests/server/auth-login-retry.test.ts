@@ -60,7 +60,7 @@ test(`Claude auth HTTP recovers a rejected code on its executor (${executionBack
     expect(owner.home).toBe(fixture.executionDirs.home);
     if (executorId !== 'local') {
       expect(owner.parentPid).not.toBe(fixture.garcon.pid);
-      expect(await client.get('/api/v1/agents/auth/login?agent=claude&executorId=local')).toEqual({ state: 'idle', running: false });
+      expect(await client.get<AgentAuthLoginStatus>('/api/v1/agents/auth/login?agent=claude&executorId=local')).toEqual({ state: 'idle', running: false });
     }
 
     const complete = (code: string) => client.fetch('/api/v1/agents/auth/login/complete', {
