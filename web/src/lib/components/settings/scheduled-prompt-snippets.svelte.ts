@@ -16,6 +16,7 @@ interface Options {
 	get interactionKey(): string;
 	onInsert(text: string, caret: number): Promise<void>;
 	onPendingChange(pending: boolean): void;
+	onSourceChanged(source: SelectableSnippet['source']): void;
 }
 
 export class ScheduledPromptSnippets {
@@ -35,10 +36,7 @@ export class ScheduledPromptSnippets {
 	detectTrigger(caret: number, prefix: string, sourceText = this.options.prompt): void {
 		if (this.expansion.pending) return;
 		this.error = null;
-		this.palette.updateDetectedTrigger(
-			findSnippetTrigger(sourceText, caret, prefix),
-			sourceText,
-		);
+		this.palette.updateDetectedTrigger(findSnippetTrigger(sourceText, caret, prefix), sourceText);
 	}
 
 	cancel(): void {
@@ -70,7 +68,11 @@ export class ScheduledPromptSnippets {
 				return 'cancelled';
 			if (!matchesSelectableSnippetExpansion(snippet, result.response)) {
 				this.error = m.snippets_changed_before_expansion();
-				return 'failed';
+				this.options.onSourceChanged(snippet.source);
+				if (result.response.source !== snippet.source) {
+					this.options.onSourceChanged(result.response.source);
+				}
+				return 'cancelled';
 			}
 			const target = context.target;
 			if (

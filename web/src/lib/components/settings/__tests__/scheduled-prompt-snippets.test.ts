@@ -33,6 +33,7 @@ function fixture() {
 	const input = { prompt: 'Before selected after', key: 'new-chat:/repo' };
 	const onInsert = vi.fn(async (_text: string, _caret: number) => {});
 	const onPendingChange = vi.fn();
+	const onSourceChanged = vi.fn();
 	const controller = new ScheduledPromptSnippets({
 		get prompt() {
 			return input.prompt;
@@ -48,8 +49,9 @@ function fixture() {
 		},
 		onInsert,
 		onPendingChange,
+		onSourceChanged,
 	});
-	return { input, controller, onInsert, onPendingChange };
+	return { input, controller, onInsert, onPendingChange, onSourceChanged };
 }
 
 beforeEach(() => {
@@ -109,14 +111,27 @@ describe('scheduled prompt snippets', () => {
 		expect(onInsert).not.toHaveBeenCalled();
 	});
 
-	it('keeps text intact and exposes expansion failures and changed snippets', async () => {
-		const { controller, onInsert } = fixture();
+	it('keeps text intact and exposes retryable expansion failures', async () => {
+		const { controller, onInsert, onSourceChanged } = fixture();
 		expand.mockRejectedValueOnce(new Error('Path unavailable'));
 		expect(await controller.insert(item, '')).toBe('failed');
 		expect(controller.error).toBe('Path unavailable');
-		expand.mockResolvedValueOnce({ ...response, sourceUpdatedAt: '2026-01-02T00:00:00.000Z' });
-		expect(await controller.insert(item, '')).toBe('failed');
+		expect(onInsert).not.toHaveBeenCalled();
+		expect(onSourceChanged).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ sourceUpdatedAt: '2026-01-02T00:00:00.000Z' },
+		{ sourceId: 'replacement' },
+		{ source: 'preamble' as const },
+	])('cancels stale identity and refreshes affected catalogs: %j', async (changed) => {
+		const { controller, onInsert, onSourceChanged } = fixture();
+		expand.mockResolvedValueOnce({ ...response, ...changed });
+		expect(await controller.insert(item, '')).toBe('cancelled');
 		expect(controller.error).toContain('changed');
+		expect(onSourceChanged.mock.calls).toEqual(
+			'source' in changed ? [['snippet'], ['preamble']] : [['snippet']],
+		);
 		expect(onInsert).not.toHaveBeenCalled();
 	});
 });

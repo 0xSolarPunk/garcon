@@ -2,6 +2,7 @@
 	import { onDestroy, tick, untrack, type Snippet } from 'svelte';
 	import Braces from '@lucide/svelte/icons/braces';
 	import FileText from '@lucide/svelte/icons/file-text';
+	import { getSnippets, getPreambles } from '$lib/context';
 	import ComposerSnippetPalette from '$lib/components/chat/composer/ComposerSnippetPalette.svelte';
 	import { ScheduledPromptSnippets } from './scheduled-prompt-snippets.svelte';
 	import type { ScheduledSnippetExpansionContext } from '$shared/snippets';
@@ -48,6 +49,8 @@
 	const errorId = `${id}-error`;
 	let resizeFrame: number | null = null;
 	const interactionKey = $derived(`${JSON.stringify(snippetContext)}\u0000${snippetContextKey}`);
+	const snippetCatalog = untrack(() => (snippetContext !== undefined ? getSnippets() : null));
+	const preambleCatalog = untrack(() => (snippetContext !== undefined ? getPreambles() : null));
 	const snippets = new ScheduledPromptSnippets({
 		get prompt() {
 			return prompt;
@@ -67,6 +70,10 @@
 			resizeTextarea();
 		},
 		onPendingChange: (pending) => onSnippetPendingChange?.(pending),
+		onSourceChanged: (source) => {
+			if (source === 'snippet') void snippetCatalog?.refreshIfLoaded();
+			else void preambleCatalog?.refreshIfLoaded();
+		},
 	});
 	$effect(() => {
 		interactionKey;
@@ -115,7 +122,7 @@
 		if (!(textarea instanceof HTMLTextAreaElement)) return;
 		onPromptChange(textarea.value);
 		resizeTextarea();
-		if (snippetContext !== undefined) {
+		if (snippetContext !== undefined && !(event as InputEvent).isComposing) {
 			snippets.detectTrigger(textarea.selectionStart, snippetTrigger, textarea.value);
 		}
 	}
@@ -226,6 +233,7 @@
 		onOpenChange={(open) => (open ? snippets.palette.openFromMenu() : snippets.palette.hide())}
 		initialQuery={snippets.palette.initialQuery}
 		{interactionKey}
+		insertionError={snippets.error}
 		contextHint={snippetContext ? null : m.snippets_palette_context_hint()}
 		onInsert={(snippet, argumentsText) => snippets.insert(snippet, argumentsText)}
 		onCancelled={() => snippets.palette.dismiss()}
