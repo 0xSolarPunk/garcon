@@ -29,6 +29,16 @@ test.each(['in-process', 'remote-controller-dials', 'remote-executor-dials'] as 
       await browserExpect(panel.getByText('Installed version: 2.1.207', { exact: true })).toBeVisible();
       await browserExpect(panel.getByText('Claude Code 2.1.207 is unsupported. Upgrade to 2.1.238 or newer.', { exact: true })).toBeVisible();
       expect(statusRequests).toBe(1);
+      phase('reject a stale installation instance through authenticated HTTP');
+      const stale = await integration.client.fetch('/api/v1/agents/installation/update', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId: 'claude', executorId: integration.client.executorId, instanceId: 'stale-instance' }),
+      });
+      expect(stale.status).toBe(503);
+      expect(await stale.json()).toMatchObject({ errorCode: 'STALE_RESOURCE', retryable: false });
+      expect(await Bun.file(join(integration.executionDirs.home, 'claude-updates')).exists()).toBe(false);
+      const updateRequest = page.waitForRequest((request) => request.method() === 'POST'
+        && new URL(request.url()).pathname === '/api/v1/agents/installation/update');
       const artifacts = join(import.meta.dirname, '../../artifacts/chromium');
       await mkdir(artifacts, { recursive: true });
       for (const width of [1440, 390, 320]) {
@@ -40,6 +50,9 @@ test.each(['in-process', 'remote-controller-dials', 'remote-executor-dials'] as 
       }
       phase('update and verify the configured launcher');
       await panel.getByRole('button', { name: 'Update Claude Code', exact: true }).click();
+      const payload = (await updateRequest).postDataJSON();
+      expect(payload).toMatchObject({ agentId: 'claude', executorId: integration.client.executorId, instanceId: expect.any(String) });
+      expect(payload.instanceId).not.toBe('stale-instance');
       await browserExpect(panel.getByText('Claude Code 2.1.285 is ready for new sessions.', { exact: true })).toBeVisible();
       await browserExpect(panel.getByText('Installed version: 2.1.285', { exact: true })).toBeVisible();
       const updates = await readFile(join(integration.executionDirs.home, 'claude-updates'), 'utf8');

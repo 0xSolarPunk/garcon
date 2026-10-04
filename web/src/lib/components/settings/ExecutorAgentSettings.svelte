@@ -14,16 +14,16 @@
 	const authExecutorId = $derived(executorId);
 	const settingsAuth = $derived(new SettingsAuthState(catalog.forExecutor(authExecutorId), authExecutorId));
 	let openByAgent = $state<Record<string, boolean>>({});
-	const executorContext = $derived.by(() => {
+	const instanceId = $derived.by(() => {
 		const executor = executors.get(executorId);
 		if (!executor?.enabled || executor.availability !== 'ready') return null;
-		return JSON.stringify([executor.id, executor.instanceId]);
+		return executor.instanceId;
 	});
-	const ready = $derived(executorContext !== null);
+	const ready = $derived(instanceId !== null);
 
 	$effect(() => {
 		const auth = settingsAuth;
-		if (executorContext) return untrack(() => auth.initialize());
+		if (instanceId) return untrack(() => auth.initialize());
 	});
 </script>
 
@@ -35,7 +35,9 @@
 	<div class="space-y-3">
 		{#each ['claude', 'codex'] as agentId (agentId)}
 			{#snippet installation()}
-				<AgentCliUpdatePanel {agentId} {executorId} executorContext={executorContext ?? executorId} />
+				{#if instanceId}
+					<AgentCliUpdatePanel {agentId} {executorId} {instanceId} />
+				{/if}
 			{/snippet}
 			<AgentCard
 				{agentId}

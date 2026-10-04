@@ -21,7 +21,7 @@ import type {
   AgentResumeRequestV5,
 } from './execution-v5.js';
 import type { AgentNativeSessionRef } from './transcript.js';
-import type { AgentProducerBinding, AgentResourceRef, ExecutorCallOptions } from './resources.js';
+import type { AgentInstanceCallOptions, AgentProducerBinding, AgentResourceRef, ExecutorCallOptions } from './resources.js';
 
 export interface AgentCatalog {
   snapshot(request: {
@@ -63,7 +63,7 @@ export interface AgentAuth {
 
 export interface AgentInstallation {
   status(options?: ExecutorCallOptions): Promise<AgentCliInstallationStatus>;
-  update(options?: ExecutorCallOptions): Promise<AgentCliUpdateResult>;
+  update(options?: ExecutorCallOptions & AgentInstanceCallOptions): Promise<AgentCliUpdateResult>;
 }
 
 export interface AgentCommands {

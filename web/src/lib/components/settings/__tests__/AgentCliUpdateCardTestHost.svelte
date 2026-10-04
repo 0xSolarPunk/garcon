@@ -13,5 +13,5 @@
 	{open}
 	onOpenChange={(value) => { open = value; }}
 >
-	<AgentCliUpdatePanel agentId="claude" {executorId} />
+	<AgentCliUpdatePanel agentId="claude" {executorId} instanceId="instance-a" />
 </AgentCard>

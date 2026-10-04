@@ -38,6 +38,8 @@ Claude implements it using its configured binary's `update` command and release
 channel. Other integrations declare it unavailable. The controller routes the
 action to the card's executor through the same typed facet for Local and remote
 workers, without requiring working chat execution or native authentication.
+The update request captures the displayed `instanceId`; controller admission and
+remote session acquisition reject a replacement worker instead of updating it.
 The new HTTP operations are browser settings operations, outside the executor
 CLI gateway allowlist.
 
@@ -48,6 +50,13 @@ compatibility cache. A package-manager no-op or pinned launcher that still runs
 an unsupported version remains visibly unsupported. Update output is available
 for manual package-manager guidance. Existing sessions continue on their
 current binary; newly launched processes use the updated installation.
+Successful and failed command output retains sanitized stdout and stderr.
+
+Remote updates wait up to 15 seconds to acquire a session of the captured worker.
+An admitted update receives a separate 105-second RPC budget for the updater and
+version probe. Its journaled result keeps that execution budget across reconnects;
+the acquisition deadline does not cancel it. Browser requests allow 135 seconds
+for both budgets and HTTP response delivery.
 
 Executor protocol revision 14 adds `installation.status`, `installation.update`,
 and the nullable facet capability. Both RPC operations retain journaled results

@@ -6,6 +6,7 @@ import type { AgentRegistryServiceContract } from '../agents/registry.js';
 import type { ApiProviderService } from '../api-providers/service.js';
 import { asJsonBody, type JsonBody } from './route-helpers.js';
 import { AgentIntegrationError } from '@garcon/server-agent-interface';
+import type { AgentCliUpdateRequest } from '../../../common/agent-installation.js';
 import { executorIdFromUrl, executorIdFromValue } from './executor-target.js';
 import { jsonError, jsonErrorFromUnknown } from '../../common/http-error.js';
 
@@ -97,10 +98,14 @@ export default function createAgentRoutes({ agents, apiProviders }: AgentRouteDe
     try {
       const input = asJsonBody(body);
       if (typeof input.agentId !== 'string' || !input.agentId) return jsonError('agentId is required', 400);
+      if (typeof input.instanceId !== 'string' || !input.instanceId.trim() || input.instanceId.length > 128) {
+        return jsonError('instanceId is required and must be a non-empty string of at most 128 characters', 400);
+      }
       const executorId = executorIdFromValue(input.executorId);
       agents.assertExecutorReady(executorId);
       if (!agents.hasAgent(input.agentId, executorId)) return jsonError(`Unknown agent: ${input.agentId}`, 400);
-      return Response.json(await agents.updateAgentInstallation(input.agentId, executorId));
+      const request: AgentCliUpdateRequest = { agentId: input.agentId, executorId, instanceId: input.instanceId };
+      return Response.json(await agents.updateAgentInstallation(request));
     } catch (error) {
       return installationFailure(error);
     }

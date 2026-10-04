@@ -7,9 +7,9 @@
 	let {
 		agentId,
 		executorId,
-		executorContext = executorId,
-	}: { agentId: string; executorId: string; executorContext?: string } = $props();
-	const installationState = $derived(new AgentCliUpdateState(agentId, executorId, executorContext));
+		instanceId,
+	}: { agentId: string; executorId: string; instanceId: string } = $props();
+	const installationState = $derived(new AgentCliUpdateState(agentId, executorId, instanceId));
 	const busy = $derived(installationState.loading || installationState.updating);
 
 	$effect(() => {

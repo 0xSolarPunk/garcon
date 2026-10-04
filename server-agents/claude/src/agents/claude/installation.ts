@@ -68,7 +68,7 @@ export class ClaudeInstallation implements AgentInstallation {
       this.versionProbe.invalidate(binary);
       return {
         installation: await this.status(options),
-        output: [stdout, stderr].map((output) => stripVTControlCharacters(output).trim()).filter(Boolean).join('\n'),
+        output: formatUpdateOutput(stdout, stderr),
       };
     } catch (error) {
       throw installationError(error);
@@ -79,20 +79,25 @@ export class ClaudeInstallation implements AgentInstallation {
   }
 }
 
+function formatUpdateOutput(stdout: unknown, stderr: unknown): string {
+  return [stdout, stderr].map((output) => typeof output === 'string'
+    ? stripVTControlCharacters(Buffer.from(output).subarray(0, MAX_UPDATE_OUTPUT_BYTES).toString('utf8')).trim()
+    : '').filter(Boolean).join('\n');
+}
+
 function installationError(error: unknown): AgentIntegrationError {
   if (error instanceof AgentIntegrationError) return error;
-  const failure = error as { code?: unknown; killed?: unknown; stderr?: unknown; message?: unknown };
+  const failure = error as { code?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown };
+  const output = formatUpdateOutput(failure?.stdout, failure?.stderr);
   if (failure?.code === 'ENOENT') {
     return new AgentIntegrationError('BINARY_NOT_FOUND', 'Claude Code is not installed or its configured executable is unavailable.', false);
   }
   if (failure?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-    return new AgentIntegrationError('PROVIDER_FAILURE', 'Claude Code update output exceeded its size limit. Refresh the installed version before trying again.', true);
+    return new AgentIntegrationError('PROVIDER_FAILURE', ['Claude Code update output exceeded its size limit. Refresh the installed version before trying again.', output].filter(Boolean).join('\n'), true);
   }
   if (failure?.killed) {
-    return new AgentIntegrationError('TIMEOUT', 'Claude Code update timed out. Refresh the installed version before trying again.', true);
+    return new AgentIntegrationError('TIMEOUT', ['Claude Code update timed out. Refresh the installed version before trying again.', output].filter(Boolean).join('\n'), true);
   }
-  const detail = typeof failure?.stderr === 'string' && failure.stderr.trim()
-    ? failure.stderr.trim()
-    : error instanceof Error ? error.message : String(error);
+  const detail = output || (error instanceof Error ? error.message : String(error));
   return new AgentIntegrationError('PROVIDER_FAILURE', `Claude Code installation check or update failed: ${stripVTControlCharacters(detail)}`, true);
 }

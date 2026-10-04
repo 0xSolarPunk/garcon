@@ -32,6 +32,11 @@ if (command === '--version') {
   if (mode === 'large') console.log('x'.repeat(100000));
   if (mode === 'success' || mode === 'delay' || mode === 'change-fail') writeFileSync(file('version'), '2.1.285');
   if (mode === 'fail' || mode === 'change-fail') { console.error('Use your package manager: permission denied'); process.exit(1); }
+  if (mode === 'stdout-fail' || mode === 'both-fail' || mode === 'ansi-success') {
+    console.log('\\x1b[32mRun brew upgrade claude-code\\x1b[0m');
+    if (mode !== 'stdout-fail') console.error('\\x1b[31mSynthetic package-manager guidance\\x1b[0m');
+    if (mode !== 'ansi-success') process.exit(1);
+  }
   console.log(mode === 'noop' ? 'Run brew upgrade claude-code' : 'Update complete');
 } else { console.error('unexpected command'); process.exit(2); }
 `, { mode: 0o755 });
@@ -81,6 +86,24 @@ describe('Claude installation maintenance', () => {
     await expect(installation.update()).rejects.toThrow('permission denied');
     await expect(installation.update()).rejects.toThrow('permission denied');
     expect((await readFile(join(directory, 'updates'), 'utf8')).trim().split('\n')).toHaveLength(2);
+  });
+
+  it.each(['stdout-fail', 'both-fail'])('preserves sanitized output from %s', async (mode) => {
+    const { installation } = await fixture(mode);
+    const failure = await installation.update().catch((error) => error);
+    expect(failure.code).toBe('PROVIDER_FAILURE');
+    expect(failure.message).toContain('Run brew upgrade claude-code');
+    expect(failure.message).not.toContain('\x1b');
+    expect(failure.message).not.toContain('Command failed');
+    if (mode === 'both-fail') expect(failure.message).toContain('Synthetic package-manager guidance');
+  });
+
+  it('uses the same sanitizer for successful stdout and stderr', async () => {
+    const { installation } = await fixture('ansi-success');
+    const result = await installation.update();
+    expect(result.output).toContain('Run brew upgrade claude-code');
+    expect(result.output).toContain('Synthetic package-manager guidance');
+    expect(result.output).not.toContain('\x1b');
   });
 
   it('invalidates the cache even when an update changes the launcher and then fails', async () => {

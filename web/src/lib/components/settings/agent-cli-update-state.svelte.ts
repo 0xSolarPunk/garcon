@@ -11,7 +11,7 @@ export class AgentCliUpdateState {
 	#active = false;
 	#generation = 0;
 
-	constructor(readonly agentId: string, readonly executorId: string, readonly executorContext = executorId) {}
+	constructor(readonly agentId: string, readonly executorId: string, readonly instanceId: string) {}
 
 	initialize(): () => void {
 		this.#active = true;
@@ -26,9 +26,7 @@ export class AgentCliUpdateState {
 		if (!this.#active || this.updating || this.loading) return;
 		const generation = ++this.#generation;
 		this.loading = true;
-		this.error = null;
-		this.completed = false;
-		this.output = '';
+		this.#clearFeedback();
 		try {
 			const installation = await getAgentInstallationStatus(this.agentId, this.executorId);
 			if (this.#isCurrent(generation)) this.installation = installation;
@@ -46,11 +44,9 @@ export class AgentCliUpdateState {
 		if (!this.#active || this.updating || this.loading) return;
 		const generation = ++this.#generation;
 		this.updating = true;
-		this.error = null;
-		this.completed = false;
-		this.output = '';
+		this.#clearFeedback();
 		try {
-			const result = await updateAgentInstallation(this.agentId, this.executorId);
+			const result = await updateAgentInstallation({ agentId: this.agentId, executorId: this.executorId, instanceId: this.instanceId });
 			if (!this.#isCurrent(generation)) return;
 			this.installation = result.installation;
 			this.output = result.output;
@@ -66,5 +62,11 @@ export class AgentCliUpdateState {
 
 	#isCurrent(generation: number): boolean {
 		return this.#active && this.#generation === generation;
+	}
+
+	#clearFeedback(): void {
+		this.error = null;
+		this.completed = false;
+		this.output = '';
 	}
 }

@@ -1,10 +1,13 @@
-import type {
-  AgentNativeSessionRef,
-  AgentProjectPathUpdatePreparation,
-  AgentSteerResult,
-  AgentSteerTarget,
-  AgentTranscriptSourceLocation,
-  ExecutorCallOptions,
+import {
+  assertAgentResourceScope,
+  type AgentIntegration,
+  type AgentInstallation,
+  type AgentNativeSessionRef,
+  type AgentProjectPathUpdatePreparation,
+  type AgentSteerResult,
+  type AgentSteerTarget,
+  type AgentTranscriptSourceLocation,
+  type ExecutorCallOptions,
 } from '@garcon/server-agent-interface';
 import type { PermissionDecisionPayload } from '../../../common/chat-command-contracts.js';
 import type { ChatMessage } from '@garcon/common/chat-types';
@@ -12,8 +15,9 @@ import type { ChatTransientControlAction } from '../../../common/chat-transient-
 import type { PermissionMode, ThinkingMode } from '../../../common/chat-modes.js';
 import type { AgentCatalogEntry, AgentModelOption } from '../../../common/agents.js';
 import {
-  AGENT_CLI_UPDATE_TIMEOUT_MS,
+  AGENT_CLI_UPDATE_RPC_TIMEOUT_MS,
   type AgentCliInstallationStatus,
+  type AgentCliUpdateRequest,
   type AgentCliUpdateResult,
 } from '../../../common/agent-installation.js';
 import type { SlashCommand } from '../../../common/slash-commands.js';
@@ -126,7 +130,7 @@ export interface AgentRegistryServiceContract {
   getAgentReadinessMap(authByAgent?: Record<string, unknown>, executorId?: string | null): Promise<Record<string, unknown>>;
   getAgentAuthStatus(agentId: string, executorId?: string | null): Promise<unknown | null>;
   getAgentInstallationStatus(agentId: string, executorId: string): Promise<AgentCliInstallationStatus>;
-  updateAgentInstallation(agentId: string, executorId: string): Promise<AgentCliUpdateResult>;
+  updateAgentInstallation(request: AgentCliUpdateRequest): Promise<AgentCliUpdateResult>;
   getAgentCatalogEntries(executorId?: string | null): Promise<AgentCatalogEntry[]>;
   getAgentCatalogEntry(agentId: string, query?: AgentModelQuery): Promise<AgentCatalogEntry | null>;
   assertExecutionModeSelectionSupported(agentId: string, selection: {
@@ -474,16 +478,20 @@ export class AgentRegistry implements AgentRegistryServiceContract {
     return auth.launchLogin();
   }
   async getAgentInstallationStatus(agentId: string, executorId: string): Promise<AgentCliInstallationStatus> {
-    this.#directory.requireReady(executorId);
-    const installation = this.#directory.require(agentId, executorId).installation;
-    if (!installation) throw new DomainError('OPERATION_UNSUPPORTED', 'This agent does not support CLI updates.', 400);
-    return installation.status();
+    return this.#requireInstallation(agentId, executorId).installation.status();
   }
-  async updateAgentInstallation(agentId: string, executorId: string): Promise<AgentCliUpdateResult> {
+  async updateAgentInstallation({ agentId, executorId, instanceId }: AgentCliUpdateRequest): Promise<AgentCliUpdateResult> {
+    const { integration, installation } = this.#requireInstallation(agentId, executorId);
+    const expectedScope = { executorId, instanceId, integrationId: agentId };
+    assertAgentResourceScope(integration.producers.scope, expectedScope);
+    return installation.update({ expectedScope, timeoutMs: AGENT_CLI_UPDATE_RPC_TIMEOUT_MS });
+  }
+  #requireInstallation(agentId: string, executorId: string): { integration: AgentIntegration; installation: AgentInstallation } {
     this.#directory.requireReady(executorId);
-    const installation = this.#directory.require(agentId, executorId).installation;
+    const integration = this.#directory.require(agentId, executorId);
+    const installation = integration.installation;
     if (!installation) throw new DomainError('OPERATION_UNSUPPORTED', 'This agent does not support CLI updates.', 400);
-    return installation.update({ timeoutMs: AGENT_CLI_UPDATE_TIMEOUT_MS + 15_000 });
+    return { integration, installation };
   }
   async completeAgentAuthLogin(agentId: string, sessionId: string, code: string, executorId?: string | null): Promise<AgentAuthLoginCompleteResult> {
     const complete = this.#directory.require(agentId, executorId).auth?.completeLogin;
