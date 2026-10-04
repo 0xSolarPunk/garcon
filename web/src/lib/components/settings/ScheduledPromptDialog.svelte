@@ -209,14 +209,16 @@
 					<ScheduledPromptOption
 						name="schedule-cadence"
 						value="once"
-						bind:group={form.scheduleType}
+						checked={form.scheduleType === 'once'}
+						onSelect={() => (form.scheduleType = 'once')}
 						label={m.scheduled_prompts_once()}
 						description={m.scheduled_prompts_once_description()}
 					/>
 					<ScheduledPromptOption
 						name="schedule-cadence"
 						value="recurring"
-						bind:group={form.scheduleType}
+						checked={form.scheduleType === 'recurring'}
+						onSelect={() => (form.scheduleType = 'recurring')}
 						label={m.scheduled_prompts_recurring()}
 						description={m.scheduled_prompts_recurring_description()}
 					/>
@@ -289,13 +291,15 @@
 							<ScheduledPromptOption
 								name="recurrence-end"
 								value="forever"
-								bind:group={form.recurrenceEnd}
+								checked={form.recurrenceEnd === 'forever'}
+								onSelect={() => (form.recurrenceEnd = 'forever')}
 								label={m.scheduled_prompts_forever()}
 							/>
 							<ScheduledPromptOption
 								name="recurrence-end"
 								value="until"
-								bind:group={form.recurrenceEnd}
+								checked={form.recurrenceEnd === 'until'}
+								onSelect={() => (form.recurrenceEnd = 'until')}
 								label={m.scheduled_prompts_until_label()}
 							/>
 						</fieldset>
@@ -328,14 +332,16 @@
 					<ScheduledPromptOption
 						name="chat-target"
 						value="new-chat"
-						bind:group={form.targetType}
+						checked={form.targetType === 'new-chat'}
+						onSelect={() => (form.targetType = 'new-chat')}
 						label={m.scheduled_prompts_new_chat()}
 						description={m.scheduled_prompts_new_chat_description()}
 					/>
 					<ScheduledPromptOption
 						name="chat-target"
 						value="existing-chat"
-						bind:group={form.targetType}
+						checked={form.targetType === 'existing-chat'}
+						onSelect={() => (form.targetType = 'existing-chat')}
 						label={m.scheduled_prompts_existing_chat()}
 						description={m.scheduled_prompts_existing_chat_description()}
 					/>
@@ -383,14 +389,16 @@
 							<ScheduledPromptOption
 								name="busy-behavior"
 								value="queue"
-								bind:group={form.busyBehavior}
+								checked={form.busyBehavior === 'queue'}
+								onSelect={() => (form.busyBehavior = 'queue')}
 								label={m.scheduled_prompts_queue_message()}
 								description={m.scheduled_prompts_queue_message_description()}
 							/>
 							<ScheduledPromptOption
 								name="busy-behavior"
 								value="skip"
-								bind:group={form.busyBehavior}
+								checked={form.busyBehavior === 'skip'}
+								onSelect={() => (form.busyBehavior = 'skip')}
 								label={m.scheduled_prompts_skip_sending()}
 								description={m.scheduled_prompts_skip_sending_description()}
 							/>
