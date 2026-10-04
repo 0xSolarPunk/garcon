@@ -177,7 +177,7 @@ describe('SettingsAuthState login lifecycle', () => {
 		expect(settingsAuth.isLoginPending('codex')).toBe(false);
 	});
 
-	it('keeps a newer login pending when an older completion settles', async () => {
+	it.each(['resolves', 'rejects'] as const)('preserves a newer login and its polling when an older completion %s', async (settlement) => {
 		const firstCompletion = deferred<Awaited<ReturnType<typeof completeAgentAuthLogin>>>();
 		const secondLaunch = deferred<Awaited<ReturnType<typeof launchAgentAuthLogin>>>();
 		const secondSessionAuth = { url: 'https://example.test/claude-next', needsCode: true };
@@ -190,33 +190,49 @@ describe('SettingsAuthState login lifecycle', () => {
 			})
 			.mockReturnValueOnce(secondLaunch.promise);
 		vi.mocked(completeAgentAuthLogin).mockReturnValueOnce(firstCompletion.promise);
-		vi.mocked(getAgentAuthLoginStatus).mockResolvedValue({
-			state: 'running',
-			running: true, completionPending: false,
-			sessionId: 'session-b',
-			deviceAuth: secondSessionAuth,
-		});
+		vi.mocked(getAgentAuthLoginStatus)
+			.mockResolvedValueOnce({
+				state: 'running',
+				running: true, completionPending: false,
+				sessionId: SESSION_ID,
+				deviceAuth: CLAUDE_AUTH,
+			})
+			.mockResolvedValue({
+				state: 'running',
+				running: true, completionPending: true,
+				sessionId: 'session-b',
+				deviceAuth: secondSessionAuth,
+			});
 
 		const settingsAuth = new SettingsAuthState(createModelCatalog());
 		await settingsAuth.handleLogin('claude');
 		const completion = settingsAuth.completeLogin('claude', 'first-code');
 		const newerLogin = settingsAuth.handleLogin('claude');
 
-		firstCompletion.resolve({ submitted: true, sessionId: SESSION_ID });
-		await completion;
-
-		expect(settingsAuth.isLoginPending('claude')).toBe(true);
-
 		secondLaunch.resolve({
-			launched: true,
-			alreadyRunning: false,
+			launched: false,
+			alreadyRunning: true,
 			sessionId: 'session-b',
 			deviceAuth: secondSessionAuth,
 		});
 		await newerLogin;
+		expect(getAgentAuthLoginStatus).toHaveBeenCalledTimes(2);
+
+		if (settlement === 'resolves') {
+			firstCompletion.resolve({ submitted: true, sessionId: SESSION_ID });
+		} else {
+			firstCompletion.reject(new Error('stale completion failed'));
+		}
+		await completion;
 
 		expect(settingsAuth.deviceAuthFor('claude')).toEqual(secondSessionAuth);
-		expect(settingsAuth.isLoginPending('claude')).toBe(false);
+		expect(settingsAuth.isLoginPending('claude')).toBe(true);
+		expect(settingsAuth.authFor('claude').error).toBeNull();
+		expect(getAgentAuthLoginStatus).toHaveBeenCalledTimes(2);
+
+		await vi.advanceTimersByTimeAsync(POLL_TICK_MS);
+		expect(getAgentAuthLoginStatus).toHaveBeenCalledTimes(3);
+		expect(getAgentAuthLoginStatus).toHaveBeenLastCalledWith('claude', 'session-b', 'local');
 	});
 
 	it('ignores a stale restored session after a newer login launches', async () => {
