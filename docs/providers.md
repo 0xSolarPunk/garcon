@@ -58,7 +58,7 @@ version probe. Its journaled result keeps that execution budget across reconnect
 the acquisition deadline does not cancel it. Browser requests allow 135 seconds
 for both budgets and HTTP response delivery.
 
-Executor protocol revision 14 adds `installation.status`, `installation.update`,
+Executor protocol revision 15 adds `installation.status`, `installation.update`,
 and the nullable facet capability. Both RPC operations retain journaled results
 across reconnects; they never retarget another executor or restart chats.
 
