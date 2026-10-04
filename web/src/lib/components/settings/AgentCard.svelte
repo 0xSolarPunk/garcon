@@ -83,7 +83,9 @@
 	}
 
 	function handleAuthCodeKeydown(event: KeyboardEvent) {
-		if (event.key === 'Enter') submitAuthCode();
+		if (event.key !== 'Enter') return;
+		event.preventDefault();
+		submitAuthCode();
 	}
 
 	const borderColorClass: Record<AgentId, string> = {
@@ -219,6 +221,9 @@
 									<input
 										class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-base pointer-fine:text-sm text-foreground"
 										placeholder={m.settings_agents_browser_auth_code_placeholder()}
+										aria-label={m.settings_agents_browser_auth_code_placeholder()}
+										autocomplete="off"
+										spellcheck={false}
 										bind:value={authCode}
 										onkeydown={handleAuthCodeKeydown}
 										disabled={pending}
@@ -230,6 +235,11 @@
 										{m.settings_agents_browser_auth_submit_button()}
 									</Button>
 								</div>
+								{#if pending}
+									<div role="status" class="text-xs text-muted-foreground">
+										{m.settings_agents_browser_auth_completing()}
+									</div>
+								{/if}
 							</div>
 						{/if}
 
@@ -285,7 +295,7 @@
 				{/if}
 
 				{#if auth.error}
-					<div class="text-sm text-destructive">
+					<div role="alert" class="text-sm text-destructive">
 						{m.settings_agents_error({ error: auth.error })}
 					</div>
 				{/if}
