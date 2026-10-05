@@ -10,7 +10,7 @@ import { toNativePath, toExecutorPath } from '../../common/executor-path.js';
 import { readVersionedFile, getFileRevisionOrMissing, getFileLockKey, writeVersionedTextFile, FileTooLargeError } from './file-revision.js';
 import { readDirectoryCandidates, fileBreadcrumbs, listProjectFiles, readFileDirectory, relativeFilePath } from './directory-reader.js';
 import { directoryCreationError, fileOperationError, fileRevisionConflict } from './errors.js';
-import { createChildDirectory } from './directory-creation.js';
+import { createChildDirectory, descriptorPathsDirectory, directoryCreationUnsupported } from './directory-creation.js';
 
 export interface FilesServiceOptions {
   readonly executorId: string;
@@ -19,6 +19,11 @@ export interface FilesServiceOptions {
   readonly assertAvailable?: (options?: ExecutorCallOptions) => void;
   readonly resolveSaveTarget?: typeof resolveRealWithinBase;
   readonly readDirectory?: typeof readFileDirectory;
+  /**
+   * Overrides the directory in which this system names open descriptors; null
+   * stands for a system that has none. Only a descriptor directory is safe here.
+   */
+  readonly descriptorPaths?: string | null;
 }
 
 const DIRECTORY_NAME_PROBLEMS: Readonly<Record<DirectoryNameProblem, string>> = {
@@ -38,7 +43,16 @@ let activeContentOperations = 0;
 const MAX_FILE_CONTENT_OPERATIONS = 8;
 
 export class FilesService implements ExecutionFilesService {
-  constructor(private readonly options: FilesServiceOptions) {}
+  readonly #descriptorPaths: string | null;
+
+  constructor(private readonly options: FilesServiceOptions) {
+    this.#descriptorPaths = options.descriptorPaths === undefined ? descriptorPathsDirectory() : options.descriptorPaths;
+  }
+
+  /** Whether this service can create directories; the executor advertises exactly this. */
+  get canCreateDirectories(): boolean {
+    return this.#descriptorPaths !== null;
+  }
 
   async tree(request: Parameters<ExecutionFilesService['tree']>[0], options?: ExecutorCallOptions) {
     return this.#run(options, async () => {
@@ -121,13 +135,15 @@ export class FilesService implements ExecutionFilesService {
 
   async createDirectory(request: Parameters<ExecutionFilesService['createDirectory']>[0], options?: ExecutorCallOptions) {
     return this.#run(options, async () => {
+      const descriptorPaths = this.#descriptorPaths;
+      if (descriptorPaths === null) throw directoryCreationUnsupported();
       const problem = typeof request.name === 'string' ? directoryNameProblem(request.name) : 'empty';
       if (problem) throw new ValidationDomainError(DIRECTORY_NAME_PROBLEMS[problem]);
       if (!isPathInput(request.parentPath)) throw new ValidationDomainError('Invalid directory path');
-      const { root, directory } = await this.#directory(request.parentPath);
+      const { directory } = await this.#directory(request.parentPath);
       this.#available(options);
       // The name is one segment, so the target stays inside its canonical parent.
-      const target = await createChildDirectory(root, directory, request.name).catch((error: unknown) => { throw directoryCreationError(error); });
+      const target = await createChildDirectory(descriptorPaths, directory, request.name).catch((error: unknown) => { throw directoryCreationError(error); });
       return { name: request.name, path: toExecutorPath(target), type: 'directory' as const };
     });
   }

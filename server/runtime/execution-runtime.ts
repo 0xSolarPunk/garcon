@@ -52,7 +52,7 @@ export class ExecutionRuntime implements ExecutionRuntimeApi {
       instanceId,
       projectBasePath: this.#projects.projectBasePath,
       integrationIds: Object.freeze(this.#registry.list().map((integration) => integration.descriptor.id)),
-      services: Object.freeze({ files: true, git: true, gh: true, terminals: true }),
+      services: Object.freeze({ files: true, git: true, gh: true, terminals: true, directoryCreation: this.#files.canCreateDirectories }),
     });
   }
 
