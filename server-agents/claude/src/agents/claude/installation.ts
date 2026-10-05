@@ -57,6 +57,7 @@ export class ClaudeInstallation implements AgentInstallation {
     const binary = this.config.binary();
     const environment: NodeJS.ProcessEnv = { ...process.env, ...buildClaudeHostEnvironment(this.config), NO_COLOR: '1' };
     delete environment.CLAUDECODE;
+    let output = '';
     try {
       const { stdout, stderr } = await runFile(binary, ['update'], {
         env: environment,
@@ -65,13 +66,16 @@ export class ClaudeInstallation implements AgentInstallation {
         killSignal: 'SIGKILL',
         signal: options?.signal,
       });
-      this.versionProbe.invalidate(binary);
+      output = formatUpdateOutput(stdout, stderr);
       return {
         installation: await this.status(options),
-        output: formatUpdateOutput(stdout, stderr),
+        output,
       };
     } catch (error) {
-      throw installationError(error);
+      const failure = installationError(error);
+      throw output
+        ? new AgentIntegrationError(failure.code, `${failure.message}\n${output}`, failure.retryable, failure.details)
+        : failure;
     } finally {
       // Failed updates may also replace the launcher; future admissions must probe again.
       this.versionProbe.invalidate(binary);

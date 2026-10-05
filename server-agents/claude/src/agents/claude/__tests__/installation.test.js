@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { AgentIntegrationError } from '@garcon/server-agent-interface';
 import { createClaudeConfig } from '../../../config.js';
 import { ClaudeInstallation } from '../installation.js';
 import { ClaudeCliVersionProbe } from '../cli-version.js';
@@ -22,7 +23,9 @@ import { join } from 'node:path';
 const file = (name) => join(import.meta.dir, name);
 const command = process.argv[2];
 if (command === '--version') {
-  console.log(readFileSync(file('version'), 'utf8') + ' (Claude Code)');
+  const version = readFileSync(file('version'), 'utf8');
+  if (version === 'unavailable') { console.error('Synthetic version probe failure'); process.exit(1); }
+  console.log(version + ' (Claude Code)');
 } else if (command === 'update') {
   appendFileSync(file('updates'), 'update\\n');
   writeFileSync(file('environment'), JSON.stringify({ config: process.env.CLAUDE_CONFIG_DIR, nested: process.env.CLAUDECODE }));
@@ -31,11 +34,12 @@ if (command === '--version') {
   if (mode === 'hang') await new Promise(() => { setInterval(() => {}, 1000); });
   if (mode === 'large') console.log('x'.repeat(100000));
   if (mode === 'success' || mode === 'delay' || mode === 'change-fail') writeFileSync(file('version'), '2.1.285');
+  if (mode === 'probe-fail') writeFileSync(file('version'), 'unavailable');
   if (mode === 'fail' || mode === 'change-fail') { console.error('Use your package manager: permission denied'); process.exit(1); }
-  if (mode === 'stdout-fail' || mode === 'both-fail' || mode === 'ansi-success') {
+  if (mode === 'stdout-fail' || mode === 'both-fail' || mode === 'ansi-success' || mode === 'probe-fail') {
     console.log('\\x1b[32mRun brew upgrade claude-code\\x1b[0m');
     if (mode !== 'stdout-fail') console.error('\\x1b[31mSynthetic package-manager guidance\\x1b[0m');
-    if (mode !== 'ansi-success') process.exit(1);
+    if (mode === 'stdout-fail' || mode === 'both-fail') process.exit(1);
   }
   console.log(mode === 'noop' ? 'Run brew upgrade claude-code' : 'Update complete');
 } else { console.error('unexpected command'); process.exit(2); }
@@ -104,6 +108,25 @@ describe('Claude installation maintenance', () => {
     expect(result.output).toContain('Run brew upgrade claude-code');
     expect(result.output).toContain('Synthetic package-manager guidance');
     expect(result.output).not.toContain('\x1b');
+  });
+
+  it('retains sanitized updater output when the fresh version probe fails', async () => {
+    const { binary, directory, probe, installation } = await fixture('probe-fail');
+    await expect(probe.assertCompatible(binary)).rejects.toThrow('unsupported');
+    const failure = await installation.update().catch((error) => error);
+    expect(failure).toBeInstanceOf(AgentIntegrationError);
+    expect(failure).toMatchObject({ code: 'PROVIDER_FAILURE', retryable: true });
+    expect(failure.message).toContain('Claude CLI version probe exited with code 1: Synthetic version probe failure');
+    expect(failure.message).toContain('Run brew upgrade claude-code');
+    expect(failure.message).toContain('Synthetic package-manager guidance');
+    expect(failure.message).not.toContain('\x1b');
+    await expect(probe.assertCompatible(binary)).rejects.toThrow('Synthetic version probe failure');
+
+    await writeFile(join(directory, 'version'), '2.1.285');
+    await expect(probe.assertCompatible(binary)).resolves.toEqual([2, 1, 285]);
+    await expect(installation.status()).resolves.toEqual({ version: '2.1.285', minimumVersion: '2.1.238', supported: true });
+    await expect(installation.update()).rejects.toThrow('Synthetic version probe failure');
+    expect(await readFile(join(directory, 'updates'), 'utf8')).toBe('update\nupdate\n');
   });
 
   it('invalidates the cache even when an update changes the launcher and then fails', async () => {
