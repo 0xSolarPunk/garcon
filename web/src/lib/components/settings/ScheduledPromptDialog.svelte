@@ -6,6 +6,7 @@
 	import ScheduledNewChatComposer from './ScheduledNewChatComposer.svelte';
 	import ScheduledPromptField from './ScheduledPromptField.svelte';
 	import ScheduledPromptOption from './ScheduledPromptOption.svelte';
+	import ScheduledPromptHeader from './ScheduledPromptHeader.svelte';
 	import { ScheduledPromptFormState } from './scheduled-prompt-form-state.svelte';
 	import {
 		getChatSessions,
@@ -185,16 +186,16 @@
 		class="flex h-dvh max-h-dvh w-screen max-w-none flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:h-[calc(100dvh-2rem)] sm:max-h-[48rem] sm:max-w-3xl sm:rounded-lg sm:border"
 		showCloseButton={false}
 	>
-		<Dialog.Header class="shrink-0 border-b border-border bg-background px-5 py-4 sm:px-6">
-			<Dialog.Title>
-				{scheduledPrompt ? m.scheduled_prompts_edit_title() : m.scheduled_prompts_add_title()}
-			</Dialog.Title>
-			<Dialog.Description>{m.scheduled_prompts_dialog_description()}</Dialog.Description>
-		</Dialog.Header>
+		<ScheduledPromptHeader
+			title={scheduledPrompt ? m.scheduled_prompts_edit_title() : m.scheduled_prompts_add_title()}
+			description={m.scheduled_prompts_dialog_description()}
+			{onClose}
+			closeDisabled={form.saving}
+		/>
 
-		<div class="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5 sm:px-6">
+		<div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
 			<section
-				class="space-y-4 rounded-lg border border-border bg-card p-4"
+				class="space-y-3 rounded-lg border border-border bg-card p-3 sm:space-y-4 sm:p-4"
 				aria-labelledby="scheduled-prompt-cadence"
 			>
 				<div>
@@ -205,7 +206,7 @@
 						{m.scheduled_prompts_browser_time({ timezone })}
 					</p>
 				</div>
-				<fieldset class="grid gap-2 sm:grid-cols-2" aria-labelledby="scheduled-prompt-cadence">
+				<fieldset class="grid grid-cols-2 gap-2" aria-labelledby="scheduled-prompt-cadence">
 					<ScheduledPromptOption
 						name="schedule-cadence"
 						value="once"
@@ -285,7 +286,7 @@
 					<div class="space-y-2">
 						<p class="text-sm font-medium">{m.scheduled_prompts_lifecycle()}</p>
 						<fieldset
-							class="grid gap-2 sm:grid-cols-2"
+							class="grid grid-cols-2 gap-2"
 							aria-label={m.scheduled_prompts_lifecycle()}
 						>
 							<ScheduledPromptOption
@@ -322,13 +323,13 @@
 			</section>
 
 			<section
-				class="space-y-4 rounded-lg border border-border bg-card p-4"
+				class="space-y-3 rounded-lg border border-border bg-card p-3 sm:space-y-4 sm:p-4"
 				aria-labelledby="scheduled-prompt-target"
 			>
 				<h3 id="scheduled-prompt-target" class="text-sm font-medium text-foreground">
 					{m.scheduled_prompts_chat_target()}
 				</h3>
-				<fieldset class="grid gap-2 sm:grid-cols-2" aria-labelledby="scheduled-prompt-target">
+				<fieldset class="grid grid-cols-2 gap-2" aria-labelledby="scheduled-prompt-target">
 					<ScheduledPromptOption
 						name="chat-target"
 						value="new-chat"
@@ -430,7 +431,7 @@
 			{/if}
 		</div>
 
-		<Dialog.Footer class="shrink-0 border-t border-border bg-background px-5 py-4 sm:px-6">
+		<Dialog.Footer class="shrink-0 border-t border-border bg-background px-4 py-3 sm:px-6 sm:py-4">
 			<Button variant="secondary" onclick={onClose} disabled={form.saving}>
 				{m.scheduled_prompts_cancel()}
 			</Button>
