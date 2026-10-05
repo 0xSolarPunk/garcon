@@ -87,6 +87,11 @@ for (const executionBackend of ['in-process', 'remote-controller-dials', 'remote
       await browserExpect(selector).toBeVisible();
       await editor.getByRole('button', { name: 'Close', exact: true }).click();
       await page.setViewportSize({ width: 390, height: 844 });
+      await browserExpect.poll(async () => {
+        const bounds = await list.boundingBox();
+        return bounds !== null && Math.abs(bounds.x) < 1 && Math.abs(bounds.y) < 1 &&
+          Math.abs(bounds.width - 390) < 1 && Math.abs(bounds.height - 844) < 1;
+      }).toBe(true);
       await browserExpect(pills).toHaveCount(2);
       for (const pill of await pills.all()) await browserExpect(pill).toBeVisible();
       await capture('mobile-list');
