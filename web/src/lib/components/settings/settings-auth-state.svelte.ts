@@ -148,8 +148,6 @@ export class SettingsAuthState {
 
 		try {
 			await completeAgentAuthLogin(agentId, sessionId, code, this.executorId);
-			if (!this.#ownsSession(agentId, sessionId, operationGeneration, lifecycleId)) return;
-			this.#startLoginSessionPolling(agentId, sessionId, operationGeneration, lifecycleId);
 		} catch (err) {
 			if (!this.#ownsSession(agentId, sessionId, operationGeneration, lifecycleId)) return;
 			this.#setAuth(agentId, {
@@ -157,7 +155,10 @@ export class SettingsAuthState {
 				loading: false,
 				error: err instanceof Error ? err.message : String(err),
 			});
-			this.#startLoginSessionPolling(agentId, sessionId, operationGeneration, lifecycleId);
+		} finally {
+			if (this.#ownsSession(agentId, sessionId, operationGeneration, lifecycleId)) {
+				this.#startLoginSessionPolling(agentId, sessionId, operationGeneration, lifecycleId);
+			}
 		}
 	}
 
@@ -326,7 +327,6 @@ export class SettingsAuthState {
 		this.#stopAuthPolling(agentId);
 		const pollRunId = ++this.#nextAuthPollRunId;
 		this.#authPollRunIds[agentId] = pollRunId;
-		this.#authPollStartedAt[agentId] = Date.now();
 		void this.#pollLoginSessionUntilDone(
 			agentId,
 			sessionId,
