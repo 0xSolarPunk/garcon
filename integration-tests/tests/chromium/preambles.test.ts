@@ -672,6 +672,24 @@ describe('Chromium preambles', () => {
           height: 568,
           touch: true,
         });
+        const noticeElement = await notice.elementHandle();
+        if (!noticeElement) throw new Error('Missing preamble application notice.');
+        try {
+          await fixture.page.waitForFunction((element) => {
+            if (!(element instanceof HTMLElement) || !element.isConnected || innerWidth !== 320) return false;
+            const rootRect = element.getBoundingClientRect();
+            const titleRects = [
+              ...element.querySelectorAll<HTMLElement>('[data-slot="preamble-application-title"]'),
+            ].map((title) => title.getBoundingClientRect());
+            return (
+              rootRect.width > 0 && rootRect.height > 0 &&
+              titleRects.every((rect) => rect.width > 0 && rect.height > 0) &&
+              new Set(titleRects.map((rect) => Math.round(rect.top))).size > 1
+            );
+          }, noticeElement, { timeout: 10_000 });
+        } finally {
+          await noticeElement.dispose();
+        }
         const noticeLayout = await notice.evaluate((element) => {
           const root = element as HTMLElement;
           const rootRect = root.getBoundingClientRect();
