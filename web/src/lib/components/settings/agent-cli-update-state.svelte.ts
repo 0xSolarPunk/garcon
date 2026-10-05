@@ -6,12 +6,15 @@ export class AgentCliUpdateState {
 	loading = $state(false);
 	updating = $state(false);
 	error = $state<string | null>(null);
-	completed = $state(false);
-	output = $state('');
+	output = $state<string | null>(null);
 	#active = false;
 	#generation = 0;
 
 	constructor(readonly agentId: string, readonly executorId: string, readonly instanceId: string) {}
+
+	get completed(): boolean {
+		return this.output !== null;
+	}
 
 	initialize(): () => void {
 		this.#active = true;
@@ -50,7 +53,6 @@ export class AgentCliUpdateState {
 			if (!this.#isCurrent(generation)) return;
 			this.installation = result.installation;
 			this.output = result.output;
-			this.completed = true;
 		} catch (error) {
 			if (!this.#isCurrent(generation)) return;
 			this.installation = null;
@@ -66,7 +68,6 @@ export class AgentCliUpdateState {
 
 	#clearFeedback(): void {
 		this.error = null;
-		this.completed = false;
-		this.output = '';
+		this.output = null;
 	}
 }

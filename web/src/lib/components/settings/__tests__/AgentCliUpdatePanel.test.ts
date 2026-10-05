@@ -51,6 +51,16 @@ describe('Claude Code provider settings', () => {
 		expect(screen.queryByText(/2.1.207 is unsupported/)).toBeNull();
 	});
 
+	it('shows verified completion when the updater produces no output', async () => {
+		vi.mocked(updateAgentInstallation).mockResolvedValueOnce({ installation: newVersion, output: '' });
+		const { container } = render(AgentCliUpdatePanel, { agentId: 'claude', executorId: 'local', instanceId: 'instance-a' });
+		await screen.findByText('Installed version: 2.1.207');
+		expect(screen.queryByText(/is ready for new sessions/)).toBeNull();
+		await fireEvent.click(screen.getByRole('button', { name: 'Update Claude Code' }));
+		expect(await screen.findByText('Claude Code 2.1.285 is ready for new sessions.')).toBeTruthy();
+		expect(container.querySelector('details')).toBeNull();
+	});
+
 	it('keeps a package-manager no-op visibly unsupported', async () => {
 		vi.mocked(updateAgentInstallation).mockResolvedValueOnce({ installation: oldVersion, output: 'Run brew upgrade claude-code' });
 		render(AgentCliUpdatePanel, { agentId: 'claude', executorId: 'local', instanceId: 'instance-a' });
