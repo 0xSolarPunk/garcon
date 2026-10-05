@@ -77,6 +77,7 @@ for (const executionBackend of ['in-process', 'remote-controller-dials', 'remote
       const browserPill = browser.locator('[data-slot="directory-browser-executor"]');
       await browserExpect(browserPill).toBeVisible();
       await browserExpect(browserPill).toContainText(label);
+      await browserExpect(browser.getByRole('button', { name: 'Select this directory', exact: true })).toBeEnabled();
       expect(await browser.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
       await capture('mobile-directory');
       await page.setViewportSize({ width: 320, height: 740 });
