@@ -9,9 +9,10 @@
 	import Loader2 from '@lucide/svelte/icons/loader-2';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import Search from '@lucide/svelte/icons/search';
+	import Network from '@lucide/svelte/icons/network';
 	import * as m from '$lib/paraglide/messages.js';
 	import * as Dialog from '$lib/components/ui/dialog';
-	import { getTransientLayers } from '$lib/context';
+	import { getExecutors, getTransientLayers } from '$lib/context';
 	import { transientLayer } from '$lib/workspace/transient-layer-action.js';
 
 	interface DirectoryBrowserProps {
@@ -35,6 +36,9 @@
 		isMobile,
 	}: DirectoryBrowserProps = $props();
 	const transientLayers = getTransientLayers();
+	const executors = getExecutors();
+	const executorLabel = $derived(executors.label(executorId));
+	const executorDescription = $derived(`Executor: ${executorLabel}`);
 	const focusReturnTarget =
 		typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
 			? document.activeElement
@@ -184,14 +188,25 @@
 			class="flex h-dvh w-screen max-w-none flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:max-w-none"
 			aria-label={m.chat_directory_browser_select_directory()}
 		>
-			<div class="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
-				<h3 class="text-sm font-medium text-foreground">
-					{m.chat_directory_browser_select_directory()}
-				</h3>
+			<div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-border flex-shrink-0">
+				<div class="min-w-0 space-y-1.5">
+					<h3 class="text-sm font-medium text-foreground">
+						{m.chat_directory_browser_select_directory()}
+					</h3>
+					<span
+						class="flex w-fit min-w-0 max-w-full items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+						data-slot="directory-browser-executor"
+						title={executorDescription}
+					>
+						<Network class="size-3 shrink-0 text-file-icon-folder" aria-hidden="true" />
+						<span class="sr-only">{executorDescription}</span>
+						<span class="truncate" aria-hidden="true">{executorLabel}</span>
+					</span>
+				</div>
 				<button
 					type="button"
 					onclick={onClose}
-					class="text-sm text-muted-foreground hover:text-foreground"
+					class="shrink-0 text-sm text-muted-foreground hover:text-foreground"
 				>
 					{m.chat_directory_browser_cancel()}
 				</button>

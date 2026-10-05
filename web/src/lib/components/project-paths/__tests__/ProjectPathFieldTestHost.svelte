@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { ComponentProps } from 'svelte';
 	import { setTransientLayers } from '$lib/context';
+	import { setExecutorsTestContext } from '$lib/executors/__tests__/executors-test-context';
 	import { WorkspaceInteractionGate } from '$lib/workspace/workspace-interaction-gate.svelte';
 	import { TransientLayerRegistry } from '$lib/workspace/transient-layers.svelte';
 	import ProjectPathField from '$lib/components/project-paths/ProjectPathField.svelte';
@@ -11,6 +12,7 @@
 		...props
 	}: ComponentProps<typeof ProjectPathField> & { onSubmit?: () => void } = $props();
 	let input = $state<HTMLInputElement | null>(null);
+	setExecutorsTestContext();
 	setTransientLayers(new TransientLayerRegistry(new WorkspaceInteractionGate()));
 </script>
 
