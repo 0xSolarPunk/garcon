@@ -49,6 +49,27 @@ describe('ExecutorsStore', () => {
 		expect(executors.isReady('local')).toBe(false);
 	});
 
+	it('reports directory creation as each executor reports it, independent of readiness', () => {
+		const executors = new ExecutorsStore();
+		expect(executors.filesAvailable('local')).toBe(true);
+		expect(executors.supportsDirectoryCreation('local')).toBe(false);
+		const services = localExecutor.machineServices;
+		executors.applySnapshot([
+			localExecutor,
+			{ ...remoteExecutor, machineServices: { ...services, directoryCreation: false } },
+		]);
+		expect(executors.supportsDirectoryCreation('local')).toBe(true);
+		expect(executors.filesAvailable(remoteExecutor.id)).toBe(true);
+		expect(executors.supportsDirectoryCreation(remoteExecutor.id)).toBe(false);
+		executors.applySnapshot([
+			localExecutor,
+			{ ...remoteExecutor, availability: 'reconnecting', machineServices: services },
+		]);
+		expect(executors.filesAvailable(remoteExecutor.id)).toBe(false);
+		expect(executors.supportsDirectoryCreation(remoteExecutor.id)).toBe(true);
+		expect(executors.supportsDirectoryCreation('99999999-9999-4999-8999-999999999999')).toBe(false);
+	});
+
 	it('keeps unknown targets unavailable and removes deleted executors', () => {
 		const executors = new ExecutorsStore();
 		executors.applySnapshot([localExecutor, remoteExecutor]);
