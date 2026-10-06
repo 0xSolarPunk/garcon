@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { flushSync } from 'svelte';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ExecutorsStore } from '$lib/executors/executors-store.svelte.js';
 import {
@@ -140,12 +141,13 @@ it('updates the selected label and open menu availability when inventory changes
 	);
 });
 
-
-it('keeps the same Local trigger when the remote inventory is removed', async () => {
+it('keeps the same Local trigger when the remote inventory is removed', () => {
 	const executors = new ExecutorsStore();
 	executors.applySnapshot([localExecutor, remoteExecutor]);
 	render(ExecutorSelector, { executors, executorId: 'local', service: 'agents', onSelect: vi.fn() });
 	const trigger = screen.getByRole('button', { name: 'Executor: Local' });
 	executors.applySnapshot([localExecutor]);
-	await waitFor(() => expect(screen.getByRole('button', { name: 'Executor: Local' })).toBe(trigger));
+	// Flushed first, so a trigger that unmounts with the inventory fails here.
+	flushSync();
+	expect(screen.getByRole('button', { name: 'Executor: Local' })).toBe(trigger);
 });

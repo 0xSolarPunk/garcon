@@ -279,23 +279,31 @@ describe('mobile directory sheet', () => {
 	});
 });
 
-it('shows the owning Local executor in the mobile browser without remote executors', async () => {
-	vi.mocked(browseDirectory).mockReset().mockResolvedValue([]);
-	const view = render(DirectoryBrowserTestHost, {
-		executorId: 'local', currentPath: '/repo/', basePath: '/repo', isMobile: true, onSelect: vi.fn(), onClose: vi.fn(),
+function executorPill(): Element | null {
+	return document.querySelector('[data-slot="directory-browser-executor"]');
+}
+
+function renderMobileBrowser(executors: ExecutorsStore, executorId: string) {
+	vi.mocked(browseDirectory).mockResolvedValue([]);
+	return render(DirectoryBrowserTestHost, {
+		executors, executorId, currentPath: '/repo/', basePath: '/repo', isMobile: true, onSelect: vi.fn(), onClose: vi.fn(),
 	});
-	expect(view.container.ownerDocument.querySelector('[data-slot="directory-browser-executor"]')?.getAttribute('title')).toBe('Executor: Local');
+}
+
+it('shows the owning Local executor in the mobile browser when Local is the only executor', async () => {
+	const executors = new ExecutorsStore();
+	executors.applySnapshot([localExecutor]);
+	renderMobileBrowser(executors, 'local');
+	expect(executorPill()?.getAttribute('title')).toBe('Executor: Local');
+	expect(executorPill()?.textContent).toContain('Executor: Local');
 	await waitFor(() => expect(browseDirectory).toHaveBeenCalledWith('/repo', expect.any(AbortSignal), 'local'));
 });
 
 it('keeps the mobile browser pill bound to the remote owner through label and availability changes', async () => {
-	vi.mocked(browseDirectory).mockReset().mockResolvedValue([]);
 	const executors = new ExecutorsStore();
 	executors.applySnapshot([localExecutor, remoteExecutor]);
-	const view = render(DirectoryBrowserTestHost, {
-		executors, executorId: remoteExecutor.id, currentPath: '/repo/', basePath: '/repo', isMobile: true, onSelect: vi.fn(), onClose: vi.fn(),
-	});
-	const pill = view.container.ownerDocument.querySelector('[data-slot="directory-browser-executor"]');
+	renderMobileBrowser(executors, remoteExecutor.id);
+	const pill = executorPill();
 	expect(pill?.getAttribute('title')).toBe('Executor: Worker');
 	await waitFor(() => expect(browseDirectory).toHaveBeenCalledWith('/repo', expect.any(AbortSignal), remoteExecutor.id));
 	executors.applySnapshot([localExecutor, { ...remoteExecutor, label: 'Renamed worker', availability: 'offline' }]);

@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const webRoot = fileURLToPath(new URL('../../web/', import.meta.url));
 
-test('compiles recovery and scheduled prompt messages without network access or a plugin cache', async () => {
+test('compiles every message without network access or a plugin cache', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'garcon-i18n-offline-'));
   try {
     await fs.mkdir(path.join(directory, 'project.inlang'));
@@ -39,16 +39,10 @@ test('compiles recovery and scheduled prompt messages without network access or 
 
     const translations = JSON.parse(await fs.readFile(path.join(directory, 'messages/en.json'), 'utf8'));
     const messages = await import(pathToFileURL(path.join(directory, 'src/lib/paraglide/messages.js')).href);
-    for (const key of [
-      'file_recovery_storage_blocked',
-      'file_recovery_storage_open_failed',
-      'file_recovery_document_limit',
-      'scheduled_prompts_description',
-      'scheduled_prompts_dialog_description',
-    ]) {
-      expect(typeof messages[key]).toBe('function');
-      expect(messages[key]({}, { locale: 'en' })).toBe(translations[key]);
-    }
+    // A plugin that failed to load compiles nothing, so every key must be present.
+    const missing = Object.keys(translations).filter((key) => !key.startsWith('$') && typeof messages[key] !== 'function');
+    expect(missing).toEqual([]);
+    expect(messages.common_close({}, { locale: 'en' })).toBe(translations.common_close);
     await expect(fs.stat(path.join(directory, 'src/lib/paraglide/messages/en.js'))).resolves.toBeDefined();
   } finally {
     await fs.rm(directory, { recursive: true, force: true });

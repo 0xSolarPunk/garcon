@@ -61,7 +61,7 @@
 		)}
 		{disabled}
 		title={executors.get(executorId) ? executorLabel : executorId}
-		aria-label={`Executor: ${executorLabel}`}
+		aria-label={m.executors_named_label({ label: executorLabel })}
 		data-executor-picker
 		data-presentation={presentation}
 	>

@@ -12,11 +12,11 @@
 	import Loader2 from '@lucide/svelte/icons/loader-2';
 	import Plus from '@lucide/svelte/icons/plus';
 	import Search from '@lucide/svelte/icons/search';
-	import Network from '@lucide/svelte/icons/network';
 	import X from '@lucide/svelte/icons/x';
 	import * as m from '$lib/paraglide/messages.js';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Button } from '$lib/components/ui/button';
+	import ExecutorPill from '$lib/components/shared/ExecutorPill.svelte';
 	import { getExecutors, getTransientLayers } from '$lib/context';
 	import { DirectoryBrowserState } from '$lib/project-paths/directory-browser-state.svelte.js';
 	import { splitTypedDirectoryPath } from '$lib/project-paths/directory-location.js';
@@ -50,8 +50,6 @@
 	}: DirectoryBrowserProps = $props();
 	const transientLayers = getTransientLayers();
 	const executors = getExecutors();
-	const executorLabel = $derived(executors.label(executorId));
-	const executorDescription = $derived(`Executor: ${executorLabel}`);
 	// An executor that cannot create directories safely does not offer the controls.
 	const supportsCreation = $derived(executors.supportsDirectoryCreation(executorId));
 	const openedFrom =
@@ -354,15 +352,7 @@
 					<Dialog.Title class="min-w-0 truncate text-base font-semibold">
 						{m.chat_directory_browser_select_directory()}
 					</Dialog.Title>
-					<span
-						class="flex w-fit min-w-0 max-w-full items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-						data-slot="directory-browser-executor"
-						title={executorDescription}
-					>
-						<Network class="size-3 shrink-0 text-file-icon-folder" aria-hidden="true" />
-						<span class="sr-only">{executorDescription}</span>
-						<span class="truncate" aria-hidden="true">{executorLabel}</span>
-					</span>
+					<ExecutorPill label={executors.label(executorId)} data-slot="directory-browser-executor" />
 				</div>
 				<button
 					type="button"

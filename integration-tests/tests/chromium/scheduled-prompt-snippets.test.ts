@@ -148,6 +148,8 @@ test('scheduled snippets support defaults, inline triggers, both targets, and mo
       await saveEntered.promise;
       await browserExpect(editor.getByRole('button', { name: 'Close', exact: true })).toBeDisabled();
       await browserExpect(editor.getByRole('button', { name: 'Cancel', exact: true })).toBeDisabled();
+      // Escape asks to close like the buttons do and is refused while the save is in flight.
+      await page.keyboard.press('Escape');
       await browserExpect(editor).toBeVisible();
     } finally {
       releaseSave.resolve(undefined);

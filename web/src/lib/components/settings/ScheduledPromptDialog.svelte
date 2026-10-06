@@ -206,6 +206,14 @@
 			: recurringCadenceLabel(intervalMinutes);
 	}
 
+	// Escape and the overlay ask to close like the buttons do, and a save in flight refuses them all.
+	function requestClose(): void {
+		if (!form.saving) onClose();
+	}
+
+	const sectionClass = 'space-y-3 rounded-lg border border-border bg-card p-3 sm:space-y-4 sm:p-4';
+	const optionGridClass = 'grid grid-cols-2 gap-2';
+
 	function handlePromptKeydown(event: KeyboardEvent): void {
 		if (event.key !== 'Enter' || (!event.ctrlKey && !event.metaKey)) return;
 		event.preventDefault();
@@ -213,7 +221,7 @@
 	}
 </script>
 
-<Dialog.Root {open} onOpenChange={(value) => !value && !form.saving && onClose()}>
+<Dialog.Root {open} requestClose={requestClose}>
 	<Dialog.Content
 		class="flex h-dvh max-h-dvh w-screen max-w-none flex-col gap-0 overflow-hidden rounded-none border-0 p-0 sm:h-[calc(100dvh-2rem)] sm:max-h-[48rem] sm:max-w-3xl sm:rounded-lg sm:border"
 		showCloseButton={false}
@@ -227,7 +235,7 @@
 
 		<div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 sm:px-6 sm:py-5">
 			<section
-				class="space-y-3 rounded-lg border border-border bg-card p-3 sm:space-y-4 sm:p-4"
+				class={sectionClass}
 				aria-labelledby="scheduled-prompt-cadence"
 			>
 				<div>
@@ -238,7 +246,7 @@
 						{m.scheduled_prompts_browser_time({ timezone })}
 					</p>
 				</div>
-				<fieldset class="grid grid-cols-2 gap-2" aria-labelledby="scheduled-prompt-cadence">
+				<fieldset class={optionGridClass} aria-labelledby="scheduled-prompt-cadence">
 					<ScheduledPromptOption
 						name="schedule-cadence"
 						value="once"
@@ -333,7 +341,7 @@
 					<div class="space-y-2">
 						<p class="text-sm font-medium">{m.scheduled_prompts_lifecycle()}</p>
 						<fieldset
-							class="grid grid-cols-2 gap-2"
+							class={optionGridClass}
 							aria-label={m.scheduled_prompts_lifecycle()}
 						>
 							<ScheduledPromptOption
@@ -375,13 +383,13 @@
 			</section>
 
 			<section
-				class="space-y-3 rounded-lg border border-border bg-card p-3 sm:space-y-4 sm:p-4"
+				class={sectionClass}
 				aria-labelledby="scheduled-prompt-target"
 			>
 				<h3 id="scheduled-prompt-target" class="text-sm font-medium text-foreground">
 					{m.scheduled_prompts_chat_target()}
 				</h3>
-				<fieldset class="grid grid-cols-2 gap-2" aria-labelledby="scheduled-prompt-target">
+				<fieldset class={optionGridClass} aria-labelledby="scheduled-prompt-target">
 					<ScheduledPromptOption
 						name="chat-target"
 						value="new-chat"

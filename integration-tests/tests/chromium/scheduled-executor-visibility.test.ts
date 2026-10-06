@@ -56,7 +56,8 @@ for (const executionBackend of ['in-process', 'remote-controller-dials', 'remote
       await browserExpect(page.getByRole('menuitemradio', { name: label, exact: true })).toHaveAttribute('aria-checked', 'true');
       await page.keyboard.press('Escape');
       await browserExpect(editor).toBeVisible();
-      await browserExpect(editor.getByRole('button', { name: 'Save Prompt', exact: true })).toBeEnabled();
+      // Saving waits for the executor's model catalog, which a worker takes several seconds to report.
+      await browserExpect(editor.getByRole('button', { name: 'Save Prompt', exact: true })).toBeEnabled({ timeout: 20_000 });
       await capture('desktop-editor');
 
       phase('mobile executor context and owning filesystem');
